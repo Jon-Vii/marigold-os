@@ -173,6 +173,7 @@ file names in the firmware path:
 
 ```text
 /XTEINK/CACHE/E<hash>/BOOK.BIN
+/XTEINK/CACHE/E<hash>/COVER.BIN
 /XTEINK/CACHE/E<hash>/SECTIONS/S000.BIN
 /XTEINK/CACHE/E<hash>/SECTIONS/S001.BIN
 /XTEINK/STATE.BIN
@@ -190,6 +191,13 @@ one huge XHTML member remains the next cache-cursor refinement. `STATE.BIN`
 stores the encoded `AppStateRecord`; writing is present, while boot-time restore
 still needs the app/display handoff that maps the saved book id back to the
 scanned SD catalog.
+
+`COVER.BIN` is an optional Home-cover sidecar for the same cache key. It stores
+a tiny header followed by a 202x303, 1-bit, row-packed bitmap matching the Dock
+Clean cover slot. Firmware treats it as flat DOD data: valid records are drawn
+directly, while missing or invalid records fall back to generated cover art. The
+host preview tool can generate the sidecar from EPUB JPEG/PNG covers with
+`--cover-bin` or write it directly to a mounted SD cache path with `--sd-root`.
 
 Reading typography uses generated Literata bitmap assets. The host generator
 downloads OFL Literata TTFs and emits Latin-1 glyph metrics/bitmaps for Regular,

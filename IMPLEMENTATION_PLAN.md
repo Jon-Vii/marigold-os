@@ -55,10 +55,9 @@ Current code status:
   load/store implementation pending.
 - Tiny in-flash/static book source is present as reader-shell pages.
 - Home, library, active reading view, chapter navigation, and settings view are
-  present as explicit app state. Home/Library/Settings render in portrait; Reading
-  and Chapters render in landscape. Home is cover-led with
-  Continue/Library/Settings. Storage-backed EPUB entries should fill the same
-  model.
+  present as explicit app state. Home now uses the landscape Dock Clean layout
+  with the four hardware-adjacent actions on the left and the current book on
+  the right. Storage-backed EPUB entries fill the same model.
 - `DisplayOrientation` exists with landscape buttons-bottom/top and portrait
   buttons-left/right modes; default is landscape buttons-bottom.
 - Keep app state as flat structs and render requests as small `Copy` messages.
@@ -89,6 +88,11 @@ Current code status:
   section into `/XTEINK/CACHE/E<hash>/SECTIONS/SNNN.BIN`, and renders from those
   flat records. Near-end NEXT requests a larger cached page target before
   rendering, so partial section caches can extend on demand.
+- Home can now draw a selected-book cover bitmap from
+  `/XTEINK/CACHE/E<hash>/COVER.BIN`. The firmware format is a fixed 202x303,
+  1-bit, row-packed DOD bitmap; if it is absent or invalid, the Dock Clean
+  fallback artwork is used. Host preview tooling can generate this cache file
+  from an EPUB cover image.
 - Current limitation: partial caches for very large single-XHTML spine items
   can render the first decoded chunk, but true byte-accurate resume inside that
   same compressed member is still pending.

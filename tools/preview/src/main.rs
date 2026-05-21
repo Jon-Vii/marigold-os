@@ -24,12 +24,23 @@ const READER_RIGHT_X: i16 = 792;
 const READER_WRAP_SAFETY: i16 = 4;
 const STYLE_MARKER: char = '\u{1b}';
 const MAX_PREVIEW_LINES: usize = 4096;
+const COVER_WIDTH: u16 = 202;
+const COVER_HEIGHT: u16 = 303;
+const COVER_STRIDE: u16 = COVER_WIDTH.div_ceil(8);
+const COVER_BYTES: usize = COVER_STRIDE as usize * COVER_HEIGHT as usize;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse()?;
     create_dir_all(&args.out_dir)?;
     if let Some(epub) = args.epub {
-        preview_epub(&epub, &args.out_dir, args.pages)?;
+        preview_epub(
+            &epub,
+            &args.out_dir,
+            args.pages,
+            args.cover_bin.as_deref(),
+            args.sd_root.as_deref(),
+            args.source_path.as_deref(),
+        )?;
     } else {
         write_static_previews(&args.out_dir)?;
     }
@@ -40,6 +51,9 @@ struct Args {
     epub: Option<PathBuf>,
     out_dir: PathBuf,
     pages: usize,
+    cover_bin: Option<PathBuf>,
+    sd_root: Option<PathBuf>,
+    source_path: Option<String>,
 }
 
 impl Args {
@@ -47,6 +61,9 @@ impl Args {
         let mut epub = None;
         let mut out_dir = PathBuf::from("target/previews");
         let mut pages = 5usize;
+        let mut cover_bin = None;
+        let mut sd_root = None;
+        let mut source_path = None;
         let mut iter = env::args().skip(1);
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -55,9 +72,18 @@ impl Args {
                     let value = iter.next().ok_or("--pages needs a count")?;
                     pages = value.parse().map_err(|_| "--pages needs a number")?;
                 }
+                "--cover-bin" => {
+                    cover_bin = Some(PathBuf::from(iter.next().ok_or("--cover-bin needs a path")?))
+                }
+                "--sd-root" => {
+                    sd_root = Some(PathBuf::from(iter.next().ok_or("--sd-root needs a path")?))
+                }
+                "--source-path" => {
+                    source_path = Some(iter.next().ok_or("--source-path needs a path")?)
+                }
                 "--help" | "-h" => {
                     return Err(
-                        "usage: cargo run -- <book.epub> [--out target/previews] [--pages 5]"
+                        "usage: cargo run -- <book.epub> [--out target/previews] [--pages 5] [--cover-bin COVER.BIN] [--sd-root /Volumes/CARD] [--source-path /books/Book.epub]"
                             .into(),
                     );
                 }
@@ -69,6 +95,9 @@ impl Args {
             epub,
             out_dir,
             pages,
+            cover_bin,
+            sd_root,
+            source_path,
         })
     }
 }
@@ -77,6 +106,9 @@ fn preview_epub(
     epub_path: &Path,
     out_dir: &Path,
     page_limit: usize,
+    cover_bin: Option<&Path>,
+    sd_root: Option<&Path>,
+    source_path: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let bytes = read(epub_path)?;
     let zip = ZipArchive::new(&bytes).map_err(|err| format!("zip: {err:?}"))?;
@@ -93,6 +125,25 @@ fn preview_epub(
 
     let mut css_rules = CssRules::new();
     load_css_rules(&zip, &package, &mut css_rules);
+    if let Some(path) = cover_bin {
+        write_cover_cache_file(&zip, &package, path)?;
+    }
+    if let Some(sd_root) = sd_root {
+        let default_source_path;
+        let source_path = if let Some(source_path) = source_path {
+            source_path
+        } else {
+            default_source_path = default_device_source_path(epub_path);
+            default_source_path.as_str()
+        };
+        let key = cache_key_for(source_path, bytes.len() as u32);
+        let path = sd_root
+            .join("XTEINK")
+            .join("CACHE")
+            .join(key)
+            .join("COVER.BIN");
+        write_cover_cache_file(&zip, &package, &path)?;
+    }
 
     let start_spine = package
         .text_reference_href
@@ -151,6 +202,93 @@ fn preview_epub(
         out_dir.display()
     );
     Ok(())
+}
+
+fn default_device_source_path(epub_path: &Path) -> String {
+    epub_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            let mut path = String::from("/books/");
+            path.push_str(name);
+            path
+        })
+        .unwrap_or_else(|| String::from("/books/book.epub"))
+}
+
+fn cache_key_for(source_path: &str, source_len: u32) -> String {
+    let mut hash = 0x811c_9dc5u32;
+    for byte in source_path.bytes().chain(source_len.to_le_bytes()) {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    format!("E{:07X}", hash & 0x0FFF_FFFF)
+}
+
+fn write_cover_cache_file(
+    zip: &ZipArchive<'_>,
+    package: &EpubPackage<'_>,
+    path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cover = find_cover_href(package).ok_or("no cover image found in manifest")?;
+    let cover_path = resolve_epub_href(package.opf_path, cover);
+    let entry = zip
+        .entries()
+        .flatten()
+        .find(|entry| entry.name == cover_path)
+        .ok_or_else(|| format!("cover entry not found: {cover_path}"))?;
+    let bytes = read_zip_entry(zip, entry)?;
+    let image = image::load_from_memory(&bytes)?;
+    let gray = image
+        .resize_to_fill(
+            COVER_WIDTH as u32,
+            COVER_HEIGHT as u32,
+            image::imageops::FilterType::Triangle,
+        )
+        .to_luma8();
+    let mut bits = [0u8; COVER_BYTES];
+    for y in 0..COVER_HEIGHT as usize {
+        for x in 0..COVER_WIDTH as usize {
+            let luma = gray.get_pixel(x as u32, y as u32)[0];
+            if luma < 180 {
+                let index = y * COVER_STRIDE as usize + x / 8;
+                bits[index] |= 0x80 >> (x & 7);
+            }
+        }
+    }
+
+    if let Some(parent) = path.parent() {
+        create_dir_all(parent)?;
+    }
+    let mut file = File::create(path)?;
+    file.write_all(b"X4CV")?;
+    file.write_all(&[1])?;
+    file.write_all(&COVER_WIDTH.to_le_bytes())?;
+    file.write_all(&COVER_HEIGHT.to_le_bytes())?;
+    file.write_all(&COVER_STRIDE.to_le_bytes())?;
+    file.write_all(&[0])?;
+    file.write_all(&bits)?;
+    println!("Wrote cover cache to {}", path.display());
+    Ok(())
+}
+
+fn find_cover_href<'a>(package: &'a EpubPackage<'a>) -> Option<&'a str> {
+    package
+        .manifest
+        .iter()
+        .find(|item| {
+            item.properties
+                .split_ascii_whitespace()
+                .any(|prop| prop == "cover-image")
+        })
+        .or_else(|| {
+            package.manifest.iter().find(|item| {
+                item.media_type.starts_with("image/")
+                    && (item.id.eq_ignore_ascii_case("cover")
+                        || item.href.to_ascii_lowercase().contains("cover"))
+            })
+        })
+        .map(|item| item.href)
 }
 
 fn read_zip_entry(zip: &ZipArchive<'_>, entry: ZipEntry<'_>) -> Result<Vec<u8>, String> {
@@ -1608,6 +1746,7 @@ fn write_shell_preview(
             title: "Flowers for Algernon",
             author: "Daniel Keyes",
             progress_permille: 420,
+            cover: None,
         },
         library_status: UiLibraryStatus::Ready,
         library_entries: &entries,

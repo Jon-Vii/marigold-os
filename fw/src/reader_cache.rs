@@ -1,7 +1,10 @@
 use crate::display_flush::Epd;
 use crate::library_sd::{SdSpiDevice, StaticTime};
 use crate::reader_layout;
-use crate::reader_store::{BookLoadStatus, ReaderStore, MAX_READER_BLOCK_TEXT};
+use crate::reader_store::{
+    BookLoadStatus, ReaderStore, COVER_BYTES, COVER_HEIGHT, COVER_STRIDE, COVER_WIDTH,
+    MAX_READER_BLOCK_TEXT,
+};
 use display::font::{literata, FontStyle};
 use embassy_time::Instant;
 use embedded_hal::spi::SpiBus as BlockingSpiBus;
@@ -32,7 +35,10 @@ const CACHE_ROOT_DIR: &str = "XTEINK";
 const CACHE_DIR: &str = "CACHE";
 const CACHE_SECTIONS_DIR: &str = "SECTIONS";
 const CACHE_BOOK_FILE: &str = "BOOK.BIN";
+const CACHE_COVER_FILE: &str = "COVER.BIN";
 const STATE_FILE: &str = "STATE.BIN";
+const COVER_MAGIC: &[u8; 4] = b"X4CV";
+const COVER_VERSION: u8 = 1;
 
 pub(crate) struct ReaderCacheScratch {
     tail: [u8; 4096],
@@ -398,6 +404,7 @@ where
 
     copy_string(&mut library.title, package.meta.title);
     copy_string(&mut library.author, package.meta.author);
+    library.clear_cover();
     load_epub_toc(
         &mut zip,
         opf_path,
@@ -442,6 +449,7 @@ where
     let mut section_incomplete = false;
     let start_spine = requested_start_spine(&package, library, requested_chapter);
     let _ = ensure_cache_dirs(root, cache_key.as_str());
+    load_cover_cache(root, cache_key.as_str(), library);
     write_book_cache(root, cache_key.as_str(), &package, library);
     if let Some(cached_pages) =
         load_section_cache(root, cache_key.as_str(), start_spine as u16, library)
@@ -889,6 +897,58 @@ where
     library.cached_spine = spine;
     library.section_partial = header.partial;
     Some(page_count)
+}
+
+fn load_cover_cache<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    key: &str,
+    library: &mut ReaderStore,
+) where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    library.clear_cover();
+    let Some((width, height, bits)) = read_cover_cache(root, key, &mut library.cover_bits) else {
+        return;
+    };
+    library.cover_width = width;
+    library.cover_height = height;
+    library.cover_ready = bits == COVER_BYTES;
+}
+
+fn read_cover_cache<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    key: &str,
+    out: &mut [u8; COVER_BYTES],
+) -> Option<(u16, u16, usize)>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let xteink = root.open_dir(CACHE_ROOT_DIR).ok()?;
+    let cache = xteink.open_dir(CACHE_DIR).ok()?;
+    let book_dir = cache.open_dir(key).ok()?;
+    let file = book_dir
+        .open_file_in_dir(CACHE_COVER_FILE, Mode::ReadOnly)
+        .ok()?;
+    let mut header = [0u8; 12];
+    read_exact_file(&file, &mut header).ok()?;
+    if &header[..4] != COVER_MAGIC || header[4] != COVER_VERSION {
+        return None;
+    }
+    let width = u16::from_le_bytes([header[5], header[6]]);
+    let height = u16::from_le_bytes([header[7], header[8]]);
+    let stride = u16::from_le_bytes([header[9], header[10]]);
+    let flags = header[11];
+    if width as usize != COVER_WIDTH
+        || height as usize != COVER_HEIGHT
+        || stride as usize != COVER_STRIDE
+        || flags != 0
+    {
+        return None;
+    }
+    read_exact_file(&file, out).ok()?;
+    Some((width, height, COVER_BYTES))
 }
 
 fn book_string_bytes(package: &proto::epub::EpubPackage<'_>, library: &ReaderStore) -> u32 {

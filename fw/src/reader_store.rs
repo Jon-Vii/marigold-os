@@ -12,6 +12,10 @@ pub(crate) const MAX_READER_PAGES: usize = 96;
 pub(crate) const MAX_READER_TEXT_BYTES: usize = 16_384;
 pub(crate) const MAX_READER_BLOCK_TEXT: usize = 768;
 pub(crate) const CACHE_KEY_BYTES: usize = 8;
+pub(crate) const COVER_WIDTH: usize = 202;
+pub(crate) const COVER_HEIGHT: usize = 303;
+pub(crate) const COVER_STRIDE: usize = (COVER_WIDTH + 7) / 8;
+pub(crate) const COVER_BYTES: usize = COVER_STRIDE * COVER_HEIGHT;
 pub(crate) const EMPTY_BLOCK_RECORD: BlockRecord = BlockRecord {
     text_offset: 0,
     text_len: 0,
@@ -79,6 +83,10 @@ pub(crate) struct ReaderStore {
     pub(crate) author: String<64>,
     pub(crate) error: String<32>,
     pub(crate) cache_key: String<CACHE_KEY_BYTES>,
+    pub(crate) cover_ready: bool,
+    pub(crate) cover_width: u16,
+    pub(crate) cover_height: u16,
+    pub(crate) cover_bits: [u8; COVER_BYTES],
     pub(crate) cached_spine: u16,
     pub(crate) section_partial: bool,
     pub(crate) toc_text: [u8; MAX_SD_TOC_TEXT_BYTES],
@@ -112,6 +120,10 @@ impl ReaderStore {
             author: String::new(),
             error: String::new(),
             cache_key: String::new(),
+            cover_ready: false,
+            cover_width: COVER_WIDTH as u16,
+            cover_height: COVER_HEIGHT as u16,
+            cover_bits: [0; COVER_BYTES],
             cached_spine: 0,
             section_partial: false,
             toc_text: [0; MAX_SD_TOC_TEXT_BYTES],
@@ -147,6 +159,7 @@ impl ReaderStore {
         self.author.clear();
         self.error.clear();
         self.cache_key.clear();
+        self.clear_cover();
         self.cached_spine = 0;
         self.section_partial = false;
         self.clear_toc();
@@ -160,6 +173,13 @@ impl ReaderStore {
             *record = EMPTY_TOC_RECORD;
             self.toc_page[index] = 0;
         }
+    }
+
+    pub(crate) fn clear_cover(&mut self) {
+        self.cover_ready = false;
+        self.cover_width = COVER_WIDTH as u16;
+        self.cover_height = COVER_HEIGHT as u16;
+        self.cover_bits.fill(0);
     }
 
     pub(crate) fn clear_lines(&mut self) {

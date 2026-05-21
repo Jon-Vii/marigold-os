@@ -1,4 +1,4 @@
-use crate::{UiLibraryStatus, UiOrientation, UiRefreshPolicy, UiShell, UiTocItem, UiView};
+use crate::{UiCover, UiLibraryStatus, UiOrientation, UiRefreshPolicy, UiShell, UiTocItem, UiView};
 use display::fb::Framebuffer;
 use display::font::{draw_text, literata, measure_text, BitmapFont, FontStyle};
 use display::render::{draw_ascii, fill_rect, glyph_5x7, stroke_rect};
@@ -35,7 +35,7 @@ fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     draw_battery_landscape_minimal(fb, 726, 28, shell.battery_percent);
     draw_dock_clean_rail(fb, 30, 58, 258, 340);
     draw_section_divider(fb, 330, 58, 340);
-    draw_cover_art_varied(fb, 448, 48, 202, 303);
+    draw_home_cover(fb, 448, 48, 202, 303, shell.active_book.cover);
     draw_text_centered_fit(fb, title_font, shell.active_book.title, 549, 394, 300);
     draw_text_centered_fit(fb, body_font, shell.active_book.author, 549, 424, 260);
     draw_home_progress(fb, 494, 454, 110, shell.active_book.progress_permille);
@@ -247,6 +247,62 @@ fn draw_cover_art_varied(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
     }
     fill_rect(fb, Rect::new(x + 30, y + h - 48, w - 72, 1), false);
     fill_rect(fb, Rect::new(x + 42, y + h - 34, w - 104, 2), false);
+}
+
+fn draw_home_cover(
+    fb: &mut Framebuffer,
+    x: u16,
+    y: u16,
+    w: u16,
+    h: u16,
+    cover: Option<UiCover<'_>>,
+) {
+    if let Some(cover) = cover {
+        if cover.width > 0 && cover.height > 0 && !cover.bits.is_empty() {
+            draw_cover_bitmap(fb, x, y, w, h, cover);
+            return;
+        }
+    }
+    draw_cover_art_varied(fb, x, y, w, h);
+}
+
+fn draw_cover_bitmap(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16, cover: UiCover<'_>) {
+    stroke_rect(fb, Rect::new(x, y, w, h), false);
+    let src_w = cover.width as usize;
+    let src_h = cover.height as usize;
+    let stride = cover.stride as usize;
+    let dst_w = w.saturating_sub(4).max(1) as usize;
+    let dst_h = h.saturating_sub(4).max(1) as usize;
+    let scale_x = dst_w * 1024 / src_w.max(1);
+    let scale_y = dst_h * 1024 / src_h.max(1);
+    let scale = scale_x.min(scale_y).max(1);
+    let scaled_w = (src_w * scale / 1024).max(1).min(dst_w);
+    let scaled_h = (src_h * scale / 1024).max(1).min(dst_h);
+    let ox = x as usize + 2 + (dst_w - scaled_w) / 2;
+    let oy = y as usize + 2 + (dst_h - scaled_h) / 2;
+
+    fill_rect(
+        fb,
+        Rect::new(ox as u16, oy as u16, scaled_w as u16, scaled_h as u16),
+        true,
+    );
+    for dy in 0..scaled_h {
+        let sy = dy * src_h / scaled_h;
+        for dx in 0..scaled_w {
+            let sx = dx * src_w / scaled_w;
+            if cover_bit(cover.bits, stride, sx, sy) {
+                fb.set_pixel(ox + dx, oy + dy, false);
+            }
+        }
+    }
+}
+
+fn cover_bit(bits: &[u8], stride: usize, x: usize, y: usize) -> bool {
+    let index = y.saturating_mul(stride).saturating_add(x / 8);
+    let Some(byte) = bits.get(index) else {
+        return false;
+    };
+    byte & (0x80 >> (x & 7)) != 0
 }
 
 fn draw_battery_landscape_minimal(fb: &mut Framebuffer, x: u16, y: u16, percent: u8) {

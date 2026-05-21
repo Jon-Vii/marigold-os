@@ -1,5 +1,7 @@
 use crate::reader_layout::{self, READER_LEFT_X, READER_RIGHT_X};
-use crate::reader_store::{BookLoadStatus, LibraryScanStatus, ReaderStore, MAX_LIBRARY_BOOKS};
+use crate::reader_store::{
+    BookLoadStatus, LibraryScanStatus, ReaderStore, COVER_STRIDE, MAX_LIBRARY_BOOKS,
+};
 use crate::{catalog, AppView, DisplayOrientation, RefreshPolicy, RenderRequest};
 use display::fb::Framebuffer;
 use display::font::{literata, FontStyle};
@@ -8,8 +10,8 @@ use display::{Rect, HEIGHT, WIDTH};
 use heapless::String;
 use proto::text::TextAlign;
 use ui::{
-    render::render_shell_overlay, UiBook, UiLibraryStatus, UiOrientation, UiRefreshPolicy, UiShell,
-    UiTocItem, UiView,
+    render::render_shell_overlay, UiBook, UiCover, UiLibraryStatus, UiOrientation, UiRefreshPolicy,
+    UiShell, UiTocItem, UiView,
 };
 
 const SHOW_INPUT_DEBUG: bool = false;
@@ -174,6 +176,16 @@ fn render_shared_shell(fb: &mut Framebuffer, request: RenderRequest, sd_library:
             title,
             author,
             progress_permille: book_progress_permille(request),
+            cover: if request.book_id >= 2 && sd_library.cover_ready {
+                Some(UiCover {
+                    width: sd_library.cover_width,
+                    height: sd_library.cover_height,
+                    stride: COVER_STRIDE as u16,
+                    bits: &sd_library.cover_bits,
+                })
+            } else {
+                None
+            },
         },
         library_status: ui_library_status(sd_library.status),
         library_entries: &library_entries[..library_count],

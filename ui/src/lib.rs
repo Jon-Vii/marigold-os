@@ -38,10 +38,19 @@ pub enum UiLibraryStatus {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UiCover<'a> {
+    pub width: u16,
+    pub height: u16,
+    pub stride: u16,
+    pub bits: &'a [u8],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UiBook<'a> {
     pub title: &'a str,
     pub author: &'a str,
     pub progress_permille: u16,
+    pub cover: Option<UiCover<'a>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
