@@ -354,7 +354,7 @@ pub async fn run() {
                         ..
                     }
                 ) {
-                    let _ = POWER_EVENTS.try_send(PowerEvent::Activity);
+                    let _ = POWER_EVENTS.try_send(PowerEvent::SleepNow);
                     continue;
                 }
 

@@ -40,6 +40,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
     let mut sd_library = ReaderStore::new();
     let mut last_view: Option<AppView> = None;
     let mut last_book_id: Option<u32> = None;
+    let mut last_request: Option<crate::RenderRequest> = None;
     loop {
         match DISPLAY_COMMANDS.receive().await {
             DisplayCommand::Render(request) => {
@@ -131,8 +132,22 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                 } else {
                     esp_println::println!("display: SPI transfer failed");
                 }
+                last_request = Some(request);
             }
             DisplayCommand::Sleep => {
+                if let Some(request) = last_request {
+                    crate::views::render_sleep(fb, request, &sd_library);
+                    let _ = display_flush::flush(
+                        &mut epd,
+                        fb,
+                        prev_fb,
+                        tx_band,
+                        screen_on,
+                        RefreshMode::Full,
+                    )
+                    .await;
+                    prev_fb.copy_from(fb);
+                }
                 if display_flush::sleep_panel(&mut epd).await.is_ok() {
                     screen_on = false;
                     fast_refreshes = 0;

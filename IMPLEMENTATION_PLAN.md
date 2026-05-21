@@ -29,7 +29,7 @@ Current code status:
 | Input polling | Measured calibrated ADC ladder bands plus CrossPoint-style layout mapping applied; screen shows reader-facing `PREV`/`NEXT`/`BACK`/`OK` labels |
 | Reader app shell | Portrait Home/Library/Settings plus landscape Reading/Chapters present with catalog-backed book data |
 | Battery display | GPIO0-derived rough battery mV/percent flows through input/app/render |
-| Deep sleep | Timer wake + display-sleep handshake present, GPIO wake pending |
+| Deep sleep | Idle/power sleep now renders a visible sleep screen before SSD1677 deep sleep; GPIO wake pending |
 | Partial refresh | Deferred; full-screen fast refresh present |
 | NVM progress | Deferred |
 | Storage / EPUB / Wi-Fi | EPUB stream reader, FAT scan, `/books` then card-root discovery, and SD-backed hybrid-light section cache present; Wi-Fi still pending |

@@ -25,6 +25,49 @@ pub(crate) fn render(fb: &mut Framebuffer, request: RenderRequest, sd_library: &
     }
 }
 
+pub(crate) fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, sd_library: &ReaderStore) {
+    fb.clear(true);
+    stroke_rect(fb, Rect::new(0, 0, WIDTH as u16, HEIGHT as u16), false);
+
+    let fallback_book = catalog::active_book(request.book_id);
+    let (title, author) =
+        if request.book_id >= 2 && sd_library.reader_status == BookLoadStatus::Ready {
+            let title = if sd_library.title.is_empty() {
+                fallback_book.title
+            } else {
+                sd_library.title.as_str()
+            };
+            let author = if sd_library.author.is_empty() {
+                fallback_book.author
+            } else {
+                sd_library.author.as_str()
+            };
+            (title, author)
+        } else {
+            (fallback_book.title, fallback_book.author)
+        };
+
+    draw_ascii(fb, "SLEEPING", 360, 144, false);
+    draw_ascii_centered(fb, title, 216);
+    draw_ascii_centered(fb, author, 248);
+    draw_progress_bar(
+        fb,
+        Rect::new(252, 286, 296, 6),
+        book_progress_permille(request),
+    );
+    draw_ascii(fb, "PRESS POWER TO WAKE", 320, 340, false);
+
+    let mut percent = [0u8; 10];
+    draw_ascii(
+        fb,
+        fmt_percent(request.battery_percent, &mut percent),
+        688,
+        28,
+        false,
+    );
+    draw_battery_icon(fb, 736, 26, battery_bars(request.battery_percent));
+}
+
 fn draw_input_sample(fb: &mut Framebuffer, request: RenderRequest) {
     fill_rect(fb, Rect::new(488, 104, 220, 64), true);
     stroke_rect(fb, Rect::new(488, 104, 220, 64), false);
@@ -243,6 +286,10 @@ fn draw_footer(fb: &mut Framebuffer, request: RenderRequest) {
         draw_ascii(fb, "OK SELECT", 344, 432, false);
         draw_ascii(fb, "BACK", 656, 432, false);
     }
+}
+
+fn draw_ascii_centered(fb: &mut Framebuffer, text: &str, y: usize) {
+    draw_ascii(fb, text, centered_x_for(WIDTH, text), y, false);
 }
 
 fn draw_home(fb: &mut Framebuffer, request: RenderRequest) {
@@ -603,6 +650,10 @@ fn draw_progress_bar(fb: &mut Framebuffer, rect: Rect, permille: u16) {
     }
 }
 
+fn centered_x_for(width: usize, text: &str) -> usize {
+    width.saturating_sub(text.len() * 8) / 2
+}
+
 fn draw_battery_icon(fb: &mut Framebuffer, x: u16, y: u16, bars: u8) {
     stroke_rect(fb, Rect::new(x, y, 36, 16), false);
     fill_rect(fb, Rect::new(x + 36, y + 5, 4, 6), false);
@@ -681,4 +732,15 @@ fn fmt_u32(n: u32, buf: &mut [u8; 10]) -> &str {
         v /= 10;
     }
     core::str::from_utf8(&buf[i..]).unwrap_or("?")
+}
+
+fn fmt_percent(n: u8, buf: &mut [u8; 10]) -> &str {
+    let mut tmp = [0u8; 10];
+    let number = fmt_u32(n as u32, &mut tmp).as_bytes();
+    if number.len() + 1 > buf.len() {
+        return "?";
+    }
+    buf[..number.len()].copy_from_slice(number);
+    buf[number.len()] = b'%';
+    core::str::from_utf8(&buf[..number.len() + 1]).unwrap_or("?")
 }

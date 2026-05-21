@@ -42,7 +42,7 @@ app_task
 display_task
   owns EpdBus and Framebuffer
   DisplayCommand::Render -> framebuffer render -> BW/RED RAM write -> full refresh
-  DisplayCommand::Sleep -> SSD1677 deep sleep -> PowerEvent::DisplayAsleep
+  DisplayCommand::Sleep -> sleep screen full refresh -> SSD1677 deep sleep -> PowerEvent::DisplayAsleep
   sends DisplayEvent::Settled to app_task when render completes
 
 input_task
@@ -60,7 +60,9 @@ wifi_task
 Embassy is used for cooperative waits: ADC retry delays, button polling, SPI DMA
 transfers, BUSY waits, and sleep windows all yield instead of spinning. The real
 battery win comes after display settle: the power task asks the display task to
-power down the SSD1677, then moves the ESP32-C3 into deep sleep.
+draw a visible sleep screen, power down the SSD1677, then move the ESP32-C3 into
+deep sleep. The power button also requests this same sleep path instead of being
+treated as ordinary navigation input.
 
 Input/render backpressure is intentionally coalesced. The app keeps at most one
 display render in flight. While the display is refreshing, new button events
