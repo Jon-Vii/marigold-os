@@ -578,6 +578,18 @@ fn write_landscape_home_mockups(out: &Path) -> std::io::Result<()> {
             "home-landscape-dock-widebook",
             LandscapeHomeVariant::DockWideBook,
         ),
+        (
+            "home-landscape-dock-clean",
+            LandscapeHomeVariant::DockClean,
+        ),
+        (
+            "home-landscape-dock-open",
+            LandscapeHomeVariant::DockOpen,
+        ),
+        (
+            "home-landscape-dock-panel",
+            LandscapeHomeVariant::DockPanel,
+        ),
         ("home-landscape-tabs", LandscapeHomeVariant::Tabs),
         ("home-landscape-book", LandscapeHomeVariant::BookFirst),
     ];
@@ -611,6 +623,9 @@ enum LandscapeHomeVariant {
     DockRefined,
     DockPaper,
     DockWideBook,
+    DockClean,
+    DockOpen,
+    DockPanel,
     Tabs,
     BookFirst,
 }
@@ -639,6 +654,9 @@ fn draw_landscape_home(fb: &mut Framebuffer, variant: LandscapeHomeVariant) {
         LandscapeHomeVariant::DockRefined => draw_landscape_home_dock_refined(fb),
         LandscapeHomeVariant::DockPaper => draw_landscape_home_dock_paper(fb),
         LandscapeHomeVariant::DockWideBook => draw_landscape_home_dock_widebook(fb),
+        LandscapeHomeVariant::DockClean => draw_landscape_home_dock_clean(fb),
+        LandscapeHomeVariant::DockOpen => draw_landscape_home_dock_open(fb),
+        LandscapeHomeVariant::DockPanel => draw_landscape_home_dock_panel(fb),
         LandscapeHomeVariant::Tabs => draw_landscape_home_tabs(fb),
         LandscapeHomeVariant::BookFirst => draw_landscape_home_book_first(fb),
     }
@@ -880,6 +898,42 @@ fn draw_landscape_home_dock_widebook(fb: &mut Framebuffer) {
     draw_text_centered(fb, title_font, "Flowers for Algernon", 537, 414);
     draw_text_centered(fb, body_font, "Daniel Keyes", 537, 444);
     draw_ive_progress(fb, 642, 214, 76, 420);
+}
+
+fn draw_landscape_home_dock_clean(fb: &mut Framebuffer) {
+    let title_font = literata(FontStyle::Bold);
+    let body_font = literata(FontStyle::Regular);
+    draw_battery_landscape_minimal(fb, 726, 28, 82);
+    draw_refined_dock_rail(fb, 30, 58, 258, 340, DockRailStyle::Clean);
+    draw_section_divider(fb, 330, 58, 340);
+    draw_cover_art_varied(fb, 448, 48, 202, 303);
+    draw_text_centered(fb, title_font, "Flowers for Algernon", 549, 394);
+    draw_text_centered(fb, body_font, "Daniel Keyes", 549, 424);
+    draw_ive_progress(fb, 494, 454, 110, 420);
+}
+
+fn draw_landscape_home_dock_open(fb: &mut Framebuffer) {
+    let title_font = literata(FontStyle::Bold);
+    let body_font = literata(FontStyle::Regular);
+    draw_battery_landscape_minimal(fb, 726, 28, 82);
+    draw_refined_dock_rail(fb, 30, 62, 250, 332, DockRailStyle::Open);
+    draw_section_divider(fb, 326, 62, 332);
+    draw_cover_art_varied(fb, 448, 48, 202, 303);
+    draw_text_centered(fb, title_font, "Flowers for Algernon", 549, 394);
+    draw_text_centered(fb, body_font, "Daniel Keyes", 549, 424);
+    draw_ive_progress(fb, 494, 454, 110, 420);
+}
+
+fn draw_landscape_home_dock_panel(fb: &mut Framebuffer) {
+    let title_font = literata(FontStyle::Bold);
+    let body_font = literata(FontStyle::Regular);
+    draw_battery_landscape_minimal(fb, 726, 28, 82);
+    draw_refined_dock_rail(fb, 28, 54, 268, 350, DockRailStyle::Panel);
+    draw_section_divider(fb, 334, 54, 350);
+    draw_cover_art_varied(fb, 446, 50, 198, 297);
+    draw_text_centered(fb, title_font, "Flowers for Algernon", 545, 392);
+    draw_text_centered(fb, body_font, "Daniel Keyes", 545, 422);
+    draw_ive_progress(fb, 492, 452, 106, 420);
 }
 
 fn draw_landscape_home_tabs(fb: &mut Framebuffer) {
@@ -1179,9 +1233,19 @@ fn draw_affordance_dock_rail(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u1
 enum DockRailStyle {
     Plain,
     Paper,
+    Clean,
+    Open,
+    Panel,
 }
 
-fn draw_refined_dock_rail(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16, style: DockRailStyle) {
+fn draw_refined_dock_rail(
+    fb: &mut Framebuffer,
+    x: u16,
+    y: u16,
+    w: u16,
+    h: u16,
+    style: DockRailStyle,
+) {
     let labels = ["Read", "Files", "Sync", "Settings"];
     let font = literata(FontStyle::Regular);
     match style {
@@ -1196,6 +1260,18 @@ fn draw_refined_dock_rail(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16, 
             fill_rect(fb, Rect::new(x + 10, y + 8, w - 36, 1), false);
             fill_rect(fb, Rect::new(x + 16, y + h - 10, w - 52, 1), false);
             fill_rect(fb, Rect::new(x + 6, y + 34, 1, h - 68), false);
+        }
+        DockRailStyle::Clean => {
+            stroke_rect_direct(fb, x, y, w, h);
+        }
+        DockRailStyle::Open => {
+            fill_rect(fb, Rect::new(x, y + 12, 1, h - 24), false);
+            fill_rect(fb, Rect::new(x + w - 1, y + 22, 1, h - 44), false);
+        }
+        DockRailStyle::Panel => {
+            stroke_rect_direct(fb, x, y, w, h);
+            fill_rect(fb, Rect::new(x + 8, y + 8, w - 16, 1), false);
+            fill_rect(fb, Rect::new(x + 8, y + h - 10, w - 16, 1), false);
         }
     }
     let row_h = h / labels.len() as u16;
