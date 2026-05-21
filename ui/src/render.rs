@@ -1,9 +1,10 @@
 use crate::{UiLibraryStatus, UiOrientation, UiRefreshPolicy, UiShell, UiTocItem, UiView};
 use display::fb::Framebuffer;
-use display::render::{draw_ascii, fill_rect, glyph_5x7};
+use display::font::{draw_text, literata, measure_text, BitmapFont, FontStyle};
+use display::render::{draw_ascii, fill_rect, glyph_5x7, stroke_rect};
 use display::{Rect, HEIGHT, WIDTH};
 
-const HOME_ITEMS: [&str; 4] = ["READ", "FILES", "SYNC", "SETTINGS"];
+const HOME_ITEMS: [&str; 4] = ["Read", "Files", "Sync", "Settings"];
 const SETTINGS_ITEMS: [&str; 3] = ["ORIENTATION", "REFRESH", "BACK TO HOME"];
 const SHELL_ORIENTATION: UiOrientation = UiOrientation::PortraitButtonsLeft;
 
@@ -29,54 +30,15 @@ pub fn render_shell_overlay(fb: &mut Framebuffer, shell: &UiShell<'_>) {
 }
 
 fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>) {
-    let mut ui = Ui::new(fb, SHELL_ORIENTATION);
-    draw_home_status(&mut ui, shell);
-    draw_cover_placeholder(&mut ui, 68, 76, 344, 500);
-    draw_progress_bar(
-        &mut ui,
-        142,
-        600,
-        196,
-        6,
-        shell.active_book.progress_permille,
-    );
-    ui.draw_ascii(
-        shell.active_book.title,
-        centered_x_for(480, shell.active_book.title),
-        636,
-        false,
-    );
-    ui.draw_ascii(
-        shell.active_book.author,
-        centered_x_for(480, shell.active_book.author),
-        666,
-        false,
-    );
-    draw_home_soft_keys(&mut ui);
-}
-
-fn draw_home_status(ui: &mut Ui<'_>, shell: &UiShell<'_>) {
-    ui.draw_ascii("XTEINK", 36, 48, false);
-    let mut buf = [0u8; 10];
-    ui.draw_ascii(fmt_percent(shell.battery_percent, &mut buf), 366, 50, false);
-    draw_battery_icon(ui, 404, 48, battery_bars(shell.battery_percent));
-}
-
-fn draw_home_soft_keys(ui: &mut Ui<'_>) {
-    let tab_y = 742;
-    let tab_h = 58;
-    let tab_w = 120;
-    let mut x = 0;
-    for item in HOME_ITEMS {
-        ui.stroke_rect(x, tab_y, tab_w, tab_h, false);
-        ui.draw_ascii(
-            item,
-            x as usize + centered_x_for(tab_w as usize, item),
-            tab_y as usize + 24,
-            false,
-        );
-        x += tab_w;
-    }
+    let title_font = literata(FontStyle::Bold);
+    let body_font = literata(FontStyle::Regular);
+    draw_battery_landscape_minimal(fb, 726, 28, shell.battery_percent);
+    draw_dock_clean_rail(fb, 30, 58, 258, 340);
+    draw_section_divider(fb, 330, 58, 340);
+    draw_cover_art_varied(fb, 448, 48, 202, 303);
+    draw_text_centered_fit(fb, title_font, shell.active_book.title, 549, 394, 300);
+    draw_text_centered_fit(fb, body_font, shell.active_book.author, 549, 424, 260);
+    draw_home_progress(fb, 494, 454, 110, shell.active_book.progress_permille);
 }
 
 fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
@@ -188,34 +150,6 @@ fn draw_menu(ui: &mut Ui<'_>, title: &str, items: &[&str], selection: u8) {
     }
 }
 
-fn draw_cover_placeholder(ui: &mut Ui<'_>, x: u16, y: u16, w: u16, h: u16) {
-    ui.stroke_rect(x, y, w, h, false);
-    ui.stroke_rect(x + 8, y + 8, w - 16, h - 16, false);
-    ui.fill_rect(x + 24, y + 38, 2, h - 76, false);
-    ui.draw_ascii("BRING", x as usize + 90, y as usize + 126, false);
-    ui.draw_ascii("UP", x as usize + 106, y as usize + 158, false);
-    ui.draw_ascii("NOTES", x as usize + 94, y as usize + 190, false);
-}
-
-fn draw_progress_bar(ui: &mut Ui<'_>, x: u16, y: u16, w: u16, h: u16, permille: u16) {
-    ui.stroke_rect(x, y, w, h, false);
-    let inner_w = w.saturating_sub(4);
-    let fill_w = ((inner_w as u32 * permille.min(1000) as u32) / 1000) as u16;
-    if fill_w > 0 {
-        let fill_h = h.saturating_sub(4).max(1);
-        let fill_y = if h > 4 { y + 2 } else { y + 1 };
-        ui.fill_rect(x + 2, fill_y, fill_w, fill_h, false);
-    }
-}
-
-fn draw_battery_icon(ui: &mut Ui<'_>, x: u16, y: u16, bars: u8) {
-    ui.stroke_rect(x, y, 36, 16, false);
-    ui.fill_rect(x + 36, y + 5, 4, 6, false);
-    for bar in 0..bars.min(4) {
-        ui.fill_rect(x + 4 + bar as u16 * 8, y + 4, 5, 8, false);
-    }
-}
-
 fn draw_ascii_truncated(
     fb: &mut Framebuffer,
     text: &str,
@@ -238,14 +172,126 @@ fn draw_ascii_truncated(
     }
 }
 
-fn battery_bars(percent: u8) -> u8 {
-    match percent {
-        0..=10 => 0,
-        11..=35 => 1,
-        36..=60 => 2,
-        61..=85 => 3,
-        _ => 4,
+fn draw_dock_clean_rail(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
+    stroke_rect(fb, Rect::new(x, y, w, h), false);
+    let row_h = h / HOME_ITEMS.len() as u16;
+    let separator_lengths = [180u16, 206, 168];
+    let font = literata(FontStyle::Regular);
+    for (index, label) in HOME_ITEMS.iter().enumerate() {
+        let row_y = y + index as u16 * row_h;
+        let center_y = row_y + row_h / 2;
+        if index > 0 {
+            let sep_w = separator_lengths[index - 1].min(w.saturating_sub(58));
+            let sep_x = x + 22 + (index as u16 % 2) * 10;
+            fill_rect(fb, Rect::new(sep_x, row_y, sep_w, 1), false);
+        }
+        draw_refined_left_notch(fb, x + 10, center_y - 15, index);
+        draw_text(fb, font, label, x as i16 + 46, center_y as i16 + 8, false);
+        draw_refined_button_well(fb, x + w - 48, center_y - 9, index);
     }
+}
+
+fn draw_refined_left_notch(fb: &mut Framebuffer, x: u16, y: u16, index: usize) {
+    let stem_h = [30u16, 24, 28, 22][index.min(3)];
+    let arm_w = [18u16, 14, 20, 16][index.min(3)];
+    fill_rect(fb, Rect::new(x, y + (30 - stem_h) / 2, 3, stem_h), false);
+    fill_rect(fb, Rect::new(x + 6, y + 15, arm_w, 1), false);
+    if index.is_multiple_of(2) {
+        fill_rect(fb, Rect::new(x + 6, y + 7, 1, 16), false);
+    }
+}
+
+fn draw_refined_button_well(fb: &mut Framebuffer, x: u16, y: u16, index: usize) {
+    let widths = [28u16, 24, 30, 26];
+    let w = widths[index.min(3)];
+    let x = x + (30 - w);
+    stroke_rect(fb, Rect::new(x, y, w, 18), false);
+    fill_rect(fb, Rect::new(x + 5, y + 5, w - 10, 1), false);
+    if index != 1 {
+        fill_rect(fb, Rect::new(x + 5, y + 12, w - 10, 1), false);
+    }
+}
+
+fn draw_section_divider(fb: &mut Framebuffer, x: u16, y: u16, h: u16) {
+    fill_rect(fb, Rect::new(x, y, 1, h), false);
+    fill_rect(fb, Rect::new(x + 5, y + 34, 1, h - 68), false);
+}
+
+fn draw_cover_art_varied(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
+    stroke_rect(fb, Rect::new(x, y, w, h), false);
+    fill_rect(fb, Rect::new(x + 12, y + 14, w - 24, 1), false);
+    fill_rect(fb, Rect::new(x + 24, y + 42, w - 56, 2), false);
+    fill_rect(fb, Rect::new(x + 34, y + 70, w - 72, 1), false);
+    let line_specs = [
+        (104u16, 30u16, 122u16, 3u16),
+        (126, 44, 86, 2),
+        (148, 26, 138, 3),
+        (172, 58, 74, 2),
+        (194, 38, 112, 2),
+        (220, 50, 96, 3),
+        (246, 28, 130, 1),
+    ];
+    for (dy, inset, line_w, line_h) in line_specs {
+        if dy + 8 < h {
+            fill_rect(
+                fb,
+                Rect::new(
+                    x + inset,
+                    y + dy,
+                    line_w.min(w.saturating_sub(inset + 18)),
+                    line_h,
+                ),
+                false,
+            );
+        }
+    }
+    fill_rect(fb, Rect::new(x + 30, y + h - 48, w - 72, 1), false);
+    fill_rect(fb, Rect::new(x + 42, y + h - 34, w - 104, 2), false);
+}
+
+fn draw_battery_landscape_minimal(fb: &mut Framebuffer, x: u16, y: u16, percent: u8) {
+    stroke_rect(fb, Rect::new(x, y, 38, 16), false);
+    fill_rect(fb, Rect::new(x + 38, y + 5, 3, 6), false);
+    let fill_w = ((percent.min(100) as u16 * 30) / 100).max(1);
+    fill_rect(fb, Rect::new(x + 4, y + 4, fill_w, 8), false);
+}
+
+fn draw_home_progress(fb: &mut Framebuffer, x: u16, y: u16, w: u16, permille: u16) {
+    fill_rect(fb, Rect::new(x, y, w, 1), false);
+    let fill_w = ((w as u32 * permille.min(1000) as u32) / 1000) as u16;
+    fill_rect(
+        fb,
+        Rect::new(x, y.saturating_sub(1), fill_w.max(1), 3),
+        false,
+    );
+}
+
+fn draw_text_centered_fit(
+    fb: &mut Framebuffer,
+    font: &BitmapFont,
+    text: &str,
+    center_x: i16,
+    y: i16,
+    max_w: u16,
+) {
+    let text = fit_text(font, text, max_w);
+    let x = center_x - measure_text(font, text) as i16 / 2;
+    draw_text(fb, font, text, x, y, false);
+}
+
+fn fit_text<'a>(font: &BitmapFont, text: &'a str, max_w: u16) -> &'a str {
+    if measure_text(font, text) <= max_w {
+        return text;
+    }
+    let mut end = 0usize;
+    for (index, _) in text.char_indices() {
+        let candidate = &text[..index];
+        if !candidate.is_empty() && measure_text(font, candidate) > max_w {
+            break;
+        }
+        end = index;
+    }
+    text[..end].trim_end()
 }
 
 fn centered_x_for(width: usize, text: &str) -> usize {
@@ -269,32 +315,6 @@ fn refresh_policy_label(policy: UiRefreshPolicy) -> &'static str {
     }
 }
 
-fn fmt_u32(n: u32, buf: &mut [u8; 10]) -> &str {
-    let mut i = buf.len();
-    let mut v = n;
-    if v == 0 {
-        i -= 1;
-        buf[i] = b'0';
-    }
-    while v > 0 {
-        i -= 1;
-        buf[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-    }
-    core::str::from_utf8(&buf[i..]).unwrap_or("?")
-}
-
-fn fmt_percent(n: u8, buf: &mut [u8; 10]) -> &str {
-    let mut tmp = [0u8; 10];
-    let number = fmt_u32(n as u32, &mut tmp).as_bytes();
-    if number.len() + 1 > buf.len() {
-        return "?";
-    }
-    buf[..number.len()].copy_from_slice(number);
-    buf[number.len()] = b'%';
-    core::str::from_utf8(&buf[..number.len() + 1]).unwrap_or("?")
-}
-
 struct Ui<'a> {
     fb: &'a mut Framebuffer,
     orientation: UiOrientation,
@@ -311,23 +331,6 @@ impl<'a> Ui<'a> {
             for xx in x..x.saturating_add(w) {
                 self.set_pixel(xx as usize, yy as usize, white);
             }
-        }
-    }
-
-    fn stroke_rect(&mut self, x: u16, y: u16, w: u16, h: u16, white: bool) {
-        if w == 0 || h == 0 {
-            return;
-        }
-        let y = self.logical_y_for_height(y, h);
-        let x1 = x + w - 1;
-        let y1 = y + h - 1;
-        for xx in x..=x1 {
-            self.set_pixel(xx as usize, y as usize, white);
-            self.set_pixel(xx as usize, y1 as usize, white);
-        }
-        for yy in y..=y1 {
-            self.set_pixel(x as usize, yy as usize, white);
-            self.set_pixel(x1 as usize, yy as usize, white);
         }
     }
 

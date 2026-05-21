@@ -1295,7 +1295,7 @@ fn draw_refined_left_notch(fb: &mut Framebuffer, x: u16, y: u16, index: usize) {
     let arm_w = [18u16, 14, 20, 16][index.min(3)];
     fill_rect(fb, Rect::new(x, y + (30 - stem_h) / 2, 3, stem_h), false);
     fill_rect(fb, Rect::new(x + 6, y + 15, arm_w, 1), false);
-    if index % 2 == 0 {
+    if index.is_multiple_of(2) {
         fill_rect(fb, Rect::new(x + 6, y + 7, 1, 16), false);
     }
 }
