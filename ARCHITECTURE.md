@@ -140,10 +140,12 @@ and the host preview tool:
 
 - `BookMeta`, `BookProgress`, and `ChapterMeta` for catalog and progress data.
 - `BookStorage` and `FileCandidate` for microSD-backed `.epub` discovery.
-- `ZipArchive` for central-directory lookup and stored/deflated entry reads into
-  caller-owned buffers.
+- `ZipArchive` for host-side central-directory lookup and stored/deflated entry
+  reads into caller-owned buffers.
 - `ZipStream` for central-directory lookup and entry reads through a bounded
-  `ReadAt` interface, which is the path storage-backed EPUBs use.
+  `ReadAt` interface, which is the path storage-backed EPUBs use. Firmware ZIP
+  reads stream deflate input through a reusable inflater scratch state, so large
+  compressed members do not have to fit in the compressed scratch buffer.
 - `EpubPackage` for container/OPF metadata, manifest, and spine.
 - `TextRun`, `TextRole`, `FontStyle`, and `paginate_screen` for text-only XHTML
   reading and deterministic one-screen pagination.
@@ -181,9 +183,13 @@ string blob for title, author, source path, hrefs, and TOC titles. Section files
 contain a `SectionHeader`, page records, block records, paragraph flags, and the
 UTF-8 text blob for the cached rendered page chunk. The active firmware state
 keeps only loaded book metadata, active section page records, block records,
-text bytes, and small ZIP/XML scratch buffers. `STATE.BIN` stores the encoded
-`AppStateRecord`; writing is present, while boot-time restore still needs the
-app/display handoff that maps the saved book id back to the scanned SD catalog.
+text bytes, and small ZIP/XML scratch buffers. Oversized XHTML spine entries are
+decoded as a bounded prefix for the first cache chunk and marked partial, rather
+than failing before page one can be rendered. Full resumable continuation inside
+one huge XHTML member remains the next cache-cursor refinement. `STATE.BIN`
+stores the encoded `AppStateRecord`; writing is present, while boot-time restore
+still needs the app/display handoff that maps the saved book id back to the
+scanned SD catalog.
 
 Reading typography uses generated Literata bitmap assets. The host generator
 downloads OFL Literata TTFs and emits Latin-1 glyph metrics/bitmaps for Regular,

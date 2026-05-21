@@ -73,7 +73,10 @@ Current code status:
   into caller-owned buffers, parse `META-INF/container.xml`, parse OPF metadata,
   manifest, and spine, and map XHTML tags into styled text runs.
 - `proto::epub::ZipStream` can locate and read ZIP entries through a bounded
-  `ReadAt` interface, so EPUBs no longer need to fit in memory.
+  `ReadAt` interface, so EPUBs no longer need to fit in memory. The firmware
+  path now streams compressed deflate input in chunks, and XHTML spine entries
+  can decode a bounded prefix for the first section cache instead of failing
+  just because the section is larger than the XHTML scratch buffer.
 - `proto::text` defines Literata/Bookerly-ready font/style roles and a
   deterministic one-screen paginator over bounded styled runs.
 - `proto::cache` defines bounded binary cache records for book, TOC, section,
@@ -86,6 +89,9 @@ Current code status:
   section into `/XTEINK/CACHE/E<hash>/SECTIONS/SNNN.BIN`, and renders from those
   flat records. Near-end NEXT requests a larger cached page target before
   rendering, so partial section caches can extend on demand.
+- Current limitation: partial caches for very large single-XHTML spine items
+  can render the first decoded chunk, but true byte-accurate resume inside that
+  same compressed member is still pending.
 - `BOOK.BIN` stores book/spine/TOC records plus a shared string blob. Section
   files store a section header, page records, block records, paragraph flags,
   and UTF-8 text bytes. Line/word cache records remain defined in `proto::cache`

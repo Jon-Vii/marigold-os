@@ -20,7 +20,7 @@ use proto::cache::{
 use proto::epub::{
     parse_css_text_align, parse_epub2_ncx_to_sink, parse_epub3_nav_to_sink, parse_opf,
     xhtml_blocks_to_sink, CssRules, EpubTocSink, ReadAt, TocError, XhtmlBlockSink, XhtmlError,
-    ZipStream, MAX_ENTRY_NAME_BYTES,
+    ZipInflateScratch, ZipStream, MAX_ENTRY_NAME_BYTES,
 };
 use proto::text::{TextAlign, TextRole};
 
@@ -43,6 +43,7 @@ pub(crate) struct ReaderCacheScratch {
     opf: [u8; READER_OPF_SCRATCH],
     css: [u8; READER_CSS_SCRATCH],
     xhtml: [u8; READER_XHTML_SCRATCH],
+    zip_inflate: ZipInflateScratch,
 }
 
 struct CssScratch<'a> {
@@ -50,6 +51,7 @@ struct CssScratch<'a> {
     name: &'a mut [u8; MAX_ENTRY_NAME_BYTES],
     compressed: &'a mut [u8; READER_COMPRESSED_SCRATCH],
     css: &'a mut [u8; READER_CSS_SCRATCH],
+    zip_inflate: &'a mut ZipInflateScratch,
 }
 
 struct TocScratch<'a> {
@@ -57,6 +59,7 @@ struct TocScratch<'a> {
     name: &'a mut [u8; MAX_ENTRY_NAME_BYTES],
     compressed: &'a mut [u8; READER_COMPRESSED_SCRATCH],
     xhtml: &'a mut [u8; READER_XHTML_SCRATCH],
+    zip_inflate: &'a mut ZipInflateScratch,
 }
 
 struct LibraryTocSink<'a, 'p> {
@@ -86,7 +89,7 @@ impl EpubTocSink for LibraryTocSink<'_, '_> {
 
 impl ReaderCacheScratch {
     #[allow(clippy::large_stack_arrays)]
-    pub(crate) const fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             tail: [0; 4096],
             header: [0; 46],
@@ -96,6 +99,7 @@ impl ReaderCacheScratch {
             opf: [0; READER_OPF_SCRATCH],
             css: [0; READER_CSS_SCRATCH],
             xhtml: [0; READER_XHTML_SCRATCH],
+            zip_inflate: ZipInflateScratch::new(),
         }
     }
 }
@@ -362,10 +366,11 @@ where
         &mut scratch.header,
         &mut scratch.name,
     )?;
-    let container_len = zip.read_entry(
+    let container_len = zip.read_entry_streamed(
         container_entry,
         &mut scratch.compressed,
         &mut scratch.container,
+        &mut scratch.zip_inflate,
     )?;
     let container_xml = core::str::from_utf8(&scratch.container[..container_len])
         .map_err(|_| ReaderCacheError::Utf8)?;
@@ -377,7 +382,12 @@ where
         opf_entry.compressed_size,
         opf_entry.uncompressed_size
     );
-    let opf_len = zip.read_entry(opf_entry, &mut scratch.compressed, &mut scratch.opf)?;
+    let opf_len = zip.read_entry_streamed(
+        opf_entry,
+        &mut scratch.compressed,
+        &mut scratch.opf,
+        &mut scratch.zip_inflate,
+    )?;
     let opf_xml =
         core::str::from_utf8(&scratch.opf[..opf_len]).map_err(|_| ReaderCacheError::Utf8)?;
     let package = parse_opf(opf_xml, BookId(2), source_path, 0, opf_path)?;
@@ -398,6 +408,7 @@ where
             name: &mut scratch.name,
             compressed: &mut scratch.compressed,
             xhtml: &mut scratch.xhtml,
+            zip_inflate: &mut scratch.zip_inflate,
         },
     );
     esp_println::println!(
@@ -416,6 +427,7 @@ where
             name: &mut scratch.name,
             compressed: &mut scratch.compressed,
             css: &mut scratch.css,
+            zip_inflate: &mut scratch.zip_inflate,
         },
         &mut css_rules,
     );
@@ -427,6 +439,7 @@ where
 
     let mut xhtml_path = String::<MAX_ENTRY_NAME_BYTES>::new();
     let mut saw_spine = false;
+    let mut section_incomplete = false;
     let start_spine = requested_start_spine(&package, library, requested_chapter);
     let _ = ensure_cache_dirs(root, cache_key.as_str());
     write_book_cache(root, cache_key.as_str(), &package, library);
@@ -465,7 +478,14 @@ where
             xhtml_entry.compressed_size,
             xhtml_entry.uncompressed_size
         );
-        let xhtml_len = zip.read_entry(xhtml_entry, &mut scratch.compressed, &mut scratch.xhtml)?;
+        let (xhtml_len, xhtml_complete) = zip.read_entry_prefix_streamed(
+            xhtml_entry,
+            &mut scratch.compressed,
+            &mut scratch.xhtml,
+            &mut scratch.zip_inflate,
+        )?;
+        let xhtml_len = valid_utf8_prefix_len(&scratch.xhtml[..xhtml_len], xhtml_complete)?;
+        section_incomplete |= !xhtml_complete;
         let xhtml = core::str::from_utf8(&scratch.xhtml[..xhtml_len])
             .map_err(|_| ReaderCacheError::Utf8)?;
         if library.block_count > 0 {
@@ -490,7 +510,7 @@ where
         if library.block_count >= library.blocks.len().saturating_sub(4) {
             break;
         }
-        if stopped || library.page_count >= target_pages {
+        if !xhtml_complete || stopped || library.page_count >= target_pages {
             break;
         }
     }
@@ -499,7 +519,8 @@ where
         reader_layout::rebuild_page_index(library, 22, 472);
         reader_layout::rebuild_toc_page_targets(library);
         library.cached_spine = start_spine.min(u16::MAX as usize) as u16;
-        library.section_partial = library.page_count >= target_pages
+        library.section_partial = section_incomplete
+            || library.page_count >= target_pages
             || library.block_count >= library.blocks.len().saturating_sub(4);
         write_section_cache(root, cache_key.as_str(), library.cached_spine, library);
         esp_println::println!(
@@ -562,6 +583,14 @@ fn requested_start_spine(
         .unwrap_or(0)
 }
 
+fn valid_utf8_prefix_len(bytes: &[u8], complete: bool) -> Result<usize, ReaderCacheError> {
+    match core::str::from_utf8(bytes) {
+        Ok(_) => Ok(bytes.len()),
+        Err(err) if !complete && err.valid_up_to() > 0 => Ok(err.valid_up_to()),
+        Err(_) => Err(ReaderCacheError::Utf8),
+    }
+}
+
 fn load_css_rules<R>(
     zip: &mut ZipStream<R>,
     opf_path: &str,
@@ -585,8 +614,12 @@ fn load_css_rules<R>(
         else {
             continue;
         };
-        let Ok(css_len) = zip.read_entry(css_entry, &mut *scratch.compressed, &mut *scratch.css)
-        else {
+        let Ok(css_len) = zip.read_entry_streamed(
+            css_entry,
+            &mut *scratch.compressed,
+            &mut *scratch.css,
+            &mut *scratch.zip_inflate,
+        ) else {
             continue;
         };
         let Ok(css_text) = core::str::from_utf8(&scratch.css[..css_len]) else {
@@ -616,7 +649,12 @@ fn load_epub_toc<R>(
     let Ok(toc_entry) = zip.find_entry(&toc_path, scratch.header, scratch.name) else {
         return;
     };
-    let Ok(toc_len) = zip.read_entry(toc_entry, scratch.compressed, scratch.xhtml) else {
+    let Ok(toc_len) = zip.read_entry_streamed(
+        toc_entry,
+        scratch.compressed,
+        scratch.xhtml,
+        &mut *scratch.zip_inflate,
+    ) else {
         return;
     };
     let Ok(toc_text) = core::str::from_utf8(&scratch.xhtml[..toc_len]) else {

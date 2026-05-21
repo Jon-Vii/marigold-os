@@ -2,6 +2,8 @@ use crate::book::{BookId, BookMeta, BookSource, ChapterMeta, CoverStatus};
 use crate::text::{FontStyle, TextAlign, TextBlock, TextRole, TextRun};
 use heapless::Vec;
 use miniz_oxide::inflate::decompress_slice_iter_to_slice;
+use miniz_oxide::inflate::stream::{inflate, InflateState};
+use miniz_oxide::{DataFormat, MZFlush, MZStatus};
 
 pub const MAX_SPINE_ITEMS: usize = 128;
 pub const MAX_MANIFEST_ITEMS: usize = 160;
@@ -104,6 +106,24 @@ pub struct ZipStream<R> {
     entry_count: u16,
 }
 
+pub struct ZipInflateScratch {
+    state: InflateState,
+}
+
+impl ZipInflateScratch {
+    pub fn new() -> Self {
+        Self {
+            state: InflateState::new(DataFormat::Raw),
+        }
+    }
+}
+
+impl Default for ZipInflateScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<R> ZipStream<R>
 where
     R: ReadAt,
@@ -201,6 +221,117 @@ where
             .map_err(|_| ZipError::Inflate),
             _ => Err(ZipError::UnsupportedCompression),
         }
+    }
+
+    pub fn read_entry_streamed(
+        &mut self,
+        entry: OwnedZipEntry,
+        compressed_scratch: &mut [u8],
+        output: &mut [u8],
+        inflate_scratch: &mut ZipInflateScratch,
+    ) -> Result<usize, ZipError> {
+        if entry.uncompressed_size as usize > output.len() {
+            return Err(ZipError::OutputTooSmall);
+        }
+        let (len, complete) =
+            self.read_entry_prefix_streamed(entry, compressed_scratch, output, inflate_scratch)?;
+        if complete {
+            Ok(len)
+        } else {
+            Err(ZipError::OutputTooSmall)
+        }
+    }
+
+    pub fn read_entry_prefix_streamed(
+        &mut self,
+        entry: OwnedZipEntry,
+        compressed_scratch: &mut [u8],
+        output: &mut [u8],
+        inflate_scratch: &mut ZipInflateScratch,
+    ) -> Result<(usize, bool), ZipError> {
+        let payload_offset = self.entry_payload_offset(entry)?;
+        match entry.compression_method {
+            0 => {
+                let output_len = output.len().min(entry.uncompressed_size as usize);
+                read_exact_at(&mut self.reader, payload_offset, &mut output[..output_len])?;
+                Ok((output_len, output_len == entry.uncompressed_size as usize))
+            }
+            8 => self.inflate_entry_prefix(
+                payload_offset,
+                entry.compressed_size,
+                compressed_scratch,
+                output,
+                inflate_scratch,
+            ),
+            _ => Err(ZipError::UnsupportedCompression),
+        }
+    }
+
+    fn inflate_entry_prefix(
+        &mut self,
+        payload_offset: u32,
+        compressed_size: u32,
+        input: &mut [u8],
+        output: &mut [u8],
+        inflate_scratch: &mut ZipInflateScratch,
+    ) -> Result<(usize, bool), ZipError> {
+        if input.is_empty() || output.is_empty() {
+            return Err(ZipError::OutputTooSmall);
+        }
+        inflate_scratch.state.reset(DataFormat::Raw);
+        let mut compressed_read = 0u32;
+        let mut output_pos = 0usize;
+        while compressed_read < compressed_size {
+            let remaining = (compressed_size - compressed_read) as usize;
+            let input_len = input.len().min(remaining);
+            read_exact_at(
+                &mut self.reader,
+                payload_offset + compressed_read,
+                &mut input[..input_len],
+            )?;
+            compressed_read += input_len as u32;
+            let flush = if compressed_read == compressed_size {
+                MZFlush::Finish
+            } else {
+                MZFlush::None
+            };
+            let mut consumed = 0usize;
+            while consumed < input_len || flush == MZFlush::Finish {
+                if output_pos == output.len() {
+                    return Ok((output_pos, false));
+                }
+                let result = inflate(
+                    &mut inflate_scratch.state,
+                    &input[consumed..input_len],
+                    &mut output[output_pos..],
+                    flush,
+                );
+                consumed += result.bytes_consumed;
+                output_pos += result.bytes_written;
+                match result.status {
+                    Ok(MZStatus::StreamEnd) => return Ok((output_pos, true)),
+                    Ok(MZStatus::Ok) => {
+                        if result.bytes_consumed == 0 && result.bytes_written == 0 {
+                            break;
+                        }
+                        if consumed == input_len {
+                            break;
+                        }
+                    }
+                    Ok(_) => return Err(ZipError::Inflate),
+                    Err(_) => {
+                        if output_pos == output.len() {
+                            return Ok((output_pos, false));
+                        }
+                        return Err(ZipError::Inflate);
+                    }
+                }
+            }
+        }
+        Ok((
+            output_pos,
+            inflate_scratch.state.last_status() == miniz_oxide::inflate::TINFLStatus::Done,
+        ))
     }
 
     fn entry_payload_offset(&mut self, entry: OwnedZipEntry) -> Result<u32, ZipError> {
@@ -2587,39 +2718,92 @@ mod tests {
         assert_eq!(&output[..len], b"<package/>");
     }
 
+    #[test]
+    fn zip_stream_inflates_deflated_entry_in_small_chunks() {
+        let plain = b"Large compressed member ".repeat(20);
+        let deflated: &[u8] = &[
+            243, 73, 44, 74, 79, 85, 72, 206, 207, 45, 40, 74, 45, 46, 78, 77, 81, 200, 77, 205,
+            77, 74, 45, 82, 240, 25, 21, 31, 22, 226, 0,
+        ];
+        let zip_bytes = zip_with_methods(&[("OPS/chapter.xhtml", 8, deflated, plain.as_slice())]);
+        let mut stream = ZipStream::new(SliceReader { bytes: &zip_bytes }, &mut [0u8; 512])
+            .expect("stream zip parses");
+        let entry = stream
+            .find_entry("OPS/chapter.xhtml", &mut [0u8; 46], &mut [0u8; 64])
+            .expect("entry exists");
+        let mut compressed = [0u8; 8];
+        let mut output = [0u8; 512];
+        let mut inflate = ZipInflateScratch::new();
+
+        let len = stream
+            .read_entry_streamed(entry, &mut compressed, &mut output, &mut inflate)
+            .expect("entry read");
+
+        assert_eq!(&output[..len], plain.as_slice());
+    }
+
+    #[test]
+    fn zip_stream_returns_partial_prefix_when_output_fills() {
+        let zip_bytes = stored_zip(&[("OPS/chapter.xhtml", b"0123456789abcdef".as_slice())]);
+        let mut stream = ZipStream::new(SliceReader { bytes: &zip_bytes }, &mut [0u8; 512])
+            .expect("stream zip parses");
+        let entry = stream
+            .find_entry("OPS/chapter.xhtml", &mut [0u8; 46], &mut [0u8; 64])
+            .expect("entry exists");
+        let mut compressed = [0u8; 4];
+        let mut output = [0u8; 8];
+        let mut inflate = ZipInflateScratch::new();
+
+        let (len, complete) = stream
+            .read_entry_prefix_streamed(entry, &mut compressed, &mut output, &mut inflate)
+            .expect("entry read");
+
+        assert_eq!(len, 8);
+        assert!(!complete);
+        assert_eq!(&output, b"01234567");
+    }
+
     fn stored_zip(files: &[(&str, &[u8])]) -> StdVec<u8> {
+        let entries: StdVec<_> = files
+            .iter()
+            .map(|(name, data)| (*name, 0, *data, *data))
+            .collect();
+        zip_with_methods(&entries)
+    }
+
+    fn zip_with_methods(files: &[(&str, u16, &[u8], &[u8])]) -> StdVec<u8> {
         let mut bytes = StdVec::new();
         let mut central = StdVec::new();
         let mut offsets = StdVec::new();
 
-        for (name, data) in files {
+        for (name, method, compressed, plain) in files {
             offsets.push(bytes.len() as u32);
             push_u32(&mut bytes, 0x0403_4b50);
             push_u16(&mut bytes, 20);
             push_u16(&mut bytes, 0);
-            push_u16(&mut bytes, 0);
+            push_u16(&mut bytes, *method);
             push_u16(&mut bytes, 0);
             push_u16(&mut bytes, 0);
             push_u32(&mut bytes, 0);
-            push_u32(&mut bytes, data.len() as u32);
-            push_u32(&mut bytes, data.len() as u32);
+            push_u32(&mut bytes, compressed.len() as u32);
+            push_u32(&mut bytes, plain.len() as u32);
             push_u16(&mut bytes, name.len() as u16);
             push_u16(&mut bytes, 0);
             bytes.extend_from_slice(name.as_bytes());
-            bytes.extend_from_slice(data);
+            bytes.extend_from_slice(compressed);
         }
 
-        for ((name, data), offset) in files.iter().zip(offsets.iter()) {
+        for ((name, method, compressed, plain), offset) in files.iter().zip(offsets.iter()) {
             push_u32(&mut central, 0x0201_4b50);
             push_u16(&mut central, 20);
             push_u16(&mut central, 20);
             push_u16(&mut central, 0);
-            push_u16(&mut central, 0);
+            push_u16(&mut central, *method);
             push_u16(&mut central, 0);
             push_u16(&mut central, 0);
             push_u32(&mut central, 0);
-            push_u32(&mut central, data.len() as u32);
-            push_u32(&mut central, data.len() as u32);
+            push_u32(&mut central, compressed.len() as u32);
+            push_u32(&mut central, plain.len() as u32);
             push_u16(&mut central, name.len() as u16);
             push_u16(&mut central, 0);
             push_u16(&mut central, 0);
