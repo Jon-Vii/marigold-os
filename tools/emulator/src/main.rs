@@ -192,6 +192,7 @@ pub struct Emulator {
     last_view: Option<app_core::AppView>,
     last_book_id: Option<u32>,
     last_selection: u8,
+    last_library_count: u8,
 }
 
 impl Emulator {
@@ -209,6 +210,7 @@ impl Emulator {
             last_view: None,
             last_book_id: None,
             last_selection: 0,
+            last_library_count: 0,
         };
         emu.panel.init_sequence().expect("panel init");
         emu.render(app_core::RenderKind::Boot);
@@ -268,6 +270,7 @@ impl Emulator {
         self.last_view = Some(request.view);
         self.last_book_id = Some(request.book_id);
         self.last_selection = request.selection;
+        self.last_library_count = request.library_count;
         if mode == display::epd::RefreshMode::Fast {
             self.fast_refreshes = self.fast_refreshes.saturating_add(1);
         } else {
@@ -301,6 +304,11 @@ impl Emulator {
             request.view,
             app_core::AppView::Library | app_core::AppView::Chapters | app_core::AppView::Settings
         ) && request.selection != self.last_selection
+        {
+            return display::epd::RefreshMode::Full;
+        }
+        if request.view == app_core::AppView::Library
+            && request.library_count != self.last_library_count
         {
             return display::epd::RefreshMode::Full;
         }

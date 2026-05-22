@@ -53,8 +53,6 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
 
     match shell.library_status {
         UiLibraryStatus::NotScanned | UiLibraryStatus::Scanning => {
-            draw_text(fb, body_font, "Library unavailable", 58, 190, false);
-            draw_text(fb, meta_font, "Storage catalog not loaded", 58, 224, false);
             mirror_framebuffer_long_axis(fb);
             return;
         }

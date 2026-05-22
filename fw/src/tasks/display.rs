@@ -53,6 +53,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
 
                 let mode = if content_context_changed
                     || needs_clean_selection_refresh(request, last_request)
+                    || needs_clean_library_refresh(request, last_request)
                 {
                     RefreshMode::Full
                 } else {
@@ -235,6 +236,16 @@ fn needs_clean_selection_refresh(
         request.view,
         AppView::Library | AppView::Chapters | AppView::Settings
     ) && request.selection != last.selection
+}
+
+fn needs_clean_library_refresh(
+    request: crate::RenderRequest,
+    last_request: Option<crate::RenderRequest>,
+) -> bool {
+    let Some(last) = last_request else {
+        return false;
+    };
+    request.view == AppView::Library && request.library_count != last.library_count
 }
 
 fn refresh_mode(screen_on: bool, fast_refreshes: u8, refresh_policy: RefreshPolicy) -> RefreshMode {

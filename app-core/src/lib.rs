@@ -88,6 +88,7 @@ pub struct RenderRequest {
     pub page_raw: u16,
     pub battery_mv: u16,
     pub battery_percent: u8,
+    pub library_count: u8,
     pub dirty: Rect,
 }
 
@@ -474,6 +475,7 @@ impl ReaderState {
             page_raw: self.page_raw,
             battery_mv: self.battery_mv,
             battery_percent: self.battery_percent,
+            library_count: self.library_count,
             dirty: self.dirty,
         }
     }
