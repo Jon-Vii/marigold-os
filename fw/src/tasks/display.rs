@@ -46,7 +46,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
             DisplayCommand::Render(request) => {
                 let mut content_context_changed =
                     last_view != Some(request.view) || last_book_id != Some(request.book_id);
-                if matches!(request.view, AppView::Home | AppView::Library)
+                if request.view == AppView::Library
                     && sd_library.status == LibraryScanStatus::NotScanned
                 {
                     sd_library.status = LibraryScanStatus::Scanning;
