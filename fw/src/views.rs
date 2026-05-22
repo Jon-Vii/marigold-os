@@ -4,7 +4,7 @@ use crate::reader_store::{
 };
 use crate::{catalog, AppView, DisplayOrientation, RefreshPolicy, RenderRequest};
 use display::fb::Framebuffer;
-use display::font::{literata, FontStyle};
+use display::font::{draw_text, literata, FontStyle};
 use display::render::{draw_ascii, fill_rect, stroke_rect};
 use display::{Rect, HEIGHT, WIDTH};
 use heapless::String;
@@ -375,21 +375,23 @@ fn draw_reader_page(fb: &mut Framebuffer, request: RenderRequest, sd_library: &R
 
     let index = (request.chapter as usize) % catalog::READER_PAGES.len();
     let page = catalog::READER_PAGES[index];
-    let mut baseline_y = 72i16;
+    let mut baseline_y = 64i16;
 
-    for line in page.iter() {
+    for line in page.iter().take(6) {
         let (style, x, advance) = match line.style {
             catalog::ReaderLineStyle::Heading => (FontStyle::Bold, 18, 34),
-            catalog::ReaderLineStyle::Body => (FontStyle::Regular, 20, 28),
-            catalog::ReaderLineStyle::Italic => (FontStyle::Italic, 20, 28),
-            catalog::ReaderLineStyle::Bold => (FontStyle::Bold, 20, 28),
-            catalog::ReaderLineStyle::Quote => (FontStyle::Italic, 46, 28),
+            catalog::ReaderLineStyle::Body => (FontStyle::Regular, 20, 30),
+            catalog::ReaderLineStyle::Italic => (FontStyle::Italic, 20, 30),
+            catalog::ReaderLineStyle::Bold => (FontStyle::Bold, 20, 30),
+            catalog::ReaderLineStyle::Quote => (FontStyle::Italic, 46, 30),
         };
-        let font = literata(style);
-        baseline_y =
-            reader_layout::draw_wrapped_literata(fb, font, line.text, x, baseline_y, 728, advance);
-        baseline_y += line.gap_after as i16;
+        draw_text(fb, literata(style), line.text, x, baseline_y, false);
+        baseline_y += advance + line.gap_after as i16;
+        if baseline_y > 420 {
+            break;
+        }
     }
+    mirror_framebuffer_long_axis(fb);
 }
 
 fn draw_sd_reader_page(fb: &mut Framebuffer, request: RenderRequest, sd_library: &ReaderStore) {
@@ -757,6 +759,19 @@ fn button_label(button: Option<crate::Button>) -> &'static str {
         None => "NONE",
     }
 }
+
+fn mirror_framebuffer_long_axis(fb: &mut Framebuffer) {
+    for y in 0..HEIGHT / 2 {
+        let other_y = HEIGHT - 1 - y;
+        for x in 0..WIDTH {
+            let top = fb.pixel(x, y);
+            let bottom = fb.pixel(x, other_y);
+            fb.set_pixel(x, y, bottom);
+            fb.set_pixel(x, other_y, top);
+        }
+    }
+}
+
 fn fmt_u32(n: u32, buf: &mut [u8; 10]) -> &str {
     let mut i = buf.len();
     let mut v = n;
