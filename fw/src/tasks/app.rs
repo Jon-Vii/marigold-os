@@ -75,10 +75,12 @@ pub async fn run() {
                     rendering = false;
                     if !catalog_refresh_requested {
                         catalog_refresh_requested = true;
-                        let _ = STORAGE_COMMANDS.try_send(StorageCommand::LoadCatalogCache);
+                        STORAGE_COMMANDS
+                            .send(StorageCommand::LoadCatalogCache)
+                            .await;
                     }
                     if let Some(command) = pending_storage.take() {
-                        let _ = STORAGE_COMMANDS.try_send(command);
+                        STORAGE_COMMANDS.send(command).await;
                     }
                     if render_pending {
                         send_render(RenderKind::Page, state).await;

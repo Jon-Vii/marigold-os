@@ -164,6 +164,13 @@ fn handle_storage_command(
             chapter,
             target_pages,
         } => {
+            esp_println::println!(
+                "storage: open command book_id={} index={} chapter={} target={}",
+                book_id,
+                index,
+                chapter,
+                target_pages
+            );
             sd_library.reader_status = BookLoadStatus::Loading;
             let scratch = epub_scratch.get_or_insert_with(init_scratch);
             reader_cache::build_or_load_book_cache(
@@ -180,6 +187,12 @@ fn handle_storage_command(
                 pages: advertised_page_count(sd_library),
                 chapters: sd_library.chapter_count_for_ui(),
             });
+            esp_println::println!(
+                "storage: open complete status={:?} pages={} chapters={}",
+                sd_library.reader_status,
+                advertised_page_count(sd_library),
+                sd_library.chapter_count_for_ui()
+            );
             crate::reader_store::publish_chapter_pages(book_id, sd_library);
         }
         StorageCommand::StoreProgress(record) => {
