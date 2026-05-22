@@ -423,14 +423,15 @@ pub async fn run() {
                     }
                 ) {
                     if sleeping {
+                        esp_println::println!("app: wake");
                         sleeping = false;
                         state.view = AppView::Home;
                         state.dirty = Rect::FULL;
-                        let _ = POWER_EVENTS.try_send(PowerEvent::Activity);
                         send_render(RenderKind::Page, state).await;
                         rendering = true;
                         render_pending = false;
                     } else {
+                        esp_println::println!("app: sleep");
                         sleeping = true;
                         let _ = POWER_EVENTS.try_send(PowerEvent::SleepNow);
                     }

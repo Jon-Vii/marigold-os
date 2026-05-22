@@ -291,10 +291,27 @@ pub(crate) fn render_reading_landscape(
     request: RenderRequest,
     sd_library: &ReaderStore,
 ) {
-    draw_reader_page(fb, request, sd_library);
     if request.book_id < 2 {
-        draw_reading_footer(fb, request);
+        draw_builtin_reader_probe(fb, request);
+        return;
     }
+    draw_reader_page(fb, request, sd_library);
+}
+
+fn draw_builtin_reader_probe(fb: &mut Framebuffer, request: RenderRequest) {
+    draw_ascii(fb, "READ MODE", 64, 96, false);
+    draw_ascii(fb, "BUILT-IN FALLBACK", 64, 136, false);
+    draw_ascii(fb, "BACK RETURNS HOME", 64, 176, false);
+    let mut page_buf = [0u8; 10];
+    draw_ascii(fb, "CHAPTER", 64, 232, false);
+    draw_ascii(
+        fb,
+        fmt_u32(request.chapter as u32 + 1, &mut page_buf),
+        160,
+        232,
+        false,
+    );
+    mirror_framebuffer_long_axis(fb);
 }
 
 fn draw_header(fb: &mut Framebuffer, request: RenderRequest) {

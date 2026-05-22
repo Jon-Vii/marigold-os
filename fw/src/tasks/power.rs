@@ -23,7 +23,8 @@ pub async fn run(lpwr: LPWR) {
             }
             PowerEvent::DisplayAsleep => {}
             PowerEvent::SleepNow => {
-                let _ = request_display_sleep().await;
+                esp_println::println!("power: display sleep");
+                let _ = DISPLAY_COMMANDS.send(DisplayCommand::Sleep).await;
             }
         }
     }
