@@ -1,11 +1,12 @@
 use display::epd::{
-    ram_x_counter, ram_x_range, ram_y_counter, ram_y_range, update_control_1, update_control_2,
-    RefreshMode, SpiOp, CMD_DEEP_SLEEP, CMD_DISPLAY_UPDATE_CTRL1, CMD_DISPLAY_UPDATE_CTRL2,
-    CMD_MASTER_ACTIVATION, CMD_SET_RAM_X_COUNTER, CMD_SET_RAM_X_RANGE, CMD_SET_RAM_Y_COUNTER,
-    CMD_SET_RAM_Y_RANGE, CMD_WRITE_RAM_BW, INIT_SEQUENCE,
+    fill_transformed_band, ram_x_counter, ram_x_range, ram_y_counter, ram_y_range,
+    update_control_1, update_control_2, RefreshMode, SpiOp, CMD_DEEP_SLEEP,
+    CMD_DISPLAY_UPDATE_CTRL1, CMD_DISPLAY_UPDATE_CTRL2, CMD_MASTER_ACTIVATION,
+    CMD_SET_RAM_X_COUNTER, CMD_SET_RAM_X_RANGE, CMD_SET_RAM_Y_COUNTER, CMD_SET_RAM_Y_RANGE,
+    CMD_WRITE_RAM_BW, INIT_SEQUENCE,
 };
 use display::fb::Framebuffer;
-use display::{Rect, BAND_BYTES, BAND_ROWS, HEIGHT, ROW_BYTES};
+use display::{Rect, BAND_BYTES, BAND_ROWS, HEIGHT};
 use embassy_time::Instant;
 use esp_hal::gpio::{Input, Output};
 use esp_hal::peripherals::SPI2;
@@ -20,10 +21,6 @@ pub(crate) type Epd = hal_ext::spi_dma::EpdBus<
     Input<'static>,
     Output<'static>,
 >;
-
-const MIRROR_X: bool = true;
-const MIRROR_Y: bool = false;
-const REVERSE_BITS: bool = true;
 
 pub(crate) async fn init_panel(epd: &mut Epd) {
     for op in INIT_SEQUENCE {
@@ -115,37 +112,4 @@ async fn write_ram(
     }
     epd.end_ram_write();
     result
-}
-
-fn fill_transformed_band(fb: &Framebuffer, band_y: usize, out: &mut [u8; BAND_BYTES]) -> usize {
-    let rows = BAND_ROWS.min(HEIGHT - band_y);
-    let len = rows * ROW_BYTES;
-
-    if !MIRROR_X && !MIRROR_Y && !REVERSE_BITS {
-        out[..len].copy_from_slice(fb.band(band_y, rows));
-        return len;
-    }
-
-    for out_row in 0..rows {
-        let panel_y = band_y + out_row;
-        let src_y = if MIRROR_Y {
-            HEIGHT - 1 - panel_y
-        } else {
-            panel_y
-        };
-        for out_byte in 0..ROW_BYTES {
-            let src_byte = if MIRROR_X {
-                ROW_BYTES - 1 - out_byte
-            } else {
-                out_byte
-            };
-            let mut value = fb.band(src_y, 1)[src_byte];
-            if MIRROR_X || REVERSE_BITS {
-                value = value.reverse_bits();
-            }
-            out[out_row * ROW_BYTES + out_byte] = value;
-        }
-    }
-
-    len
 }

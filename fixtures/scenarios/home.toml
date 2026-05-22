@@ -1,0 +1,11 @@
+[[steps]]
+button = "Confirm"
+
+[[steps]]
+button = "Back"
+
+[expect]
+view = "Home"
+selection = 1
+last_refresh = "Full"
+history_contains = "refresh Full"

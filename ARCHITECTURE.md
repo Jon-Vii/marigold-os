@@ -24,11 +24,13 @@ buttons -> app state -> display command -> framebuffer -> SSD1677 RAM -> refresh
 ## Workspace
 
 ```text
+app-core/ app state reducer and Copy message contracts shared by firmware/tools
 display/   framebuffer, drawing primitives, SSD1677 constants and address math
 hal-ext/   thin async wrappers over ESP HAL peripherals
 fw/        boot, Embassy executor, task wiring, board-owned peripherals
 ui/        bounded layout data structures for later UI work
 proto/     bounded book/storage/text/cache models plus ZIP/EPUB/XHTML parser pieces
+tools/emulator/ host-side development emulator and scenario runner
 ```
 
 ## Embassy tasks
@@ -83,12 +85,13 @@ waveform. This avoids the multi-flash full-update behavior during ordinary
 reader navigation. Periodic full-refresh cleanup is available behind a constant
 but currently disabled so page-turn behavior is deterministic during bring-up.
 
-`display_task` contains three transform constants currently validated during bring-up:
+`display::epd` contains three transform constants currently validated during bring-up:
 `MIRROR_X = true`, `MIRROR_Y = false`, and `REVERSE_BITS = true`. The logical
-framebuffer API stays upright while the task remaps bytes/bits before DMA
-streaming. This fixes the X4 panel's observed horizontal byte order and bit
-order without leaking hardware orientation into app rendering. `MIRROR_Y=true`
-was tested and rejected because it made glyphs vertically mirrored/upside down.
+framebuffer API stays upright while firmware and host tools remap bytes/bits
+before panel-RAM writes. This fixes the X4 panel's observed horizontal byte
+order and bit order without leaking hardware orientation into app rendering.
+`MIRROR_Y=true` was tested and rejected because it made glyphs vertically
+mirrored/upside down.
 
 Physical orientation is an app/layout concern, not an SSD1677 streaming concern.
 The current readable build places logical top on the physical button side. The
@@ -124,6 +127,12 @@ RenderRequest     view/book/page/orientation/refresh/battery/dirty rect
 Layout<N>         parallel arrays of kind/rect/parent/text span
 Framebuffer       single flat byte array
 ```
+
+`app-core` owns the reader reducer and the shared message contracts. The
+firmware `app_task` is an Embassy shell around this pure reducer, and host tools
+use the same reducer for deterministic navigation tests. This keeps button flow,
+library events, restore events, orientation, refresh policy, and render requests
+from drifting between device and emulator.
 
 EPUB work keeps the same shape:
 
@@ -203,6 +212,38 @@ Reading and chapter navigation typography use generated Literata bitmap assets.
 The host generator downloads OFL Literata TTFs and emits Latin-1 glyph
 metrics/bitmaps for Regular, Italic, Bold, and BoldItalic. Firmware does not
 rasterize TTFs on-device.
+
+## Development emulator
+
+`tools/emulator` is a host-side parity tool for fast development loops. It has a
+headless scenario runner for agents/CI and an optional egui frontend for manual
+interactive testing. The default build is headless; the desktop window is built
+with `--features gui` to keep routine checks lightweight.
+
+The emulator intentionally models the behavior that is useful during ordinary
+development:
+
+- app reducer state transitions from button and library events
+- 800x480, 1 bpp framebuffer rendering
+- shared panel byte/bit transform from `display::epd`
+- SSD1677-style BW/RED RAM, address counters/ranges, refresh mode history, and
+  deep-sleep command validation
+- scripted scenarios that can assert final view/book/page/selection/panel state,
+  dump PNG frames, and compare against golden frames
+
+It does not model ESP32-C3 CPU timing, ADC noise, SPI DMA edge cases, BUSY
+timings, voltage/temperature behavior, or true e-paper waveform physics. Those
+remain hardware-validation concerns.
+
+Typical development loop:
+
+```sh
+cargo test -p app-core -p proto --target aarch64-apple-darwin
+cargo test --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --no-default-features
+cargo run --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --no-default-features -- --scenario fixtures/scenarios --check fixtures/golden
+cargo run --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --no-default-features -- --scenario fixtures/scenarios --dump target/emulator
+cargo run --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --features gui -- --gui
+```
 
 ## Reader app model
 

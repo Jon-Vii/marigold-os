@@ -1,0 +1,21 @@
+[package]
+name = "x4-emulator"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[features]
+default = []
+gui = ["dep:eframe", "dep:egui"]
+
+[dependencies]
+app-core = { path = "../../app-core" }
+display = { path = "../../display" }
+ui = { path = "../../ui" }
+eframe = { version = "0.28", default-features = false, features = ["glow", "default_fonts"], optional = true }
+egui = { version = "0.28", optional = true }
+png = "0.17"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

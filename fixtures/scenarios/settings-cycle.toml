@@ -1,0 +1,24 @@
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Confirm"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Confirm"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Confirm"
+
+[expect]
+view = "Home"
+selection = 2
+orientation = "LandscapeButtonsTop"
+refresh_policy = "FullEveryTen"
+last_refresh = "Full"

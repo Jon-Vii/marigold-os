@@ -1,0 +1,116 @@
+use display::fb::Framebuffer;
+#[cfg(feature = "gui")]
+use display::{HEIGHT, WIDTH};
+#[cfg(feature = "gui")]
+use egui::{Color32, ColorImage};
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::Path;
+use ui::{
+    app_render::{render_request as render_shared_request, render_sleep as render_shared_sleep, UiRenderModel},
+    UiBook, UiLibraryStatus, UiTocItem,
+};
+
+const DEMO_TITLE: &str = "Flowers for Algernon";
+const DEMO_AUTHOR: &str = "Daniel Keyes";
+const DEMO_CHAPTERS: [UiTocItem<'static>; 4] = [
+    UiTocItem {
+        title: "Bring Up",
+        level: 1,
+    },
+    UiTocItem {
+        title: "Architecture",
+        level: 1,
+    },
+    UiTocItem {
+        title: "Power",
+        level: 1,
+    },
+    UiTocItem {
+        title: "Next Phase",
+        level: 1,
+    },
+];
+
+pub fn render_request(
+    fb: &mut Framebuffer,
+    request: app_core::RenderRequest,
+    library_entries: &[String],
+) {
+    let borrowed_entries: Vec<&str> = library_entries.iter().map(String::as_str).collect();
+    let model = demo_model(request, &borrowed_entries);
+    render_shared_request(fb, request, &model);
+}
+
+pub fn render_sleep(fb: &mut Framebuffer, request: app_core::RenderRequest) {
+    let model = demo_model(request, &[]);
+    render_shared_sleep(fb, request, &model);
+}
+
+#[cfg(feature = "gui")]
+pub fn framebuffer_to_color_image(fb: &Framebuffer) -> ColorImage {
+    let mut pixels = Vec::with_capacity(WIDTH * HEIGHT);
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            pixels.push(if fb.pixel(x, y) {
+                Color32::from_rgb(238, 236, 226)
+            } else {
+                Color32::from_rgb(22, 22, 20)
+            });
+        }
+    }
+    ColorImage {
+        size: [WIDTH, HEIGHT],
+        pixels,
+    }
+}
+
+pub fn write_png(path: &Path, fb: &Framebuffer) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+    encode_png(&mut writer, fb)?;
+    Ok(())
+}
+
+pub fn encode_png<W: Write>(writer: W, fb: &Framebuffer) -> Result<(), png::EncodingError> {
+    let mut encoder = png::Encoder::new(writer, display::WIDTH as u32, display::HEIGHT as u32);
+    encoder.set_color(png::ColorType::Grayscale);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header()?;
+    let mut data = Vec::with_capacity(display::WIDTH * display::HEIGHT);
+    for y in 0..display::HEIGHT {
+        for x in 0..display::WIDTH {
+            data.push(if fb.pixel(x, y) { 0xEE } else { 0x18 });
+        }
+    }
+    writer.write_image_data(&data)
+}
+
+fn demo_model<'a>(
+    request: app_core::RenderRequest,
+    library_entries: &'a [&'a str],
+) -> UiRenderModel<'a> {
+    UiRenderModel {
+        active_book: UiBook {
+            title: DEMO_TITLE,
+            author: DEMO_AUTHOR,
+            progress_permille: progress_permille(request),
+            cover: None,
+        },
+        library_status: if library_entries.is_empty() {
+            UiLibraryStatus::Empty
+        } else {
+            UiLibraryStatus::Ready
+        },
+        library_entries,
+        chapters: &DEMO_CHAPTERS,
+    }
+}
+
+fn progress_permille(request: app_core::RenderRequest) -> u16 {
+    let total = if request.book_id >= 2 { 24 } else { 4 };
+    (((request.page + request.chapter as u32) * 1000) / total).min(1000) as u16
+}

@@ -15,6 +15,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "app-core"
+version = "0.1.0"
+dependencies = [
+ "display",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -571,6 +578,7 @@ dependencies = [
 name = "fw"
 version = "0.1.0"
 dependencies = [
+ "app-core",
  "display",
  "embassy-executor",
  "embassy-futures",
@@ -1064,6 +1072,7 @@ checksum = "e87a2ed6b42ec5e28cc3b94c09982969e9227600b2e3dcbc1db927a84c06bd69"
 name = "ui"
 version = "0.1.0"
 dependencies = [
+ "app-core",
  "display",
 ]
 

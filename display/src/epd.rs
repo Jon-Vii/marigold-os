@@ -1,4 +1,4 @@
-use crate::{Rect, HEIGHT, WIDTH};
+use crate::{fb::Framebuffer, Rect, BAND_BYTES, BAND_ROWS, HEIGHT, ROW_BYTES, WIDTH};
 
 pub const CMD_DRIVER_OUTPUT_CONTROL: u8 = 0x01;
 pub const CMD_BOOSTER_SOFT_START: u8 = 0x0C;
@@ -18,6 +18,10 @@ pub const CMD_AUTO_WRITE_BW_RAM: u8 = 0x46;
 pub const CMD_AUTO_WRITE_RED_RAM: u8 = 0x47;
 pub const CMD_SET_RAM_X_COUNTER: u8 = 0x4E;
 pub const CMD_SET_RAM_Y_COUNTER: u8 = 0x4F;
+
+pub const MIRROR_X: bool = true;
+pub const MIRROR_Y: bool = false;
+pub const REVERSE_BITS: bool = true;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RefreshMode {
@@ -142,4 +146,37 @@ pub const fn update_control_1(mode: RefreshMode) -> [u8; 2] {
 
 pub const fn is_byte_aligned(rect: Rect) -> bool {
     rect.x & 7 == 0 && rect.w & 7 == 0 && rect.w > 0 && rect.h > 0 && rect.x < WIDTH as u16
+}
+
+pub fn fill_transformed_band(fb: &Framebuffer, band_y: usize, out: &mut [u8; BAND_BYTES]) -> usize {
+    let rows = BAND_ROWS.min(HEIGHT - band_y);
+    let len = rows * ROW_BYTES;
+
+    if !MIRROR_X && !MIRROR_Y && !REVERSE_BITS {
+        out[..len].copy_from_slice(fb.band(band_y, rows));
+        return len;
+    }
+
+    for out_row in 0..rows {
+        let panel_y = band_y + out_row;
+        let src_y = if MIRROR_Y {
+            HEIGHT - 1 - panel_y
+        } else {
+            panel_y
+        };
+        for out_byte in 0..ROW_BYTES {
+            let src_byte = if MIRROR_X {
+                ROW_BYTES - 1 - out_byte
+            } else {
+                out_byte
+            };
+            let mut value = fb.band(src_y, 1)[src_byte];
+            if MIRROR_X || REVERSE_BITS {
+                value = value.reverse_bits();
+            }
+            out[out_row * ROW_BYTES + out_byte] = value;
+        }
+    }
+
+    len
 }

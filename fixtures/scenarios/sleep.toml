@@ -1,0 +1,8 @@
+[[steps]]
+button = "Power"
+
+[expect]
+view = "Home"
+sleeping = true
+panel_sleeping = true
+history_contains = "cmd 0x10"

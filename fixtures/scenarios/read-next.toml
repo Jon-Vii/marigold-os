@@ -1,0 +1,25 @@
+[[steps]]
+button = "Confirm"
+
+[[steps]]
+library = "Scanned"
+count = 1
+
+[[steps]]
+button = "Confirm"
+
+[[steps]]
+library = "Loaded"
+book_id = 2
+pages = 3
+chapters = 1
+
+[[steps]]
+button = "Next"
+
+[expect]
+view = "Reading"
+book_id = 2
+page = 1
+last_button = "Next"
+last_refresh = "Fast"

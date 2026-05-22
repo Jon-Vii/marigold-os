@@ -5,6 +5,7 @@ edition = "2021"
 default-run = "fw"
 
 [dependencies]
+app-core = { path = "../app-core" }
 display = { path = "../display" }
 ui = { path = "../ui" }
 proto = { path = "../proto" }

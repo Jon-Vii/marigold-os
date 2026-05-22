@@ -127,6 +127,25 @@ Current code status:
   and Settings into `target/previews`. It can also render EPUB parser previews
   from host-side files for layout inspection before flashing.
 
+## Phase 4c: development emulator
+
+- `app-core` now owns the shared reader message types and pure `ReaderState`
+  reducer. Firmware keeps the Embassy channels and task shell, while host tools
+  can drive the same navigation/library/restore logic without ESP HAL.
+- `display::epd::fill_transformed_band` exposes the validated X4 panel byte/bit
+  transform so firmware and emulator stream the same panel RAM layout.
+- `tools/emulator` provides a deterministic headless runner plus an optional
+  egui frontend behind `--features gui`. Headless mode accepts one TOML scenario
+  or a scenario directory, applies scripted button/library events, validates app
+  and panel state, writes PNG frame dumps, and compares against golden PNGs.
+- The emulator includes an SSD1677-oriented panel model that tracks BW/RED RAM,
+  address ranges/counters, refresh controls, refresh mode history, and deep
+  sleep validation. It is a protocol model, not an analog e-paper or ESP32-C3
+  timing emulator.
+- Scenarios live under `fixtures/scenarios`; matching golden frames live under
+  `fixtures/golden`. Add or update both before/alongside UI/navigation changes
+  so agents can verify behavior before flashing hardware.
+
 ## Phase 5: Wi-Fi sync
 
 - Enable `esp-wifi`.
@@ -138,7 +157,11 @@ Current code status:
 
 ```sh
 cargo check --target riscv32imc-unknown-none-elf --release
-cargo test -p proto --target aarch64-apple-darwin
+cargo test -p app-core -p proto --target aarch64-apple-darwin
+cargo test --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --no-default-features
+cargo run --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --no-default-features -- --scenario fixtures/scenarios --check fixtures/golden
+cargo run --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --no-default-features -- --scenario fixtures/scenarios --dump target/emulator
+cargo run --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --features gui -- --gui
 cargo clippy --workspace --target riscv32imc-unknown-none-elf --release -- -D warnings
 cargo run --manifest-path tools/preview/Cargo.toml --target aarch64-apple-darwin
 ```

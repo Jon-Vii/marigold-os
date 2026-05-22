@@ -1,6 +1,7 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod app_render;
 pub mod layout;
 pub mod render;
 

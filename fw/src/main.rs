@@ -47,7 +47,10 @@ pub static _ESP_APP_DESC: EspAppDesc = EspAppDesc {
     reserv2: [0; 18],
 };
 
-use display::Rect;
+pub use app_core::{
+    AppView, Button, DisplayCommand, DisplayEvent, DisplayOrientation, InputEvent, LibraryEvent,
+    PowerEvent, RefreshPolicy, RenderKind, RenderRequest,
+};
 use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
@@ -71,121 +74,6 @@ mod reader_layout;
 mod reader_store;
 pub mod tasks;
 mod views;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Button {
-    Power,
-    Back,
-    Confirm,
-    Previous,
-    Next,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InputEvent {
-    Sample {
-        button: Option<Button>,
-        aux_raw: u16,
-        nav_raw: u16,
-        page_raw: u16,
-        battery_mv: u16,
-        battery_percent: u8,
-    },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RenderKind {
-    Boot,
-    Page,
-    Battery,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DisplayOrientation {
-    LandscapeButtonsBottom,
-    LandscapeButtonsTop,
-    PortraitButtonsLeft,
-    PortraitButtonsRight,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AppView {
-    Home,
-    Library,
-    Reading,
-    Chapters,
-    Sync,
-    Settings,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RefreshPolicy {
-    FastOnly,
-    FullOnWake,
-    FullEveryTen,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RenderRequest {
-    pub kind: RenderKind,
-    pub view: AppView,
-    pub page: u32,
-    pub chapter: u8,
-    pub selection: u8,
-    pub book_id: u32,
-    pub orientation: DisplayOrientation,
-    pub refresh_policy: RefreshPolicy,
-    pub last_button: Option<Button>,
-    pub aux_raw: u16,
-    pub nav_raw: u16,
-    pub page_raw: u16,
-    pub battery_mv: u16,
-    pub battery_percent: u8,
-    pub dirty: Rect,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DisplayCommand {
-    Render(RenderRequest),
-    Sleep,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DisplayEvent {
-    Settled,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LibraryEvent {
-    Scanned {
-        count: u8,
-    },
-    Loaded {
-        book_id: u32,
-        pages: u32,
-        chapters: u8,
-    },
-    ChapterPage {
-        book_id: u32,
-        chapter: u8,
-        page: u32,
-    },
-    Restored {
-        book_id: u32,
-        chapter: u8,
-        page: u32,
-        reading_orientation: u8,
-        refresh_policy: u8,
-    },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PowerEvent {
-    Activity,
-    DisplaySettled,
-    DisplayAsleep,
-    SleepNow,
-}
 
 pub static INPUT_EVENTS: Channel<CriticalSectionRawMutex, InputEvent, 8> = Channel::new();
 pub static DISPLAY_COMMANDS: Channel<CriticalSectionRawMutex, DisplayCommand, 1> = Channel::new();

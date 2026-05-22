@@ -1,0 +1,22 @@
+[[steps]]
+button = "Back"
+
+[[steps]]
+button = "Confirm"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Confirm"
+
+[expect]
+view = "Reading"
+book_id = 1
+chapter = 2
+page = 0
+selection = 2
+last_refresh = "Full"
