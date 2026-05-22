@@ -77,7 +77,12 @@ where
 
     pub async fn wait_ready(&mut self) {
         Timer::after_millis(1).await;
+        let mut polls = 0u16;
         while self.busy.is_high().unwrap_or(false) {
+            if polls >= 750 {
+                break;
+            }
+            polls += 1;
             Timer::after(Duration::from_millis(20)).await;
         }
     }

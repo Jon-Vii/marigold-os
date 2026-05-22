@@ -122,7 +122,11 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                     esp_println::println!("display: wake init complete");
                 }
 
-                let mode = refresh_mode(screen_on, fast_refreshes, request.refresh_policy);
+                let mode = if content_context_changed {
+                    RefreshMode::Full
+                } else {
+                    refresh_mode(screen_on, fast_refreshes, request.refresh_policy)
+                };
                 if content_context_changed {
                     esp_println::println!(
                         "display: context changed, refresh policy {:?} -> {:?}",
