@@ -170,6 +170,13 @@ pub enum LibraryEvent {
         chapter: u8,
         page: u32,
     },
+    Restored {
+        book_id: u32,
+        chapter: u8,
+        page: u32,
+        reading_orientation: u8,
+        refresh_policy: u8,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

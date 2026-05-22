@@ -188,9 +188,9 @@ text bytes, and small ZIP/XML scratch buffers. Oversized XHTML spine entries are
 decoded as a bounded prefix for the first cache chunk and marked partial, rather
 than failing before page one can be rendered. Full resumable continuation inside
 one huge XHTML member remains the next cache-cursor refinement. `STATE.BIN`
-stores the encoded `AppStateRecord`; writing is present, while boot-time restore
-still needs the app/display handoff that maps the saved book id back to the
-scanned SD catalog.
+stores the encoded `AppStateRecord`; version 2 records include the SD source
+size and path-derived hash so boot restore can map saved progress back onto the
+scanned SD catalog instead of trusting a volatile list index.
 
 `COVER.BIN` is an optional Home-cover sidecar for the same cache key. It stores
 a tiny header followed by a 202x303, 1-bit, row-packed bitmap matching the Dock
@@ -199,9 +199,10 @@ directly, while missing or invalid records fall back to generated cover art. The
 host preview tool can generate the sidecar from EPUB JPEG/PNG covers with
 `--cover-bin` or write it directly to a mounted SD cache path with `--sd-root`.
 
-Reading typography uses generated Literata bitmap assets. The host generator
-downloads OFL Literata TTFs and emits Latin-1 glyph metrics/bitmaps for Regular,
-Italic, Bold, and BoldItalic. Firmware does not rasterize TTFs on-device.
+Reading and chapter navigation typography use generated Literata bitmap assets.
+The host generator downloads OFL Literata TTFs and emits Latin-1 glyph
+metrics/bitmaps for Regular, Italic, Bold, and BoldItalic. Firmware does not
+rasterize TTFs on-device.
 
 ## Reader app model
 
@@ -223,8 +224,12 @@ the chapter, symbolic battery, and a thin whole-book progress bar. Home shows a
 small battery percentage because it is a status surface. GPIO0 is sampled as the
 current rough battery source using a 2:1 divider assumption and a simple
 3300-4200 mV LiPo percentage curve. The current book may be the built-in
-fallback or a microSD EPUB. SD EPUBs use the same flat book/chapter/page fields
-as built-in content, but page bodies come from the SD-backed cache instead of
+fallback or the restored/last-selected microSD EPUB. Home triggers SD scan and
+state restore on first render, then `Read` resumes the current EPUB through the
+same cache-loading path as Files. If there is no current SD EPUB, `Read` opens
+Files when EPUBs are present and falls back to the built-in reader when the card
+is empty or unavailable. SD EPUBs use the same flat book/chapter/page fields as
+built-in content, but page bodies come from the SD-backed cache instead of
 static text arrays.
 
 ## Current module map
@@ -262,9 +267,9 @@ size.
 
 Persistent app state is represented by `hal_ext::nvm::AppStateRecord`, a compact
 versioned/checksummed record for book id, chapter, rendered screen, shell
-orientation, reading orientation, and refresh policy. Actual flash writes are
-still pending; the record format is intentionally separate from ESP flash driver
-choice.
+orientation, reading orientation, refresh policy, source hash, and source file
+size. The firmware stores it at `/XTEINK/STATE.BIN` for SD reading progress;
+flash/NVM fallback remains separate from the record format.
 
 ## Bring-up checklist
 

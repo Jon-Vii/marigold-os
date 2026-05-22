@@ -29,6 +29,7 @@ struct ReaderState {
     sd_page_count: u32,
     sd_chapter_count: u8,
     sd_chapter_pages: [u16; MAX_SD_CHAPTERS],
+    read_request_pending: bool,
     dirty: Rect,
 }
 
@@ -52,6 +53,7 @@ impl ReaderState {
             sd_page_count: 1,
             sd_chapter_count: 1,
             sd_chapter_pages: [0; MAX_SD_CHAPTERS],
+            read_request_pending: false,
             dirty: Rect::FULL,
         }
     }
@@ -78,20 +80,30 @@ impl ReaderState {
             (_, None) => {}
             (_, Some(Button::Power)) => {}
             (AppView::Home, Some(Button::Back)) => {
-                next.view = AppView::Reading;
-                next.selection = self.chapter;
+                if self.book_id >= 2 {
+                    next.view = AppView::Reading;
+                    next.selection = self.chapter;
+                    next.read_request_pending = false;
+                } else {
+                    next.view = AppView::Library;
+                    next.selection = 0;
+                    next.read_request_pending = true;
+                }
             }
             (AppView::Home, Some(Button::Confirm)) => {
                 next.view = AppView::Library;
                 next.selection = 0;
+                next.read_request_pending = false;
             }
             (AppView::Home, Some(Button::Previous)) => {
                 next.view = AppView::Sync;
                 next.selection = 0;
+                next.read_request_pending = false;
             }
             (AppView::Home, Some(Button::Next)) => {
                 next.view = AppView::Settings;
                 next.selection = 0;
+                next.read_request_pending = false;
             }
 
             (AppView::Library, Some(Button::Next)) => {
@@ -110,15 +122,18 @@ impl ReaderState {
                     next.sd_page_count = 1;
                     next.sd_chapter_count = 1;
                     next.sd_chapter_pages = [0; MAX_SD_CHAPTERS];
+                    next.read_request_pending = false;
                 } else if let Some(book) = catalog::book_at(self.selection as usize) {
                     next.book_id = book.id.0;
                     next.view = AppView::Reading;
                     next.selection = 0;
+                    next.read_request_pending = false;
                 }
             }
             (AppView::Library, Some(Button::Back)) => {
                 next.view = AppView::Home;
                 next.selection = 1;
+                next.read_request_pending = false;
             }
 
             (AppView::Reading, Some(Button::Next)) => {
@@ -210,10 +225,20 @@ impl ReaderState {
             LibraryEvent::Scanned { count } => {
                 self.library_count = count;
                 if self.view == AppView::Library {
-                    if count == 0 {
+                    if self.read_request_pending && count == 0 {
+                        self.book_id = 1;
+                        self.chapter = 0;
+                        self.page = 0;
+                        self.selection = 0;
+                        self.view = AppView::Reading;
+                        self.read_request_pending = false;
+                    } else if count == 0 {
                         self.selection = 0;
                     } else if self.selection >= count {
                         self.selection = count - 1;
+                    }
+                    if count > 0 {
+                        self.read_request_pending = false;
                     }
                     self.dirty = Rect::FULL;
                 }
@@ -241,6 +266,26 @@ impl ReaderState {
                         *slot = page.min(u16::MAX as u32) as u16;
                     }
                 }
+            }
+            LibraryEvent::Restored {
+                book_id,
+                chapter,
+                page,
+                reading_orientation,
+                refresh_policy,
+            } => {
+                self.book_id = book_id;
+                self.chapter = chapter;
+                self.selection = chapter;
+                self.page = page;
+                self.read_request_pending = false;
+                if let Some(orientation) = display_orientation_from_u8(reading_orientation) {
+                    self.orientation = orientation;
+                }
+                if let Some(policy) = refresh_policy_from_u8(refresh_policy) {
+                    self.refresh_policy = policy;
+                }
+                self.dirty = Rect::FULL;
             }
         }
         if self.view == AppView::Library {
@@ -281,7 +326,28 @@ impl ReaderState {
             shell_orientation: DisplayOrientation::PortraitButtonsLeft as u8,
             reading_orientation: self.orientation as u8,
             refresh_policy: self.refresh_policy as u8,
+            source_hash: 0,
+            source_size: 0,
         }
+    }
+}
+
+fn display_orientation_from_u8(value: u8) -> Option<DisplayOrientation> {
+    match value {
+        0 => Some(DisplayOrientation::LandscapeButtonsBottom),
+        1 => Some(DisplayOrientation::LandscapeButtonsTop),
+        2 => Some(DisplayOrientation::PortraitButtonsLeft),
+        3 => Some(DisplayOrientation::PortraitButtonsRight),
+        _ => None,
+    }
+}
+
+fn refresh_policy_from_u8(value: u8) -> Option<RefreshPolicy> {
+    match value {
+        0 => Some(RefreshPolicy::FastOnly),
+        1 => Some(RefreshPolicy::FullOnWake),
+        2 => Some(RefreshPolicy::FullEveryTen),
+        _ => None,
     }
 }
 
@@ -336,6 +402,7 @@ pub async fn run() {
     let mut state = ReaderState::boot();
     let mut rendering = true;
     let mut render_pending = false;
+    let mut sleeping = false;
     send_render(RenderKind::Boot, state).await;
 
     loop {
@@ -354,7 +421,22 @@ pub async fn run() {
                         ..
                     }
                 ) {
-                    let _ = POWER_EVENTS.try_send(PowerEvent::SleepNow);
+                    if sleeping {
+                        sleeping = false;
+                        state.view = AppView::Home;
+                        state.dirty = Rect::FULL;
+                        let _ = POWER_EVENTS.try_send(PowerEvent::Activity);
+                        send_render(RenderKind::Page, state).await;
+                        rendering = true;
+                        render_pending = false;
+                    } else {
+                        sleeping = true;
+                        let _ = POWER_EVENTS.try_send(PowerEvent::SleepNow);
+                    }
+                    continue;
+                }
+
+                if sleeping {
                     continue;
                 }
 

@@ -32,22 +32,12 @@ pub(crate) fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, sd_libr
     stroke_rect(fb, Rect::new(0, 0, WIDTH as u16, HEIGHT as u16), false);
 
     let fallback_book = catalog::active_book(request.book_id);
-    let (title, author) =
-        if request.book_id >= 2 && sd_library.reader_status == BookLoadStatus::Ready {
-            let title = if sd_library.title.is_empty() {
-                fallback_book.title
-            } else {
-                sd_library.title.as_str()
-            };
-            let author = if sd_library.author.is_empty() {
-                fallback_book.author
-            } else {
-                sd_library.author.as_str()
-            };
-            (title, author)
-        } else {
-            (fallback_book.title, fallback_book.author)
-        };
+    let (title, author) = active_book_labels(
+        request,
+        sd_library,
+        fallback_book.title,
+        fallback_book.author,
+    );
 
     draw_ascii(fb, "SLEEPING", 360, 144, false);
     draw_ascii_centered(fb, title, 216);
@@ -176,7 +166,11 @@ fn render_shared_shell(fb: &mut Framebuffer, request: RenderRequest, sd_library:
             title,
             author,
             progress_permille: book_progress_permille(request),
-            cover: if request.book_id >= 2 && sd_library.cover_ready {
+            cover: if request.book_id >= 2
+                && sd_library.current_index
+                    == request.book_id.checked_sub(2).map(|index| index as usize)
+                && sd_library.cover_ready
+            {
                 Some(UiCover {
                     width: sd_library.cover_width,
                     height: sd_library.cover_height,
@@ -192,6 +186,38 @@ fn render_shared_shell(fb: &mut Framebuffer, request: RenderRequest, sd_library:
         chapters: &chapters[..chapter_count],
     };
     render_shell_overlay(fb, &shell);
+}
+
+fn active_book_labels<'a>(
+    request: RenderRequest,
+    sd_library: &'a ReaderStore,
+    fallback_title: &'a str,
+    fallback_author: &'a str,
+) -> (&'a str, &'a str) {
+    if request.book_id < 2 {
+        return (fallback_title, fallback_author);
+    }
+    if sd_library.reader_status == BookLoadStatus::Ready
+        && sd_library.loaded_index == request.book_id.checked_sub(2).map(|index| index as usize)
+    {
+        let title = if sd_library.title.is_empty() {
+            fallback_title
+        } else {
+            sd_library.title.as_str()
+        };
+        let author = if sd_library.author.is_empty() {
+            fallback_author
+        } else {
+            sd_library.author.as_str()
+        };
+        return (title, author);
+    }
+    request
+        .book_id
+        .checked_sub(2)
+        .and_then(|index| sd_library.entries.get(index as usize))
+        .map(|entry| (entry.display_name.as_str(), ""))
+        .unwrap_or((fallback_title, fallback_author))
 }
 
 fn fill_chapters<'a>(

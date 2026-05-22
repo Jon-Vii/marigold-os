@@ -23,9 +23,7 @@ pub async fn run(lpwr: LPWR) {
             }
             PowerEvent::DisplayAsleep => {}
             PowerEvent::SleepNow => {
-                if request_display_sleep().await {
-                    hal_ext::rtc::enter_deep_sleep_timer(rtc, Duration::from_secs(RTC_WAKE_SECS));
-                }
+                let _ = request_display_sleep().await;
             }
         }
     }

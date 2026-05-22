@@ -102,8 +102,13 @@ Current code status:
   for the next rendering refinement; the current firmware renderer still draws
   styled block text with Literata.
 - `/XTEINK/STATE.BIN` writes the encoded `AppStateRecord` for SD reading
-  progress. Boot-time restore is still pending the app/display handoff that maps
-  the saved book id/path back onto the scanned SD catalog.
+  progress. Version 2 stores the volatile book id plus stable SD source identity
+  derived from path and file size; boot/Home restore scans the card, maps the
+  record back to the matching EPUB, and keeps v1 decode fallback for older state
+  files.
+- Home `Read` now resumes the restored/last-selected SD EPUB. If no current EPUB
+  exists, it opens Files when SD books exist and falls back to the built-in book
+  when the card is empty or unavailable.
 - X4 SD pins are configured on the shared SPI bus: SCK GPIO8, MOSI GPIO10, MISO
   GPIO7, SD CS GPIO12. `embedded-sdmmc` is present with default features
   disabled.
@@ -116,8 +121,8 @@ Current code status:
 - `tools/generate_literata.py` downloads OFL Literata TTFs and generates Latin-1
   bitmap tables for Regular, Italic, Bold, and BoldItalic.
 - `display::font` renders generated bitmap glyphs directly into the framebuffer.
-- Reading mode uses Literata for the current demo text; tiny 5x7 remains for
-  debug/status chrome.
+- Reading mode and the chapter navigation screen use Literata; tiny 5x7 remains
+  for debug/status chrome and non-reader utility views.
 - `tools/preview` exports PBM/PNG snapshots for Home, Files, Reading, Chapters,
   and Settings into `target/previews`. It can also render EPUB parser previews
   from host-side files for layout inspection before flashing.

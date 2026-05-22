@@ -12,12 +12,16 @@ pub struct AppStateRecord {
     pub shell_orientation: u8,
     pub reading_orientation: u8,
     pub refresh_policy: u8,
+    pub source_hash: u32,
+    pub source_size: u32,
 }
 
 impl AppStateRecord {
-    pub const ENCODED_LEN: usize = 24;
+    pub const ENCODED_LEN: usize = 32;
+    const V1_ENCODED_LEN: usize = 24;
     const MAGIC: u32 = 0x5834_4F53;
-    const VERSION: u8 = 1;
+    const VERSION: u8 = 2;
+    const V1_VERSION: u8 = 1;
 
     pub const fn new(book_id: u32) -> Self {
         Self {
@@ -27,6 +31,8 @@ impl AppStateRecord {
             shell_orientation: 3,
             reading_orientation: 0,
             refresh_policy: 1,
+            source_hash: 0,
+            source_size: 0,
         }
     }
 
@@ -40,30 +46,58 @@ impl AppStateRecord {
         write_u32(&mut out, 8, self.book_id);
         write_u16(&mut out, 12, self.chapter);
         write_u32(&mut out, 14, self.screen);
-        let checksum = checksum(&out[..20]);
-        write_u32(&mut out, 20, checksum);
+        write_u32(&mut out, 18, self.source_hash);
+        write_u32(&mut out, 22, self.source_size);
+        let checksum = checksum(&out[..28]);
+        write_u32(&mut out, 28, checksum);
         out
     }
 
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < Self::ENCODED_LEN {
+        if bytes.len() < Self::V1_ENCODED_LEN {
             return None;
         }
-        if read_u32(bytes, 0) != Self::MAGIC || bytes[4] != Self::VERSION {
+        if read_u32(bytes, 0) != Self::MAGIC {
             return None;
         }
-        let expected = read_u32(bytes, 20);
-        if checksum(&bytes[..20]) != expected {
-            return None;
+        match bytes[4] {
+            Self::VERSION => {
+                if bytes.len() < Self::ENCODED_LEN {
+                    return None;
+                }
+                let expected = read_u32(bytes, 28);
+                if checksum(&bytes[..28]) != expected {
+                    return None;
+                }
+                Some(Self {
+                    book_id: read_u32(bytes, 8),
+                    chapter: read_u16(bytes, 12),
+                    screen: read_u32(bytes, 14),
+                    shell_orientation: bytes[5],
+                    reading_orientation: bytes[6],
+                    refresh_policy: bytes[7],
+                    source_hash: read_u32(bytes, 18),
+                    source_size: read_u32(bytes, 22),
+                })
+            }
+            Self::V1_VERSION => {
+                let expected = read_u32(bytes, 20);
+                if checksum(&bytes[..20]) != expected {
+                    return None;
+                }
+                Some(Self {
+                    book_id: read_u32(bytes, 8),
+                    chapter: read_u16(bytes, 12),
+                    screen: read_u32(bytes, 14),
+                    shell_orientation: bytes[5],
+                    reading_orientation: bytes[6],
+                    refresh_policy: bytes[7],
+                    source_hash: 0,
+                    source_size: 0,
+                })
+            }
+            _ => None,
         }
-        Some(Self {
-            book_id: read_u32(bytes, 8),
-            chapter: read_u16(bytes, 12),
-            screen: read_u32(bytes, 14),
-            shell_orientation: bytes[5],
-            reading_orientation: bytes[6],
-            refresh_policy: bytes[7],
-        })
     }
 }
 

@@ -158,12 +158,19 @@ fn collect_epubs<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_
             if !is_epub_name(&name) {
                 return;
             }
-            push_prefixed(prefix, &name, &open_name, in_books_dir, library);
+            push_prefixed(prefix, &name, &open_name, in_books_dir, entry.size, library);
             return;
         };
 
         if is_epub_name(file_name) {
-            push_prefixed(prefix, file_name, &open_name, in_books_dir, library);
+            push_prefixed(
+                prefix,
+                file_name,
+                &open_name,
+                in_books_dir,
+                entry.size,
+                library,
+            );
         }
     });
 }
@@ -173,12 +180,13 @@ fn push_prefixed(
     name: &str,
     open_name: &str,
     in_books_dir: bool,
+    byte_size: u32,
     library: &mut ReaderStore,
 ) {
     let mut path = String::<64>::new();
     let _ = path.push_str(prefix);
     let _ = path.push_str(name);
-    library.push(&path, open_name, in_books_dir);
+    library.push(&path, open_name, in_books_dir, byte_size);
 }
 
 fn is_epub_name(name: &str) -> bool {

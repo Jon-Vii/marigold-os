@@ -60,6 +60,8 @@ pub(crate) struct LibraryBookEntry {
     pub(crate) display_name: String<64>,
     pub(crate) open_name: String<16>,
     pub(crate) in_books_dir: bool,
+    pub(crate) byte_size: u32,
+    pub(crate) source_hash: u32,
 }
 
 impl LibraryBookEntry {
@@ -68,6 +70,8 @@ impl LibraryBookEntry {
             display_name: String::new(),
             open_name: String::new(),
             in_books_dir: false,
+            byte_size: 0,
+            source_hash: 0,
         }
     }
 }
@@ -76,6 +80,7 @@ pub(crate) struct ReaderStore {
     pub(crate) status: LibraryScanStatus,
     pub(crate) entries: [LibraryBookEntry; MAX_LIBRARY_BOOKS],
     pub(crate) count: usize,
+    pub(crate) current_index: Option<usize>,
     pub(crate) loaded_index: Option<usize>,
     pub(crate) loaded_chapter: u8,
     pub(crate) reader_status: BookLoadStatus,
@@ -113,6 +118,7 @@ impl ReaderStore {
             status: LibraryScanStatus::NotScanned,
             entries: core::array::from_fn(|_| LibraryBookEntry::new()),
             count: 0,
+            current_index: None,
             loaded_index: None,
             loaded_chapter: 0,
             reader_status: BookLoadStatus::Empty,
@@ -151,7 +157,10 @@ impl ReaderStore {
             entry.display_name.clear();
             entry.open_name.clear();
             entry.in_books_dir = false;
+            entry.byte_size = 0;
+            entry.source_hash = 0;
         }
+        self.current_index = None;
         self.loaded_index = None;
         self.loaded_chapter = 0;
         self.reader_status = BookLoadStatus::Empty;
@@ -283,7 +292,13 @@ impl ReaderStore {
             .max(1) as u8
     }
 
-    pub(crate) fn push(&mut self, display_name: &str, open_name: &str, in_books_dir: bool) {
+    pub(crate) fn push(
+        &mut self,
+        display_name: &str,
+        open_name: &str,
+        in_books_dir: bool,
+        byte_size: u32,
+    ) {
         if self.count >= self.entries.len() {
             return;
         }
@@ -293,7 +308,35 @@ impl ReaderStore {
         let _ = entry.display_name.push_str(display_name);
         let _ = entry.open_name.push_str(open_name);
         entry.in_books_dir = in_books_dir;
+        entry.byte_size = byte_size;
+        entry.source_hash = source_hash(display_name, byte_size);
         self.count += 1;
+    }
+
+    pub(crate) fn set_current_index(&mut self, index: usize) {
+        if index < self.count {
+            self.current_index = Some(index);
+        }
+    }
+
+    pub(crate) fn find_entry_by_state(
+        &self,
+        source_hash: u32,
+        source_size: u32,
+        fallback_book_id: u32,
+    ) -> Option<usize> {
+        if source_hash != 0 {
+            if let Some(index) = self.entries.iter().take(self.count).position(|entry| {
+                entry.source_hash == source_hash
+                    && (source_size == 0 || entry.byte_size == source_size)
+            }) {
+                return Some(index);
+            }
+        }
+        fallback_book_id
+            .checked_sub(2)
+            .map(|index| index as usize)
+            .filter(|index| *index < self.count)
     }
 }
 
@@ -319,4 +362,13 @@ pub(crate) fn publish_chapter_pages(book_id: u32, store: &ReaderStore) {
 
 fn strip_fragment(value: &str) -> &str {
     value.split('#').next().unwrap_or(value)
+}
+
+pub(crate) fn source_hash(path: &str, byte_size: u32) -> u32 {
+    let mut hash = 0x811c_9dc5u32;
+    for byte in path.bytes().chain(byte_size.to_le_bytes()) {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
 }

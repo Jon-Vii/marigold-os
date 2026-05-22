@@ -39,7 +39,7 @@ const CACHE_COVER_FILE: &str = "COVER.BIN";
 const STATE_FILE: &str = "STATE.BIN";
 const COVER_MAGIC: &[u8; 4] = b"X4CV";
 const COVER_VERSION: u8 = 1;
-const COVER_SIDECAR_ENABLED: bool = false;
+const COVER_SIDECAR_ENABLED: bool = true;
 
 pub(crate) struct ReaderCacheScratch {
     tail: [u8; 4096],
@@ -242,10 +242,87 @@ pub(crate) fn build_or_load_book_cache(
 
     epd.spi_mut().change_bus_frequency(40_u32.MHz());
     if matches!(status, BookLoadStatus::Ready | BookLoadStatus::Error) {
+        if matches!(status, BookLoadStatus::Ready) {
+            library.set_current_index(index);
+        }
         library.loaded_index = Some(index);
         library.loaded_chapter = requested_chapter;
     }
     library.reader_status = status;
+}
+
+pub(crate) fn load_app_state(epd: &mut Epd, sd_cs: &mut Output<'static>) -> Option<AppStateRecord> {
+    epd.deselect_display();
+    sd_cs.set_high();
+    epd.spi_mut().change_bus_frequency(400_u32.kHz());
+    let startup_clocks = [0xFF; 10];
+    if BlockingSpiBus::write(epd.spi_mut(), &startup_clocks).is_err() {
+        epd.spi_mut().change_bus_frequency(40_u32.MHz());
+        return None;
+    }
+
+    let record = {
+        let spi = SdSpiDevice {
+            spi: epd.spi_mut(),
+            cs: sd_cs,
+            delay: esp_hal::delay::Delay::new(),
+        };
+        let card = SdCard::new(spi, esp_hal::delay::Delay::new());
+        if card.num_bytes().is_err() {
+            None
+        } else {
+            card.spi(|device| device.spi.change_bus_frequency(8_u32.MHz()));
+            let volume_mgr: VolumeManager<_, _, 4, 4, 1> = VolumeManager::new(card, StaticTime);
+            let loaded = match volume_mgr.open_volume(VolumeIdx(0)) {
+                Ok(volume) => match volume.open_root_dir() {
+                    Ok(root) => read_state_file(&root),
+                    Err(_) => None,
+                },
+                Err(_) => None,
+            };
+            loaded
+        }
+    };
+    epd.spi_mut().change_bus_frequency(40_u32.MHz());
+    record
+}
+
+pub(crate) fn load_current_cover(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    library: &mut ReaderStore,
+    index: usize,
+) {
+    let Some(entry) = library.entries.get(index) else {
+        return;
+    };
+    let key = cache_key_for(entry.display_name.as_str(), entry.byte_size);
+
+    epd.deselect_display();
+    sd_cs.set_high();
+    epd.spi_mut().change_bus_frequency(400_u32.kHz());
+    let startup_clocks = [0xFF; 10];
+    if BlockingSpiBus::write(epd.spi_mut(), &startup_clocks).is_err() {
+        epd.spi_mut().change_bus_frequency(40_u32.MHz());
+        return;
+    }
+
+    let spi = SdSpiDevice {
+        spi: epd.spi_mut(),
+        cs: sd_cs,
+        delay: esp_hal::delay::Delay::new(),
+    };
+    let card = SdCard::new(spi, esp_hal::delay::Delay::new());
+    if card.num_bytes().is_ok() {
+        card.spi(|device| device.spi.change_bus_frequency(8_u32.MHz()));
+        let volume_mgr: VolumeManager<_, _, 4, 4, 1> = VolumeManager::new(card, StaticTime);
+        if let Ok(volume) = volume_mgr.open_volume(VolumeIdx(0)) {
+            if let Ok(root) = volume.open_root_dir() {
+                load_cover_cache(&root, key.as_str(), library);
+            }
+        };
+    }
+    epd.spi_mut().change_bus_frequency(40_u32.MHz());
 }
 
 pub(crate) fn store_app_state(epd: &mut Epd, sd_cs: &mut Output<'static>, record: AppStateRecord) {
@@ -714,6 +791,20 @@ where
         .open_file_in_dir(STATE_FILE, Mode::ReadWriteCreateOrTruncate)
         .map_err(|_| ())?;
     file.write(&record.encode()).map_err(|_| ())
+}
+
+fn read_state_file<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> Option<AppStateRecord>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let xteink = root.open_dir(CACHE_ROOT_DIR).ok()?;
+    let file = xteink.open_file_in_dir(STATE_FILE, Mode::ReadOnly).ok()?;
+    let mut bytes = [0u8; AppStateRecord::ENCODED_LEN];
+    let read = file.read(&mut bytes).ok()?;
+    AppStateRecord::decode(&bytes[..read])
 }
 
 fn open_or_make_dir<

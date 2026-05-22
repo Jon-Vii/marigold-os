@@ -1,7 +1,7 @@
 use crate::{UiCover, UiLibraryStatus, UiOrientation, UiRefreshPolicy, UiShell, UiTocItem, UiView};
 use display::fb::Framebuffer;
 use display::font::{draw_text, literata, measure_text, BitmapFont, FontStyle};
-use display::render::{draw_ascii, fill_rect, glyph_5x7, stroke_rect};
+use display::render::{fill_rect, glyph_5x7, stroke_rect};
 use display::{Rect, HEIGHT, WIDTH};
 
 const HOME_ITEMS: [&str; 4] = ["Read", "Files", "Sync", "Settings"];
@@ -30,6 +30,7 @@ pub fn render_shell_overlay(fb: &mut Framebuffer, shell: &UiShell<'_>) {
 }
 
 fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>) {
+    fb.clear(true);
     let title_font = literata(FontStyle::Bold);
     let body_font = literata(FontStyle::Regular);
     draw_battery_landscape_minimal(fb, 726, 28, shell.battery_percent);
@@ -39,6 +40,7 @@ fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     draw_text_centered_fit(fb, title_font, shell.active_book.title, 549, 394, 300);
     draw_text_centered_fit(fb, body_font, shell.active_book.author, 549, 424, 260);
     draw_home_progress(fb, 494, 454, 110, shell.active_book.progress_permille);
+    mirror_framebuffer_long_axis(fb);
 }
 
 fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
@@ -104,33 +106,59 @@ fn render_sync(fb: &mut Framebuffer) {
 }
 
 fn render_chapters_landscape(fb: &mut Framebuffer, shell: &UiShell<'_>) {
-    draw_ascii(fb, "CHAPTERS", 96, 112, false);
+    fb.clear(true);
+    let title_font = literata(FontStyle::Bold);
+    let body_font = literata(FontStyle::Regular);
+    let meta_font = literata(FontStyle::Italic);
+    draw_text(fb, title_font, "Chapters", 58, 54, false);
+    draw_text_truncated(fb, body_font, shell.active_book.title, 58, 84, 500, false);
+    draw_battery_landscape_minimal(fb, 718, 32, shell.battery_percent);
+    fill_rect(fb, Rect::new(58, 104, 684, 1), false);
     if shell.chapters.is_empty() {
-        draw_ascii(fb, "NO CHAPTERS", 96, 168, false);
+        draw_text(fb, body_font, "No chapters found", 58, 190, false);
         return;
     }
     let selected = (shell.selection as usize).min(shell.chapters.len().saturating_sub(1));
-    let first = selected.saturating_sub(4);
-    let mut item_y = 168usize;
-    for (index, item) in shell.chapters.iter().enumerate().skip(first).take(8) {
-        draw_toc_item(fb, item, index == selected, item_y);
-        item_y += 36;
+    let first = selected.saturating_sub(5);
+    let visible_count = 9usize;
+    let mut baseline_y = 142i16;
+    for (index, item) in shell
+        .chapters
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(visible_count)
+    {
+        draw_literata_toc_item(fb, body_font, item, index == selected, baseline_y);
+        baseline_y += 34;
     }
-    draw_ascii(fb, "OK JUMPS TO CHAPTER", 96, 408, false);
+    let mut counter = [0u8; 32];
+    let counter = fmt_chapter_counter(selected + 1, shell.chapters.len(), &mut counter);
+    draw_text(fb, meta_font, counter, 58, 448, false);
+    draw_text(fb, meta_font, "OK opens  Back returns", 516, 448, false);
 }
 
-fn draw_toc_item(fb: &mut Framebuffer, item: &UiTocItem<'_>, selected: bool, y: usize) {
+fn draw_literata_toc_item(
+    fb: &mut Framebuffer,
+    font: &BitmapFont,
+    item: &UiTocItem<'_>,
+    selected: bool,
+    baseline_y: i16,
+) {
+    let indent = 58 + (item.level.saturating_sub(1) as u16 * 18);
     if selected {
-        fill_rect(fb, Rect::new(88, y as u16 - 10, 624, 28), false);
+        fill_rect(fb, Rect::new(46, (baseline_y - 24) as u16, 708, 31), false);
     }
-    draw_ascii(fb, if selected { ">" } else { " " }, 104, y, selected);
-    let indent = 136 + (item.level.saturating_sub(1) as usize * 18);
-    draw_ascii_truncated(
+    if selected {
+        draw_text(fb, font, ">", 60, baseline_y, true);
+    }
+    draw_text_truncated(
         fb,
+        font,
         item.title,
-        indent,
-        y,
-        66usize.saturating_sub(item.level as usize * 2),
+        (indent + 34) as i16,
+        baseline_y,
+        650usize.saturating_sub(indent as usize),
         selected,
     );
 }
@@ -147,28 +175,6 @@ fn draw_menu(ui: &mut Ui<'_>, title: &str, items: &[&str], selection: u8) {
         ui.draw_ascii(if selected { ">" } else { " " }, 76, y as usize, selected);
         ui.draw_ascii(item, 112, y as usize, selected);
         y += 48;
-    }
-}
-
-fn draw_ascii_truncated(
-    fb: &mut Framebuffer,
-    text: &str,
-    x: usize,
-    y: usize,
-    max_chars: usize,
-    inverted: bool,
-) {
-    let mut cursor = x;
-    for byte in text.bytes().take(max_chars) {
-        let glyph = glyph_5x7(byte);
-        for (col, bits) in glyph.iter().enumerate() {
-            for row in 0..7 {
-                if bits & (1 << row) != 0 {
-                    fb.set_pixel(cursor + col, y + row, inverted);
-                }
-            }
-        }
-        cursor += 8;
     }
 }
 
@@ -305,6 +311,18 @@ fn cover_bit(bits: &[u8], stride: usize, x: usize, y: usize) -> bool {
     byte & (0x80 >> (x & 7)) != 0
 }
 
+fn mirror_framebuffer_long_axis(fb: &mut Framebuffer) {
+    for y in 0..HEIGHT / 2 {
+        let other_y = HEIGHT - 1 - y;
+        for x in 0..WIDTH {
+            let top = fb.pixel(x, y);
+            let bottom = fb.pixel(x, other_y);
+            fb.set_pixel(x, y, bottom);
+            fb.set_pixel(x, other_y, top);
+        }
+    }
+}
+
 fn draw_battery_landscape_minimal(fb: &mut Framebuffer, x: u16, y: u16, percent: u8) {
     stroke_rect(fb, Rect::new(x, y, 38, 16), false);
     fill_rect(fb, Rect::new(x + 38, y + 5, 3, 6), false);
@@ -335,6 +353,19 @@ fn draw_text_centered_fit(
     draw_text(fb, font, text, x, y, false);
 }
 
+fn draw_text_truncated(
+    fb: &mut Framebuffer,
+    font: &BitmapFont,
+    text: &str,
+    x: i16,
+    y: i16,
+    max_w: usize,
+    white: bool,
+) {
+    let text = fit_text(font, text, max_w.min(u16::MAX as usize) as u16);
+    draw_text(fb, font, text, x, y, white);
+}
+
 fn fit_text<'a>(font: &BitmapFont, text: &'a str, max_w: u16) -> &'a str {
     if measure_text(font, text) <= max_w {
         return text;
@@ -352,6 +383,47 @@ fn fit_text<'a>(font: &BitmapFont, text: &'a str, max_w: u16) -> &'a str {
 
 fn centered_x_for(width: usize, text: &str) -> usize {
     width.saturating_sub(text.len() * 8) / 2
+}
+
+fn fmt_chapter_counter(current: usize, total: usize, buf: &mut [u8; 32]) -> &str {
+    let mut cursor = 0;
+    push_str(buf, &mut cursor, "Chapter ");
+    push_usize(buf, &mut cursor, current);
+    push_str(buf, &mut cursor, " of ");
+    push_usize(buf, &mut cursor, total);
+    core::str::from_utf8(&buf[..cursor]).unwrap_or("")
+}
+
+fn push_str(buf: &mut [u8], cursor: &mut usize, value: &str) {
+    for byte in value.bytes() {
+        if *cursor >= buf.len() {
+            return;
+        }
+        buf[*cursor] = byte;
+        *cursor += 1;
+    }
+}
+
+fn push_usize(buf: &mut [u8], cursor: &mut usize, value: usize) {
+    let mut digits = [0u8; 20];
+    let mut len = 0;
+    let mut value = value;
+    if value == 0 {
+        digits[0] = b'0';
+        len = 1;
+    }
+    while value > 0 && len < digits.len() {
+        digits[len] = b'0' + (value % 10) as u8;
+        value /= 10;
+        len += 1;
+    }
+    for index in (0..len).rev() {
+        if *cursor >= buf.len() {
+            return;
+        }
+        buf[*cursor] = digits[index];
+        *cursor += 1;
+    }
 }
 
 fn orientation_label(orientation: UiOrientation) -> &'static str {

@@ -46,7 +46,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
             DisplayCommand::Render(request) => {
                 let mut content_context_changed =
                     last_view != Some(request.view) || last_book_id != Some(request.book_id);
-                if request.view == AppView::Library
+                if matches!(request.view, AppView::Home | AppView::Library)
                     && sd_library.status == LibraryScanStatus::NotScanned
                 {
                     sd_library.status = LibraryScanStatus::Scanning;
@@ -54,6 +54,29 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                     let _ = LIBRARY_EVENTS.try_send(LibraryEvent::Scanned {
                         count: sd_library.count.min(u8::MAX as usize) as u8,
                     });
+                    if let Some(record) = reader_cache::load_app_state(&mut epd, &mut sd_cs) {
+                        if let Some(index) = sd_library.find_entry_by_state(
+                            record.source_hash,
+                            record.source_size,
+                            record.book_id,
+                        ) {
+                            sd_library.set_current_index(index);
+                            reader_cache::load_current_cover(
+                                &mut epd,
+                                &mut sd_cs,
+                                &mut sd_library,
+                                index,
+                            );
+                            let book_id = index as u32 + 2;
+                            let _ = LIBRARY_EVENTS.try_send(LibraryEvent::Restored {
+                                book_id,
+                                chapter: record.chapter.min(u8::MAX as u16) as u8,
+                                page: record.screen,
+                                reading_orientation: record.reading_orientation,
+                                refresh_policy: record.refresh_policy,
+                            });
+                        }
+                    }
                 }
                 if request.view == AppView::Reading && request.book_id >= 2 {
                     let index = request.book_id.saturating_sub(2) as usize;
@@ -94,6 +117,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                 }
                 crate::views::render(fb, request, &sd_library);
                 if request.view == AppView::Reading && request.book_id >= 2 {
+                    let (source_hash, source_size) = source_identity(&sd_library, request.book_id);
                     reader_cache::store_app_state(
                         &mut epd,
                         &mut sd_cs,
@@ -104,8 +128,16 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                             shell_orientation: crate::DisplayOrientation::PortraitButtonsLeft as u8,
                             reading_orientation: request.orientation as u8,
                             refresh_policy: request.refresh_policy as u8,
+                            source_hash,
+                            source_size,
                         },
                     );
+                }
+
+                if !screen_on && last_request.is_none() {
+                    esp_println::println!("display: wake init start");
+                    display_flush::init_panel(&mut epd).await;
+                    esp_println::println!("display: wake init complete");
                 }
 
                 let mode = refresh_mode(screen_on, fast_refreshes, request.refresh_policy);
@@ -155,6 +187,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                     fast_refreshes = 0;
                     last_view = None;
                     last_book_id = None;
+                    last_request = None;
                     let _ = POWER_EVENTS.send(PowerEvent::DisplayAsleep).await;
                 } else {
                     esp_println::println!("display: sleep command failed");
@@ -178,6 +211,19 @@ fn advertised_page_count(library: &ReaderStore) -> u32 {
     } else {
         cached
     }
+}
+
+fn source_identity(library: &ReaderStore, book_id: u32) -> (u32, u32) {
+    let Some(index) = book_id.checked_sub(2).map(|index| index as usize) else {
+        return (0, 0);
+    };
+    if index >= library.count {
+        return (0, 0);
+    }
+    let Some(entry) = library.entries.get(index) else {
+        return (0, 0);
+    };
+    (entry.source_hash, entry.byte_size)
 }
 
 fn refresh_mode(screen_on: bool, fast_refreshes: u8, refresh_policy: RefreshPolicy) -> RefreshMode {
