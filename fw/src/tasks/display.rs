@@ -189,7 +189,7 @@ fn handle_storage_command(
                 target_pages as usize,
                 scratch,
             );
-            send_required_library_event(LibraryEvent::Loaded {
+            send_loaded_library_event(LibraryEvent::Loaded {
                 book_id,
                 pages: sd_library.advertised_page_count(),
                 chapters: sd_library.chapter_count_for_ui(),
@@ -237,6 +237,16 @@ fn send_required_library_event(event: LibraryEvent) {
     if LIBRARY_EVENTS.try_send(event).is_err() {
         esp_println::println!("display: required library event queue full");
     }
+}
+
+fn send_loaded_library_event(event: LibraryEvent) {
+    if DISPLAY_EVENTS
+        .try_send(DisplayEvent::Library(event))
+        .is_ok()
+    {
+        return;
+    }
+    send_required_library_event(event);
 }
 
 fn ensure_epub_scratch<'a>(
