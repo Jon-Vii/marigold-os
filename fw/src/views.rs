@@ -280,7 +280,7 @@ fn draw_reader_footer(
     sd_library: &ReaderStore,
     page_count: u32,
 ) {
-    let font = literata(FontStyle::Bold);
+    let font = literata(FontStyle::Regular);
     let fallback = catalog::active_book(request.book_id);
     let (title, _) = sd_library.active_book_labels(request.book_id, fallback.title, "");
 

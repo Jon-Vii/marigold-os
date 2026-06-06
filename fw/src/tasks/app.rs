@@ -181,11 +181,17 @@ fn library_event_affects_view(state: ReaderState, event: crate::LibraryEvent) ->
 }
 
 fn should_send_storage_immediately(command: StorageCommand) -> bool {
-    matches!(command, StorageCommand::ExtendSection { .. })
+    matches!(
+        command,
+        StorageCommand::OpenBook { .. } | StorageCommand::ExtendSection { .. }
+    )
 }
 
 fn should_wait_for_loaded_before_render(command: StorageCommand) -> bool {
-    matches!(command, StorageCommand::ExtendSection { .. })
+    matches!(
+        command,
+        StorageCommand::OpenBook { .. } | StorageCommand::ExtendSection { .. }
+    )
 }
 
 async fn send_render(kind: RenderKind, state: ReaderState) {
