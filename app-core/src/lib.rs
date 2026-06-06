@@ -196,10 +196,8 @@ impl RefreshPlanner {
     }
 
     fn needs_clean_selection_refresh(request: RenderRequest, last: RenderRequest) -> bool {
-        matches!(
-            request.view,
-            AppView::Library | AppView::Chapters | AppView::Settings
-        ) && request.selection != last.selection
+        matches!(request.view, AppView::Chapters | AppView::Settings)
+            && request.selection != last.selection
     }
 
     fn needs_clean_library_refresh(request: RenderRequest, last: RenderRequest) -> bool {
@@ -930,6 +928,20 @@ mod tests {
 
         request.selection = 1;
         assert_eq!(planner.mode_for(request), RefreshMode::Full);
+    }
+
+    #[test]
+    fn refresh_plan_keeps_library_selection_fast() {
+        let mut planner = RefreshPlanner::new();
+        let mut state = ReaderState::boot();
+        state.view = AppView::Library;
+        state.library_count = 3;
+        let mut request = state.render_request(RenderKind::Page);
+
+        planner.record_render(request, RefreshMode::Full);
+        request.selection = 1;
+
+        assert_eq!(planner.mode_for(request), RefreshMode::Fast);
     }
 
     #[test]
