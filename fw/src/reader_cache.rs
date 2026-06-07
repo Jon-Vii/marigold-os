@@ -363,7 +363,10 @@ where
                         pages,
                         library.toc_count()
                     );
-                    if library.toc_count() > 0 && !library.title.is_empty() {
+                    if library.toc_count() > 0
+                        && !library.title.is_empty()
+                        && !library.author.is_empty()
+                    {
                         return Ok(());
                     }
                     fast_cache_hit_needs_metadata = true;

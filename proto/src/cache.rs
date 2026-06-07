@@ -111,6 +111,7 @@ pub struct BookV2Header {
     pub toc_count: u16,
     pub toc_text_bytes: u32,
     pub title_text_bytes: u32,
+    pub author_text_bytes: u32,
     pub viewport_width: u16,
     pub viewport_height: u16,
     pub font_config: u16,
@@ -228,6 +229,7 @@ pub fn book_v2_cache_size(header: BookV2Header) -> usize {
         + header.toc_count as usize * TOC_RECORD_BYTES
         + header.toc_text_bytes as usize
         + header.title_text_bytes as usize
+        + header.author_text_bytes as usize
 }
 
 pub fn cache_key_for(source_path: &str, source_len: u32) -> String<CACHE_KEY_BYTES> {
@@ -454,7 +456,7 @@ pub fn encode_book_v2_header(header: BookV2Header, out: &mut [u8]) -> Result<usi
     write_u16(out, 34, 0);
     write_u32(out, 36, header.toc_text_bytes);
     write_u32(out, 40, header.title_text_bytes);
-    write_u32(out, 44, 0);
+    write_u32(out, 44, header.author_text_bytes);
     Ok(BOOK_V2_HEADER_BYTES)
 }
 
@@ -476,6 +478,7 @@ pub fn decode_book_v2_header(input: &[u8]) -> Result<BookV2Header, CacheError> {
         toc_count: read_u16(input, 24)?,
         toc_text_bytes: read_u32(input, 36)?,
         title_text_bytes: read_u32(input, 40)?,
+        author_text_bytes: read_u32(input, 44)?,
         viewport_width: read_u16(input, 28)?,
         viewport_height: read_u16(input, 30)?,
         font_config: read_u16(input, 32)?,
@@ -1001,6 +1004,7 @@ mod tests {
             toc_count: 4,
             toc_text_bytes: 128,
             title_text_bytes: 20,
+            author_text_bytes: 18,
             viewport_width: 800,
             viewport_height: 480,
             font_config: 1,
@@ -1028,6 +1032,7 @@ mod tests {
                 + TOC_RECORD_BYTES * 4
                 + 128
                 + 20
+                + 18
         );
 
         header_bytes[4] = CACHE_VERSION as u8;
