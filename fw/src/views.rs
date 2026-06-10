@@ -182,7 +182,7 @@ fn draw_sd_reader_page(fb: &mut Framebuffer, request: RenderRequest, sd_library:
                                 block.text,
                                 x,
                                 block.y,
-                                reader_layout::reader_max_x_for(role, align),
+                                reader_layout::READER_RIGHT_X,
                                 block.advance,
                             );
                         }
@@ -204,7 +204,7 @@ fn draw_sd_reader_page(fb: &mut Framebuffer, request: RenderRequest, sd_library:
                                 block.text,
                                 x,
                                 block.y,
-                                reader_layout::reader_max_x_for(role, align),
+                                reader_layout::READER_RIGHT_X,
                                 block.advance,
                             );
                         }

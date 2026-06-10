@@ -25,11 +25,11 @@ use ui::{
     UiTocItem, UiView,
 };
 
-const PAGE_TOP: i16 = 22;
-const PAGE_BOTTOM: i16 = 472;
-const READER_LEFT_X: i16 = 8;
-const READER_RIGHT_X: i16 = 792;
-const READER_WRAP_SAFETY: i16 = 4;
+use ui::reading::{
+    draw_styled_line, first_styled_line_style, line_advance_for, paragraph_gap, reader_x_for,
+    styled_text_ink_width, READER_LEFT_X, READER_PAGE_BOTTOM as PAGE_BOTTOM,
+    READER_PAGE_TOP as PAGE_TOP, READER_RIGHT_X, READER_WRAP_SAFETY,
+};
 const MAX_PREVIEW_LINES: usize = 4096;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -448,7 +448,7 @@ fn push_styled_fragment(
     let align = block_align_for(align, &normalized, role);
     let font = literata(style);
     let x = reader_x_for(role);
-    let max_x = reader_max_x_for(role, align);
+    let max_x = READER_RIGHT_X;
 
     if !sink.line.is_empty() && (sink.line_role != role || sink.line_align != align) {
         flush_preview_line(sink, false);
@@ -1866,41 +1866,12 @@ fn preview_style_for_proto_style(style: proto::text::FontStyle, role: TextRole) 
     }
 }
 
-fn line_advance_for(role: TextRole) -> i16 {
-    if matches!(role, TextRole::Heading1 | TextRole::Heading2) {
-        32
-    } else {
-        27
-    }
-}
-
-fn paragraph_gap(role: TextRole) -> i16 {
-    match role {
-        TextRole::Heading1 | TextRole::Heading2 => 10,
-        TextRole::Heading3 => 6,
-        TextRole::BlockQuote => 6,
-        TextRole::Body => 3,
-    }
-}
-
 fn paragraph_gap_after(line: &PreviewLine) -> i16 {
     if line.paragraph_end {
         paragraph_gap(line.role)
     } else {
         0
     }
-}
-
-fn reader_x_for(role: TextRole) -> i16 {
-    if matches!(role, TextRole::BlockQuote) {
-        32
-    } else {
-        READER_LEFT_X
-    }
-}
-
-fn reader_max_x_for(_role: TextRole, _align: TextAlign) -> i16 {
-    READER_RIGHT_X
 }
 
 fn block_align_for(run_align: TextAlign, block: &str, role: TextRole) -> TextAlign {
@@ -2067,90 +2038,6 @@ fn is_leading_punctuation_word(word: &str) -> bool {
             )
         })
         .unwrap_or(false)
-}
-
-fn first_styled_line_style(text: &str) -> Option<FontStyle> {
-    let mut chars = text.chars();
-    while let Some(ch) = chars.next() {
-        if ch == STYLE_MARKER {
-            return chars.next().and_then(style_from_marker_code);
-        }
-    }
-    None
-}
-
-fn styled_text_ink_width(text: &str, default_font: &BitmapFont) -> i16 {
-    let mut font = default_font;
-    let mut chars = text.chars();
-    let mut advance = 0i16;
-    let mut right = 0i16;
-    while let Some(ch) = chars.next() {
-        if ch == STYLE_MARKER {
-            if let Some(code) = chars.next() {
-                font = literata(style_from_marker_code(code).unwrap_or(FontStyle::Regular));
-            }
-            continue;
-        }
-        let codepoint = if ch as u32 > u16::MAX as u32 {
-            b'?' as u16
-        } else {
-            ch as u16
-        };
-        let Some((metric, _)) = font.glyph(codepoint).or_else(|| font.glyph(b'?' as u16)) else {
-            advance += 8;
-            right = right.max(advance);
-            continue;
-        };
-        let glyph_right = advance + metric.x_offset as i16 + metric.width as i16;
-        right = right.max(glyph_right);
-        advance += metric.advance as i16;
-    }
-    right.max(advance)
-}
-
-fn draw_styled_line(
-    fb: &mut Framebuffer,
-    text: &str,
-    x: i16,
-    baseline_y: i16,
-    default_style: FontStyle,
-) -> i16 {
-    let mut cursor_x = x;
-    let mut run_start = 0usize;
-    let mut style = default_style;
-    let mut iter = text.char_indices();
-    while let Some((index, ch)) = iter.next() {
-        if ch != STYLE_MARKER {
-            continue;
-        }
-        if run_start < index {
-            cursor_x = draw_text(
-                fb,
-                literata(style),
-                &text[run_start..index],
-                cursor_x,
-                baseline_y,
-                false,
-            );
-        }
-        if let Some((code_index, code)) = iter.next() {
-            style = style_from_marker_code(code).unwrap_or(style);
-            run_start = code_index + code.len_utf8();
-        } else {
-            run_start = index + ch.len_utf8();
-        }
-    }
-    if run_start < text.len() {
-        cursor_x = draw_text(
-            fb,
-            literata(style),
-            &text[run_start..],
-            cursor_x,
-            baseline_y,
-            false,
-        );
-    }
-    cursor_x
 }
 
 fn styled_text_snapshot(text: &str) -> String {

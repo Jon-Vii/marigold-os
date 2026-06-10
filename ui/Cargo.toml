@@ -6,3 +6,7 @@ edition = "2021"
 [dependencies]
 app-core = { path = "../app-core" }
 display = { path = "../display" }
+proto = { path = "../proto" }
+
+[dev-dependencies]
+heapless = "0.8.0"

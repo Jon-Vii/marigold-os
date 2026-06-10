@@ -1085,6 +1085,8 @@ version = "0.1.0"
 dependencies = [
  "app-core",
  "display",
+ "heapless",
+ "proto",
 ]
 
 [[package]]

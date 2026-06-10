@@ -3,6 +3,7 @@
 
 pub mod app_render;
 pub mod layout;
+pub mod reading;
 pub mod render;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

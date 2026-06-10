@@ -1174,7 +1174,7 @@ fn push_styled_preview_fragment<
     let align = block_align_for(align, normalized.as_str(), role);
     let font = literata(style);
     let x = reader_layout::reader_x_for(role);
-    let max_x = reader_layout::reader_max_x_for(role, align);
+    let max_x = reader_layout::READER_RIGHT_X;
 
     if !sink.line.is_empty() && (sink.line_role != role || sink.line_align != align) {
         flush_styled_preview_line(sink, false);
