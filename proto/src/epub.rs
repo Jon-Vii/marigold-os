@@ -1730,314 +1730,288 @@ pub fn xhtml_blocks_to_sink(
     css: Option<&CssRules>,
     sink: &mut impl XhtmlBlockSink,
 ) -> Result<(), XhtmlError> {
-    let mut cursor = XmlCursor::new(xhtml);
-    let mut block = heapless::String::<384>::new();
-    let mut role = TextRole::Body;
-    let mut align = TextAlign::Justify;
-    let mut bold_depth = 0u8;
-    let mut italic_depth = 0u8;
     let body_required = xhtml.contains("<body") || xhtml.contains(":body");
-    let mut in_body = !body_required;
-    let mut skip_depth = 0u8;
-    let mut skip_tag: Option<&str> = None;
-    let mut list_kind_stack = [ListKind::Unordered; 8];
-    let mut list_count_stack = [0u16; 8];
-    let mut list_depth = 0usize;
-    let mut table_align_stack = [TextAlign::Justify; 4];
-    let mut table_depth = 0usize;
-
+    let mut parser = XhtmlBlockStreamParser::new(!body_required);
+    let mut cursor = XmlCursor::new(xhtml);
     while let Some(token) = cursor.next_token() {
         match token {
-            Token::Start(tag) if tag_name_is(tag, "body") => {
-                in_body = true;
-            }
-            Token::End(tag) if tag_name_is(tag, "body") => {
-                flush_sink_block(
-                    &mut block,
-                    role,
-                    style_for(bold_depth, italic_depth),
-                    align,
-                    sink,
-                )?;
-                in_body = false;
-            }
-            Token::Start(tag)
-                if skip_depth == 0
-                    && (tag_name_is(tag, "head")
-                        || tag_name_is(tag, "style")
-                        || tag_name_is(tag, "script")
-                        || tag_name_is(tag, "svg")
-                        || tag_name_is(tag, "nav")
-                        || tag_is_hidden(tag)
-                        || tag_is_pagebreak(tag)) =>
-            {
-                if !tag_is_void(tag) {
-                    skip_tag = tag_local_name(tag);
-                    skip_depth = skip_depth.saturating_add(1);
-                }
-            }
-            Token::End(tag) if skip_tag.map(|name| tag_name_is(tag, name)).unwrap_or(false) => {
-                skip_depth = skip_depth.saturating_sub(1);
-                if skip_depth == 0 {
-                    skip_tag = None;
-                }
-            }
-            _ if !in_body || skip_depth > 0 => {}
-            Token::Start(tag) if tag_name_is(tag, "table") => {
-                flush_sink_block(
-                    &mut block,
-                    role,
-                    style_for(bold_depth, italic_depth),
-                    align,
-                    sink,
-                )?;
-                if table_depth < table_align_stack.len() {
-                    table_align_stack[table_depth] =
-                        table_align_for_tag(tag, css).unwrap_or(TextAlign::Justify);
-                    table_depth += 1;
-                }
-            }
-            Token::End(tag) if tag_name_is(tag, "table") => {
-                flush_sink_block(
-                    &mut block,
-                    role,
-                    style_for(bold_depth, italic_depth),
-                    align,
-                    sink,
-                )?;
-                table_depth = table_depth.saturating_sub(1);
-            }
-            Token::Start(tag) if tag_name_is(tag, "td") || tag_name_is(tag, "th") => {
-                append_table_cell_separator(&mut block);
-            }
-            Token::Start(tag) if tag_name_is(tag, "br") => {
-                flush_sink_block(
-                    &mut block,
-                    role,
-                    style_for(bold_depth, italic_depth),
-                    align,
-                    sink,
-                )?;
-            }
-            Token::Start(tag) if tag_name_is(tag, "img") => {
-                flush_sink_block(
-                    &mut block,
-                    role,
-                    style_for(bold_depth, italic_depth),
-                    align,
-                    sink,
-                )?;
-                let placeholder = attr_value(tag, "alt").unwrap_or("[Image]");
-                sink.push_block(
-                    placeholder,
-                    TextRole::Body,
-                    FontStyle::Italic,
-                    TextAlign::Center,
-                    true,
-                )?;
-            }
-            Token::Start(tag) if tag_name_is(tag, "ul") || tag_name_is(tag, "ol") => {
-                flush_sink_block(
-                    &mut block,
-                    role,
-                    style_for(bold_depth, italic_depth),
-                    align,
-                    sink,
-                )?;
-                if list_depth < list_kind_stack.len() {
-                    list_kind_stack[list_depth] = if tag_name_is(tag, "ol") {
-                        ListKind::Ordered
-                    } else {
-                        ListKind::Unordered
-                    };
-                    list_count_stack[list_depth] = 0;
-                    list_depth += 1;
-                }
-            }
-            Token::End(tag) if tag_name_is(tag, "ul") || tag_name_is(tag, "ol") => {
-                flush_sink_block(
-                    &mut block,
-                    role,
-                    style_for(bold_depth, italic_depth),
-                    align,
-                    sink,
-                )?;
-                list_depth = list_depth.saturating_sub(1);
-            }
-            Token::Start(tag) if tag_starts_block(tag) => {
-                flush_sink_block(
-                    &mut block,
-                    role,
-                    style_for(bold_depth, italic_depth),
-                    align,
-                    sink,
-                )?;
-                align = block_align_for_tag(tag, css)
-                    .or_else(|| current_table_align(&table_align_stack, table_depth))
-                    .unwrap_or(TextAlign::Justify);
-                if tag_name_is(tag, "li") {
-                    append_list_marker(
-                        &mut block,
-                        &mut list_count_stack,
-                        &list_kind_stack,
-                        list_depth,
-                    );
-                }
-            }
-            Token::Start(tag) if tag_name_is(tag, "h1") => {
-                flush_sink_block(
-                    &mut block,
-                    role,
-                    style_for(bold_depth, italic_depth),
-                    align,
-                    sink,
-                )?;
-                role = TextRole::Heading1;
-                align = TextAlign::Center;
-                bold_depth = bold_depth.saturating_add(1);
-            }
-            Token::Start(tag) if tag_name_is(tag, "h2") => {
-                flush_sink_block(
-                    &mut block,
-                    role,
-                    style_for(bold_depth, italic_depth),
-                    align,
-                    sink,
-                )?;
-                role = TextRole::Heading2;
-                align = TextAlign::Center;
-                bold_depth = bold_depth.saturating_add(1);
-            }
-            Token::Start(tag)
-                if tag_name_is(tag, "h3")
-                    || tag_name_is(tag, "h4")
-                    || tag_name_is(tag, "h5")
-                    || tag_name_is(tag, "h6") =>
-            {
-                flush_sink_block(
-                    &mut block,
-                    role,
-                    style_for(bold_depth, italic_depth),
-                    align,
-                    sink,
-                )?;
-                role = TextRole::Heading3;
-                align = TextAlign::Center;
-                bold_depth = bold_depth.saturating_add(1);
-            }
-            Token::Start(tag) if tag_name_is(tag, "blockquote") => {
-                flush_sink_block(
-                    &mut block,
-                    role,
-                    style_for(bold_depth, italic_depth),
-                    align,
-                    sink,
-                )?;
-                role = TextRole::BlockQuote;
-                align = block_align_for_tag(tag, css).unwrap_or(TextAlign::Left);
-                italic_depth = italic_depth.saturating_add(1);
-            }
-            Token::Start(tag) if tag_name_is(tag, "strong") || tag_name_is(tag, "b") => {
-                flush_sink_block_continue(
-                    &mut block,
-                    role,
-                    style_for(bold_depth, italic_depth),
-                    align,
-                    sink,
-                )?;
-                bold_depth = bold_depth.saturating_add(1);
-            }
-            Token::Start(tag) if tag_is_italic(tag) => {
-                flush_sink_block_continue(
-                    &mut block,
-                    role,
-                    style_for(bold_depth, italic_depth),
-                    align,
-                    sink,
-                )?;
-                italic_depth = italic_depth.saturating_add(1);
-            }
-            Token::End(tag)
-                if tag_name_is(tag, "h1")
-                    || tag_name_is(tag, "h2")
-                    || tag_name_is(tag, "h3")
-                    || tag_name_is(tag, "h4")
-                    || tag_name_is(tag, "h5")
-                    || tag_name_is(tag, "h6") =>
-            {
-                flush_sink_block(
-                    &mut block,
-                    role,
-                    style_for(bold_depth, italic_depth),
-                    align,
-                    sink,
-                )?;
-                role = TextRole::Body;
-                bold_depth = bold_depth.saturating_sub(1);
-                align = TextAlign::Justify;
-            }
-            Token::End(tag) if tag_name_is(tag, "blockquote") => {
-                flush_sink_block(
-                    &mut block,
-                    role,
-                    style_for(bold_depth, italic_depth),
-                    align,
-                    sink,
-                )?;
-                role = TextRole::Body;
-                italic_depth = italic_depth.saturating_sub(1);
-                align = TextAlign::Justify;
-            }
-            Token::End(tag) if tag_name_is(tag, "strong") || tag_name_is(tag, "b") => {
-                flush_sink_block_continue(
-                    &mut block,
-                    role,
-                    style_for(bold_depth, italic_depth),
-                    align,
-                    sink,
-                )?;
-                bold_depth = bold_depth.saturating_sub(1);
-            }
-            Token::End(tag) if tag_is_italic(tag) => {
-                flush_sink_block_continue(
-                    &mut block,
-                    role,
-                    style_for(bold_depth, italic_depth),
-                    align,
-                    sink,
-                )?;
-                italic_depth = italic_depth.saturating_sub(1);
-            }
-            Token::End(tag) if tag_ends_block(tag) => {
-                flush_sink_block(
-                    &mut block,
-                    role,
-                    style_for(bold_depth, italic_depth),
-                    align,
-                    sink,
-                )?;
-                align = TextAlign::Justify;
-            }
-            Token::Text(text) => {
-                append_text_to_sink_block(
-                    &mut block,
-                    text,
-                    role,
-                    style_for(bold_depth, italic_depth),
-                    align,
-                    sink,
-                )?;
-            }
-            _ => {}
+            Token::Start(tag) => parser.handle_start(tag, css, sink)?,
+            Token::End(tag) => parser.handle_end(tag, sink)?,
+            Token::Text(text) => parser.handle_text(text, sink)?,
         }
     }
-    flush_sink_block(
-        &mut block,
-        role,
-        style_for(bold_depth, italic_depth),
-        align,
-        sink,
-    )
+    parser.finish(sink)
+}
+
+const SKIP_TAG_NAME_BYTES: usize = 24;
+
+/// Resumable form of the XHTML block state machine: the one extraction
+/// path behind both [`xhtml_blocks_to_sink`] (whole document in RAM) and
+/// the streamed front-end on [`StreamingXmlTokenizer`], which lets
+/// firmware decode spine members of any size through a bounded window.
+pub struct XhtmlBlockStreamParser {
+    block: heapless::String<384>,
+    role: TextRole,
+    align: TextAlign,
+    bold_depth: u8,
+    italic_depth: u8,
+    in_body: bool,
+    skip_depth: u8,
+    skip_tag: Option<heapless::String<SKIP_TAG_NAME_BYTES>>,
+    list_kind_stack: [ListKind; 8],
+    list_count_stack: [u16; 8],
+    list_depth: usize,
+    table_align_stack: [TextAlign; 4],
+    table_depth: usize,
+}
+
+impl XhtmlBlockStreamParser {
+    /// `assume_in_body` mirrors the whole-document behavior for inputs
+    /// without a `<body>` element: callers that cannot scan ahead decide
+    /// from whatever prefix they have.
+    pub fn new(assume_in_body: bool) -> Self {
+        Self {
+            block: heapless::String::new(),
+            role: TextRole::Body,
+            align: TextAlign::Justify,
+            bold_depth: 0,
+            italic_depth: 0,
+            in_body: assume_in_body,
+            skip_depth: 0,
+            skip_tag: None,
+            list_kind_stack: [ListKind::Unordered; 8],
+            list_count_stack: [0u16; 8],
+            list_depth: 0,
+            table_align_stack: [TextAlign::Justify; 4],
+            table_depth: 0,
+        }
+    }
+
+    pub fn handle_start(
+        &mut self,
+        tag: &str,
+        css: Option<&CssRules>,
+        sink: &mut impl XhtmlBlockSink,
+    ) -> Result<(), XhtmlError> {
+        if tag_name_is(tag, "body") {
+            self.in_body = true;
+            return Ok(());
+        }
+        if self.skip_depth == 0
+            && (tag_name_is(tag, "head")
+                || tag_name_is(tag, "style")
+                || tag_name_is(tag, "script")
+                || tag_name_is(tag, "svg")
+                || tag_name_is(tag, "nav")
+                || tag_is_hidden(tag)
+                || tag_is_pagebreak(tag))
+        {
+            if !tag_is_void(tag) {
+                self.skip_tag = tag_local_name(tag).map(bounded_skip_name);
+                self.skip_depth = self.skip_depth.saturating_add(1);
+            }
+            return Ok(());
+        }
+        if !self.in_body || self.skip_depth > 0 {
+            return Ok(());
+        }
+        if tag_name_is(tag, "table") {
+            self.flush(sink)?;
+            if self.table_depth < self.table_align_stack.len() {
+                self.table_align_stack[self.table_depth] =
+                    table_align_for_tag(tag, css).unwrap_or(TextAlign::Justify);
+                self.table_depth += 1;
+            }
+        } else if tag_name_is(tag, "td") || tag_name_is(tag, "th") {
+            append_table_cell_separator(&mut self.block);
+        } else if tag_name_is(tag, "br") {
+            self.flush(sink)?;
+        } else if tag_name_is(tag, "img") {
+            self.flush(sink)?;
+            let placeholder = attr_value(tag, "alt").unwrap_or("[Image]");
+            sink.push_block(
+                placeholder,
+                TextRole::Body,
+                FontStyle::Italic,
+                TextAlign::Center,
+                true,
+            )?;
+        } else if tag_name_is(tag, "ul") || tag_name_is(tag, "ol") {
+            self.flush(sink)?;
+            if self.list_depth < self.list_kind_stack.len() {
+                self.list_kind_stack[self.list_depth] = if tag_name_is(tag, "ol") {
+                    ListKind::Ordered
+                } else {
+                    ListKind::Unordered
+                };
+                self.list_count_stack[self.list_depth] = 0;
+                self.list_depth += 1;
+            }
+        } else if tag_starts_block(tag) {
+            self.flush(sink)?;
+            self.align = block_align_for_tag(tag, css)
+                .or_else(|| current_table_align(&self.table_align_stack, self.table_depth))
+                .unwrap_or(TextAlign::Justify);
+            if tag_name_is(tag, "li") {
+                append_list_marker(
+                    &mut self.block,
+                    &mut self.list_count_stack,
+                    &self.list_kind_stack,
+                    self.list_depth,
+                );
+            }
+        } else if tag_name_is(tag, "h1") {
+            self.flush(sink)?;
+            self.role = TextRole::Heading1;
+            self.align = TextAlign::Center;
+            self.bold_depth = self.bold_depth.saturating_add(1);
+        } else if tag_name_is(tag, "h2") {
+            self.flush(sink)?;
+            self.role = TextRole::Heading2;
+            self.align = TextAlign::Center;
+            self.bold_depth = self.bold_depth.saturating_add(1);
+        } else if tag_name_is(tag, "h3")
+            || tag_name_is(tag, "h4")
+            || tag_name_is(tag, "h5")
+            || tag_name_is(tag, "h6")
+        {
+            self.flush(sink)?;
+            self.role = TextRole::Heading3;
+            self.align = TextAlign::Center;
+            self.bold_depth = self.bold_depth.saturating_add(1);
+        } else if tag_name_is(tag, "blockquote") {
+            self.flush(sink)?;
+            self.role = TextRole::BlockQuote;
+            self.align = block_align_for_tag(tag, css).unwrap_or(TextAlign::Left);
+            self.italic_depth = self.italic_depth.saturating_add(1);
+        } else if tag_name_is(tag, "strong") || tag_name_is(tag, "b") {
+            self.flush_continue(sink)?;
+            self.bold_depth = self.bold_depth.saturating_add(1);
+        } else if tag_is_italic(tag) {
+            self.flush_continue(sink)?;
+            self.italic_depth = self.italic_depth.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    pub fn handle_end(
+        &mut self,
+        tag: &str,
+        sink: &mut impl XhtmlBlockSink,
+    ) -> Result<(), XhtmlError> {
+        if tag_name_is(tag, "body") {
+            self.flush(sink)?;
+            self.in_body = false;
+            return Ok(());
+        }
+        if self.skip_tag_matches(tag) {
+            self.skip_depth = self.skip_depth.saturating_sub(1);
+            if self.skip_depth == 0 {
+                self.skip_tag = None;
+            }
+            return Ok(());
+        }
+        if !self.in_body || self.skip_depth > 0 {
+            return Ok(());
+        }
+        if tag_name_is(tag, "table") {
+            self.flush(sink)?;
+            self.table_depth = self.table_depth.saturating_sub(1);
+        } else if tag_name_is(tag, "ul") || tag_name_is(tag, "ol") {
+            self.flush(sink)?;
+            self.list_depth = self.list_depth.saturating_sub(1);
+        } else if tag_name_is(tag, "h1")
+            || tag_name_is(tag, "h2")
+            || tag_name_is(tag, "h3")
+            || tag_name_is(tag, "h4")
+            || tag_name_is(tag, "h5")
+            || tag_name_is(tag, "h6")
+        {
+            self.flush(sink)?;
+            self.role = TextRole::Body;
+            self.bold_depth = self.bold_depth.saturating_sub(1);
+            self.align = TextAlign::Justify;
+        } else if tag_name_is(tag, "blockquote") {
+            self.flush(sink)?;
+            self.role = TextRole::Body;
+            self.italic_depth = self.italic_depth.saturating_sub(1);
+            self.align = TextAlign::Justify;
+        } else if tag_name_is(tag, "strong") || tag_name_is(tag, "b") {
+            self.flush_continue(sink)?;
+            self.bold_depth = self.bold_depth.saturating_sub(1);
+        } else if tag_is_italic(tag) {
+            self.flush_continue(sink)?;
+            self.italic_depth = self.italic_depth.saturating_sub(1);
+        } else if tag_ends_block(tag) {
+            self.flush(sink)?;
+            self.align = TextAlign::Justify;
+        }
+        Ok(())
+    }
+
+    pub fn handle_text(
+        &mut self,
+        text: &str,
+        sink: &mut impl XhtmlBlockSink,
+    ) -> Result<(), XhtmlError> {
+        if !self.in_body || self.skip_depth > 0 {
+            return Ok(());
+        }
+        append_text_to_sink_block(
+            &mut self.block,
+            text,
+            self.role,
+            style_for(self.bold_depth, self.italic_depth),
+            self.align,
+            sink,
+        )
+    }
+
+    pub fn finish(&mut self, sink: &mut impl XhtmlBlockSink) -> Result<(), XhtmlError> {
+        self.flush(sink)
+    }
+
+    fn flush(&mut self, sink: &mut impl XhtmlBlockSink) -> Result<(), XhtmlError> {
+        flush_sink_block(
+            &mut self.block,
+            self.role,
+            style_for(self.bold_depth, self.italic_depth),
+            self.align,
+            sink,
+        )
+    }
+
+    fn flush_continue(&mut self, sink: &mut impl XhtmlBlockSink) -> Result<(), XhtmlError> {
+        flush_sink_block_continue(
+            &mut self.block,
+            self.role,
+            style_for(self.bold_depth, self.italic_depth),
+            self.align,
+            sink,
+        )
+    }
+
+    fn skip_tag_matches(&self, tag: &str) -> bool {
+        let Some(stored) = self.skip_tag.as_ref() else {
+            return false;
+        };
+        tag_local_name(tag)
+            .map(|name| bounded_skip_name(name).as_str() == stored.as_str())
+            .unwrap_or(false)
+    }
+}
+
+/// Skip-tag names are stored owned (streaming input has no stable slice
+/// to borrow); both the opening and closing side truncate identically so
+/// overlong names still pair up.
+fn bounded_skip_name(name: &str) -> heapless::String<SKIP_TAG_NAME_BYTES> {
+    let mut out = heapless::String::new();
+    for ch in name.chars() {
+        if out.push(ch).is_err() {
+            break;
+        }
+    }
+    out
 }
 
 pub fn parse_epub3_nav_to_sink(xhtml: &str, sink: &mut impl EpubTocSink) -> Result<(), TocError> {
@@ -2270,6 +2244,32 @@ impl StreamingXmlTokenizer {
         sink: &mut impl EpubTocSink,
     ) -> Result<(), TocStreamError> {
         self.finish(&mut |event| parser.handle(event, sink))
+    }
+
+    pub fn feed_xhtml_blocks(
+        &mut self,
+        bytes: &[u8],
+        parser: &mut XhtmlBlockStreamParser,
+        css: Option<&CssRules>,
+        sink: &mut impl XhtmlBlockSink,
+    ) -> Result<(), XhtmlError> {
+        self.feed(bytes, &mut |event| match event {
+            TokEvent::StartTag(tag) => parser.handle_start(tag, css, sink),
+            TokEvent::EndTag(tag) => parser.handle_end(tag, sink),
+            TokEvent::Text(text) => parser.handle_text(text, sink),
+        })
+    }
+
+    pub fn finish_xhtml_blocks(
+        &mut self,
+        parser: &mut XhtmlBlockStreamParser,
+        sink: &mut impl XhtmlBlockSink,
+    ) -> Result<(), XhtmlError> {
+        self.finish(&mut |event| match event {
+            TokEvent::StartTag(_) | TokEvent::EndTag(_) => Ok(()),
+            TokEvent::Text(text) => parser.handle_text(text, sink),
+        })?;
+        parser.finish(sink)
     }
 
     fn feed<F, E>(&mut self, bytes: &[u8], emit: &mut F) -> Result<(), E>
@@ -4462,6 +4462,83 @@ mod tests {
         assert_eq!(len, 8);
         assert!(!complete);
         assert_eq!(&output, b"01234567");
+    }
+
+    #[test]
+    fn streamed_xhtml_blocks_match_whole_document_parse_for_any_chunking() {
+        // Rich enough to exercise every state-machine path: headings,
+        // nested styles, lists, a table, br, img alt, skipped head/style/
+        // script/nav/hidden content, entities, multi-byte UTF-8, and a
+        // paragraph long enough to force a mid-block word-boundary flush.
+        let mut long_para = std::string::String::new();
+        for index in 0..80 {
+            long_para.push_str(&std::format!("w{index:03}rd léng—thy "));
+        }
+        let xhtml = std::format!(
+            r#"<?xml version="1.0"?><!DOCTYPE html><!-- comment -->
+            <html><head><title>skip me</title><style>p {{ color: red; }}</style>
+            <script>var x = "<p>not text</p>";</script></head>
+            <body>
+              <nav><ol><li>toc entry</li></ol></nav>
+              <h1>Chapter &amp; Verse</h1>
+              <p>Hello <em>soft &#233;</em> and <strong>bold <i>both</i></strong> end.</p>
+              <p style="display:none">invisible</p>
+              <blockquote>Quoted &hellip; text</blockquote>
+              <ul><li>alpha</li><li>beta<ol><li>nested</li></ol></li></ul>
+              <table style="margin-left: auto; margin-right: auto;">
+                <tr><td>I</td><td>Intro 世界</td></tr>
+              </table>
+              <p>{long_para}</p>
+              <p class="center">Centered<br/>after break</p>
+              <img src="x.png" alt="A picture"/>
+              <span epub:type="pagebreak" title="12"></span>
+            </body></html>"#
+        );
+
+        struct Recorder {
+            fragments: StdVec<(std::string::String, TextRole, FontStyle, TextAlign, bool)>,
+        }
+        impl XhtmlBlockSink for Recorder {
+            fn push_block(
+                &mut self,
+                text: &str,
+                role: TextRole,
+                style: FontStyle,
+                align: TextAlign,
+                paragraph_end: bool,
+            ) -> Result<(), XhtmlError> {
+                self.fragments
+                    .push((text.into(), role, style, align, paragraph_end));
+                Ok(())
+            }
+        }
+
+        let mut whole = Recorder {
+            fragments: StdVec::new(),
+        };
+        xhtml_blocks_to_sink(&xhtml, None, &mut whole).expect("whole parse");
+        assert!(whole.fragments.len() > 10, "doc should produce many blocks");
+
+        for chunk_len in [1usize, 2, 3, 5, 7, 64, 4096] {
+            let mut streamed = Recorder {
+                fragments: StdVec::new(),
+            };
+            let mut tokenizer = StreamingXmlTokenizer::new();
+            let mut parser = XhtmlBlockStreamParser::new(false);
+            for chunk in xhtml.as_bytes().chunks(chunk_len) {
+                tokenizer
+                    .feed_xhtml_blocks(chunk, &mut parser, None, &mut streamed)
+                    .expect("chunk feeds");
+            }
+            tokenizer
+                .finish_xhtml_blocks(&mut parser, &mut streamed)
+                .expect("finish");
+
+            assert_eq!(
+                whole.fragments, streamed.fragments,
+                "chunk size {chunk_len} must not change emitted blocks"
+            );
+        }
     }
 
     #[test]
