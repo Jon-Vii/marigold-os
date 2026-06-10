@@ -2823,6 +2823,7 @@ dependencies = [
  "eframe",
  "egui",
  "png 0.17.16",
+ "proto",
  "serde",
  "toml",
  "ui",

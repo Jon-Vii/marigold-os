@@ -813,6 +813,38 @@ fn proto_style_for_display_style(style: FontStyle) -> proto::text::FontStyle {
     }
 }
 
+impl ui::reading::ReadingBlocks for ReaderStore {
+    fn block_count(&self) -> usize {
+        self.block_count
+    }
+
+    fn block(&self, index: usize) -> Option<BlockRecord> {
+        self.block_record(index)
+    }
+
+    fn block_text(&self, index: usize) -> &str {
+        ReaderStore::block_text(self, index)
+    }
+
+    fn block_style(&self, index: usize) -> FontStyle {
+        ReaderStore::block_style(self, index)
+    }
+
+    fn page_break_before(&self, index: usize) -> bool {
+        self.block_page_break_before
+            .get(index)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    fn paragraph_end(&self, index: usize) -> bool {
+        self.block_paragraph_end
+            .get(index)
+            .copied()
+            .unwrap_or(true)
+    }
+}
+
 pub(crate) fn chapter_pages_for_event(store: &ReaderStore) -> [u16; MAX_SD_CHAPTERS] {
     let mut pages = [0u16; MAX_SD_CHAPTERS];
     if store.toc_count > 0 {

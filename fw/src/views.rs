@@ -5,9 +5,8 @@ use core::fmt::Write;
 use display::fb::Framebuffer;
 use display::font::{draw_text, literata, measure_text, FontStyle};
 use display::render::{draw_ascii, fill_rect, stroke_rect};
-use display::{Rect, WIDTH};
+use display::Rect;
 use heapless::String;
-use proto::text::TextAlign;
 use ui::{
     app_render::{self, UiRenderModel},
     UiBook, UiCover, UiLibraryStatus, UiTocItem,
@@ -161,81 +160,7 @@ fn draw_sd_reader_page(fb: &mut Framebuffer, request: RenderRequest, sd_library:
         (BookLoadStatus::Ready, _) => {
             let plan = reader_layout::ReaderPagePlan::new(sd_library, request.page);
             let page_count = plan.page_count().max(1);
-            plan.for_each_block(sd_library, |block| {
-                let role = block.record.role;
-                let align = block.record.align;
-                match align {
-                    TextAlign::Left => {
-                        let x = reader_layout::reader_x_for(role);
-                        if block.record.line_count == 1 {
-                            reader_layout::draw_styled_line(
-                                fb,
-                                block.text,
-                                x,
-                                block.y,
-                                block.style,
-                            );
-                        } else {
-                            reader_layout::draw_wrapped_literata(
-                                fb,
-                                block.font,
-                                block.text,
-                                x,
-                                block.y,
-                                reader_layout::READER_RIGHT_X,
-                                block.advance,
-                            );
-                        }
-                    }
-                    TextAlign::Justify => {
-                        let x = reader_layout::reader_x_for(role);
-                        if block.record.line_count == 1 {
-                            reader_layout::draw_styled_line(
-                                fb,
-                                block.text,
-                                x,
-                                block.y,
-                                block.style,
-                            );
-                        } else {
-                            reader_layout::draw_justified_wrapped_literata(
-                                fb,
-                                block.font,
-                                block.text,
-                                x,
-                                block.y,
-                                reader_layout::READER_RIGHT_X,
-                                block.advance,
-                            );
-                        }
-                    }
-                    TextAlign::Center => {
-                        if block.record.line_count == 1 {
-                            let width =
-                                reader_layout::styled_text_ink_width(block.text, block.font)
-                                    .min(READER_RIGHT_X - READER_LEFT_X);
-                            let x = ((WIDTH as i16 - width) / 2).max(READER_LEFT_X);
-                            reader_layout::draw_styled_line(
-                                fb,
-                                block.text,
-                                x,
-                                block.y,
-                                block.style,
-                            );
-                        } else {
-                            reader_layout::draw_centered_wrapped_literata(
-                                fb,
-                                block.font,
-                                block.text,
-                                block.y,
-                                READER_RIGHT_X - READER_LEFT_X,
-                                block.advance,
-                            );
-                        }
-                    }
-                };
-                true
-            });
+            ui::reading::draw_reading_page_body(fb, sd_library, plan.page());
             draw_reader_footer(fb, request, sd_library, page_count);
         }
     }

@@ -1,5 +1,5 @@
 use crate::{Button, InputEvent, INPUT_EVENTS};
-use embassy_time::Timer;
+use embassy_time::{Instant, Timer};
 use esp_hal::analog::adc::{Adc, AdcCalCurve, AdcCalScheme, AdcPin};
 use esp_hal::gpio::{GpioPin, Input};
 use esp_hal::peripherals::ADC1;
@@ -196,11 +196,12 @@ fn battery_percent(aux_mv: u16) -> u8 {
 
 fn log_input(button: Option<Button>, sample: RawSample) {
     esp_println::println!(
-        "input: {:?} gpio0={} gpio1={} gpio2={}",
+        "input: {:?} gpio0={} gpio1={} gpio2={} t={}",
         button,
         sample.aux,
         sample.nav,
         sample.page,
+        Instant::now().as_millis(),
     );
 }
 

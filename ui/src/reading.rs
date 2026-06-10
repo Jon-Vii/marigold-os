@@ -11,7 +11,220 @@ use display::fb::Framebuffer;
 use display::font::{
     draw_text, literata, measure_text, style_from_marker_code, BitmapFont, FontStyle, STYLE_MARKER,
 };
+use proto::cache::{BlockRecord, PageRecord};
 use proto::text::{TextAlign, TextRole};
+
+/// Narrow read model for the reader page plan: bounded block records,
+/// their cached text, and pagination flags. Firmware's ReaderStore and
+/// host-side fixtures both implement it, so pagination and page drawing
+/// cannot drift between device and tools.
+pub trait ReadingBlocks {
+    fn block_count(&self) -> usize;
+    /// Record at `index` while it is inside the live block range.
+    fn block(&self, index: usize) -> Option<BlockRecord>;
+    fn block_text(&self, index: usize) -> &str;
+    fn block_style(&self, index: usize) -> FontStyle;
+    fn page_break_before(&self, index: usize) -> bool;
+    fn paragraph_end(&self, index: usize) -> bool;
+}
+
+pub struct ReaderDrawableBlock<'a> {
+    pub record: BlockRecord,
+    pub text: &'a str,
+    pub y: i16,
+    pub advance: i16,
+    pub style: FontStyle,
+    pub font: &'static BitmapFont,
+}
+
+pub fn block_height(source: &impl ReadingBlocks, index: usize) -> i16 {
+    let Some(record) = source.block(index) else {
+        return 0;
+    };
+    let advance = line_advance_for(record.role);
+    let height = if record.line_count == 1 {
+        advance
+    } else {
+        wrapped_block_height(
+            literata(source.block_style(index)),
+            source.block_text(index),
+            record.role,
+            record.align,
+            advance,
+        )
+    };
+    height + paragraph_gap_after(source, index)
+}
+
+pub fn paragraph_gap_after(source: &impl ReadingBlocks, index: usize) -> i16 {
+    if source.paragraph_end(index) {
+        paragraph_gap(
+            source
+                .block(index)
+                .map(|record| record.role)
+                .unwrap_or(TextRole::Body),
+        )
+    } else {
+        0
+    }
+}
+
+/// Count the pages the loaded blocks paginate into, using the same height
+/// math as rendering.
+pub fn paginate_block_pages(source: &impl ReadingBlocks, page_top: i16, page_bottom: i16) -> usize {
+    let mut pages = 1u32;
+    let mut y = page_top;
+
+    for index in 0..source.block_count() {
+        if source.page_break_before(index) && y > page_top {
+            pages = pages.saturating_add(1);
+            y = page_top;
+        }
+        let height = block_height(source, index);
+
+        if y + height > page_bottom && y > page_top {
+            pages = pages.saturating_add(1);
+            y = page_top;
+        }
+        y += height;
+    }
+
+    pages.max(1) as usize
+}
+
+/// Walk the blocks until `page_index` and return its page record.
+pub fn page_record_at(
+    source: &impl ReadingBlocks,
+    page_index: usize,
+    page_top: i16,
+    page_bottom: i16,
+) -> PageRecord {
+    let mut current = 0usize;
+    let mut first_block = 0usize;
+    let mut block_count = 0usize;
+    let mut y = page_top;
+
+    for index in 0..source.block_count() {
+        let height = block_height(source, index);
+        let new_page =
+            (y + height > page_bottom || source.page_break_before(index)) && y > page_top;
+        if new_page {
+            if current == page_index {
+                return PageRecord {
+                    first_block: first_block as u16,
+                    block_count: block_count as u16,
+                };
+            }
+            current += 1;
+            first_block = index;
+            block_count = 0;
+            y = page_top;
+        }
+        block_count += 1;
+        y += height;
+    }
+
+    PageRecord {
+        first_block: first_block as u16,
+        block_count: block_count as u16,
+    }
+}
+
+pub fn for_each_drawable_block(
+    source: &impl ReadingBlocks,
+    page: PageRecord,
+    mut visit: impl FnMut(ReaderDrawableBlock<'_>) -> bool,
+) {
+    let mut y = READER_PAGE_TOP;
+    for offset in 0..page.block_count as usize {
+        let index = page.first_block as usize + offset;
+        let Some(record) = source.block(index) else {
+            break;
+        };
+        let text = source.block_text(index);
+        let advance = line_advance_for(record.role);
+        let style = source.block_style(index);
+        let height = block_height(source, index);
+        if y + height > READER_PAGE_BOTTOM && y > READER_PAGE_TOP {
+            break;
+        }
+        if !visit(ReaderDrawableBlock {
+            record,
+            text,
+            y: y + advance,
+            advance,
+            style,
+            font: literata(style),
+        }) {
+            break;
+        }
+        y += height;
+    }
+}
+
+/// Draw one page of reading-body blocks: the single rendering of cached
+/// reader content shared by firmware views and host tooling.
+pub fn draw_reading_page_body(
+    fb: &mut Framebuffer,
+    source: &impl ReadingBlocks,
+    page: PageRecord,
+) {
+    for_each_drawable_block(source, page, |block| {
+        let role = block.record.role;
+        match block.record.align {
+            TextAlign::Left => {
+                let x = reader_x_for(role);
+                if block.record.line_count == 1 {
+                    draw_styled_line(fb, block.text, x, block.y, block.style);
+                } else {
+                    draw_wrapped_literata(
+                        fb,
+                        block.font,
+                        block.text,
+                        x,
+                        block.y,
+                        READER_RIGHT_X,
+                        block.advance,
+                    );
+                }
+            }
+            TextAlign::Justify => {
+                let x = reader_x_for(role);
+                if block.record.line_count == 1 {
+                    draw_styled_line(fb, block.text, x, block.y, block.style);
+                } else {
+                    draw_justified_wrapped_literata(
+                        fb,
+                        block.font,
+                        block.text,
+                        x,
+                        block.y,
+                        READER_RIGHT_X,
+                        block.advance,
+                    );
+                }
+            }
+            TextAlign::Center => {
+                if block.record.line_count == 1 {
+                    let width = styled_text_ink_width(block.text, block.font)
+                        .min(READER_RIGHT_X - READER_LEFT_X);
+                    let x = ((display::WIDTH as i16 - width) / 2).max(READER_LEFT_X);
+                    draw_styled_line(fb, block.text, x, block.y, block.style);
+                } else {
+                    draw_centered_wrapped_literata(
+                        fb,
+                        block.font,
+                        block.text,
+                        block.y,
+                        READER_RIGHT_X - READER_LEFT_X,
+                        block.advance,
+                    );
+                }
+            }
+        };
+        true
+    });
+}
 
 pub const READER_PAGE_TOP: i16 = 6;
 pub const READER_FOOTER_TOP: i16 = 466;

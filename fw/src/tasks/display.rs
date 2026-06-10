@@ -76,7 +76,9 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                     .last_request()
                     .map(|last| (last.view, last.book_id))
                     != Some((request.view, request.book_id));
+                let layout_start = Instant::now();
                 crate::views::render(fb, request, sd_library);
+                let layout_ms = layout_start.elapsed().as_millis();
 
                 if !refresh_planner.screen_on() && refresh_planner.last_request().is_none() {
                     esp_println::println!("display: wake init start");
@@ -93,6 +95,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                         mode
                     );
                 }
+                let flush_start = Instant::now();
                 if display_flush::flush(
                     &mut epd,
                     fb,
@@ -105,11 +108,24 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                 .await
                 .is_ok()
                 {
+                    let flush_ms = flush_start.elapsed().as_millis();
                     refresh_planner.record_render(request, mode);
                     prev_fb.copy_from(fb);
+                    let prestage_start = Instant::now();
                     red_prestaged = display_flush::prestage_red(&mut epd, fb, tx_band)
                         .await
                         .is_ok();
+                    esp_println::println!(
+                        "bench: render {:?} {:?} page={} ch={} layout={}ms flush={}ms prestage={}ms t={}",
+                        request.view,
+                        mode,
+                        request.page,
+                        request.chapter,
+                        layout_ms,
+                        flush_ms,
+                        prestage_start.elapsed().as_millis(),
+                        Instant::now().as_millis(),
+                    );
                     send_required_display_event(DisplayEvent::Settled);
                     let _ = POWER_EVENTS.try_send(PowerEvent::DisplaySettled);
                 } else {

@@ -46,20 +46,33 @@ pub(crate) async fn flush(
     (),
     <SpiDmaBus<'static, SPI2, FullDuplexMode, Async> as embedded_hal_async::spi::ErrorType>::Error,
 > {
-    esp_println::println!("display: write BW RAM {:?}", mode);
+    let bw_start = Instant::now();
     write_ram(epd, CMD_WRITE_RAM_BW, fb, tx_band).await?;
+    esp_println::println!(
+        "display: write BW RAM {:?} {} ms",
+        mode,
+        bw_start.elapsed().as_millis()
+    );
     if mode == RefreshMode::Fast {
         if red_holds_prev {
             // The previous frame was prestaged into RED RAM right after the
             // last refresh settled, so this page turn streams only BW.
             esp_println::println!("display: RED RAM already holds previous");
         } else {
-            esp_println::println!("display: write RED RAM previous");
+            let red_start = Instant::now();
             write_ram(epd, CMD_WRITE_RAM_RED, prev_fb, tx_band).await?;
+            esp_println::println!(
+                "display: write RED RAM previous {} ms",
+                red_start.elapsed().as_millis()
+            );
         }
     } else {
-        esp_println::println!("display: write RED RAM current");
+        let red_start = Instant::now();
         write_ram(epd, CMD_WRITE_RAM_RED, fb, tx_band).await?;
+        esp_println::println!(
+            "display: write RED RAM current {} ms",
+            red_start.elapsed().as_millis()
+        );
     }
 
     esp_println::println!("display: refresh activate");
