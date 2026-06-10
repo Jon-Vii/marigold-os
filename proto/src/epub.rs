@@ -109,11 +109,36 @@ pub struct OwnedZipEntry {
     pub local_header_offset: u32,
 }
 
+/// How a [`ZipStream`] resolves entry names against the central directory.
+#[derive(Clone, Copy)]
+enum CentralLookup<'a> {
+    /// The whole central directory fit in the tail scratch.
+    Cached(&'a [u8]),
+    /// One streaming pass built a bounded `(name hash, entry)` index in
+    /// the tail scratch. Hash hits are verified against the local file
+    /// header before use, so collisions cannot return the wrong entry.
+    Indexed { records: &'a [u8], complete: bool },
+    /// No acceleration: walk the central directory on storage per lookup.
+    Walk,
+}
+
+const CENTRAL_INDEX_RECORD_BYTES: usize = 20;
+const FNV_OFFSET: u32 = 0x811c_9dc5;
+const FNV_PRIME: u32 = 0x0100_0193;
+
+fn fnv1a_update(mut hash: u32, bytes: &[u8]) -> u32 {
+    for byte in bytes {
+        hash ^= *byte as u32;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
 pub struct ZipStream<'a, R> {
     reader: R,
     central_offset: u32,
     entry_count: u16,
-    central_cache: Option<&'a [u8]>,
+    lookup: CentralLookup<'a>,
 }
 
 pub struct ZipLocalStream<R> {
@@ -390,18 +415,21 @@ where
             }
             chunk_end = chunk_start + ZIP_EOCD_OVERLAP_BYTES;
         };
-        let central_cache = if central_size as usize <= tail_scratch.len() {
+        let lookup = if central_size as usize <= tail_scratch.len() {
             let central = &mut tail_scratch[..central_size as usize];
             read_exact_at(&mut reader, central_offset, central)?;
-            Some(&central[..])
+            CentralLookup::Cached(&central[..])
         } else {
-            None
+            match build_central_index(&mut reader, central_offset, entry_count, tail_scratch) {
+                Ok((records, complete)) => CentralLookup::Indexed { records, complete },
+                Err(_) => CentralLookup::Walk,
+            }
         };
         Ok(Self {
             reader,
             central_offset,
             entry_count,
-            central_cache,
+            lookup,
         })
     }
 
@@ -411,9 +439,53 @@ where
         header_scratch: &mut [u8; 46],
         name_scratch: &mut [u8],
     ) -> Result<OwnedZipEntry, ZipError> {
-        if let Some(central) = self.central_cache {
-            return find_entry_in_central_cache(central, self.entry_count, name);
+        match self.lookup {
+            CentralLookup::Cached(central) => {
+                find_entry_in_central_cache(central, self.entry_count, name)
+            }
+            CentralLookup::Indexed { records, complete } => {
+                let hash = fnv1a_update(FNV_OFFSET, name.as_bytes());
+                let mut unverified_hit = false;
+                for record in records.chunks_exact(CENTRAL_INDEX_RECORD_BYTES) {
+                    if read_u32(record, 0)? != hash {
+                        continue;
+                    }
+                    let entry = OwnedZipEntry {
+                        compression_method: read_u16(record, 16)?,
+                        compressed_size: read_u32(record, 8)?,
+                        uncompressed_size: read_u32(record, 12)?,
+                        local_header_offset: read_u32(record, 4)?,
+                    };
+                    if self.local_name_matches(
+                        entry.local_header_offset,
+                        name,
+                        header_scratch,
+                        name_scratch,
+                    )? {
+                        return Ok(entry);
+                    }
+                    unverified_hit = true;
+                }
+                if complete && !unverified_hit {
+                    Err(ZipError::EntryNotFound)
+                } else {
+                    // Either the index holds only a prefix of the central
+                    // directory, or a hash hit failed local-header
+                    // verification (possible with central/local name
+                    // mismatches); the walk stays authoritative.
+                    self.find_entry_by_walk(name, header_scratch, name_scratch)
+                }
+            }
+            CentralLookup::Walk => self.find_entry_by_walk(name, header_scratch, name_scratch),
         }
+    }
+
+    fn find_entry_by_walk(
+        &mut self,
+        name: &str,
+        header_scratch: &mut [u8; 46],
+        name_scratch: &mut [u8],
+    ) -> Result<OwnedZipEntry, ZipError> {
         let mut cursor = self.central_offset;
         for _ in 0..self.entry_count {
             read_exact_at(&mut self.reader, cursor, header_scratch)?;
@@ -447,6 +519,30 @@ where
                 .ok_or(ZipError::BadCentralDirectory)?;
         }
         Err(ZipError::EntryNotFound)
+    }
+
+    fn local_name_matches(
+        &mut self,
+        local_header_offset: u32,
+        name: &str,
+        header_scratch: &mut [u8; 46],
+        name_scratch: &mut [u8],
+    ) -> Result<bool, ZipError> {
+        let header = &mut header_scratch[..30];
+        read_exact_at(&mut self.reader, local_header_offset, header)?;
+        if read_u32(header, 0)? != 0x0403_4b50 {
+            return Err(ZipError::BadLocalHeader);
+        }
+        let name_len = read_u16(header, 26)? as usize;
+        if name_len != name.len() || name_len > name_scratch.len() {
+            return Ok(false);
+        }
+        read_exact_at(
+            &mut self.reader,
+            local_header_offset + 30,
+            &mut name_scratch[..name_len],
+        )?;
+        Ok(&name_scratch[..name_len] == name.as_bytes())
     }
 
     pub fn read_entry(
@@ -950,6 +1046,74 @@ where
             return Err(ZipError::Inflate);
         }
     }
+}
+
+/// One sequential pass over a central directory too large for the tail
+/// scratch, emitting bounded `(name hash, entry)` records into `scratch`.
+/// Returns the encoded records and whether every entry fit. Sequential
+/// reads are the access pattern storage likes; afterwards each lookup is
+/// a RAM scan plus one local-header verification read, instead of a
+/// per-lookup walk of the whole directory on storage.
+fn build_central_index<'a, R>(
+    reader: &mut R,
+    central_offset: u32,
+    entry_count: u16,
+    scratch: &'a mut [u8],
+) -> Result<(&'a [u8], bool), ZipError>
+where
+    R: ReadAt,
+{
+    let capacity = scratch.len() / CENTRAL_INDEX_RECORD_BYTES;
+    let indexed = (entry_count as usize).min(capacity);
+    let mut cursor = central_offset;
+    let mut header = [0u8; 46];
+    let mut name_chunk = [0u8; 64];
+    for slot in 0..indexed {
+        read_exact_at(reader, cursor, &mut header)?;
+        if read_u32(&header, 0)? != 0x0201_4b50 {
+            return Err(ZipError::BadCentralDirectory);
+        }
+        let compression_method = read_u16(&header, 10)?;
+        let compressed_size = read_u32(&header, 20)?;
+        let uncompressed_size = read_u32(&header, 24)?;
+        let name_len = read_u16(&header, 28)? as u32;
+        let extra_len = read_u16(&header, 30)? as u32;
+        let comment_len = read_u16(&header, 32)? as u32;
+        let local_header_offset = read_u32(&header, 42)?;
+
+        let mut hash = FNV_OFFSET;
+        let mut name_cursor = cursor.checked_add(46).ok_or(ZipError::BadCentralDirectory)?;
+        let mut remaining = name_len;
+        while remaining > 0 {
+            let take = (remaining as usize).min(name_chunk.len());
+            read_exact_at(reader, name_cursor, &mut name_chunk[..take])?;
+            hash = fnv1a_update(hash, &name_chunk[..take]);
+            name_cursor = name_cursor
+                .checked_add(take as u32)
+                .ok_or(ZipError::BadCentralDirectory)?;
+            remaining -= take as u32;
+        }
+
+        let record = &mut scratch
+            [slot * CENTRAL_INDEX_RECORD_BYTES..(slot + 1) * CENTRAL_INDEX_RECORD_BYTES];
+        record[0..4].copy_from_slice(&hash.to_le_bytes());
+        record[4..8].copy_from_slice(&local_header_offset.to_le_bytes());
+        record[8..12].copy_from_slice(&compressed_size.to_le_bytes());
+        record[12..16].copy_from_slice(&uncompressed_size.to_le_bytes());
+        record[16..18].copy_from_slice(&compression_method.to_le_bytes());
+        record[18..20].copy_from_slice(&[0u8; 2]);
+
+        cursor = cursor
+            .checked_add(46)
+            .and_then(|value| value.checked_add(name_len))
+            .and_then(|value| value.checked_add(extra_len))
+            .and_then(|value| value.checked_add(comment_len))
+            .ok_or(ZipError::BadCentralDirectory)?;
+    }
+    Ok((
+        &scratch[..indexed * CENTRAL_INDEX_RECORD_BYTES],
+        indexed == entry_count as usize,
+    ))
 }
 
 fn find_entry_in_central_cache(
@@ -4327,6 +4491,83 @@ mod tests {
         assert_eq!(len, 8);
         assert!(!complete);
         assert_eq!(&output, b"01234567");
+    }
+
+    #[test]
+    fn zip_stream_indexes_oversized_central_directory() {
+        // 16 entries x (46-byte header + 20-byte name) > 1 KB of central
+        // directory against a 1 KB tail scratch: the whole directory no
+        // longer fits, but all 16 index records (20 bytes each) do.
+        let names: StdVec<std::string::String> = (0..16)
+            .map(|index| std::format!("OPS/chapter-{index:02}.xhtml"))
+            .collect();
+        let bodies: StdVec<std::string::String> =
+            (0..16).map(|index| std::format!("body {index:02}")).collect();
+        let files: StdVec<(&str, &[u8])> = names
+            .iter()
+            .zip(bodies.iter())
+            .map(|(name, body)| (name.as_str(), body.as_bytes()))
+            .collect();
+        let zip_bytes = stored_zip(&files);
+        let mut tail = [0u8; 1024];
+        let mut stream = ZipStream::new(SliceReader { bytes: &zip_bytes }, &mut tail)
+            .expect("stream zip parses");
+
+        for (name, body) in files.iter() {
+            let entry = stream
+                .find_entry(name, &mut [0u8; 46], &mut [0u8; 64])
+                .expect("indexed entry found");
+            let mut compressed = [0u8; 64];
+            let mut output = [0u8; 64];
+            let len = stream
+                .read_entry(entry, &mut compressed, &mut output)
+                .expect("entry read");
+            assert_eq!(&output[..len], *body);
+        }
+        assert_eq!(
+            stream
+                .find_entry("OPS/missing.xhtml", &mut [0u8; 46], &mut [0u8; 64])
+                .err(),
+            Some(ZipError::EntryNotFound)
+        );
+    }
+
+    #[test]
+    fn zip_stream_partial_index_falls_back_to_the_walk() {
+        // 128-byte scratch indexes only 6 of 10 entries; lookups past the
+        // indexed prefix must still resolve through the directory walk.
+        let names: StdVec<std::string::String> = (0..10)
+            .map(|index| std::format!("OPS/chapter-{index:02}.xhtml"))
+            .collect();
+        let bodies: StdVec<std::string::String> =
+            (0..10).map(|index| std::format!("body {index:02}")).collect();
+        let files: StdVec<(&str, &[u8])> = names
+            .iter()
+            .zip(bodies.iter())
+            .map(|(name, body)| (name.as_str(), body.as_bytes()))
+            .collect();
+        let zip_bytes = stored_zip(&files);
+        let mut tail = [0u8; 128];
+        let mut stream = ZipStream::new(SliceReader { bytes: &zip_bytes }, &mut tail)
+            .expect("stream zip parses");
+
+        for (name, body) in files.iter() {
+            let entry = stream
+                .find_entry(name, &mut [0u8; 46], &mut [0u8; 64])
+                .expect("entry found through index or walk");
+            let mut compressed = [0u8; 64];
+            let mut output = [0u8; 64];
+            let len = stream
+                .read_entry(entry, &mut compressed, &mut output)
+                .expect("entry read");
+            assert_eq!(&output[..len], *body);
+        }
+        assert_eq!(
+            stream
+                .find_entry("OPS/missing.xhtml", &mut [0u8; 46], &mut [0u8; 64])
+                .err(),
+            Some(ZipError::EntryNotFound)
+        );
     }
 
     fn stored_zip(files: &[(&str, &[u8])]) -> StdVec<u8> {
