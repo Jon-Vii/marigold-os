@@ -287,8 +287,9 @@ fn handle_storage_command(
             };
             // Coalesce same-context page turns; anything beyond the screen
             // number changing (book, chapter, orientation, policy) is rare
-            // and worth landing immediately, after first preserving the
-            // previous context's pending position.
+            // and worth landing immediately. A pending record for the same
+            // book is superseded by the new one; only a different book's
+            // pending position must be preserved first.
             let context_changed = pending_progress
                 .map(|pending| {
                     AppStateRecord {
@@ -300,7 +301,10 @@ fn handle_storage_command(
             let due = last_progress_write
                 .map(|written| written.elapsed().as_secs() >= PROGRESS_WRITE_MIN_SECS)
                 .unwrap_or(true);
-            if context_changed {
+            if pending_progress
+                .map(|pending| pending.book_id != record.book_id)
+                .unwrap_or(false)
+            {
                 flush_pending_progress(epd, sd_cs, pending_progress, last_progress_write);
             }
             if context_changed || due {
