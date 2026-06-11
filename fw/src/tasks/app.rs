@@ -352,17 +352,20 @@ fn storage_command_for_transition(
 
     if previous.view != AppView::Reading {
         if previous.view == AppView::Chapters {
+            // Chapters is only reachable from Reading, so the book is
+            // loaded; backing out unchanged needs no request.
             return if previous.page != next.page || previous.chapter != next.chapter {
                 Some(extend_section_command(next, index))
             } else {
                 None
             };
         }
-        return if previous.page != next.page || previous.chapter != next.chapter {
-            Some(extend_section_command(next, index))
-        } else {
-            None
-        };
+        // An unchanged book id no longer proves the store holds its
+        // pages: boot restore and the scan default set the active book
+        // without loading anything. Entering Reading always requests
+        // the section; an already-loaded book answers from RAM without
+        // an SD session.
+        return Some(open_book_command(next, index));
     }
 
     if previous.page != next.page || previous.chapter != next.chapter {
