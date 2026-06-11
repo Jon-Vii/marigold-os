@@ -45,7 +45,24 @@ Current code status:
 - GPIO0 battery sampling is present as a rough 2:1 divider estimate; calibrate
   against measured pack voltage.
 - Add GPIO wake for the power/home button.
-- Record measured BUSY timings in this document.
+- Measured BUSY timings (June 10 2026, on-device, room temperature, commit
+  `14c7eba` + page-plan seam, Unsong.epub 1001 pages / 78 chapters; from the
+  permanent `bench:` serial lines via `tools/serial_capture.py`):
+  - Fast-waveform refresh BUSY: **421 ms**, constant across 44 refreshes.
+  - Full-waveform refresh BUSY: **3.53–3.61 s**. Dominates every view change,
+    boot (~4.1 s to Home), and wake (~3.8 s to Home); software around it is
+    noise, so any future improvement here is waveform/temperature
+    configuration, not SPI or layout work.
+  - Whole-frame RAM stream over band DMA: 22–24 ms per plane (BW or RED).
+  - Layout + framebuffer draw: Reading 20–36 ms, menu views 82–90 ms.
+  - EPUB page turn, button press to panel settled: **~470 ms median**
+    (~89% is the fast BUSY wait); sustained held-button rate ≈ 2 pages/s.
+    RED prestaging held on every fast turn (each streamed BW only), and
+    SD-backed section extends (~50–85 ms v2 cache hits) never stalled a
+    render. Add ~40–80 ms ADC poll + debounce ahead of the logged press for
+    true finger-to-eye latency.
+  - Book open with a v2 cache hit: cache ready in 50–85 ms; perceived ~4 s is
+    the full refresh that paints the first page.
 - Use the on-screen input calibration panel to record raw GPIO1/GPIO2 values for every button.
 
 ## Phase 3: reader core
