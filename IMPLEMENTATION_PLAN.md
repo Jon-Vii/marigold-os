@@ -225,7 +225,15 @@ Current code status:
   credentials persist through StoreWifiCredentials into /XTEINK/WIFI.BIN
   and the next session joins as a station. Join QR baked by
   tools/generate_qr.py. Stack region after the portal: ~38.9 KB.
-- Browser EPUB upload implemented (pending hardware validation): after the
+- Browser EPUB upload validated end to end on hardware June 11 2026: a
+  2.4 MB EPUB traveled browser -> Wi-Fi -> loaned buffers -> /BOOKS and
+  surfaced on the shelf after the rescan; the page lists the catalog with
+  per-book removal (both /BOOKS and card-root entries) and shows real
+  upload progress. Found live and fixed: a literal newline inside the
+  page's JS string (parse error masked every other symptom), the kosync
+  exchange clobbering the catalog in the loaned http_b, missing UTF-8
+  charset, and the catalog snapshot hiding new books from the boot scan.
+  Implementation: after the
   kosync exchange the session keeps serving at the device's LAN address
   (SyncStatus::Serving screen hands out the URL); POST /upload streams raw
   EPUB bytes through a two-buffer ping-pong into the display task, which
