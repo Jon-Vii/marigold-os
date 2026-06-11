@@ -4,10 +4,8 @@ use embedded_hal::digital::OutputPin;
 use embedded_hal::spi::{Operation, SpiBus as BlockingSpiBus, SpiDevice};
 use embedded_sdmmc::{Directory, SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
 use esp_hal::gpio::Output;
-use esp_hal::peripherals::SPI2;
-use esp_hal::prelude::*;
-use esp_hal::spi::master::SpiDmaBus;
-use esp_hal::spi::FullDuplexMode;
+use esp_hal::spi::master::{Config as SpiConfig, SpiDmaBus};
+use esp_hal::time::RateExtU32;
 use esp_hal::Async;
 
 /// SD SPI-mode identification must run at 100-400 kHz; data transfer is
@@ -155,7 +153,7 @@ where
     }
 }
 
-type SdSpi<'a> = SdSpiDevice<'a, SpiDmaBus<'static, SPI2, FullDuplexMode, Async>, Output<'static>>;
+type SdSpi<'a> = SdSpiDevice<'a, SpiDmaBus<'static, Async>, Output<'static>>;
 
 type SdCardDevice<'a> = SdCard<SdSpi<'a>, SdDelay>;
 pub(crate) type SdRoot<'a> = Directory<'a, SdCardDevice<'a>, StaticTime, 8, 8, 1>;
@@ -183,7 +181,7 @@ pub(crate) fn with_root<R>(
     // chip select is asserted, per the SD spec and embedded-sdmmc's docs.
     {
         let spi = epd.spi_mut();
-        spi.change_bus_frequency(SD_IDENT_FREQ_KHZ.kHz());
+        let _ = spi.apply_config(&SpiConfig::default().with_frequency(SD_IDENT_FREQ_KHZ.kHz()));
         let mut wake = [0xFFu8; 10];
         let _ = BlockingSpiBus::transfer_in_place(spi, &mut wake);
         let _ = BlockingSpiBus::flush(spi);
@@ -203,7 +201,11 @@ pub(crate) fn with_root<R>(
             esp_println::println!("sd: card ready");
             // Card acquired: switch to the in-spec data rate for the rest
             // of the session.
-            card.spi(|device| device.spi.change_bus_frequency(SD_DATA_FREQ_MHZ.MHz()));
+            card.spi(|device| {
+                let _ = device
+                    .spi
+                    .apply_config(&SpiConfig::default().with_frequency(SD_DATA_FREQ_MHZ.MHz()));
+            });
             let volume_mgr: VolumeManager<_, _, 8, 8, 1> =
                 VolumeManager::new_with_limits(card, StaticTime, 5000);
             let result = match volume_mgr.open_volume(VolumeIdx(0)) {
@@ -231,6 +233,8 @@ pub(crate) fn with_root<R>(
 
     esp_println::println!("sd: session exit");
     sd_cs.set_high();
-    epd.spi_mut().change_bus_frequency(DISPLAY_FREQ_MHZ.MHz());
+    let _ = epd
+        .spi_mut()
+        .apply_config(&SpiConfig::default().with_frequency(DISPLAY_FREQ_MHZ.MHz()));
     result
 }

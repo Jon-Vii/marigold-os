@@ -2,9 +2,6 @@
 runner = "espflash flash --monitor --ignore-app-descriptor"
 rustflags = [
   "-C", "link-arg=-Tlinkall.x",
-  # esp-wifi-sys stages this script (wifi blob ROM data addresses) into the
-  # link search path; the radio cannot link without it.
-  "-C", "link-arg=-Trom_functions.x",
   # Required to work with portable-atomic for CAS operations on single-core riscv32
   "--cfg", "portable_atomic_unsafe_assume_single_core",
 ]
@@ -16,8 +13,8 @@ target = "riscv32imc-unknown-none-elf"
 # trimmed buffer counts keep esp-wifi's static and heap demand inside the
 # loaned sync-session memory. Revisit for the AP file-upload phase.
 [env]
-ESP_WIFI_STATIC_RX_BUF_NUM = "4"
-ESP_WIFI_DYNAMIC_RX_BUF_NUM = "8"
-ESP_WIFI_DYNAMIC_TX_BUF_NUM = "8"
-ESP_WIFI_AMPDU_RX_ENABLE = "false"
-ESP_WIFI_AMPDU_TX_ENABLE = "false"
+ESP_WIFI_CONFIG_STATIC_RX_BUF_NUM = "4"
+ESP_WIFI_CONFIG_DYNAMIC_RX_BUF_NUM = "8"
+ESP_WIFI_CONFIG_DYNAMIC_TX_BUF_NUM = "8"
+ESP_WIFI_CONFIG_AMPDU_RX_ENABLE = "false"
+ESP_WIFI_CONFIG_AMPDU_TX_ENABLE = "false"

@@ -28,9 +28,3 @@ opt-level = 3
 # warns below opt-level 2); the rest of the sync session is network-bound.
 [profile.release.package.esp-wifi]
 opt-level = 3
-
-# esp-wifi 0.10.1 (the pairing for esp-hal 0.21) predates the riscv
-# c_char i8->u8 change in newer toolchains; the vendored copy carries the
-# four mechanical cast fixes that esp-wifi 0.11 shipped upstream.
-[patch.crates-io]
-esp-wifi = { path = "vendor/esp-wifi" }

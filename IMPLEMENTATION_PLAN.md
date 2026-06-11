@@ -182,9 +182,9 @@ Current code status:
 
 ## Phase 5: Wi-Fi sync
 
-- esp-wifi 0.10.1 (esp-hal 0.21 pairing) linked: vendored under
-  `vendor/esp-wifi` with the upstream riscv c_char fixes, `-Trom_functions.x`
-  added to the linker flags, and trimmed buffer config in `.cargo/config.toml`.
+- esp-wifi 0.12.0 linked from crates.io on the esp-hal 0.23.1 stack
+  (esp-hal-embassy 0.6, embassy-executor 0.7, embassy-time 0.4, embassy-net
+  0.6); trimmed `ESP_WIFI_CONFIG_*` buffer counts live in `.cargo/config.toml`.
 - RAM accounting after linking the radio: PREV_FB moved into dram2, a 16 KB
   dram2 heap claim, and the loaned EPUB scratch give the session ~84 KB of
   esp-alloc heap in three regions while the stack region holds at ~41 KB

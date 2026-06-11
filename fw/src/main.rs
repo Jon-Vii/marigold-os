@@ -63,14 +63,12 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use esp_backtrace as _;
 use esp_hal::analog::adc::{Adc, AdcCalCurve, AdcConfig, Attenuation};
-use esp_hal::dma::{Dma, DmaPriority};
-use esp_hal::entry;
-use esp_hal::gpio::{Input, Io, Level, Output, Pull};
+use esp_hal::gpio::{Input, Level, Output, Pull};
 use esp_hal::interrupt::software::SoftwareInterruptControl;
 use esp_hal::interrupt::Priority;
 use esp_hal::peripherals::ADC1;
-use esp_hal::prelude::*;
-use esp_hal::spi::master::Spi;
+use esp_hal::spi::master::{Config as SpiConfig, Spi};
+use esp_hal::time::RateExtU32;
 use esp_hal::timer::{timg::TimerGroup, AnyTimer};
 use esp_hal_embassy::{Executor, InterruptExecutor};
 use static_cell::StaticCell;
@@ -110,13 +108,12 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 static EXECUTOR: StaticCell<Executor> = StaticCell::new();
 static INPUT_EXECUTOR: StaticCell<InterruptExecutor<0>> = StaticCell::new();
 
-#[entry]
+#[esp_hal::main]
 fn main() -> ! {
     // Config::default() leaves the ESP32-C3 at 80 MHz; layout, panel byte
     // transforms, and EPUB inflate are all CPU-bound, so run at full speed
     // and rely on race-to-idle for power.
-    let mut config = esp_hal::Config::default();
-    config.cpu_clock = esp_hal::clock::CpuClock::Clock160MHz;
+    let config = esp_hal::Config::default().with_cpu_clock(esp_hal::clock::CpuClock::_160MHz);
     let peripherals = esp_hal::init(config);
     esp_println::println!("xteink-x4-os: boot");
 
@@ -124,36 +121,38 @@ fn main() -> ! {
     let timg1 = TimerGroup::new(peripherals.TIMG1);
     esp_hal_embassy::init([AnyTimer::from(timg0.timer0), AnyTimer::from(timg1.timer0)]);
 
-    let io = Io::new(peripherals.GPIO, peripherals.IO_MUX);
-    let epd_cs = Output::new(io.pins.gpio21, Level::High);
-    let epd_dc = Output::new(io.pins.gpio4, Level::High);
-    let epd_rst = Output::new(io.pins.gpio5, Level::High);
-    let epd_busy = Input::new(io.pins.gpio6, Pull::None);
-    let sd_cs = Output::new(io.pins.gpio12, Level::High);
-    let power_button = Input::new(io.pins.gpio3, Pull::Up);
+    let epd_cs = Output::new(peripherals.GPIO21, Level::High);
+    let epd_dc = Output::new(peripherals.GPIO4, Level::High);
+    let epd_rst = Output::new(peripherals.GPIO5, Level::High);
+    let epd_busy = Input::new(peripherals.GPIO6, Pull::None);
+    let sd_cs = Output::new(peripherals.GPIO12, Level::High);
+    let power_button = Input::new(peripherals.GPIO3, Pull::Up);
 
     let mut adc_config = AdcConfig::new();
     let aux_adc = adc_config
-        .enable_pin_with_cal::<_, AdcCalCurve<ADC1>>(io.pins.gpio0, Attenuation::Attenuation11dB);
+        .enable_pin_with_cal::<_, AdcCalCurve<ADC1>>(peripherals.GPIO0, Attenuation::_11dB);
     let nav_adc = adc_config
-        .enable_pin_with_cal::<_, AdcCalCurve<ADC1>>(io.pins.gpio1, Attenuation::Attenuation11dB);
+        .enable_pin_with_cal::<_, AdcCalCurve<ADC1>>(peripherals.GPIO1, Attenuation::_11dB);
     let page_adc = adc_config
-        .enable_pin_with_cal::<_, AdcCalCurve<ADC1>>(io.pins.gpio2, Attenuation::Attenuation11dB);
+        .enable_pin_with_cal::<_, AdcCalCurve<ADC1>>(peripherals.GPIO2, Attenuation::_11dB);
     let adc1 = Adc::new(peripherals.ADC1, adc_config);
 
-    let dma = Dma::new(peripherals.DMA);
-    let dma_channel = dma
-        .channel0
-        .configure_for_async(false, DmaPriority::Priority0);
     let (rx_buffer, rx_descriptors, tx_buffer, tx_descriptors) = esp_hal::dma_buffers!(8000);
     let dma_rx = esp_hal::dma::DmaRxBuf::new(rx_descriptors, rx_buffer).unwrap();
     let dma_tx = esp_hal::dma::DmaTxBuf::new(tx_descriptors, tx_buffer).unwrap();
-    let epd_spi = Spi::new(peripherals.SPI2, 40_u32.MHz(), esp_hal::spi::SpiMode::Mode0)
-        .with_sck(io.pins.gpio8)
-        .with_mosi(io.pins.gpio10)
-        .with_miso(io.pins.gpio7)
-        .with_dma(dma_channel)
-        .with_buffers(dma_rx, dma_tx);
+    let epd_spi = Spi::new(
+        peripherals.SPI2,
+        SpiConfig::default()
+            .with_frequency(40_u32.MHz())
+            .with_mode(esp_hal::spi::Mode::_0),
+    )
+    .expect("SPI2 config")
+    .with_sck(peripherals.GPIO8)
+    .with_mosi(peripherals.GPIO10)
+    .with_miso(peripherals.GPIO7)
+    .with_dma(peripherals.DMA_CH0)
+    .with_buffers(dma_rx, dma_tx)
+    .into_async();
     let epd_bus = hal_ext::spi_dma::EpdBus::new(epd_spi, epd_cs, epd_dc, epd_busy, epd_rst);
 
     // Input polls from an interrupt-priority executor so button sampling

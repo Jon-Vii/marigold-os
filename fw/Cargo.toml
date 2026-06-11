@@ -11,12 +11,12 @@ ui = { path = "../ui" }
 proto = { path = "../proto" }
 hal-ext = { path = "../hal-ext" }
 
-embassy-executor  = { version = "0.6.0", features = ["nightly"] }
-embassy-time      = { version = "0.3.0", features = ["generic-queue-8"] }
+embassy-executor  = { version = "0.7.0", features = ["nightly"] }
+embassy-time      = "0.4.0"
 embassy-sync      = "0.6.0"
 embassy-futures   = "0.1.1"
-esp-hal           = { version = "0.21.1", features = ["esp32c3"] }
-esp-hal-embassy   = { version = "0.4.0", features = ["esp32c3", "executors"] }
+esp-hal           = { version = "0.23.1", features = ["esp32c3"] }
+esp-hal-embassy   = { version = "0.6.0", features = ["esp32c3", "executors"] }
 embedded-hal-async = "1.0.0"
 embedded-hal       = "1.0.0"
 embedded-sdmmc     = { version = "0.9.0", default-features = false }
@@ -24,10 +24,10 @@ nb                = "1.1.0"
 portable-atomic   = { version = "1.10.0", features = ["unsafe-assume-single-core"] }
 static_cell       = "2.1.0"
 heapless          = "0.8.0"
-esp-println       = { version = "0.12.0", features = ["esp32c3"] }
-esp-wifi          = { version = "0.10.1", features = ["esp32c3", "wifi", "async", "embassy-net", "phy-enable-usb"] }
-esp-alloc         = "0.5.0"
-embassy-net       = { version = "0.4.0", features = ["proto-ipv4", "tcp", "udp", "dns", "dhcpv4", "medium-ethernet"] }
+esp-println       = { version = "0.13.0", features = ["esp32c3"] }
+esp-wifi          = { version = "0.12.0", features = ["esp32c3", "wifi"] }
+esp-alloc         = "0.6.0"
+embassy-net       = { version = "0.6.0", features = ["proto-ipv4", "tcp", "udp", "dns", "dhcpv4", "medium-ethernet"] }
 # Prints registers + backtrace over USB on CPU exceptions, then halts in
 # place instead of silently resetting. Keep: crash evidence beats reboots.
-esp-backtrace     = { version = "0.14.2", features = ["esp32c3", "println", "exception-handler"] }
+esp-backtrace     = { version = "0.15.0", features = ["esp32c3", "println", "exception-handler"] }

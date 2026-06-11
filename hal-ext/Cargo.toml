@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-esp-hal = { version = "0.21.1", features = ["esp32c3"] }
-embassy-time = { version = "0.3.0", features = ["generic-queue-8"] }
+esp-hal = { version = "0.23.1", features = ["esp32c3"] }
+embassy-time = "0.4.0"
 embassy-sync = "0.6.0"
 embedded-hal-async = "1.0.0"
 embedded-hal = "1.0.0"

@@ -17,16 +17,16 @@ use app_core::{PersistedAppState, SyncError};
 use embassy_executor::Spawner;
 use embassy_net::dns::DnsQueryType;
 use embassy_net::tcp::TcpSocket;
-use embassy_net::{Config as NetConfig, IpAddress, Stack, StackResources};
+use embassy_net::{Config as NetConfig, IpAddress, Runner, Stack, StackResources};
 use embassy_time::{with_timeout, Duration, Timer};
 use esp_hal::peripherals::{RADIO_CLK, RNG, SYSTIMER, WIFI};
 use esp_hal::rng::Rng;
-use esp_hal::timer::systimer::{SystemTimer, Target};
+use esp_hal::timer::systimer::SystemTimer;
 use esp_wifi::wifi::{
     new_with_mode, AuthMethod, ClientConfiguration, Configuration, WifiController, WifiDevice,
     WifiStaDevice,
 };
-use esp_wifi::EspWifiInitFor;
+use esp_wifi::EspWifiController;
 use proto::kosync;
 
 const JOIN_TIMEOUT: Duration = Duration::from_secs(20);
@@ -54,8 +54,8 @@ fn kosync_account() -> Option<(&'static str, &'static str, &'static str)> {
 }
 
 #[embassy_executor::task]
-async fn net_task(stack: &'static Stack<WifiDevice<'static, WifiStaDevice>>) -> ! {
-    stack.run().await
+async fn net_task(mut runner: Runner<'static, WifiDevice<'static, WifiStaDevice>>) -> ! {
+    runner.run().await
 }
 
 #[embassy_executor::task]
@@ -92,16 +92,20 @@ pub async fn run(spawner: Spawner, wifi: WIFI, systimer: SYSTIMER, rng: RNG, rad
 
     let mut rng = Rng::new(rng);
     let seed = (u64::from(rng.random()) << 32) | u64::from(rng.random());
-    let timer = SystemTimer::new(systimer).split::<Target>();
-    let init = match esp_wifi::init(EspWifiInitFor::Wifi, timer.alarm0, rng, radio_clk) {
-        Ok(init) => init,
+    let timer = SystemTimer::new(systimer);
+    let inited = match esp_wifi::init(timer.alarm0, rng, radio_clk) {
+        Ok(inited) => inited,
         Err(err) => {
             esp_println::println!("wifi: init failed: {:?}", err);
             send_event(SyncEvent::Failed(SyncError::RadioInit));
             park_until_exit().await;
         }
     };
-    let (device, controller) = match new_with_mode(&init, wifi, WifiStaDevice) {
+    // Everything radio-shaped lives in the loaned heap; Box::leak is
+    // honest here because the session never ends except by reset.
+    let inited: &'static EspWifiController<'static> =
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(inited));
+    let (device, controller) = match new_with_mode(inited, wifi, WifiStaDevice) {
         Ok(parts) => parts,
         Err(err) => {
             esp_println::println!("wifi: sta mode failed: {:?}", err);
@@ -110,18 +114,15 @@ pub async fn run(spawner: Spawner, wifi: WIFI, systimer: SYSTIMER, rng: RNG, rad
         }
     };
 
-    // The net stack lives in the loaned heap; Box::leak is honest here
-    // because the session never ends except by reset.
     let resources: &'static mut StackResources<4> =
         alloc::boxed::Box::leak(alloc::boxed::Box::new(StackResources::new()));
-    let stack: &'static Stack<WifiDevice<'static, WifiStaDevice>> =
-        alloc::boxed::Box::leak(alloc::boxed::Box::new(Stack::new(
-            device,
-            NetConfig::dhcpv4(Default::default()),
-            resources,
-            seed,
-        )));
-    if spawner.spawn(net_task(stack)).is_err() {
+    let (stack, runner) = embassy_net::new(
+        device,
+        NetConfig::dhcpv4(Default::default()),
+        resources,
+        seed,
+    );
+    if spawner.spawn(net_task(runner)).is_err() {
         send_event(SyncEvent::Failed(SyncError::RadioInit));
         park_until_exit().await;
     }
@@ -178,7 +179,7 @@ fn send_event(event: SyncEvent) {
 
 struct Session {
     controller: WifiController<'static>,
-    stack: &'static Stack<WifiDevice<'static, WifiStaDevice>>,
+    stack: Stack<'static>,
     tcp_rx: &'static mut [u8],
     tcp_tx: &'static mut [u8],
     http_a: &'static mut [u8],
@@ -202,7 +203,7 @@ impl Session {
         })
         .await
         .map_err(|_| SyncError::Dhcp)?;
-        let ip = config.address.address().0;
+        let ip = config.address.address().octets();
         esp_println::println!("wifi: up at {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
         send_event(SyncEvent::Connected(ip));
 
@@ -241,10 +242,13 @@ impl Session {
             self.controller
                 .set_configuration(&config)
                 .map_err(|_| SyncError::Join)?;
-            self.controller.start().await.map_err(|_| SyncError::Join)?;
+            self.controller
+                .start_async()
+                .await
+                .map_err(|_| SyncError::Join)?;
             self.started = true;
         }
-        with_timeout(JOIN_TIMEOUT, self.controller.connect())
+        with_timeout(JOIN_TIMEOUT, self.controller.connect_async())
             .await
             .map_err(|_| SyncError::Join)?
             .map_err(|err| {

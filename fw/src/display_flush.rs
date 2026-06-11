@@ -10,13 +10,11 @@ use display::fb::Framebuffer;
 use display::{Rect, BAND_BYTES, BAND_ROWS, HEIGHT};
 use embassy_time::Instant;
 use esp_hal::gpio::{Input, Output};
-use esp_hal::peripherals::SPI2;
 use esp_hal::spi::master::SpiDmaBus;
-use esp_hal::spi::FullDuplexMode;
 use esp_hal::Async;
 
 pub(crate) type Epd = hal_ext::spi_dma::EpdBus<
-    SpiDmaBus<'static, SPI2, FullDuplexMode, Async>,
+    SpiDmaBus<'static, Async>,
     Output<'static>,
     Output<'static>,
     Input<'static>,
@@ -43,10 +41,7 @@ pub(crate) async fn flush(
     screen_on: bool,
     mode: RefreshMode,
     red_holds_prev: bool,
-) -> Result<
-    (),
-    <SpiDmaBus<'static, SPI2, FullDuplexMode, Async> as embedded_hal_async::spi::ErrorType>::Error,
-> {
+) -> Result<(), <SpiDmaBus<'static, Async> as embedded_hal_async::spi::ErrorType>::Error> {
     let bw_start = Instant::now();
     write_ram(epd, CMD_WRITE_RAM_BW, fb, tx_band).await?;
     esp_println::println!(
@@ -112,19 +107,13 @@ pub(crate) async fn prestage_red(
     epd: &mut Epd,
     fb: &Framebuffer,
     tx_band: &mut [u8; BAND_BYTES],
-) -> Result<
-    (),
-    <SpiDmaBus<'static, SPI2, FullDuplexMode, Async> as embedded_hal_async::spi::ErrorType>::Error,
-> {
+) -> Result<(), <SpiDmaBus<'static, Async> as embedded_hal_async::spi::ErrorType>::Error> {
     write_ram(epd, CMD_WRITE_RAM_RED, fb, tx_band).await
 }
 
 pub(crate) async fn sleep_panel(
     epd: &mut Epd,
-) -> Result<
-    (),
-    <SpiDmaBus<'static, SPI2, FullDuplexMode, Async> as embedded_hal_async::spi::ErrorType>::Error,
-> {
+) -> Result<(), <SpiDmaBus<'static, Async> as embedded_hal_async::spi::ErrorType>::Error> {
     esp_println::println!("display: sleep start");
     epd.command(
         CMD_DISPLAY_UPDATE_CTRL2,
@@ -142,10 +131,7 @@ async fn write_ram(
     ram_command: u8,
     fb: &Framebuffer,
     tx_band: &mut [u8; BAND_BYTES],
-) -> Result<
-    (),
-    <SpiDmaBus<'static, SPI2, FullDuplexMode, Async> as embedded_hal_async::spi::ErrorType>::Error,
-> {
+) -> Result<(), <SpiDmaBus<'static, Async> as embedded_hal_async::spi::ErrorType>::Error> {
     let rect = Rect::FULL;
     epd.command(CMD_SET_RAM_X_RANGE, &ram_x_range(rect)).await?;
     epd.command(CMD_SET_RAM_Y_RANGE, &ram_y_range(rect)).await?;

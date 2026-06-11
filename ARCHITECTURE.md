@@ -20,7 +20,7 @@ flowchart TD
     app_task["app_task<br/>owns ReaderState reducer shell"]
     display_task["board I/O + display task<br/>single owner of EPD bus, SD CS,<br/>ReaderStore, framebuffer"]
     power_task["power_task<br/>idle timer + deep sleep"]
-    wifi_task["wifi_task<br/>parked sync placeholder"]
+    wifi_task["wifi_task<br/>kosync sync session"]
 
     app_core["app-core<br/>Copy message contracts<br/>ReaderState reducer<br/>RefreshPlanner"]
     display_crate["display<br/>1 bpp framebuffer<br/>drawing + fonts<br/>SSD1677 transforms"]
@@ -147,9 +147,6 @@ parsing) with host tests.
 Station and kosync credentials are compile-time `option_env!` values
 (`XTEINK_WIFI_SSID`/`XTEINK_WIFI_PASS`, `XTEINK_KOSYNC_HOST`/`_USER`/
 `_PASS`) for the dev phase; AP-mode web onboarding replaces them later.
-esp-wifi 0.10.1 is vendored under `vendor/esp-wifi` with the riscv c_char
-fixes its 0.11 release shipped upstream, because the workspace toolchain
-is newer than the crate.
 
 Embassy is used for cooperative waits: ADC retry delays, button polling, SPI DMA
 transfers, BUSY waits, and sleep windows all yield instead of spinning. The real
