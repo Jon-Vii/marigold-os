@@ -237,15 +237,19 @@ pub fn draw_reading_page_body(
     });
 }
 
-pub const READER_PAGE_TOP: i16 = 6;
+// Sized so the default 27px body grid closes: 3 + 17*27 = 462 ≤ 463 puts
+// seventeen lines on the page where 6/-4 fit sixteen and left ~28px (one
+// full row) dead above the footer. Last-line descenders reach ~467,
+// clearing the digits-only counter whose ink starts at ~468.
+pub const READER_PAGE_TOP: i16 = 3;
 pub const READER_FOOTER_TOP: i16 = 466;
-pub const READER_PAGE_BOTTOM: i16 = READER_FOOTER_TOP - 4;
+pub const READER_PAGE_BOTTOM: i16 = READER_FOOTER_TOP - 3;
 pub const READER_LEFT_X: i16 = 8;
 pub const READER_RIGHT_X: i16 = 792;
 pub const READER_WRAP_SAFETY: i16 = 4;
 /// Version of the wrap rules and page constants in this module. Bump when
 /// layout changes for unchanged type settings.
-const READER_LAYOUT_VERSION: u16 = 5;
+const READER_LAYOUT_VERSION: u16 = 6;
 
 /// Section cache layout config: the wrap-rule version plus the type
 /// settings the section was paginated under. Stored in cache headers; a
