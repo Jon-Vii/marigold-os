@@ -1,11 +1,11 @@
 [[steps]]
-button = "Confirm"
+button = "Back"
 
 [[steps]]
 button = "Back"
 
 [expect]
 view = "Home"
-selection = 1
+selection = 0
 last_refresh = "Full"
 history_contains = "refresh Full"

@@ -3,7 +3,7 @@
 
 use display::{epd::RefreshMode, Rect};
 
-pub const SETTINGS_ITEMS: u8 = 3;
+pub const SETTINGS_ITEMS: u8 = 2;
 pub const MAX_SD_CHAPTERS: usize = 128;
 pub const FIRST_SD_BOOK_ID: u32 = 2;
 
@@ -204,6 +204,7 @@ pub struct RenderRequest {
     pub kind: RenderKind,
     pub view: AppView,
     pub page: u32,
+    pub page_count: u32,
     pub chapter: u8,
     pub selection: u8,
     pub book_id: u32,
@@ -391,11 +392,8 @@ impl ReaderState {
             (AppView::Library, Some(Button::Previous)) => {
                 next.selection = wrap_prev(self.selection, self.library_item_count(ctx));
             }
-            (AppView::Library, Some(Button::Back)) => {
-                next.view = AppView::Home;
-                next.selection = 1;
-                next.read_request_pending = false;
-            }
+            // Imprint key grammar: Back always zooms out one level,
+            // Confirm always affirms the screen's primary action.
             (AppView::Library, Some(Button::Confirm)) => {
                 if self.selection < self.library_count {
                     next.book_id = ReaderSource::sd(self.selection).book_id();
@@ -408,6 +406,11 @@ impl ReaderState {
                     next.sd_chapter_pages = [0; MAX_SD_CHAPTERS];
                     next.read_request_pending = false;
                 }
+            }
+            (AppView::Library, Some(Button::Back)) => {
+                next.view = AppView::Home;
+                next.selection = 0;
+                next.read_request_pending = false;
             }
             (AppView::Reading, Some(Button::Next)) => {
                 if ReaderSource::from_book_id(self.book_id).is_sd() {
@@ -488,7 +491,7 @@ impl ReaderState {
             }
             (AppView::Settings, Some(Button::Back)) => {
                 next.view = AppView::Home;
-                next.selection = 2;
+                next.selection = 0;
             }
         }
 
@@ -581,6 +584,7 @@ impl ReaderState {
             kind,
             view: self.view,
             page: self.page,
+            page_count: self.sd_page_count,
             chapter: self.chapter,
             selection: self.selection,
             book_id: self.book_id,
@@ -672,10 +676,11 @@ fn wrap_prev(value: u8, len: u8) -> u8 {
 
 fn home_action_for_button(button: Button) -> HomeAction {
     match button {
-        // Home is a physical dock, not a semantic list. The bottom-edge
-        // hardware order is Back, Confirm, Previous/Left, Next/Right.
-        Button::Back => HomeAction::Read,
-        Button::Confirm => HomeAction::Files,
+        // Home direct-maps the left-edge key column (top to bottom:
+        // Back, Confirm, Previous, Next). Back zooms out of the book
+        // onto the shelf; Confirm affirms continuing to read.
+        Button::Back => HomeAction::Files,
+        Button::Confirm => HomeAction::Read,
         Button::Previous => HomeAction::Sync,
         Button::Next | Button::Power => HomeAction::Settings,
     }
@@ -723,16 +728,12 @@ fn apply_setting(mut state: ReaderState) -> ReaderState {
                 }
             };
         }
-        1 => {
+        _ => {
             state.refresh_policy = match state.refresh_policy {
                 RefreshPolicy::FastOnly => RefreshPolicy::FullOnWake,
                 RefreshPolicy::FullOnWake => RefreshPolicy::FullEveryTen,
                 RefreshPolicy::FullEveryTen => RefreshPolicy::FastOnly,
             };
-        }
-        _ => {
-            state.view = AppView::Home;
-            state.selection = 2;
         }
     }
     state
@@ -752,11 +753,11 @@ mod tests {
     fn home_navigation_opens_primary_views() {
         assert_eq!(
             press(ReaderState::boot(), Button::Confirm).view,
-            AppView::Library
+            AppView::Reading
         );
         assert_eq!(
             press(ReaderState::boot(), Button::Back).view,
-            AppView::Reading
+            AppView::Library
         );
         assert_eq!(
             press(ReaderState::boot(), Button::Previous).view,
@@ -780,8 +781,8 @@ mod tests {
     }
 
     #[test]
-    fn library_selection_opens_sd_book() {
-        let state = press(ReaderState::boot(), Button::Confirm)
+    fn library_open_key_opens_sd_book() {
+        let state = press(ReaderState::boot(), Button::Back)
             .apply_library_event(CTX, LibraryEvent::Scanned { count: 2 });
         let state = press(press(state, Button::Next), Button::Confirm);
         assert_eq!(state.view, AppView::Reading);
@@ -789,8 +790,8 @@ mod tests {
     }
 
     #[test]
-    fn library_back_returns_home_without_opening() {
-        let state = press(ReaderState::boot(), Button::Confirm)
+    fn library_back_key_returns_home_without_opening() {
+        let state = press(ReaderState::boot(), Button::Back)
             .apply_library_event(CTX, LibraryEvent::Scanned { count: 2 });
         let state = press(press(state, Button::Next), Button::Back);
         assert_eq!(state.view, AppView::Home);
@@ -814,6 +815,7 @@ mod tests {
         state.view = AppView::Reading;
         state.book_id = 1;
         let state = press(state, Button::Confirm);
+        assert_eq!(state.view, AppView::Chapters);
         let state = press(press(state, Button::Next), Button::Confirm);
         assert_eq!(state.view, AppView::Reading);
         assert_eq!(state.chapter, 1);
@@ -878,7 +880,7 @@ mod tests {
 
     #[test]
     fn catalog_scan_does_not_auto_open_from_files() {
-        let state = press(ReaderState::boot(), Button::Confirm);
+        let state = press(ReaderState::boot(), Button::Back);
         assert_eq!(state.view, AppView::Library);
         assert!(!state.read_request_pending);
 
@@ -889,8 +891,8 @@ mod tests {
     }
 
     #[test]
-    fn library_confirm_before_scan_stays_in_files() {
-        let state = press(ReaderState::boot(), Button::Confirm);
+    fn library_open_before_scan_stays_in_files() {
+        let state = press(ReaderState::boot(), Button::Back);
         let state = press(state, Button::Confirm);
         assert_eq!(state.view, AppView::Library);
         assert_eq!(state.book_id, 1);
@@ -901,13 +903,15 @@ mod tests {
     }
 
     #[test]
-    fn settings_cycle_orientation_and_refresh_policy() {
+    fn settings_change_key_cycles_orientation_and_refresh_policy() {
         let state = press(ReaderState::boot(), Button::Next);
         let state = press(state, Button::Confirm);
         assert_eq!(state.orientation, DisplayOrientation::LandscapeButtonsTop);
         let state = press(state, Button::Next);
         let state = press(state, Button::Confirm);
         assert_eq!(state.refresh_policy, RefreshPolicy::FullEveryTen);
+        let state = press(state, Button::Back);
+        assert_eq!(state.view, AppView::Home);
     }
 
     #[test]

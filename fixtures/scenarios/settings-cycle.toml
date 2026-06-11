@@ -11,14 +11,11 @@ button = "Next"
 button = "Confirm"
 
 [[steps]]
-button = "Next"
-
-[[steps]]
-button = "Confirm"
+button = "Back"
 
 [expect]
 view = "Home"
-selection = 2
+selection = 0
 orientation = "LandscapeButtonsTop"
 refresh_policy = "FullEveryTen"
 last_refresh = "Full"

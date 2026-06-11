@@ -17,18 +17,22 @@ const DEMO_CHAPTERS: [UiTocItem<'static>; 4] = [
     UiTocItem {
         title: "Bring Up",
         level: 1,
+        page: 3,
     },
     UiTocItem {
         title: "Architecture",
         level: 1,
+        page: 9,
     },
     UiTocItem {
         title: "Power",
         level: 1,
+        page: 17,
     },
     UiTocItem {
         title: "Next Phase",
         level: 1,
+        page: 24,
     },
 ];
 

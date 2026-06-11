@@ -98,6 +98,8 @@ pub(crate) struct ReaderCover<'a> {
 pub(crate) struct TocItem<'a> {
     pub(crate) title: &'a str,
     pub(crate) level: u8,
+    /// 1-based book page the chapter starts on; 0 when unknown.
+    pub(crate) page: u32,
 }
 
 pub(crate) struct ReaderStore {
@@ -548,6 +550,7 @@ impl ReaderStore {
         Some(TocItem {
             title: self.toc_title(index),
             level: self.toc[index].level.max(1),
+            page: u32::from(self.toc_page[index]) + 1,
         })
     }
 

@@ -25,6 +25,7 @@ pub(crate) fn render(fb: &mut Framebuffer, request: RenderRequest, sd_library: &
         let mut chapters = [UiTocItem {
             title: "",
             level: 1,
+            page: 0,
         }; MAX_UI_CHAPTERS];
         let model = ui_model(request, sd_library, &mut library_entries, &mut chapters);
         app_render::render_request(fb, request, &model);
@@ -40,6 +41,7 @@ pub(crate) fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, sd_libr
     let mut chapters = [UiTocItem {
         title: "",
         level: 1,
+        page: 0,
     }; MAX_UI_CHAPTERS];
     let model = ui_model(request, sd_library, &mut library_entries, &mut chapters);
     app_render::render_sleep(fb, request, &model);
@@ -105,6 +107,7 @@ fn fill_chapters<'a>(
                 *item = UiTocItem {
                     title: toc_item.title,
                     level: toc_item.level,
+                    page: toc_item.page,
                 };
             }
         }
@@ -116,10 +119,11 @@ fn fill_chapters<'a>(
             .max(1)
             .min(chapters.len() as u8) as usize;
         for item in chapters.iter_mut().take(count) {
-            // Empty titles render as numbered chapters in the chapters view.
+            // Empty titles render as numbered chapters in the contents view.
             *item = UiTocItem {
                 title: "",
                 level: 1,
+                page: 0,
             };
         }
         return count;
@@ -131,6 +135,7 @@ fn fill_chapters<'a>(
             *item = UiTocItem {
                 title: chapter.title,
                 level: 1,
+                page: 0,
             };
         }
     }
@@ -166,16 +171,15 @@ fn draw_sd_reader_page(fb: &mut Framebuffer, request: RenderRequest, sd_library:
     }
 }
 
+/// The reading page is full bleed; its only resident furniture is the
+/// page-in-chapter counter, set in the 16px apparatus size.
 fn draw_reader_footer(
     fb: &mut Framebuffer,
     request: RenderRequest,
     sd_library: &ReaderStore,
     page_count: u32,
 ) {
-    let title_font = literata(FontStyle::Italic);
-    let label_font = literata(FontStyle::Regular);
-    let fallback = catalog::active_book(request.book_id);
-    let (title, _) = sd_library.active_book_labels(request.book_id, fallback.title, "");
+    let label_font = display::font::literata_small(FontStyle::Regular);
 
     let section_total = if sd_library.current_section_page_count > 0 {
         sd_library.current_section_page_count as u32
@@ -199,8 +203,6 @@ fn draw_reader_footer(
     let footer_y = 477;
     let footer_pad = 16;
     let label_x = READER_RIGHT_X - label_width - footer_pad;
-    let title_right = label_x - 14;
-    draw_text_centered_truncated_local(fb, title_font, title, footer_pad, title_right, footer_y);
     draw_text(fb, label_font, label.as_str(), label_x, footer_y, false);
 }
 

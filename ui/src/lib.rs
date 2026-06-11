@@ -59,6 +59,8 @@ pub struct UiBook<'a> {
 pub struct UiTocItem<'a> {
     pub title: &'a str,
     pub level: u8,
+    /// 1-based book page the chapter starts on; 0 when unknown.
+    pub page: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,6 +69,9 @@ pub struct UiShell<'a> {
     pub orientation: UiOrientation,
     pub refresh_policy: UiRefreshPolicy,
     pub selection: u8,
+    pub chapter: u8,
+    pub page: u32,
+    pub page_count: u32,
     pub battery_percent: u8,
     pub active_book: UiBook<'a>,
     pub library_status: UiLibraryStatus,

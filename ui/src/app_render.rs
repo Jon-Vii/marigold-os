@@ -4,7 +4,8 @@ use crate::{
 };
 use app_core::{AppView, Button, DisplayOrientation, RefreshPolicy, RenderRequest};
 use display::fb::Framebuffer;
-use display::render::{draw_ascii, fill_rect, stroke_rect};
+use display::font::{draw_text, literata_display, literata_small, measure_text, FontStyle};
+use display::render::{draw_ascii, fill_rect};
 use display::{Rect, HEIGHT, WIDTH};
 
 #[derive(Clone, Copy, Debug)]
@@ -26,6 +27,9 @@ pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRe
         orientation: ui_orientation(request.orientation),
         refresh_policy: ui_refresh_policy(request.refresh_policy),
         selection: request.selection,
+        chapter: request.chapter,
+        page: request.page,
+        page_count: request.page_count,
         battery_percent: request.battery_percent,
         active_book: model.active_book,
         library_status: model.library_status,
@@ -35,28 +39,105 @@ pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRe
     render_shell(fb, &shell);
 }
 
+/// The sleep bookplate: no key is listening, so there is no margin
+/// rail — the one ceremonial centered screen. Same furniture as home
+/// (caps author, progress rule, italic chapter name), centered. No
+/// battery; a days-old panel image must not show stale numbers.
 pub fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, model: &UiRenderModel<'_>) {
     fb.clear(true);
-    stroke_rect(fb, Rect::new(0, 0, WIDTH as u16, HEIGHT as u16), false);
-    draw_ascii(fb, "SLEEPING", 360, 144, false);
-    draw_ascii_centered(fb, model.active_book.title, 216);
-    draw_ascii_centered(fb, model.active_book.author, 248);
-    draw_progress_bar(
-        fb,
-        Rect::new(252, 286, 296, 6),
-        model.active_book.progress_permille,
-    );
-    draw_ascii(fb, "PRESS POWER TO WAKE", 320, 340, false);
+    draw_font_centered_fit(fb, literata_display(), model.active_book.title, 400, 204, 720);
+    if !model.active_book.author.is_empty() {
+        let caps = literata_small(FontStyle::Regular);
+        let width = crate::render::ls_width(caps, model.active_book.author, 3);
+        crate::render::ls_caps(
+            fb,
+            caps,
+            model.active_book.author,
+            400 - width / 2,
+            246,
+            3,
+        );
+    }
 
-    let mut percent = [0u8; 10];
-    draw_ascii(
+    let permille = if request.page_count > 1 {
+        (((request.page + 1).min(request.page_count) as u64 * 1000) / request.page_count as u64)
+            as u16
+    } else {
+        model.active_book.progress_permille
+    };
+    crate::render::progress_rule(fb, 280, 302, 240, permille);
+
+    let colophon_w = crate::render::chapter_colophon_width(model.chapters, request.chapter, 600);
+    crate::render::draw_chapter_colophon(
         fb,
-        fmt_percent(request.battery_percent, &mut percent),
-        688,
-        28,
-        false,
+        model.chapters,
+        request.chapter,
+        400 - colophon_w / 2,
+        340,
+        600,
     );
-    draw_battery_icon(fb, 736, 26, battery_bars(request.battery_percent));
+
+    draw_font_centered_fit(
+        fb,
+        literata_small(FontStyle::Regular),
+        "\u{00B7} asleep \u{00B7}",
+        400,
+        456,
+        600,
+    );
+    mirror_framebuffer_long_axis(fb);
+}
+
+fn draw_font_centered_fit(
+    fb: &mut Framebuffer,
+    font: &display::font::BitmapFont,
+    text: &str,
+    cx: i16,
+    y: i16,
+    max_w: u16,
+) {
+    let mut shown = text;
+    while measure_text(font, shown) > max_w && !shown.is_empty() {
+        let mut end = shown.len() - 1;
+        while end > 0 && !shown.is_char_boundary(end) {
+            end -= 1;
+        }
+        shown = shown[..end].trim_end();
+    }
+    let x = cx - measure_text(font, shown) as i16 / 2;
+    draw_text(fb, font, shown, x, y, false);
+}
+
+fn push_bytes(buf: &mut [u8], cursor: &mut usize, value: &str) {
+    for byte in value.bytes() {
+        if *cursor >= buf.len() {
+            return;
+        }
+        buf[*cursor] = byte;
+        *cursor += 1;
+    }
+}
+
+fn push_number(buf: &mut [u8], cursor: &mut usize, value: usize) {
+    let mut digits = [0u8; 20];
+    let mut len = 0;
+    let mut value = value;
+    if value == 0 {
+        digits[0] = b'0';
+        len = 1;
+    }
+    while value > 0 && len < digits.len() {
+        digits[len] = b'0' + (value % 10) as u8;
+        value /= 10;
+        len += 1;
+    }
+    for index in (0..len).rev() {
+        if *cursor >= buf.len() {
+            return;
+        }
+        buf[*cursor] = digits[index];
+        *cursor += 1;
+    }
 }
 
 fn render_builtin_reading(fb: &mut Framebuffer, request: RenderRequest, model: &UiRenderModel<'_>) {
@@ -107,46 +188,6 @@ fn ui_refresh_policy(policy: RefreshPolicy) -> UiRefreshPolicy {
     }
 }
 
-fn draw_ascii_centered(fb: &mut Framebuffer, text: &str, y: usize) {
-    draw_ascii(fb, text, centered_x_for(WIDTH, text), y, false);
-}
-
-fn centered_x_for(width: usize, text: &str) -> usize {
-    width.saturating_sub(text.len() * 8) / 2
-}
-
-fn draw_progress_bar(fb: &mut Framebuffer, rect: Rect, permille: u16) {
-    stroke_rect(fb, rect, false);
-    let inner_w = rect.w.saturating_sub(2);
-    let fill_w = ((inner_w as u32 * permille.min(1000) as u32) / 1000) as u16;
-    if fill_w > 0 {
-        fill_rect(
-            fb,
-            Rect::new(rect.x + 1, rect.y + 1, fill_w, rect.h.saturating_sub(2)),
-            false,
-        );
-    }
-}
-
-fn draw_battery_icon(fb: &mut Framebuffer, x: u16, y: u16, bars: u8) {
-    stroke_rect(fb, Rect::new(x, y, 42, 18), false);
-    fill_rect(fb, Rect::new(x + 42, y + 5, 4, 8), false);
-    let bars = bars.min(4);
-    for index in 0..bars {
-        fill_rect(fb, Rect::new(x + 4 + index as u16 * 9, y + 4, 6, 10), false);
-    }
-}
-
-fn battery_bars(percent: u8) -> u8 {
-    match percent {
-        0..=10 => 0,
-        11..=35 => 1,
-        36..=60 => 2,
-        61..=85 => 3,
-        _ => 4,
-    }
-}
-
 fn mirror_framebuffer_long_axis(fb: &mut Framebuffer) {
     for y in 0..HEIGHT / 2 {
         let other_y = HEIGHT - 1 - y;
@@ -184,13 +225,3 @@ fn fmt_u32(n: u32, buf: &mut [u8; 10]) -> &str {
     core::str::from_utf8(&buf[i..]).unwrap_or("?")
 }
 
-fn fmt_percent(n: u8, buf: &mut [u8; 10]) -> &str {
-    let mut tmp = [0u8; 10];
-    let number = fmt_u32(n as u32, &mut tmp).as_bytes();
-    if number.len() + 1 > buf.len() {
-        return "?";
-    }
-    buf[..number.len()].copy_from_slice(number);
-    buf[number.len()] = b'%';
-    core::str::from_utf8(&buf[..number.len() + 1]).unwrap_or("?")
-}

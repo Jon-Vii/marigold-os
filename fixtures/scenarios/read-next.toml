@@ -1,5 +1,5 @@
 [[steps]]
-button = "Confirm"
+button = "Back"
 
 [[steps]]
 library = "Scanned"

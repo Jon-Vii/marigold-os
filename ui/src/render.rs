@@ -1,221 +1,527 @@
-use crate::{UiCover, UiLibraryStatus, UiOrientation, UiRefreshPolicy, UiShell, UiTocItem, UiView};
+//! The Imprint shell: the UI is typeset like a fine book. Three text
+//! voices — upright body for content, italic for the book's voice,
+//! letterspaced small caps for the device's voice (headings and the
+//! margin keys). The four left-bezel buttons get em-dash margin notes
+//! aligned beside them (KEY_YS); key order is semantic: slot 1 is the
+//! screen's primary action (bold caps), slot 2 the way elsewhere/out,
+//! slots 3-4 the paired browse keys. Apparatus shows battery percent
+//! only — the device does not tell time.
+
+use crate::{UiLibraryStatus, UiOrientation, UiRefreshPolicy, UiShell, UiTocItem, UiView};
 use display::fb::Framebuffer;
-use display::font::{draw_text, literata, measure_text, BitmapFont, FontStyle};
-use display::render::{fill_rect, stroke_rect};
+use display::font::{
+    draw_text, literata, literata_display, literata_small, measure_text, BitmapFont, FontStyle,
+};
+use display::render::fill_rect;
 use display::{Rect, HEIGHT, WIDTH};
 
-const HOME_ITEMS: [&str; 4] = ["Read", "Files", "Sync", "Settings"];
-const SETTINGS_ITEMS: [&str; 3] = ["ORIENTATION", "REFRESH", "BACK TO HOME"];
+/// Vertical centers of the four left-bezel buttons on screen,
+/// top to bottom: Back, Confirm, Previous, Next.
+const KEY_YS: [i16; 4] = [120, 200, 280, 360];
+const KEY_DASH_X: i16 = 10;
+const KEY_LABEL_X: i16 = 40;
+const CONTENT_X: i16 = 210;
+const CONTENT_RIGHT: i16 = 740;
+const HEADING_CX: i16 = 480;
+const ROW_STEP: i16 = 56;
+const FIRST_ROW_Y: i16 = 118;
+const VISIBLE_ROWS: usize = 6;
+const FOOTER_Y: i16 = 456;
+
 pub fn render_shell(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     fb.clear(true);
     match shell.view {
         UiView::Home => render_home(fb, shell),
         UiView::Library => render_library(fb, shell),
-        UiView::Chapters => render_chapters_landscape(fb, shell),
-        UiView::Sync => render_sync(fb),
+        UiView::Chapters => render_chapters(fb, shell),
+        UiView::Sync => render_sync(fb, shell),
         UiView::Settings => render_settings(fb, shell),
     }
 }
 
 pub fn render_shell_overlay(fb: &mut Framebuffer, shell: &UiShell<'_>) {
-    match shell.view {
-        UiView::Home => render_home(fb, shell),
-        UiView::Library => render_library(fb, shell),
-        UiView::Chapters => render_chapters_landscape(fb, shell),
-        UiView::Sync => render_sync(fb),
-        UiView::Settings => render_settings(fb, shell),
+    render_shell(fb, shell);
+}
+
+/// Home is a title page: big title, the author in letterspaced caps,
+/// the progress rule, and a colophon in chapter-and-pages terms.
+fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>) {
+    fb.clear(true);
+    dash_key(fb, 0, "library", false);
+    dash_key(fb, 1, "continue", true);
+    dash_key(fb, 2, "sync", false);
+    dash_key(fb, 3, "settings", false);
+
+    draw_text_truncated(
+        fb,
+        literata_display(),
+        shell.active_book.title,
+        CONTENT_X,
+        180,
+        (CONTENT_RIGHT - CONTENT_X) as usize,
+        false,
+    );
+    if !shell.active_book.author.is_empty() {
+        ls_caps(
+            fb,
+            literata_small(FontStyle::Regular),
+            shell.active_book.author,
+            CONTENT_X,
+            222,
+            3,
+        );
+    }
+
+    let permille = if shell.page_count > 1 {
+        (((shell.page + 1).min(shell.page_count) as u64 * 1000) / shell.page_count as u64) as u16
+    } else {
+        shell.active_book.progress_permille
+    };
+    progress_rule(fb, CONTENT_X, 280, 240, permille);
+
+    // Colophon: the chapter name alone, in the book's italic voice —
+    // the progress rule already answers "how far". Roman numeral
+    // fallback when the book has no usable chapter title.
+    draw_chapter_colophon(
+        fb,
+        shell.chapters,
+        shell.chapter,
+        CONTENT_X,
+        312,
+        CONTENT_RIGHT - CONTENT_X,
+    );
+
+    draw_battery_percent(fb, shell.battery_percent);
+    mirror_framebuffer_long_axis(fb);
+}
+
+pub(crate) fn draw_chapter_colophon(
+    fb: &mut Framebuffer,
+    chapters: &[UiTocItem<'_>],
+    chapter: u8,
+    x: i16,
+    baseline: i16,
+    max_w: i16,
+) -> i16 {
+    let chapter_name = chapters
+        .get(chapter as usize)
+        .map(|item| item.title)
+        .unwrap_or("");
+    if chapter_name.is_empty() {
+        let mut numeral = [0u8; 16];
+        let mut cursor = 0;
+        push_roman(&mut numeral, &mut cursor, chapter as usize + 1);
+        let numeral = core::str::from_utf8(&numeral[..cursor]).unwrap_or("");
+        draw_text(
+            fb,
+            literata_small(FontStyle::Regular),
+            numeral,
+            x,
+            baseline,
+            false,
+        )
+    } else {
+        let italic = literata_small(FontStyle::Italic);
+        let shown = fit_text(italic, chapter_name, max_w.max(60) as u16);
+        draw_text(fb, italic, shown, x, baseline, false)
     }
 }
 
-fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>) {
-    fb.clear(true);
-    let title_font = literata(FontStyle::Bold);
-    let body_font = literata(FontStyle::Regular);
-    draw_battery_landscape_minimal(fb, 726, 28, shell.battery_percent);
-    draw_dock_clean_rail(fb, 30, 58, 258, 340);
-    draw_section_divider(fb, 330, 58, 340);
-    draw_home_cover(fb, 448, 48, 202, 303, shell.active_book.cover);
-    draw_text_centered_fit(fb, title_font, shell.active_book.title, 549, 394, 300);
-    draw_text_centered_fit(fb, body_font, shell.active_book.author, 549, 424, 260);
-    draw_home_progress(fb, 494, 454, 110, shell.active_book.progress_permille);
-    mirror_framebuffer_long_axis(fb);
+/// Width the colophon will occupy, for centered layouts.
+pub(crate) fn chapter_colophon_width(
+    chapters: &[UiTocItem<'_>],
+    chapter: u8,
+    max_w: i16,
+) -> i16 {
+    let chapter_name = chapters
+        .get(chapter as usize)
+        .map(|item| item.title)
+        .unwrap_or("");
+    if chapter_name.is_empty() {
+        let mut numeral = [0u8; 16];
+        let mut cursor = 0;
+        push_roman(&mut numeral, &mut cursor, chapter as usize + 1);
+        let numeral = core::str::from_utf8(&numeral[..cursor]).unwrap_or("");
+        measure_text(literata_small(FontStyle::Regular), numeral) as i16
+    } else {
+        let italic = literata_small(FontStyle::Italic);
+        let shown = fit_text(italic, chapter_name, max_w.max(60) as u16);
+        measure_text(italic, shown) as i16
+    }
+}
+
+/// The 1px rule with a 3px head filled to the reading position.
+pub(crate) fn progress_rule(fb: &mut Framebuffer, x: i16, y: i16, w: i16, permille: u16) {
+    hline(fb, x, y, w);
+    let fill = ((w as i32 * permille.min(1000) as i32) / 1000) as i16;
+    fill_rect(
+        fb,
+        Rect::new(x as u16, (y - 1) as u16, fill.max(2) as u16, 3),
+        false,
+    );
+}
+
+fn push_roman(buf: &mut [u8], cursor: &mut usize, value: usize) {
+    const PAIRS: [(usize, &str); 9] = [
+        (100, "C"),
+        (90, "XC"),
+        (50, "L"),
+        (40, "XL"),
+        (10, "X"),
+        (9, "IX"),
+        (5, "V"),
+        (4, "IV"),
+        (1, "I"),
+    ];
+    let mut remaining = value.min(399);
+    for (weight, glyphs) in PAIRS {
+        while remaining >= weight {
+            push_str(buf, cursor, glyphs);
+            remaining -= weight;
+        }
+    }
 }
 
 fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     fb.clear(true);
-    let title_font = literata(FontStyle::Bold);
-    let body_font = literata(FontStyle::Regular);
-    let meta_font = literata(FontStyle::Italic);
-    draw_text(fb, title_font, "Files", 58, 54, false);
-    draw_text(fb, meta_font, "/books, then card root", 58, 84, false);
-    draw_battery_landscape_minimal(fb, 718, 32, shell.battery_percent);
-    fill_rect(fb, Rect::new(58, 104, 684, 1), false);
+    dash_key(fb, 0, "home", false);
+    dash_key(fb, 1, "open", true);
+    dash_key(fb, 2, "previous", false);
+    dash_key(fb, 3, "next", false);
+    heading(fb, "Library");
 
     match shell.library_status {
         UiLibraryStatus::NotScanned | UiLibraryStatus::Scanning => {
-            mirror_framebuffer_long_axis(fb);
+            centered_note(fb, "reading the card\u{2026}");
+            finish_working_screen(fb, shell);
             return;
         }
         UiLibraryStatus::Error => {
-            draw_text(fb, body_font, "Library unavailable", 58, 190, false);
-            draw_text(fb, meta_font, "Storage catalog not loaded", 58, 224, false);
-            mirror_framebuffer_long_axis(fb);
+            centered_note(fb, "the library is unavailable");
+            finish_working_screen(fb, shell);
             return;
         }
         UiLibraryStatus::Empty => {
-            draw_text(fb, body_font, "No books available", 58, 190, false);
-            draw_text(fb, meta_font, "Add EPUB files to /books", 58, 224, false);
-            mirror_framebuffer_long_axis(fb);
+            centered_note(fb, "no books \u{2014} add EPUB files to /books");
+            finish_working_screen(fb, shell);
             return;
         }
         UiLibraryStatus::Ready => {}
     }
-
     if shell.library_entries.is_empty() {
-        draw_text(fb, body_font, "No books available", 58, 190, false);
-        draw_text(fb, meta_font, "Add EPUB files to /books", 58, 224, false);
-        mirror_framebuffer_long_axis(fb);
+        centered_note(fb, "no books \u{2014} add EPUB files to /books");
+        finish_working_screen(fb, shell);
         return;
     }
 
-    let visible_rows = 8usize;
     let selected_index = shell.selection as usize;
-    let start = if selected_index >= visible_rows {
-        selected_index + 1 - visible_rows
+    let start = if selected_index >= VISIBLE_ROWS {
+        selected_index + 1 - VISIBLE_ROWS
     } else {
         0
     }
-    .min(shell.library_entries.len().saturating_sub(visible_rows));
-    let mut baseline_y = 142i16;
+    .min(shell.library_entries.len().saturating_sub(VISIBLE_ROWS));
+    let body = literata(FontStyle::Regular);
+    let mut y = FIRST_ROW_Y;
     for (index, entry) in shell
         .library_entries
         .iter()
         .enumerate()
         .skip(start)
-        .take(visible_rows)
+        .take(VISIBLE_ROWS)
     {
-        let selected = index == shell.selection as usize;
-        if selected {
-            fill_rect(fb, Rect::new(46, (baseline_y - 25) as u16, 708, 34), false);
-            draw_text(fb, body_font, ">", 60, baseline_y, true);
+        if index == selected_index {
+            selection_arrow(fb, y);
         }
-        draw_text_truncated(fb, body_font, entry, 92, baseline_y, 620, selected);
-        baseline_y += 38;
+        draw_text_truncated(
+            fb,
+            body,
+            entry,
+            CONTENT_X,
+            y,
+            (CONTENT_RIGHT - CONTENT_X) as usize,
+            false,
+        );
+        y += ROW_STEP;
     }
-    draw_text(fb, meta_font, "OK opens  Back returns", 58, 448, false);
-    mirror_framebuffer_long_axis(fb);
+
+    position_footer(fb, selected_index + 1, shell.library_entries.len());
+    finish_working_screen(fb, shell);
 }
 
-fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
-    fb.clear(true);
-    let title_font = literata(FontStyle::Bold);
-    let body_font = literata(FontStyle::Regular);
-    let meta_font = literata(FontStyle::Italic);
-    draw_text(fb, title_font, "Settings", 58, 54, false);
-    draw_battery_landscape_minimal(fb, 718, 32, shell.battery_percent);
-    fill_rect(fb, Rect::new(58, 104, 684, 1), false);
+// The contents page uses tight index rows — a real table of contents,
+// not a menu: title, dot leaders, the chapter's book page right-aligned.
+const TOC_ROW_STEP: i16 = 36;
+const TOC_VISIBLE_ROWS: usize = 9;
 
-    let values = [
-        orientation_label(shell.orientation),
-        refresh_policy_label(shell.refresh_policy),
-        "",
-    ];
-    let mut baseline_y = 156i16;
-    for (index, item) in SETTINGS_ITEMS.iter().enumerate() {
-        let selected = index == shell.selection as usize;
-        if selected {
-            fill_rect(fb, Rect::new(46, (baseline_y - 25) as u16, 708, 34), false);
-        }
-        if selected {
-            draw_text(fb, body_font, ">", 60, baseline_y, true);
-        }
-        draw_text(fb, body_font, item, 92, baseline_y, selected);
-        if !values[index].is_empty() {
-            draw_text_truncated(fb, meta_font, values[index], 410, baseline_y, 300, selected);
-        }
-        baseline_y += 54;
-    }
-    mirror_framebuffer_long_axis(fb);
-}
-
-fn render_sync(fb: &mut Framebuffer) {
+fn render_chapters(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     fb.clear(true);
-    let title_font = literata(FontStyle::Bold);
-    let body_font = literata(FontStyle::Regular);
-    let meta_font = literata(FontStyle::Italic);
-    draw_text(fb, title_font, "Sync", 58, 54, false);
-    fill_rect(fb, Rect::new(58, 104, 684, 1), false);
-    draw_text(fb, body_font, "Not configured", 58, 190, false);
-    draw_text(fb, meta_font, "Back returns", 58, 448, false);
-    mirror_framebuffer_long_axis(fb);
-}
+    dash_key(fb, 0, "close", false);
+    dash_key(fb, 1, "open", true);
+    dash_key(fb, 2, "previous", false);
+    dash_key(fb, 3, "next", false);
+    heading(fb, "Contents");
 
-fn render_chapters_landscape(fb: &mut Framebuffer, shell: &UiShell<'_>) {
-    fb.clear(true);
-    let title_font = literata(FontStyle::Bold);
-    let body_font = literata(FontStyle::Regular);
-    let meta_font = literata(FontStyle::Italic);
-    draw_text(fb, title_font, "Chapters", 58, 54, false);
-    draw_text_truncated(fb, body_font, shell.active_book.title, 58, 84, 500, false);
-    draw_battery_landscape_minimal(fb, 718, 32, shell.battery_percent);
-    fill_rect(fb, Rect::new(58, 104, 684, 1), false);
     if shell.chapters.is_empty() {
-        draw_text(fb, body_font, "No chapters found", 58, 190, false);
+        centered_note(fb, "no chapters found");
+        finish_working_screen(fb, shell);
         return;
     }
+
     let selected = (shell.selection as usize).min(shell.chapters.len().saturating_sub(1));
-    let first = selected.saturating_sub(5);
-    let visible_count = 9usize;
-    let mut baseline_y = 142i16;
+    let start = if selected >= TOC_VISIBLE_ROWS {
+        selected + 1 - TOC_VISIBLE_ROWS
+    } else {
+        0
+    }
+    .min(shell.chapters.len().saturating_sub(TOC_VISIBLE_ROWS));
+    let mut y = FIRST_ROW_Y;
     for (index, item) in shell
         .chapters
         .iter()
         .enumerate()
-        .skip(first)
-        .take(visible_count)
+        .skip(start)
+        .take(TOC_VISIBLE_ROWS)
     {
-        draw_literata_toc_item(fb, body_font, item, index, index == selected, baseline_y);
-        baseline_y += 34;
+        if index == selected {
+            selection_arrow(fb, y);
+        }
+        draw_toc_row(fb, item, index, y);
+        y += TOC_ROW_STEP;
     }
-    let mut counter = [0u8; 32];
-    let counter = fmt_chapter_counter(selected + 1, shell.chapters.len(), &mut counter);
-    draw_text(fb, meta_font, counter, 58, 448, false);
-    draw_text(fb, meta_font, "OK opens  Back returns", 516, 448, false);
-    mirror_framebuffer_long_axis(fb);
+
+    position_footer(fb, selected + 1, shell.chapters.len());
+    finish_working_screen(fb, shell);
 }
 
-fn draw_literata_toc_item(
+fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
+    fb.clear(true);
+    dash_key(fb, 0, "home", false);
+    dash_key(fb, 1, "change", true);
+    dash_key(fb, 2, "previous", false);
+    dash_key(fb, 3, "next", false);
+    heading(fb, "Settings");
+
+    index_row(
+        fb,
+        "Orientation",
+        orientation_label(shell.orientation),
+        FIRST_ROW_Y,
+        shell.selection == 0,
+    );
+    index_row(
+        fb,
+        "Refresh",
+        refresh_policy_label(shell.refresh_policy),
+        FIRST_ROW_Y + 64,
+        shell.selection == 1,
+    );
+
+    finish_working_screen(fb, shell);
+}
+
+fn render_sync(fb: &mut Framebuffer, shell: &UiShell<'_>) {
+    fb.clear(true);
+    dash_key(fb, 0, "home", false);
+    dash_unused(fb, 1);
+    dash_unused(fb, 2);
+    dash_unused(fb, 3);
+    heading(fb, "Sync");
+
+    centered_note(fb, "sync is not configured");
+    draw_text_centered(
+        fb,
+        literata_small(FontStyle::Italic),
+        "add EPUB files to /books on the card",
+        HEADING_CX,
+        280,
+    );
+
+    finish_working_screen(fb, shell);
+}
+
+// ------------------------------------------------------------------
+// Imprint furniture
+// ------------------------------------------------------------------
+
+/// An em-dash faces the physical button; the label is letterspaced
+/// small caps, bold for the screen's one primary action.
+fn dash_key(fb: &mut Framebuffer, slot: usize, label: &str, primary: bool) {
+    let y = KEY_YS[slot];
+    draw_text(
+        fb,
+        literata(FontStyle::Regular),
+        "\u{2014}",
+        KEY_DASH_X,
+        y + 8,
+        false,
+    );
+    let style = if primary {
+        FontStyle::Bold
+    } else {
+        FontStyle::Regular
+    };
+    ls_caps(fb, literata_small(style), label, KEY_LABEL_X, y + 6, 2);
+}
+
+/// An unused key keeps its bare dash: the mark stays, the word goes.
+fn dash_unused(fb: &mut Framebuffer, slot: usize) {
+    draw_text(
+        fb,
+        literata(FontStyle::Regular),
+        "\u{2014}",
+        KEY_DASH_X,
+        KEY_YS[slot] + 8,
+        false,
+    );
+}
+
+fn heading(fb: &mut Framebuffer, text: &str) {
+    let small = literata_small(FontStyle::Regular);
+    let width = ls_width(small, text, 5);
+    ls_caps(fb, small, text, HEADING_CX - width / 2, 42, 5);
+    hline(fb, HEADING_CX - 160, 56, 320);
+}
+
+/// Letterspaced all-caps, the small-caps stand-in for this bitmap set.
+pub(crate) fn ls_caps(
     fb: &mut Framebuffer,
     font: &BitmapFont,
-    item: &UiTocItem<'_>,
-    index: usize,
-    selected: bool,
-    baseline_y: i16,
+    text: &str,
+    x: i16,
+    baseline: i16,
+    extra: i16,
 ) {
-    let indent = 58 + (item.level.saturating_sub(1) as u16 * 18);
-    if selected {
-        fill_rect(fb, Rect::new(46, (baseline_y - 24) as u16, 708, 31), false);
+    let mut cursor = x;
+    for ch in text.chars() {
+        let upper = ch.to_ascii_uppercase();
+        let mut buf = [0u8; 4];
+        let glyph = upper.encode_utf8(&mut buf);
+        cursor = draw_text(fb, font, glyph, cursor, baseline, false) + extra;
     }
-    if selected {
-        draw_text(fb, font, ">", 60, baseline_y, true);
+}
+
+pub(crate) fn ls_width(font: &BitmapFont, text: &str, extra: i16) -> i16 {
+    let mut width = 0i16;
+    let mut count = 0i16;
+    for ch in text.chars() {
+        let upper = ch.to_ascii_uppercase();
+        let mut buf = [0u8; 4];
+        let glyph = upper.encode_utf8(&mut buf);
+        width += measure_text(font, glyph) as i16;
+        count += 1;
     }
-    // Untitled entries (no TOC in the book, or budget-truncated records) are
-    // presented by position so every chapter stays reachable and labeled.
+    width + (count - 1).max(0) * extra
+}
+
+/// Name, dot leaders, italic value right-aligned: the index pattern
+/// shared by every list screen.
+fn index_row(fb: &mut Framebuffer, name: &str, value: &str, y: i16, selected: bool) {
+    if selected {
+        selection_arrow(fb, y);
+    }
+    let body = literata(FontStyle::Regular);
+    let end_x = draw_text(fb, body, name, CONTENT_X, y, false);
+    let value_font = literata(FontStyle::Italic);
+    let value_w = measure_text(value_font, value) as i16;
+    let mut dx = end_x + 16;
+    while dx < CONTENT_RIGHT - value_w - 14 {
+        fill_rect(fb, Rect::new(dx as u16, (y - 2) as u16, 1, 1), false);
+        dx += 8;
+    }
+    draw_text(fb, value_font, value, CONTENT_RIGHT - value_w, y, false);
+}
+
+fn draw_toc_row(fb: &mut Framebuffer, item: &UiTocItem<'_>, index: usize, y: i16) {
+    let body = literata(FontStyle::Regular);
+    let indent = CONTENT_X + (item.level.saturating_sub(1) as i16 * 18);
     let mut numbered = [0u8; 32];
     let title = if item.title.is_empty() {
         fmt_numbered_chapter(index + 1, &mut numbered)
     } else {
         item.title
     };
-    draw_text_truncated(
+
+    if item.page == 0 {
+        draw_text_truncated(
+            fb,
+            body,
+            title,
+            indent,
+            y,
+            (CONTENT_RIGHT - indent).max(0) as usize,
+            false,
+        );
+        return;
+    }
+
+    let mut page_buf = [0u8; 16];
+    let mut cursor = 0;
+    push_usize(&mut page_buf, &mut cursor, item.page as usize);
+    let page = core::str::from_utf8(&page_buf[..cursor]).unwrap_or("");
+    let page_w = measure_text(body, page) as i16;
+
+    let title_max = (CONTENT_RIGHT - indent - page_w - 40).max(40) as usize;
+    let shown = fit_text(body, title, title_max as u16);
+    let end_x = draw_text(fb, body, shown, indent, y, false);
+    let mut dx = end_x + 16;
+    while dx < CONTENT_RIGHT - page_w - 14 {
+        fill_rect(fb, Rect::new(dx as u16, (y - 2) as u16, 1, 1), false);
+        dx += 8;
+    }
+    draw_text(fb, body, page, CONTENT_RIGHT - page_w, y, false);
+}
+
+fn selection_arrow(fb: &mut Framebuffer, y: i16) {
+    draw_text(fb, literata(FontStyle::Regular), "\u{2192}", 178, y, false);
+}
+
+fn centered_note(fb: &mut Framebuffer, text: &str) {
+    draw_text_centered(fb, literata(FontStyle::Italic), text, HEADING_CX, 230);
+}
+
+/// "– n of m –" centered on the content column.
+fn position_footer(fb: &mut Framebuffer, current: usize, total: usize) {
+    let mut buf = [0u8; 32];
+    let mut cursor = 0;
+    push_str(&mut buf, &mut cursor, "\u{2013} ");
+    push_usize(&mut buf, &mut cursor, current);
+    push_str(&mut buf, &mut cursor, " of ");
+    push_usize(&mut buf, &mut cursor, total);
+    push_str(&mut buf, &mut cursor, " \u{2013}");
+    let label = core::str::from_utf8(&buf[..cursor]).unwrap_or("");
+    draw_text_centered(
         fb,
-        font,
-        title,
-        (indent + 34) as i16,
-        baseline_y,
-        650usize.saturating_sub(indent as usize),
-        selected,
+        literata_small(FontStyle::Regular),
+        label,
+        HEADING_CX,
+        FOOTER_Y,
     );
+}
+
+fn draw_battery_percent(fb: &mut Framebuffer, percent: u8) {
+    let mut buf = [0u8; 8];
+    let mut cursor = 0;
+    push_usize(&mut buf, &mut cursor, percent.min(100) as usize);
+    push_str(&mut buf, &mut cursor, "%");
+    let label = core::str::from_utf8(&buf[..cursor]).unwrap_or("");
+    let small = literata_small(FontStyle::Regular);
+    let width = measure_text(small, label) as i16;
+    draw_text(fb, small, label, CONTENT_RIGHT - width, FOOTER_Y, false);
+}
+
+fn finish_working_screen(fb: &mut Framebuffer, shell: &UiShell<'_>) {
+    draw_battery_percent(fb, shell.battery_percent);
+    mirror_framebuffer_long_axis(fb);
+}
+
+fn hline(fb: &mut Framebuffer, x: i16, y: i16, w: i16) {
+    fill_rect(fb, Rect::new(x as u16, y as u16, w as u16, 1), false);
+}
+
+fn draw_text_centered(fb: &mut Framebuffer, font: &BitmapFont, text: &str, cx: i16, y: i16) {
+    let x = cx - measure_text(font, text) as i16 / 2;
+    draw_text(fb, font, text, x, y, false);
 }
 
 fn fmt_numbered_chapter(number: usize, buf: &mut [u8; 32]) -> &str {
@@ -223,139 +529,6 @@ fn fmt_numbered_chapter(number: usize, buf: &mut [u8; 32]) -> &str {
     push_str(buf, &mut cursor, "Chapter ");
     push_usize(buf, &mut cursor, number);
     core::str::from_utf8(&buf[..cursor]).unwrap_or("Chapter")
-}
-
-fn draw_dock_clean_rail(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
-    stroke_rect(fb, Rect::new(x, y, w, h), false);
-    let row_h = h / HOME_ITEMS.len() as u16;
-    let separator_lengths = [180u16, 206, 168];
-    let font = literata(FontStyle::Regular);
-    for (index, label) in HOME_ITEMS.iter().enumerate() {
-        let row_y = y + index as u16 * row_h;
-        let center_y = row_y + row_h / 2;
-        if index > 0 {
-            let sep_w = separator_lengths[index - 1].min(w.saturating_sub(58));
-            let sep_x = x + 22 + (index as u16 % 2) * 10;
-            fill_rect(fb, Rect::new(sep_x, row_y, sep_w, 1), false);
-        }
-        draw_refined_left_notch(fb, x + 10, center_y - 15, index);
-        draw_text(fb, font, label, x as i16 + 46, center_y as i16 + 8, false);
-        draw_refined_button_well(fb, x + w - 48, center_y - 9, index);
-    }
-}
-
-fn draw_refined_left_notch(fb: &mut Framebuffer, x: u16, y: u16, index: usize) {
-    let stem_h = [30u16, 24, 28, 22][index.min(3)];
-    let arm_w = [18u16, 14, 20, 16][index.min(3)];
-    fill_rect(fb, Rect::new(x, y + (30 - stem_h) / 2, 3, stem_h), false);
-    fill_rect(fb, Rect::new(x + 6, y + 15, arm_w, 1), false);
-    if index.is_multiple_of(2) {
-        fill_rect(fb, Rect::new(x + 6, y + 7, 1, 16), false);
-    }
-}
-
-fn draw_refined_button_well(fb: &mut Framebuffer, x: u16, y: u16, index: usize) {
-    let widths = [28u16, 24, 30, 26];
-    let w = widths[index.min(3)];
-    let x = x + (30 - w);
-    stroke_rect(fb, Rect::new(x, y, w, 18), false);
-    fill_rect(fb, Rect::new(x + 5, y + 5, w - 10, 1), false);
-    if index != 1 {
-        fill_rect(fb, Rect::new(x + 5, y + 12, w - 10, 1), false);
-    }
-}
-
-fn draw_section_divider(fb: &mut Framebuffer, x: u16, y: u16, h: u16) {
-    fill_rect(fb, Rect::new(x, y, 1, h), false);
-    fill_rect(fb, Rect::new(x + 5, y + 34, 1, h - 68), false);
-}
-
-fn draw_cover_art_varied(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
-    stroke_rect(fb, Rect::new(x, y, w, h), false);
-    fill_rect(fb, Rect::new(x + 12, y + 14, w - 24, 1), false);
-    fill_rect(fb, Rect::new(x + 24, y + 42, w - 56, 2), false);
-    fill_rect(fb, Rect::new(x + 34, y + 70, w - 72, 1), false);
-    let line_specs = [
-        (104u16, 30u16, 122u16, 3u16),
-        (126, 44, 86, 2),
-        (148, 26, 138, 3),
-        (172, 58, 74, 2),
-        (194, 38, 112, 2),
-        (220, 50, 96, 3),
-        (246, 28, 130, 1),
-    ];
-    for (dy, inset, line_w, line_h) in line_specs {
-        if dy + 8 < h {
-            fill_rect(
-                fb,
-                Rect::new(
-                    x + inset,
-                    y + dy,
-                    line_w.min(w.saturating_sub(inset + 18)),
-                    line_h,
-                ),
-                false,
-            );
-        }
-    }
-    fill_rect(fb, Rect::new(x + 30, y + h - 48, w - 72, 1), false);
-    fill_rect(fb, Rect::new(x + 42, y + h - 34, w - 104, 2), false);
-}
-
-fn draw_home_cover(
-    fb: &mut Framebuffer,
-    x: u16,
-    y: u16,
-    w: u16,
-    h: u16,
-    cover: Option<UiCover<'_>>,
-) {
-    if let Some(cover) = cover {
-        if cover.width > 0 && cover.height > 0 && !cover.bits.is_empty() {
-            draw_cover_bitmap(fb, x, y, w, h, cover);
-            return;
-        }
-    }
-    draw_cover_art_varied(fb, x, y, w, h);
-}
-
-fn draw_cover_bitmap(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16, cover: UiCover<'_>) {
-    stroke_rect(fb, Rect::new(x, y, w, h), false);
-    let src_w = cover.width as usize;
-    let src_h = cover.height as usize;
-    let stride = cover.stride as usize;
-    let dst_w = w.saturating_sub(4).max(1) as usize;
-    let dst_h = h.saturating_sub(4).max(1) as usize;
-    let scale_x = dst_w * 1024 / src_w.max(1);
-    let scale_y = dst_h * 1024 / src_h.max(1);
-    let scale = scale_x.min(scale_y).max(1);
-    let scaled_w = (src_w * scale / 1024).max(1).min(dst_w);
-    let scaled_h = (src_h * scale / 1024).max(1).min(dst_h);
-    let ox = x as usize + 2 + (dst_w - scaled_w) / 2;
-    let oy = y as usize + 2 + (dst_h - scaled_h) / 2;
-
-    fill_rect(
-        fb,
-        Rect::new(ox as u16, oy as u16, scaled_w as u16, scaled_h as u16),
-        true,
-    );
-    for dy in 0..scaled_h {
-        let sy = dy * src_h / scaled_h;
-        for dx in 0..scaled_w {
-            let sx = dx * src_w / scaled_w;
-            if cover_bit(cover.bits, stride, sx, sy) {
-                fb.set_pixel(ox + dx, oy + dy, false);
-            }
-        }
-    }
-}
-
-fn cover_bit(bits: &[u8], stride: usize, x: usize, y: usize) -> bool {
-    let index = y.saturating_mul(stride).saturating_add(x / 8);
-    let Some(byte) = bits.get(index) else {
-        return false;
-    };
-    byte & (0x80 >> (x & 7)) != 0
 }
 
 fn mirror_framebuffer_long_axis(fb: &mut Framebuffer) {
@@ -368,36 +541,6 @@ fn mirror_framebuffer_long_axis(fb: &mut Framebuffer) {
             fb.set_pixel(x, other_y, top);
         }
     }
-}
-
-fn draw_battery_landscape_minimal(fb: &mut Framebuffer, x: u16, y: u16, percent: u8) {
-    stroke_rect(fb, Rect::new(x, y, 38, 16), false);
-    fill_rect(fb, Rect::new(x + 38, y + 5, 3, 6), false);
-    let fill_w = ((percent.min(100) as u16 * 30) / 100).max(1);
-    fill_rect(fb, Rect::new(x + 4, y + 4, fill_w, 8), false);
-}
-
-fn draw_home_progress(fb: &mut Framebuffer, x: u16, y: u16, w: u16, permille: u16) {
-    fill_rect(fb, Rect::new(x, y, w, 1), false);
-    let fill_w = ((w as u32 * permille.min(1000) as u32) / 1000) as u16;
-    fill_rect(
-        fb,
-        Rect::new(x, y.saturating_sub(1), fill_w.max(1), 3),
-        false,
-    );
-}
-
-fn draw_text_centered_fit(
-    fb: &mut Framebuffer,
-    font: &BitmapFont,
-    text: &str,
-    center_x: i16,
-    y: i16,
-    max_w: u16,
-) {
-    let text = fit_text(font, text, max_w);
-    let x = center_x - measure_text(font, text) as i16 / 2;
-    draw_text(fb, font, text, x, y, false);
 }
 
 fn draw_text_truncated(
@@ -413,7 +556,7 @@ fn draw_text_truncated(
     draw_text(fb, font, text, x, y, white);
 }
 
-fn fit_text<'a>(font: &BitmapFont, text: &'a str, max_w: u16) -> &'a str {
+pub(crate) fn fit_text<'a>(font: &BitmapFont, text: &'a str, max_w: u16) -> &'a str {
     if measure_text(font, text) <= max_w {
         return text;
     }
@@ -426,15 +569,6 @@ fn fit_text<'a>(font: &BitmapFont, text: &'a str, max_w: u16) -> &'a str {
         end = index;
     }
     text[..end].trim_end()
-}
-
-fn fmt_chapter_counter(current: usize, total: usize, buf: &mut [u8; 32]) -> &str {
-    let mut cursor = 0;
-    push_str(buf, &mut cursor, "Chapter ");
-    push_usize(buf, &mut cursor, current);
-    push_str(buf, &mut cursor, " of ");
-    push_usize(buf, &mut cursor, total);
-    core::str::from_utf8(&buf[..cursor]).unwrap_or("")
 }
 
 fn push_str(buf: &mut [u8], cursor: &mut usize, value: &str) {
@@ -471,17 +605,17 @@ fn push_usize(buf: &mut [u8], cursor: &mut usize, value: usize) {
 
 fn orientation_label(orientation: UiOrientation) -> &'static str {
     match orientation {
-        UiOrientation::LandscapeButtonsBottom => "LANDSCAPE BOTTOM",
-        UiOrientation::LandscapeButtonsTop => "LANDSCAPE TOP",
-        UiOrientation::PortraitButtonsLeft => "PORTRAIT LEFT",
-        UiOrientation::PortraitButtonsRight => "PORTRAIT RIGHT",
+        UiOrientation::LandscapeButtonsBottom => "buttons bottom",
+        UiOrientation::LandscapeButtonsTop => "buttons top",
+        UiOrientation::PortraitButtonsLeft => "buttons left",
+        UiOrientation::PortraitButtonsRight => "buttons right",
     }
 }
 
 fn refresh_policy_label(policy: UiRefreshPolicy) -> &'static str {
     match policy {
-        UiRefreshPolicy::FastOnly => "FAST ONLY",
-        UiRefreshPolicy::FullOnWake => "FULL ON WAKE",
-        UiRefreshPolicy::FullEveryTen => "FULL EVERY 10",
+        UiRefreshPolicy::FastOnly => "fast only",
+        UiRefreshPolicy::FullOnWake => "full on wake",
+        UiRefreshPolicy::FullEveryTen => "full every ten",
     }
 }
