@@ -4,6 +4,7 @@
 pub mod epd;
 pub mod fb;
 pub mod font;
+pub mod literata_extra_generated;
 pub mod literata_generated;
 pub mod render;
 

@@ -73,6 +73,22 @@ pub fn literata(style: FontStyle) -> &'static BitmapFont {
     }
 }
 
+/// The 16px apparatus set: folios, colophons, margin-key small caps.
+pub fn literata_small(style: FontStyle) -> &'static BitmapFont {
+    match style {
+        FontStyle::Regular => &crate::literata_extra_generated::LITERATA_SMALL_REGULAR,
+        FontStyle::Italic => &crate::literata_extra_generated::LITERATA_SMALL_ITALIC,
+        FontStyle::Bold | FontStyle::BoldItalic => {
+            &crate::literata_extra_generated::LITERATA_SMALL_BOLD
+        }
+    }
+}
+
+/// The 46px display set: the book title on home and the sleep plate.
+pub fn literata_display() -> &'static BitmapFont {
+    &crate::literata_extra_generated::LITERATA_DISPLAY_REGULAR
+}
+
 pub fn draw_text(
     fb: &mut Framebuffer,
     font: &BitmapFont,
