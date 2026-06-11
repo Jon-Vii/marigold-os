@@ -212,7 +212,13 @@ Current code status:
   restore at screen 1016/chapter 127). Still pending: a heap high-water
   reading (log esp_alloc::HEAP stats during a session) and interop against
   a real kosync server implementation rather than a protocol stub.
-- AP-mode web onboarding implemented (pending hardware validation): with no
+- AP-mode web onboarding validated on hardware June 11 2026: the hotspot
+  raised, the phone leased an address, and submitted credentials landed in
+  WIFI.BIN (the user typed the portal URL manually that run; the DNS
+  responder's silence on AAAA/HTTPS queries was stalling captive
+  detection and is fixed since, untested on a phone). Still to observe on
+  serial: a station join sourced from WIFI.BIN rather than compile-time
+  credentials, and the auto-raised sign-in sheet. Details: with no
   WIFI.BIN and no compile-time credentials, Confirm on the Sync screen
   raises an open XTEINK-X4 hotspot at 192.168.4.1 with hand-rolled captive
   DHCP/DNS (proto::captive, host-tested) and a credential form; submitted
