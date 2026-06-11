@@ -272,8 +272,7 @@ const UPLOAD_PAGE: &str = concat!(
     r##"if(text===null){shelf.textContent='';"##,
     r##"shelf.appendChild(row('— the card did not answer —'));return}"##,
     r##"shelf.textContent='';"##,
-    r##"const lines=text.split('
-').filter(Boolean);"##,
+    r##"const lines=text.split(String.fromCharCode(10)).filter(Boolean);"##,
     r##"if(!lines.length){shelf.appendChild(row('— nothing yet —'))}"##,
     r##"for(const line of lines){const[flag,open,label]=line.split('|');"##,
     r##"const li=row(label||open);"##,
