@@ -27,6 +27,10 @@ const ROW_STEP: i16 = 56;
 const FIRST_ROW_Y: i16 = 118;
 const VISIBLE_ROWS: usize = 6;
 const FOOTER_Y: i16 = 456;
+/// Baseline-to-baseline leading for the wrapped 46px display title,
+/// tighter than the face's default 62px line height as title blocks
+/// conventionally are.
+const TITLE_LEADING: i16 = 54;
 
 pub fn render_shell(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     fb.clear(true);
@@ -52,15 +56,20 @@ fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     dash_key(fb, 2, "sync", false);
     dash_key(fb, 3, "settings", false);
 
-    draw_text_truncated(
-        fb,
-        literata_display(),
+    // Long titles wrap to a second line that grows upward, keeping the
+    // author/rule/colophon furniture (and one-line titles) fixed.
+    let title_font = literata_display();
+    let (first, second) = wrap_title(
+        title_font,
         shell.active_book.title,
-        CONTENT_X,
-        180,
-        (CONTENT_RIGHT - CONTENT_X) as usize,
-        false,
+        (CONTENT_RIGHT - CONTENT_X) as u16,
     );
+    if second.is_empty() {
+        draw_text(fb, title_font, first, CONTENT_X, 180, false);
+    } else {
+        draw_text(fb, title_font, first, CONTENT_X, 180 - TITLE_LEADING, false);
+        draw_text(fb, title_font, second, CONTENT_X, 180, false);
+    }
     if !shell.active_book.author.is_empty() {
         ls_caps(
             fb,
@@ -570,6 +579,29 @@ fn draw_text_truncated(
     draw_text(fb, font, text, x, y, white);
 }
 
+/// Greedy two-line word wrap for the display-face title. Returns the
+/// title's two lines; the second is empty when one line fits. The
+/// second line is glyph-truncated if the remainder still overflows,
+/// and a single unbreakable overlong word truncates on line one.
+pub(crate) fn wrap_title<'a>(font: &BitmapFont, text: &'a str, max_w: u16) -> (&'a str, &'a str) {
+    if measure_text(font, text) <= max_w {
+        return (text, "");
+    }
+    let mut split = 0usize;
+    for (index, _) in text.match_indices(' ') {
+        if measure_text(font, &text[..index]) <= max_w {
+            split = index;
+        } else {
+            break;
+        }
+    }
+    if split == 0 {
+        return (fit_text(font, text, max_w), "");
+    }
+    let rest = text[split + 1..].trim_start();
+    (&text[..split], fit_text(font, rest, max_w))
+}
+
 pub(crate) fn fit_text<'a>(font: &BitmapFont, text: &'a str, max_w: u16) -> &'a str {
     if measure_text(font, text) <= max_w {
         return text;
@@ -647,5 +679,41 @@ fn line_spacing_label(spacing: display::font::LineSpacing) -> &'static str {
         display::font::LineSpacing::Compact => "compact",
         display::font::LineSpacing::Normal => "normal",
         display::font::LineSpacing::Relaxed => "relaxed",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrap_title_keeps_short_titles_on_one_line() {
+        let font = literata_display();
+        let (first, second) = wrap_title(font, "Dune", 530);
+        assert_eq!(first, "Dune");
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn wrap_title_breaks_long_titles_at_a_word_boundary() {
+        let font = literata_display();
+        let title = "Harry Potter and the Methods of Rationality";
+        let (first, second) = wrap_title(font, title, 530);
+        assert!(!second.is_empty());
+        assert!(measure_text(font, first) <= 530);
+        assert!(measure_text(font, second) <= 530);
+        // The break consumes the separating space and loses no words up
+        // to the second line's own truncation point.
+        assert!(title.starts_with(first));
+        assert!(title[first.len() + 1..].starts_with(second));
+    }
+
+    #[test]
+    fn wrap_title_truncates_an_unbreakable_word() {
+        let font = literata_display();
+        let title = "Donaudampfschifffahrtsgesellschaftskapitaen";
+        let (first, second) = wrap_title(font, title, 200);
+        assert!(measure_text(font, first) <= 200);
+        assert!(second.is_empty());
     }
 }

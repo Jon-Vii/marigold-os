@@ -5,8 +5,8 @@ use crate::{
 use app_core::{AppView, Button, DisplayOrientation, RefreshPolicy, RenderRequest};
 use display::fb::Framebuffer;
 use display::font::{draw_text, literata_display, literata_small, measure_text, FontStyle};
-use display::render::{draw_ascii, fill_rect};
-use display::{Rect, HEIGHT, WIDTH};
+use display::render::draw_ascii;
+use display::{HEIGHT, WIDTH};
 
 #[derive(Clone, Copy, Debug)]
 pub struct UiRenderModel<'a> {
@@ -47,7 +47,16 @@ pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRe
 /// battery; a days-old panel image must not show stale numbers.
 pub fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, model: &UiRenderModel<'_>) {
     fb.clear(true);
-    draw_font_centered_fit(fb, literata_display(), model.active_book.title, 400, 204, 720);
+    let title_font = literata_display();
+    let (first, second) = crate::render::wrap_title(title_font, model.active_book.title, 720);
+    if second.is_empty() {
+        draw_font_centered_fit(fb, title_font, first, 400, 204, 720);
+    } else {
+        // Two-line titles grow upward so the author/rule furniture
+        // below keeps its place, mirroring the home title page.
+        draw_font_centered_fit(fb, title_font, first, 400, 204 - 54, 720);
+        draw_font_centered_fit(fb, title_font, second, 400, 204, 720);
+    }
     if !model.active_book.author.is_empty() {
         let caps = literata_small(FontStyle::Regular);
         let width = crate::render::ls_width(caps, model.active_book.author, 3);
