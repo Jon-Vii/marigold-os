@@ -1,0 +1,14 @@
+# The hotspot screen itself: QR to join, portal address as fallback.
+
+[[steps]]
+button = "Previous"
+
+[[steps]]
+button = "Confirm"
+
+[[steps]]
+sync = "PortalUp"
+
+[expect]
+view = "Sync"
+sync_status = "portal-up"

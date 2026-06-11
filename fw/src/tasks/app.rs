@@ -352,6 +352,9 @@ fn log_storage_command(label: &str, command: StorageCommand) {
         StorageCommand::LoanSyncMemory => {
             esp_println::println!("app: storage {label} loan sync memory")
         }
+        StorageCommand::StoreWifiCredentials(_) => {
+            esp_println::println!("app: storage {label} wifi credentials")
+        }
     }
 }
 

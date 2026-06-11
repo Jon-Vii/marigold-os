@@ -218,7 +218,9 @@ fn handle_storage_command(
     if *sync_loaned
         && !matches!(
             command,
-            StorageCommand::StoreProgress(_) | StorageCommand::LoanSyncMemory
+            StorageCommand::StoreProgress(_)
+                | StorageCommand::LoanSyncMemory
+                | StorageCommand::StoreWifiCredentials(_)
         )
     {
         esp_println::println!("storage: refused during sync session");
@@ -241,6 +243,14 @@ fn handle_storage_command(
             *sync_loaned = true;
             let mut loan = reader_cache::dismantle_scratch(scratch);
             loan.book = book;
+            loan.wifi = reader_cache::load_wifi_credentials(epd, sd_cs).map(|record| {
+                app_core::WifiCredentials {
+                    ssid: record.ssid,
+                    ssid_len: record.ssid_len,
+                    password: record.password,
+                    password_len: record.password_len,
+                }
+            });
             if crate::SYNC_LOANS.try_send(loan).is_err() {
                 // Unreachable in practice: the wifi task requests exactly
                 // one loan per boot. The memory is gone either way.
@@ -345,6 +355,19 @@ fn handle_storage_command(
                 sd_library.advertised_page_count(),
                 sd_library.chapter_count_for_ui()
             );
+        }
+        StorageCommand::StoreWifiCredentials(credentials) => {
+            let stored = reader_cache::store_wifi_credentials(
+                epd,
+                sd_cs,
+                hal_ext::nvm::WifiCredentialsRecord {
+                    ssid: credentials.ssid,
+                    ssid_len: credentials.ssid_len,
+                    password: credentials.password,
+                    password_len: credentials.password_len,
+                },
+            );
+            esp_println::println!("storage: wifi credentials stored={}", stored);
         }
         StorageCommand::StoreProgress(record) => {
             let (source_hash, source_size) = source_identity(sd_library, record.book_id);

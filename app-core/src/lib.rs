@@ -283,6 +283,45 @@ pub enum StorageCommand {
     /// way: after this the display task refuses scratch-using commands
     /// until the session's software reset reboots the reader.
     LoanSyncMemory,
+    /// Persist the credentials captured by the onboarding portal to
+    /// /XTEINK/WIFI.BIN. Allowed during a sync session: it is the portal
+    /// that sends it.
+    StoreWifiCredentials(WifiCredentials),
+}
+
+/// Station credentials as a bounded Copy message: what the onboarding
+/// portal captures and what `/XTEINK/WIFI.BIN` stores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WifiCredentials {
+    pub ssid: [u8; 32],
+    pub ssid_len: u8,
+    pub password: [u8; 64],
+    pub password_len: u8,
+}
+
+impl WifiCredentials {
+    pub fn from_strs(ssid: &str, password: &str) -> Option<Self> {
+        if ssid.is_empty() || ssid.len() > 32 || password.len() > 64 {
+            return None;
+        }
+        let mut record = Self {
+            ssid: [0; 32],
+            ssid_len: ssid.len() as u8,
+            password: [0; 64],
+            password_len: password.len() as u8,
+        };
+        record.ssid[..ssid.len()].copy_from_slice(ssid.as_bytes());
+        record.password[..password.len()].copy_from_slice(password.as_bytes());
+        Some(record)
+    }
+
+    pub fn ssid(&self) -> &str {
+        core::str::from_utf8(&self.ssid[..self.ssid_len.min(32) as usize]).unwrap_or("")
+    }
+
+    pub fn password(&self) -> &str {
+        core::str::from_utf8(&self.password[..self.password_len.min(64) as usize]).unwrap_or("")
+    }
 }
 
 // Bounded Copy messages by design: chapter_pages rides inside the event
@@ -342,6 +381,11 @@ pub enum SyncStatus {
         pushed: bool,
         pulled: bool,
     },
+    /// The onboarding hotspot is up; the screen shows the join QR.
+    PortalUp,
+    /// The portal captured and stored credentials; a fresh session will
+    /// use them after the reset.
+    CredentialsSaved,
     Error(SyncError),
 }
 
@@ -362,6 +406,8 @@ pub enum SyncEvent {
     Connected([u8; 4]),
     Syncing,
     Done { pushed: bool, pulled: bool },
+    PortalUp,
+    CredentialsSaved,
     Failed(SyncError),
 }
 
@@ -587,16 +633,19 @@ impl ReaderState {
                 next.view = AppView::Reading;
             }
             (AppView::Sync, Some(Button::Confirm)) => match self.sync_status {
-                SyncStatus::Idle | SyncStatus::Error(_) => {
+                // NotConfigured starts too: with no stored or built-in
+                // credentials the wifi task answers with the onboarding
+                // portal instead of a station join.
+                SyncStatus::NotConfigured | SyncStatus::Idle | SyncStatus::Error(_) => {
                     next.sync_status = SyncStatus::Starting;
                 }
-                SyncStatus::Done { .. } => {
+                SyncStatus::Done { .. } | SyncStatus::CredentialsSaved => {
                     next.view = AppView::Home;
                     next.selection = 0;
                     next.sync_status = sync_entry_status(ctx);
                 }
-                // NotConfigured has nothing to start; an in-flight session
-                // ignores Confirm until it lands in Done or Error.
+                // An in-flight session ignores Confirm until it lands in
+                // Done, CredentialsSaved, or Error.
                 _ => {}
             },
             (AppView::Sync, Some(Button::Back)) => {
@@ -738,6 +787,8 @@ impl ReaderState {
             SyncEvent::Connected(ip) => SyncStatus::Connected(ip),
             SyncEvent::Syncing => SyncStatus::Syncing,
             SyncEvent::Done { pushed, pulled } => SyncStatus::Done { pushed, pulled },
+            SyncEvent::PortalUp => SyncStatus::PortalUp,
+            SyncEvent::CredentialsSaved => SyncStatus::CredentialsSaved,
             SyncEvent::Failed(error) => SyncStatus::Error(error),
         };
         self.dirty = Rect::FULL;
@@ -974,13 +1025,30 @@ mod tests {
     }
 
     #[test]
-    fn sync_without_credentials_reports_not_configured_and_never_starts() {
+    fn sync_without_credentials_starts_the_portal_flow() {
         let state = press(ReaderState::boot(), Button::Previous);
         assert_eq!(state.view, AppView::Sync);
         assert_eq!(state.sync_status, SyncStatus::NotConfigured);
         let state = press(state, Button::Confirm);
-        assert_eq!(state.view, AppView::Sync);
-        assert_eq!(state.sync_status, SyncStatus::NotConfigured);
+        assert_eq!(state.sync_status, SyncStatus::Starting);
+        let state = state.apply_sync_event(SyncEvent::PortalUp);
+        assert_eq!(state.sync_status, SyncStatus::PortalUp);
+        // Confirm is inert while the portal serves.
+        let state = press(state, Button::Confirm);
+        assert_eq!(state.sync_status, SyncStatus::PortalUp);
+        let state = state.apply_sync_event(SyncEvent::CredentialsSaved);
+        assert_eq!(state.sync_status, SyncStatus::CredentialsSaved);
+        let state = press(state, Button::Confirm);
+        assert_eq!(state.view, AppView::Home);
+    }
+
+    #[test]
+    fn wifi_credentials_round_trip_strs() {
+        let creds = WifiCredentials::from_strs("latent.space", "a&b c/9").unwrap();
+        assert_eq!(creds.ssid(), "latent.space");
+        assert_eq!(creds.password(), "a&b c/9");
+        assert!(WifiCredentials::from_strs("", "x").is_none());
+        assert!(WifiCredentials::from_strs("123456789012345678901234567890123", "x").is_none());
     }
 
     #[test]

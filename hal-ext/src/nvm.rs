@@ -136,6 +136,58 @@ pub trait AppStateStore {
     fn store_app_state(&mut self, record: AppStateRecord) -> Result<(), Self::Error>;
 }
 
+/// Station credentials at `/XTEINK/WIFI.BIN`, written by the onboarding
+/// portal and read back ahead of every sync session. Same envelope as
+/// `AppStateRecord`: magic, version, payload, checksum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WifiCredentialsRecord {
+    pub ssid: [u8; 32],
+    pub ssid_len: u8,
+    pub password: [u8; 64],
+    pub password_len: u8,
+}
+
+impl WifiCredentialsRecord {
+    pub const ENCODED_LEN: usize = 4 + 1 + 1 + 1 + 32 + 64 + 4;
+    const MAGIC: u32 = 0x5834_5746; // "X4WF"
+    const VERSION: u8 = 1;
+
+    pub fn encode(self) -> [u8; Self::ENCODED_LEN] {
+        let mut out = [0u8; Self::ENCODED_LEN];
+        write_u32(&mut out, 0, Self::MAGIC);
+        out[4] = Self::VERSION;
+        out[5] = self.ssid_len.min(32);
+        out[6] = self.password_len.min(64);
+        out[7..39].copy_from_slice(&self.ssid);
+        out[39..103].copy_from_slice(&self.password);
+        let checksum = checksum(&out[..103]);
+        write_u32(&mut out, 103, checksum);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::ENCODED_LEN
+            || read_u32(bytes, 0) != Self::MAGIC
+            || bytes[4] != Self::VERSION
+            || read_u32(bytes, 103) != checksum(&bytes[..103])
+        {
+            return None;
+        }
+        let mut record = Self {
+            ssid: [0; 32],
+            ssid_len: bytes[5].min(32),
+            password: [0; 64],
+            password_len: bytes[6].min(64),
+        };
+        record.ssid.copy_from_slice(&bytes[7..39]);
+        record.password.copy_from_slice(&bytes[39..103]);
+        if record.ssid_len == 0 {
+            return None;
+        }
+        Some(record)
+    }
+}
+
 fn checksum(bytes: &[u8]) -> u32 {
     let mut hash = 0x811C_9DC5u32;
     for byte in bytes {

@@ -144,9 +144,20 @@ survives the session-ending reset. `proto::kosync` holds the sans-IO
 protocol pieces (MD5, partial digest, HTTP request building and response
 parsing) with host tests.
 
-Station and kosync credentials are compile-time `option_env!` values
-(`XTEINK_WIFI_SSID`/`XTEINK_WIFI_PASS`, `XTEINK_KOSYNC_HOST`/`_USER`/
-`_PASS`) for the dev phase; AP-mode web onboarding replaces them later.
+Station credentials come from `/XTEINK/WIFI.BIN` (written by the
+onboarding portal below), falling back to compile-time `option_env!`
+values (`XTEINK_WIFI_SSID`/`XTEINK_WIFI_PASS`) for dev builds. The kosync
+account stays compile-time for now (`XTEINK_KOSYNC_HOST`/`_USER`/`_PASS`).
+
+With no credentials anywhere, starting sync raises the onboarding portal
+instead: an open `XTEINK-X4` hotspot at 192.168.4.1 with a captive DHCP
+server, a DNS catch-all (every name resolves to the portal, which makes
+phones raise their sign-in sheet unprompted), and a credential form on
+port 80. The Sync screen shows a baked-at-build-time join QR
+(`tools/generate_qr.py`). Submitted credentials travel to the display
+task as a `StoreWifiCredentials` Copy message, land in WIFI.BIN, and the
+next session joins as a station. `proto::captive` holds the sans-IO
+DHCP/DNS/HTTP codecs under host tests; the wifi task only owns sockets.
 
 Embassy is used for cooperative waits: ADC retry delays, button polling, SPI DMA
 transfers, BUSY waits, and sleep windows all yield instead of spinning. The real

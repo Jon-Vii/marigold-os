@@ -150,6 +150,7 @@ pub(crate) fn dismantle_scratch(
             http_a: core::slice::from_raw_parts_mut(container_ptr, READER_CONTAINER_SCRATCH),
             http_b: core::slice::from_raw_parts_mut(tail_ptr, READER_TAIL_SCRATCH),
             book: None,
+            wifi: None,
         }
     }
 }
@@ -358,6 +359,29 @@ pub(crate) fn store_app_state(epd: &mut Epd, sd_cs: &mut Output<'static>, record
     let _ = sd_session::with_root(epd, sd_cs, |root| {
         reader_cache_files::write_state_file(root, record)
     });
+}
+
+#[inline(never)]
+pub(crate) fn store_wifi_credentials(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    record: hal_ext::nvm::WifiCredentialsRecord,
+) -> bool {
+    sd_session::with_root(epd, sd_cs, |root| {
+        reader_cache_files::write_wifi_file(root, record).is_ok()
+    })
+    .unwrap_or(false)
+}
+
+#[inline(never)]
+pub(crate) fn load_wifi_credentials(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+) -> Option<hal_ext::nvm::WifiCredentialsRecord> {
+    #[allow(clippy::redundant_closure)]
+    sd_session::with_root(epd, sd_cs, |root| reader_cache_files::read_wifi_file(root))
+        .ok()
+        .flatten()
 }
 
 /// Kept out of line for the same stack discipline as the store side.

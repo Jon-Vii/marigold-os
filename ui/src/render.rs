@@ -8,7 +8,8 @@
 //! only — the device does not tell time.
 
 use crate::{
-    UiLibraryStatus, UiOrientation, UiRefreshPolicy, UiShell, UiSyncStatus, UiTocItem, UiView,
+    qr_generated, UiLibraryStatus, UiOrientation, UiRefreshPolicy, UiShell, UiSyncStatus,
+    UiTocItem, UiView,
 };
 use display::fb::Framebuffer;
 use display::font::{
@@ -346,8 +347,11 @@ fn render_sync(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     dash_key(fb, 0, "home", false);
     match shell.sync_status {
         UiSyncStatus::Idle => dash_key(fb, 1, "sync", true),
+        UiSyncStatus::NotConfigured => dash_key(fb, 1, "set up", true),
         UiSyncStatus::Error(_) => dash_key(fb, 1, "again", true),
-        UiSyncStatus::Done { .. } => dash_key(fb, 1, "done", true),
+        UiSyncStatus::Done { .. } | UiSyncStatus::CredentialsSaved => {
+            dash_key(fb, 1, "done", true)
+        }
         _ => dash_unused(fb, 1),
     }
     dash_unused(fb, 2);
@@ -357,11 +361,11 @@ fn render_sync(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     let hint_y = 280;
     match shell.sync_status {
         UiSyncStatus::NotConfigured => {
-            centered_note(fb, "sync is not configured");
+            centered_note(fb, "no wi-fi network saved yet");
             draw_text_centered(
                 fb,
                 literata_small(FontStyle::Italic),
-                "this build carries no wi-fi credentials",
+                "set up opens a hotspot your phone can configure",
                 HEADING_CX,
                 hint_y,
             );
@@ -405,6 +409,43 @@ fn render_sync(fb: &mut Framebuffer, shell: &UiShell<'_>) {
                 hint_y,
             );
         }
+        UiSyncStatus::PortalUp => {
+            // The QR joins the open hotspot; the captive DNS then raises
+            // the phone's sign-in sheet with the credential form.
+            draw_qr(
+                fb,
+                &qr_generated::QR_JOIN_BITS,
+                qr_generated::QR_JOIN_SIZE,
+                qr_generated::QR_JOIN_STRIDE,
+                HEADING_CX,
+                160,
+                5,
+            );
+            draw_text_centered(
+                fb,
+                literata_small(FontStyle::Regular),
+                "scan to join \u{201c}XTEINK-X4\u{201d}",
+                HEADING_CX,
+                348,
+            );
+            draw_text_centered(
+                fb,
+                literata_small(FontStyle::Italic),
+                "then enter your wi-fi in the page that opens \u{00b7} http://192.168.4.1",
+                HEADING_CX,
+                382,
+            );
+        }
+        UiSyncStatus::CredentialsSaved => {
+            centered_note(fb, "wi-fi saved");
+            draw_text_centered(
+                fb,
+                literata_small(FontStyle::Italic),
+                "press done to restart, then sync again to connect",
+                HEADING_CX,
+                hint_y,
+            );
+        }
         UiSyncStatus::Error(reason) => {
             let mut buf = [0u8; 64];
             let mut cursor = 0;
@@ -415,6 +456,50 @@ fn render_sync(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     }
 
     finish_working_screen(fb, shell);
+}
+
+/// Blits a packed QR matrix centered on `cx`, `scale` pixels per module,
+/// with the quiet zone cleared around it.
+fn draw_qr(
+    fb: &mut Framebuffer,
+    bits: &[u8],
+    size: usize,
+    stride: usize,
+    cx: i16,
+    top: i16,
+    scale: i16,
+) {
+    let edge = size as i16 * scale;
+    let left = (cx - edge / 2).max(0) as u16;
+    let top = top.max(0) as u16;
+    let quiet = (scale * 2) as u16;
+    fill_rect(
+        fb,
+        Rect {
+            x: left.saturating_sub(quiet),
+            y: top.saturating_sub(quiet),
+            w: edge as u16 + quiet * 2,
+            h: edge as u16 + quiet * 2,
+        },
+        true,
+    );
+    let scale = scale as u16;
+    for row in 0..size {
+        for col in 0..size {
+            if bits[row * stride + col / 8] & (0x80 >> (col % 8)) != 0 {
+                fill_rect(
+                    fb,
+                    Rect {
+                        x: left + col as u16 * scale,
+                        y: top + row as u16 * scale,
+                        w: scale,
+                        h: scale,
+                    },
+                    false,
+                );
+            }
+        }
+    }
 }
 
 fn push_ipv4(buf: &mut [u8], cursor: &mut usize, ip: [u8; 4]) {

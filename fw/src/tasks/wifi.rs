@@ -13,26 +13,35 @@ use crate::{
     StorageCommand, SyncCommand, SyncEvent, STORAGE_COMMANDS, SYNC_COMMANDS, SYNC_EVENTS,
     SYNC_LOANS,
 };
-use app_core::{PersistedAppState, SyncError};
+use app_core::{PersistedAppState, SyncError, WifiCredentials};
 use embassy_executor::Spawner;
+use embassy_futures::join::join3;
+use embassy_futures::select::select;
 use embassy_net::dns::DnsQueryType;
 use embassy_net::tcp::TcpSocket;
-use embassy_net::{Config as NetConfig, IpAddress, Runner, Stack, StackResources};
+use embassy_net::udp::{PacketMetadata, UdpSocket};
+use embassy_net::{
+    Config as NetConfig, IpAddress, Ipv4Address, Ipv4Cidr, Runner, Stack, StackResources,
+    StaticConfigV4,
+};
 use embassy_time::{with_timeout, Duration, Timer};
 use esp_hal::peripherals::{RADIO_CLK, RNG, SYSTIMER, WIFI};
 use esp_hal::rng::Rng;
 use esp_hal::timer::systimer::SystemTimer;
 use esp_wifi::wifi::{
-    new_with_mode, AuthMethod, ClientConfiguration, Configuration, WifiController, WifiDevice,
-    WifiStaDevice,
+    new_with_mode, AccessPointConfiguration, AuthMethod, ClientConfiguration, Configuration,
+    WifiApDevice, WifiController, WifiDevice, WifiStaDevice,
 };
 use esp_wifi::EspWifiController;
+use proto::captive;
 use proto::kosync;
 
 const JOIN_TIMEOUT: Duration = Duration::from_secs(20);
 const DHCP_TIMEOUT: Duration = Duration::from_secs(15);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const DEVICE_NAME: &str = "xteink-x4";
+const PORTAL_SSID: &str = "XTEINK-X4";
+const PORTAL_IP: [u8; 4] = [192, 168, 4, 1];
 
 /// Compile-time station credentials for the dev phase:
 /// `XTEINK_WIFI_SSID=... XTEINK_WIFI_PASS=... cargo build ...`
@@ -59,6 +68,11 @@ async fn net_task(mut runner: Runner<'static, WifiDevice<'static, WifiStaDevice>
 }
 
 #[embassy_executor::task]
+async fn ap_net_task(mut runner: Runner<'static, WifiDevice<'static, WifiApDevice>>) -> ! {
+    runner.run().await
+}
+
+#[embassy_executor::task]
 pub async fn run(spawner: Spawner, wifi: WIFI, systimer: SYSTIMER, rng: RNG, radio_clk: RADIO_CLK) {
     // Idle until the first Start; Exit before any radio work is a no-op
     // because nothing has been loaned yet.
@@ -68,13 +82,6 @@ pub async fn run(spawner: Spawner, wifi: WIFI, systimer: SYSTIMER, rng: RNG, rad
             SyncCommand::Exit => {}
         }
     }
-
-    let Some((ssid, password)) = credentials() else {
-        // The reducer keeps Confirm inert without credentials; reaching
-        // here means the build and the screen disagree, so say so.
-        send_event(SyncEvent::Failed(SyncError::NoCredentials));
-        return;
-    };
 
     // The loan request runs through the storage queue so it serializes
     // behind any in-flight SD work, then the memory comes back to us.
@@ -87,8 +94,15 @@ pub async fn run(spawner: Spawner, wifi: WIFI, systimer: SYSTIMER, rng: RNG, rad
         http_a,
         http_b,
         book,
+        wifi: stored_credentials,
         ..
     } = loan;
+
+    // Stored credentials from the portal beat the compile-time dev pair;
+    // neither present means this session runs the onboarding portal.
+    let resolved = stored_credentials.or_else(|| {
+        credentials().and_then(|(ssid, password)| WifiCredentials::from_strs(ssid, password))
+    });
 
     let mut rng = Rng::new(rng);
     let seed = (u64::from(rng.random()) << 32) | u64::from(rng.random());
@@ -105,6 +119,10 @@ pub async fn run(spawner: Spawner, wifi: WIFI, systimer: SYSTIMER, rng: RNG, rad
     // honest here because the session never ends except by reset.
     let inited: &'static EspWifiController<'static> =
         alloc::boxed::Box::leak(alloc::boxed::Box::new(inited));
+    let Some(creds) = resolved else {
+        run_portal(spawner, inited, wifi, seed, tcp_rx, tcp_tx, http_a, http_b).await;
+    };
+
     let (device, controller) = match new_with_mode(inited, wifi, WifiStaDevice) {
         Ok(parts) => parts,
         Err(err) => {
@@ -141,7 +159,7 @@ pub async fn run(spawner: Spawner, wifi: WIFI, systimer: SYSTIMER, rng: RNG, rad
     // First Start already consumed; later Starts are Confirm retries
     // from the error screen.
     loop {
-        let event = match session.attempt(ssid, password).await {
+        let event = match session.attempt(creds.ssid(), creds.password()).await {
             Ok(event) => event,
             Err(error) => SyncEvent::Failed(error),
         };
@@ -153,6 +171,255 @@ pub async fn run(spawner: Spawner, wifi: WIFI, systimer: SYSTIMER, rng: RNG, rad
             SyncCommand::Exit => reset_now(),
         }
     }
+}
+
+// ------------------------------------------------------------------
+// Onboarding portal
+// ------------------------------------------------------------------
+
+const PORTAL_PAGE: &str = concat!(
+    "<!doctype html><html><head>",
+    "<meta name=viewport content=\"width=device-width,initial-scale=1\">",
+    "<title>XTEINK X4</title>",
+    "<style>body{font-family:Georgia,serif;margin:2.5em auto;max-width:22em;",
+    "padding:0 1em;color:#222}h1{font-size:1.25em;letter-spacing:.08em}",
+    "label{display:block;margin:1em 0 .2em}",
+    "input{width:100%;font-size:1.05em;padding:.5em;border:1px solid #999;",
+    "border-radius:4px;box-sizing:border-box}",
+    "button{margin-top:1.2em;font-size:1.05em;padding:.6em 1.6em;",
+    "border:1px solid #222;background:#222;color:#fff;border-radius:4px}",
+    "</style></head><body><h1>XTEINK&nbsp;X4</h1>",
+    "<p>Connect this reader to your Wi-Fi network.</p>",
+    "<form method=post action=/save>",
+    "<label>Network name</label><input name=ssid maxlength=32 required>",
+    "<label>Password</label><input name=pass type=password maxlength=64>",
+    "<button>Save</button></form></body></html>",
+);
+
+const SAVED_PAGE: &str = concat!(
+    "<!doctype html><html><head>",
+    "<meta name=viewport content=\"width=device-width,initial-scale=1\">",
+    "<title>XTEINK X4</title>",
+    "<style>body{font-family:Georgia,serif;margin:2.5em auto;max-width:22em;",
+    "padding:0 1em;color:#222}h1{font-size:1.25em;letter-spacing:.08em}",
+    "</style></head><body><h1>Saved</h1>",
+    "<p>Back on the reader: press <i>done</i>, then run sync again to ",
+    "connect to your network.</p></body></html>",
+);
+
+/// The onboarding hotspot: open AP, captive DHCP + DNS, and the
+/// credential form on port 80. Never returns; the session ends with the
+/// reset that `SyncCommand::Exit` triggers.
+#[allow(clippy::too_many_arguments)]
+async fn run_portal(
+    spawner: Spawner,
+    inited: &'static EspWifiController<'static>,
+    wifi: WIFI,
+    seed: u64,
+    tcp_rx: &'static mut [u8],
+    tcp_tx: &'static mut [u8],
+    http_a: &'static mut [u8],
+    http_b: &'static mut [u8],
+) -> ! {
+    let (device, mut controller) = match new_with_mode(inited, wifi, WifiApDevice) {
+        Ok(parts) => parts,
+        Err(err) => {
+            esp_println::println!("portal: ap mode failed: {:?}", err);
+            send_event(SyncEvent::Failed(SyncError::RadioInit));
+            park_until_exit().await;
+        }
+    };
+    let config = Configuration::AccessPoint(AccessPointConfiguration {
+        ssid: PORTAL_SSID.try_into().unwrap_or_default(),
+        auth_method: AuthMethod::None,
+        ..Default::default()
+    });
+    if controller.set_configuration(&config).is_err() || controller.start_async().await.is_err() {
+        esp_println::println!("portal: ap start failed");
+        send_event(SyncEvent::Failed(SyncError::RadioInit));
+        park_until_exit().await;
+    }
+
+    let portal = Ipv4Address::new(PORTAL_IP[0], PORTAL_IP[1], PORTAL_IP[2], PORTAL_IP[3]);
+    let mut dns_servers = heapless::Vec::new();
+    let _ = dns_servers.push(portal);
+    let resources: &'static mut StackResources<6> =
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(StackResources::new()));
+    let (stack, runner) = embassy_net::new(
+        device,
+        NetConfig::ipv4_static(StaticConfigV4 {
+            address: Ipv4Cidr::new(portal, 24),
+            gateway: Some(portal),
+            dns_servers,
+        }),
+        resources,
+        seed,
+    );
+    if spawner.spawn(ap_net_task(runner)).is_err() {
+        send_event(SyncEvent::Failed(SyncError::RadioInit));
+        park_until_exit().await;
+    }
+
+    esp_println::println!("portal: up at 192.168.4.1 as {}", PORTAL_SSID);
+    send_event(SyncEvent::PortalUp);
+
+    // Three servers share the task; Exit interrupts them with the reset.
+    select(
+        park_until_exit(),
+        join3(
+            dhcp_server(stack),
+            dns_server(stack),
+            credential_portal(stack, tcp_rx, tcp_tx, http_a, http_b),
+        ),
+    )
+    .await;
+    // park_until_exit resets and join3 never completes.
+    unreachable!()
+}
+
+async fn dhcp_server(stack: Stack<'static>) -> ! {
+    let rx_buf = alloc::vec![0u8; 1536].leak();
+    let tx_buf = alloc::vec![0u8; 1536].leak();
+    let mut rx_meta = [PacketMetadata::EMPTY; 4];
+    let mut tx_meta = [PacketMetadata::EMPTY; 4];
+    let mut socket = UdpSocket::new(stack, &mut rx_meta, rx_buf, &mut tx_meta, tx_buf);
+    if socket.bind(67).is_err() {
+        esp_println::println!("portal: dhcp bind failed");
+        park_until_exit().await;
+    }
+    let mut server = captive::DhcpServer::new(PORTAL_IP);
+    let mut packet = [0u8; 600];
+    let mut reply = [0u8; captive::DHCP_REPLY_LEN];
+    loop {
+        let Ok((len, _meta)) = socket.recv_from(&mut packet).await else {
+            continue;
+        };
+        if let Some(reply_len) = server.handle(&packet[..len], &mut reply) {
+            let _ = socket
+                .send_to(&reply[..reply_len], (IpAddress::v4(255, 255, 255, 255), 68))
+                .await;
+        }
+    }
+}
+
+async fn dns_server(stack: Stack<'static>) -> ! {
+    let rx_buf = alloc::vec![0u8; 1024].leak();
+    let tx_buf = alloc::vec![0u8; 1024].leak();
+    let mut rx_meta = [PacketMetadata::EMPTY; 4];
+    let mut tx_meta = [PacketMetadata::EMPTY; 4];
+    let mut socket = UdpSocket::new(stack, &mut rx_meta, rx_buf, &mut tx_meta, tx_buf);
+    if socket.bind(53).is_err() {
+        esp_println::println!("portal: dns bind failed");
+        park_until_exit().await;
+    }
+    let mut query = [0u8; 300];
+    let mut answer = [0u8; 360];
+    loop {
+        let Ok((len, meta)) = socket.recv_from(&mut query).await else {
+            continue;
+        };
+        if let Some(answer_len) = captive::dns_answer(&query[..len], PORTAL_IP, &mut answer) {
+            let _ = socket.send_to(&answer[..answer_len], meta).await;
+        }
+    }
+}
+
+async fn credential_portal(
+    stack: Stack<'static>,
+    tcp_rx: &'static mut [u8],
+    tcp_tx: &'static mut [u8],
+    request_buf: &'static mut [u8],
+    _spare: &'static mut [u8],
+) -> ! {
+    loop {
+        let mut socket = TcpSocket::new(stack, &mut *tcp_rx, &mut *tcp_tx);
+        socket.set_timeout(Some(Duration::from_secs(10)));
+        if socket.accept(80).await.is_err() {
+            continue;
+        }
+
+        let mut filled = 0;
+        let saved = loop {
+            if filled == request_buf.len() {
+                break false;
+            }
+            let Ok(read) = socket.read(&mut request_buf[filled..]).await else {
+                break false;
+            };
+            if read == 0 {
+                break false;
+            }
+            filled += read;
+            if let Some(request) = captive::parse_request(&request_buf[..filled]) {
+                break handle_portal_request(&request).await;
+            }
+        };
+
+        let body = if saved { SAVED_PAGE } else { PORTAL_PAGE };
+        let _ = write_http_page(&mut socket, body).await;
+        socket.close();
+        let _ = with_timeout(Duration::from_secs(2), socket.flush()).await;
+    }
+}
+
+/// Routes one parsed request; true means credentials were captured and
+/// the success page should answer.
+async fn handle_portal_request(request: &captive::HttpRequest<'_>) -> bool {
+    if request.method != "POST" || request.path != "/save" {
+        return false;
+    }
+    let mut ssid_buf = [0u8; 32];
+    let mut pass_buf = [0u8; 64];
+    let ssid = captive::form_value(request.body, "ssid", &mut ssid_buf).unwrap_or("");
+    let password = captive::form_value(request.body, "pass", &mut pass_buf).unwrap_or("");
+    let Some(credentials) = WifiCredentials::from_strs(ssid, password) else {
+        return false;
+    };
+    esp_println::println!("portal: credentials captured for '{}'", credentials.ssid());
+    STORAGE_COMMANDS
+        .send(StorageCommand::StoreWifiCredentials(credentials))
+        .await;
+    send_event(SyncEvent::CredentialsSaved);
+    true
+}
+
+async fn write_http_page(
+    socket: &mut TcpSocket<'_>,
+    body: &str,
+) -> Result<(), embassy_net::tcp::Error> {
+    let mut length = [0u8; 8];
+    let mut at = length.len();
+    let mut value = body.len();
+    loop {
+        at -= 1;
+        length[at] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    write_all(
+        socket,
+        b"HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: ",
+    )
+    .await?;
+    write_all(socket, &length[at..]).await?;
+    write_all(socket, b"\r\nconnection: close\r\n\r\n").await?;
+    write_all(socket, body.as_bytes()).await
+}
+
+async fn write_all(
+    socket: &mut TcpSocket<'_>,
+    mut data: &[u8],
+) -> Result<(), embassy_net::tcp::Error> {
+    while !data.is_empty() {
+        let written = socket.write(data).await?;
+        if written == 0 {
+            return Err(embassy_net::tcp::Error::ConnectionReset);
+        }
+        data = &data[written..];
+    }
+    Ok(())
 }
 
 async fn park_until_exit() -> ! {

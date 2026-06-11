@@ -212,10 +212,16 @@ Current code status:
   restore at screen 1016/chapter 127). Still pending: a heap high-water
   reading (log esp_alloc::HEAP stats during a session) and interop against
   a real kosync server implementation rather than a protocol stub.
-- Next: AP-mode web onboarding (hotspot + QR + credential form persisted to
-  /XTEINK/WIFI.BIN via edge-dhcp + captive DNS), then browser EPUB upload
-  through the same HTTP server in bounded chunks written by the board I/O
-  task.
+- AP-mode web onboarding implemented (pending hardware validation): with no
+  WIFI.BIN and no compile-time credentials, Confirm on the Sync screen
+  raises an open XTEINK-X4 hotspot at 192.168.4.1 with hand-rolled captive
+  DHCP/DNS (proto::captive, host-tested) and a credential form; submitted
+  credentials persist through StoreWifiCredentials into /XTEINK/WIFI.BIN
+  and the next session joins as a station. Join QR baked by
+  tools/generate_qr.py. Stack region after the portal: ~38.9 KB.
+- Next: browser EPUB upload through the same portal HTTP server in bounded
+  chunks written by the board I/O task, kosync account onboarding via the
+  same form, and TLS for the official sync server.
 
 ## Verification commands
 

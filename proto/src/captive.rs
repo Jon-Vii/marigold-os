@@ -70,7 +70,9 @@ impl DhcpServer {
         {
             return None;
         }
-        let message_type = option_value(&request[DHCP_OPTIONS_AT..], 53)?.first().copied()?;
+        let message_type = option_value(&request[DHCP_OPTIONS_AT..], 53)?
+            .first()
+            .copied()?;
         let mut mac = [0u8; 6];
         mac.copy_from_slice(&request[28..34]);
         let slot = self.slot_for(mac);
@@ -217,10 +219,7 @@ pub struct HttpRequest<'a> {
 /// Splits a buffered request once the header/body boundary and declared
 /// content length are present. `None` means keep reading.
 pub fn parse_request(raw: &[u8]) -> Option<HttpRequest<'_>> {
-    let headers_end = raw
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")?
-        + 4;
+    let headers_end = raw.windows(4).position(|window| window == b"\r\n\r\n")? + 4;
     let head = core::str::from_utf8(&raw[..headers_end]).ok()?;
     let mut request_line = head.lines().next()?.split(' ');
     let method = request_line.next()?;
@@ -322,9 +321,18 @@ mod tests {
             option_value(&reply[DHCP_OPTIONS_AT..], 53),
             Some(&[DHCP_OFFER][..])
         );
-        assert_eq!(option_value(&reply[DHCP_OPTIONS_AT..], 54), Some(&PORTAL[..]));
-        assert_eq!(option_value(&reply[DHCP_OPTIONS_AT..], 3), Some(&PORTAL[..]));
-        assert_eq!(option_value(&reply[DHCP_OPTIONS_AT..], 6), Some(&PORTAL[..]));
+        assert_eq!(
+            option_value(&reply[DHCP_OPTIONS_AT..], 54),
+            Some(&PORTAL[..])
+        );
+        assert_eq!(
+            option_value(&reply[DHCP_OPTIONS_AT..], 3),
+            Some(&PORTAL[..])
+        );
+        assert_eq!(
+            option_value(&reply[DHCP_OPTIONS_AT..], 6),
+            Some(&PORTAL[..])
+        );
     }
 
     #[test]

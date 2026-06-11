@@ -3,6 +3,7 @@
 
 pub mod app_render;
 pub mod layout;
+pub mod qr_generated;
 pub mod reading;
 pub mod render;
 
@@ -41,6 +42,8 @@ pub enum UiSyncStatus {
     Connected([u8; 4]),
     Syncing,
     Done { pushed: bool, pulled: bool },
+    PortalUp,
+    CredentialsSaved,
     Error(&'static str),
 }
 

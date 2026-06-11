@@ -293,6 +293,7 @@ impl Emulator {
             Some(StorageCommand::ExtendSection { .. }) => Some("ExtendSection"),
             Some(StorageCommand::StoreProgress(_)) => Some("StoreProgress"),
             Some(StorageCommand::LoanSyncMemory) => Some("LoanSyncMemory"),
+            Some(StorageCommand::StoreWifiCredentials(_)) => Some("StoreWifiCredentials"),
             None => None,
         }
     }

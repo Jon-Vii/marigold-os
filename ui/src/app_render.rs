@@ -53,6 +53,8 @@ fn ui_sync_status(status: SyncStatus) -> UiSyncStatus {
         SyncStatus::Connected(ip) => UiSyncStatus::Connected(ip),
         SyncStatus::Syncing => UiSyncStatus::Syncing,
         SyncStatus::Done { pushed, pulled } => UiSyncStatus::Done { pushed, pulled },
+        SyncStatus::PortalUp => UiSyncStatus::PortalUp,
+        SyncStatus::CredentialsSaved => UiSyncStatus::CredentialsSaved,
         SyncStatus::Error(error) => UiSyncStatus::Error(sync_error_label(error)),
     }
 }

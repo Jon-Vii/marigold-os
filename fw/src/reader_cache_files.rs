@@ -116,6 +116,51 @@ where
     hal_ext::nvm::AppStateRecord::decode(&bytes[..len])
 }
 
+const WIFI_FILE: &str = "WIFI.BIN";
+
+/// Write the onboarding portal's captured credentials to /XTEINK/WIFI.BIN.
+pub(crate) fn write_wifi_file<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    record: hal_ext::nvm::WifiCredentialsRecord,
+) -> Result<(), ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let xteink = open_or_make_dir(root, CACHE_ROOT_DIR)?;
+    let file = xteink
+        .open_file_in_dir(WIFI_FILE, Mode::ReadWriteCreateOrTruncate)
+        .map_err(|_| ())?;
+    file.write(&record.encode()).map_err(|_| ())
+}
+
+/// Read /XTEINK/WIFI.BIN; None when missing, short, or corrupt.
+pub(crate) fn read_wifi_file<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> Option<hal_ext::nvm::WifiCredentialsRecord>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let xteink = root.open_dir(CACHE_ROOT_DIR).ok()?;
+    let file = xteink.open_file_in_dir(WIFI_FILE, Mode::ReadOnly).ok()?;
+    let mut bytes = [0u8; hal_ext::nvm::WifiCredentialsRecord::ENCODED_LEN];
+    let len = file.read(&mut bytes).ok()?;
+    hal_ext::nvm::WifiCredentialsRecord::decode(&bytes[..len])
+}
+
 pub(crate) fn load_v2_cover_cache<
     D,
     T,

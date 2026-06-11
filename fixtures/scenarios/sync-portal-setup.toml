@@ -1,0 +1,19 @@
+# First-run onboarding: with no saved network the sync screen offers
+# set up, Confirm raises the hotspot, the portal page captures
+# credentials, and the saved screen tells the reader to sync again.
+
+[[steps]]
+button = "Previous"
+
+[[steps]]
+button = "Confirm"
+
+[[steps]]
+sync = "PortalUp"
+
+[[steps]]
+sync = "CredentialsSaved"
+
+[expect]
+view = "Sync"
+sync_status = "credentials-saved"

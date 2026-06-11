@@ -66,6 +66,9 @@ pub struct SyncLoan {
     pub http_a: &'static mut [u8],
     pub http_b: &'static mut [u8],
     pub book: Option<SyncBookInfo>,
+    /// Credentials from /XTEINK/WIFI.BIN; `None` sends the wifi task into
+    /// the onboarding portal unless the build carries compile-time ones.
+    pub wifi: Option<app_core::WifiCredentials>,
 }
 
 struct Dram2(UnsafeCell<MaybeUninit<[u8; DRAM2_HEAP_BYTES]>>);
