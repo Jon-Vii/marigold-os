@@ -3,7 +3,9 @@ use crate::upload::{UploadBegin, UploadChunk};
 use crate::{UPLOAD_BEGINS, UPLOAD_CHUNKS, UPLOAD_RESULTS, UPLOAD_RETURNS};
 use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::OutputPin;
+use core::sync::atomic::{AtomicU8, Ordering};
 use embedded_hal::spi::{Operation, SpiBus as BlockingSpiBus, SpiDevice};
+use embedded_sdmmc::sdcard::CardType;
 use embedded_sdmmc::{Directory, Mode, SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
 use esp_hal::gpio::Output;
 use esp_hal::spi::master::{Config as SpiConfig, SpiDmaBus};
@@ -167,6 +169,41 @@ pub(crate) enum SdSessionError {
     Root,
 }
 
+/// Each per-page-turn SD access shares the SPI bus with the panel, so the
+/// card is re-acquired every call. A *cold* acquire runs the SD SPI init
+/// handshake (CMD0/ACMD41), specced to take up to hundreds of milliseconds
+/// — far more than the section read itself. While the device stays awake
+/// the card never loses power or its SPI-mode init, so after the first
+/// successful acquire we remember its `CardType` and skip the handshake on
+/// later sessions via `mark_card_as_init`. Deep sleep resets the chip and
+/// clears this static, forcing one honest cold acquire on wake. A warm
+/// acquire that can't open the volume falls back to a cold one, so a wrong
+/// guess is at worst as slow as before — never a failed read.
+const WARM_CARD_NONE: u8 = 0;
+static WARM_CARD_CODE: AtomicU8 = AtomicU8::new(WARM_CARD_NONE);
+
+fn remembered_card_type() -> Option<CardType> {
+    match WARM_CARD_CODE.load(Ordering::Relaxed) {
+        1 => Some(CardType::SD1),
+        2 => Some(CardType::SD2),
+        3 => Some(CardType::SDHC),
+        _ => None,
+    }
+}
+
+fn remember_card_type(card_type: CardType) {
+    let code = match card_type {
+        CardType::SD1 => 1,
+        CardType::SD2 => 2,
+        CardType::SDHC => 3,
+    };
+    WARM_CARD_CODE.store(code, Ordering::Relaxed);
+}
+
+fn forget_card_warmth() {
+    WARM_CARD_CODE.store(WARM_CARD_NONE, Ordering::Relaxed);
+}
+
 /// Kept out of line: the VolumeManager/SdCard session state is multi-KB
 /// and must not be pooled into every caller's frame.
 #[inline(never)]
@@ -179,8 +216,48 @@ pub(crate) fn with_root<R>(
     sd_cs.set_high();
     esp_println::println!("sd: session enter");
 
+    // The callback is consumed only once the root dir is open, so a warm
+    // acquire that bails before then leaves it intact for the cold retry.
+    let mut pending = Some(f);
+    let mut result = Err(SdSessionError::CardInit);
+    if let Some(card_type) = remembered_card_type() {
+        result = run_sd_session(epd, sd_cs, Some(card_type), &mut pending);
+        if result.is_err() {
+            esp_println::println!("sd: warm reuse failed, cold retry");
+            forget_card_warmth();
+        }
+    }
+    if pending.is_some() {
+        result = run_sd_session(epd, sd_cs, None, &mut pending);
+    }
+
+    esp_println::println!("sd: session exit");
+    sd_cs.set_high();
+    let _ = epd
+        .spi_mut()
+        .apply_config(&SpiConfig::default().with_frequency(DISPLAY_FREQ_MHZ.MHz()));
+    result
+}
+
+/// One SD acquire + open-root + callback. `assume_init` skips the init
+/// handshake for a card known to still be warm. The callback is taken from
+/// `f` only after the root dir opens, so any earlier failure returns with
+/// `f` untouched for the caller to retry cold.
+#[allow(unsafe_code)]
+#[inline(never)]
+fn run_sd_session<R, F>(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    assume_init: Option<CardType>,
+    f: &mut Option<F>,
+) -> Result<R, SdSessionError>
+where
+    F: for<'a> FnOnce(&SdRoot<'a>) -> R,
+{
     // Identification phase: 400 kHz with at least 74 wake clocks while no
     // chip select is asserted, per the SD spec and embedded-sdmmc's docs.
+    // Harmless for an already-initialised card (it ignores the bus while
+    // deselected), so the warm path runs it too rather than special-casing.
     {
         let spi = epd.spi_mut();
         let _ = spi.apply_config(&SpiConfig::default().with_frequency(SD_IDENT_FREQ_KHZ.kHz()));
@@ -189,55 +266,65 @@ pub(crate) fn with_root<R>(
         let _ = BlockingSpiBus::flush(spi);
     }
 
-    let result = {
-        let spi = SdSpiDevice {
-            spi: epd.spi_mut(),
-            cs: sd_cs,
-            delay: SdDelay,
-        };
-        let card = SdCard::new(spi, SdDelay);
-        esp_println::println!("sd: card probe");
-        if card.num_bytes().is_err() {
-            Err(SdSessionError::CardInit)
-        } else {
-            esp_println::println!("sd: card ready");
-            // Card acquired: switch to the in-spec data rate for the rest
-            // of the session.
-            card.spi(|device| {
-                let _ = device
-                    .spi
-                    .apply_config(&SpiConfig::default().with_frequency(SD_DATA_FREQ_MHZ.MHz()));
-            });
-            let volume_mgr: VolumeManager<_, _, 8, 8, 1> =
-                VolumeManager::new_with_limits(card, StaticTime, 5000);
-            let result = match volume_mgr.open_volume(VolumeIdx(0)) {
-                Ok(volume) => {
-                    esp_println::println!("sd: volume open");
-                    let raw_volume = volume.to_raw_volume();
-                    if let Ok(raw_root) = volume_mgr.open_root_dir(raw_volume) {
-                        esp_println::println!("sd: root open");
-                        let root = Directory::new(raw_root, &volume_mgr);
-                        let value = f(&root);
-                        esp_println::println!("sd: root callback done");
-                        drop(root);
-                        let _ = volume_mgr.close_volume(raw_volume);
-                        Ok(value)
-                    } else {
-                        let _ = volume_mgr.close_volume(raw_volume);
-                        Err(SdSessionError::Root)
-                    }
-                }
-                Err(_) => Err(SdSessionError::Volume),
-            };
-            result
-        }
+    let spi = SdSpiDevice {
+        spi: epd.spi_mut(),
+        cs: sd_cs,
+        delay: SdDelay,
     };
+    let card = SdCard::new(spi, SdDelay);
+    match assume_init {
+        Some(card_type) => {
+            // SAFETY: the card has stayed powered and in SPI mode since the
+            // cold acquire that recorded this type; reads below skip
+            // re-init because the type is already set. A stale guess
+            // surfaces as an open_volume failure and a cold retry, so this
+            // never reads with the wrong addressing mode silently.
+            unsafe { card.mark_card_as_init(card_type) };
+        }
+        None => {
+            esp_println::println!("sd: card probe");
+            if card.num_bytes().is_err() {
+                return Err(SdSessionError::CardInit);
+            }
+            esp_println::println!("sd: card ready");
+            if let Some(card_type) = card.get_card_type() {
+                remember_card_type(card_type);
+            }
+        }
+    }
 
-    esp_println::println!("sd: session exit");
-    sd_cs.set_high();
-    let _ = epd
-        .spi_mut()
-        .apply_config(&SpiConfig::default().with_frequency(DISPLAY_FREQ_MHZ.MHz()));
+    // Card acquired: switch to the in-spec data rate for the rest of the
+    // session.
+    card.spi(|device| {
+        let _ = device
+            .spi
+            .apply_config(&SpiConfig::default().with_frequency(SD_DATA_FREQ_MHZ.MHz()));
+    });
+    let volume_mgr: VolumeManager<_, _, 8, 8, 1> =
+        VolumeManager::new_with_limits(card, StaticTime, 5000);
+    // Bind the outcome so the open_volume scrutinee temporary (which borrows
+    // volume_mgr) is dropped at the `;` while volume_mgr is still alive,
+    // rather than racing volume_mgr's own drop at the function tail.
+    let result = match volume_mgr.open_volume(VolumeIdx(0)) {
+        Ok(volume) => {
+            esp_println::println!("sd: volume open");
+            let raw_volume = volume.to_raw_volume();
+            if let Ok(raw_root) = volume_mgr.open_root_dir(raw_volume) {
+                esp_println::println!("sd: root open");
+                let root = Directory::new(raw_root, &volume_mgr);
+                let callback = f.take().expect("sd session callback present");
+                let value = callback(&root);
+                esp_println::println!("sd: root callback done");
+                drop(root);
+                let _ = volume_mgr.close_volume(raw_volume);
+                Ok(value)
+            } else {
+                let _ = volume_mgr.close_volume(raw_volume);
+                Err(SdSessionError::Root)
+            }
+        }
+        Err(_) => Err(SdSessionError::Volume),
+    };
     result
 }
 
