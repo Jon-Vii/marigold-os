@@ -337,6 +337,46 @@ impl ReaderStore {
         }
     }
 
+    /// Keep only the blocks of the in-progress final page at the front of
+    /// the store, rebasing their text. Lets an intermediate section flush on
+    /// a whole-page boundary and carry the half-finished page into the next
+    /// section, instead of writing it as a short, half-empty page the reader
+    /// stops on. `first_block` is that page's first block; callers guarantee
+    /// `0 < first_block < block_count`.
+    pub(crate) fn carry_last_page(&mut self, first_block: usize) {
+        if first_block == 0 || first_block >= self.block_count {
+            return;
+        }
+        let text_start = self.blocks[first_block].text_offset as usize;
+        let carried_blocks = self.block_count - first_block;
+        let carried_text = self.text_len.saturating_sub(text_start);
+        self.text.copy_within(text_start..self.text_len, 0);
+        for offset in 0..carried_blocks {
+            let src = first_block + offset;
+            let mut record = self.blocks[src];
+            record.text_offset = record.text_offset.saturating_sub(text_start as u32);
+            self.blocks[offset] = record;
+            self.block_styles[offset] = self.block_styles[src];
+            self.block_spine[offset] = self.block_spine[src];
+            self.block_page_break_before[offset] = self.block_page_break_before[src];
+            self.block_paragraph_end[offset] = self.block_paragraph_end[src];
+        }
+        for index in carried_blocks..self.block_count {
+            self.blocks[index] = EMPTY_BLOCK_RECORD;
+            self.block_styles[index] = FontStyle::Regular;
+            self.block_spine[index] = 0;
+            self.block_page_break_before[index] = false;
+            self.block_paragraph_end[index] = true;
+        }
+        self.block_count = carried_blocks;
+        self.text_len = carried_text;
+        self.page_count = 0;
+        for (index, page) in self.pages.iter_mut().enumerate() {
+            *page = EMPTY_PAGE_RECORD;
+            self.page_spine[index] = 0;
+        }
+    }
+
     pub(crate) fn clear_book_index(&mut self) {
         self.book_total_pages = 0;
         self.current_section_start_page = 0;

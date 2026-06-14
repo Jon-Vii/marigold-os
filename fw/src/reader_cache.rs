@@ -1216,10 +1216,10 @@ where
 {
     fn finish_spine(&mut self, partial: bool) {
         flush_styled_preview_line(self, true);
-        self.flush_section(partial || self.stopped);
+        self.flush_section(partial || self.stopped, false);
     }
 
-    fn flush_section(&mut self, partial: bool) -> bool {
+    fn flush_section(&mut self, partial: bool, carry_incomplete: bool) -> bool {
         reader_layout::rebuild_page_index(
             self.library,
             reader_layout::READER_PAGE_TOP,
@@ -1236,6 +1236,26 @@ where
         }
         if partial {
             *self.book_partial = true;
+        }
+
+        // Intermediate sections end on a whole page: the half-finished final
+        // page carries into the next section rather than being written as a
+        // short, half-empty page the reader would stop on mid-chapter. The
+        // last section of a chapter (finish_spine) keeps its trailing page —
+        // that is the genuine end of the text.
+        let full_blocks = self.library.block_count();
+        let full_text = self.library.text_len;
+        let full_pages = self.library.page_count;
+        let carry_first = if carry_incomplete && full_pages > 1 {
+            let cut = self.library.pages[full_pages - 1].first_block as usize;
+            (cut > 0 && cut < full_blocks).then_some(cut)
+        } else {
+            None
+        };
+        if let Some(cut) = carry_first {
+            self.library.block_count = cut;
+            self.library.page_count = full_pages - 1;
+            self.library.text_len = self.library.blocks[cut].text_offset as usize;
         }
 
         self.library.set_cached_spine(self.spine_index);
@@ -1260,7 +1280,20 @@ where
         };
         *self.total_pages = (*self.total_pages).saturating_add(self.library.page_count as u32);
         *self.section_count += 1;
-        self.library.clear_lines();
+
+        match carry_first {
+            Some(cut) => {
+                self.library.block_count = full_blocks;
+                self.library.text_len = full_text;
+                self.library.carry_last_page(cut);
+                reader_layout::rebuild_page_index(
+                    self.library,
+                    reader_layout::READER_PAGE_TOP,
+                    reader_layout::READER_PAGE_BOTTOM,
+                );
+            }
+            None => self.library.clear_lines(),
+        }
         true
     }
 
@@ -1275,7 +1308,7 @@ where
             || self.library.text_capacity_reached()
         {
             flush_styled_preview_line(self, false);
-            self.flush_section(false);
+            self.flush_section(false, true);
         }
     }
 }
@@ -1530,7 +1563,7 @@ fn flush_styled_preview_line<
         // losing its tail. (At the book-wide section ceiling flush_section
         // refuses and sets book_partial; the line is then genuinely
         // dropped, which is the separate whole-book limit.)
-        sink.flush_section(false);
+        sink.flush_section(false, true);
         let _ = sink.library.push_line_block(
             line.as_str(),
             style,
