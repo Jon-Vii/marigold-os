@@ -557,6 +557,33 @@ impl ReaderStore {
             })
     }
 
+    /// Page position within the chapter (spine item) containing
+    /// `global_page`, as (one-based page in chapter, chapter page total).
+    /// A long chapter now spans several cache sections, so the footer
+    /// counter must aggregate every section sharing the page's spine rather
+    /// than read a single section -- otherwise it resets mid-chapter at each
+    /// chunk boundary. Returns None when there is no book index to aggregate
+    /// (single in-RAM section), letting the caller fall back.
+    pub(crate) fn chapter_page_position(&self, global_page: u32) -> Option<(u32, u32)> {
+        let spine = self.section_for_global_page(global_page)?.spine;
+        let mut start = u32::MAX;
+        let mut total = 0u32;
+        for section in self.book_sections.iter().take(self.book_section_count) {
+            if section.spine == spine {
+                start = start.min(section.start_page);
+                total = total.saturating_add(section.page_count.max(1) as u32);
+            }
+        }
+        if total == 0 {
+            return None;
+        }
+        let current = global_page
+            .saturating_sub(start)
+            .saturating_add(1)
+            .min(total);
+        Some((current, total))
+    }
+
     pub(crate) fn block_text(&self, index: usize) -> &str {
         let Some(record) = self.blocks.get(index) else {
             return "";

@@ -186,24 +186,32 @@ fn draw_reader_footer(
 ) {
     let label_font = display::font::literata_small(FontStyle::Regular);
 
-    let section_total = if sd_library.current_section_page_count > 0 {
-        sd_library.current_section_page_count as u32
-    } else {
-        page_count
-    }
-    .max(1);
-    let section_current = if sd_library.current_section_page_count > 0 {
-        request
-            .page
-            .saturating_sub(sd_library.current_section_start_page)
-            .saturating_add(1)
-    } else {
-        request.page.saturating_add(1)
-    }
-    .min(section_total);
+    // Page within the chapter (spine item), aggregated across its cache
+    // sections. Falls back to the current section, then the whole book, when
+    // no book index is loaded to aggregate from.
+    let (chapter_current, chapter_total) = sd_library
+        .chapter_page_position(request.page)
+        .unwrap_or_else(|| {
+            let total = if sd_library.current_section_page_count > 0 {
+                sd_library.current_section_page_count as u32
+            } else {
+                page_count
+            }
+            .max(1);
+            let current = if sd_library.current_section_page_count > 0 {
+                request
+                    .page
+                    .saturating_sub(sd_library.current_section_start_page)
+                    .saturating_add(1)
+            } else {
+                request.page.saturating_add(1)
+            }
+            .min(total);
+            (current, total)
+        });
 
     let mut label = String::<32>::new();
-    let _ = write!(label, "{}/{}", section_current, section_total);
+    let _ = write!(label, "{}/{}", chapter_current, chapter_total);
     let label_width = measure_text(label_font, label.as_str()) as i16;
     // The slash inks 2 rows below its baseline, so 477 is as low as the
     // counter goes without clipping the 480-row panel. READER_PAGE_BOTTOM
