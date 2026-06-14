@@ -10,3 +10,5 @@ cargo test -p app-core -p proto --target aarch64-apple-darwin   # host tests
 ```
 
 internals: [ARCHITECTURE.md](docs/ARCHITECTURE.md)
+
+[MIT](LICENSE)
