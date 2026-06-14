@@ -12,4 +12,4 @@ This repo uses the default mattpocock/skills triage vocabulary. See `docs/agents
 
 ### Domain docs
 
-This is a single-context repo: read root domain and architecture docs, plus root ADRs if present. See `docs/agents/domain.md`.
+This is a single-context repo: read the domain and architecture docs in `docs/`, plus `docs/adr/` if present. See `docs/agents/domain.md`.

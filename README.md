@@ -9,4 +9,4 @@ cargo run -p fw --release                                       # build, flash, 
 cargo test -p app-core -p proto --target aarch64-apple-darwin   # host tests
 ```
 
-internals: [ARCHITECTURE.md](ARCHITECTURE.md)
+internals: [ARCHITECTURE.md](docs/ARCHITECTURE.md)

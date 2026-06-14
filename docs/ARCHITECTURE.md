@@ -11,7 +11,7 @@ buttons -> app state -> display command -> framebuffer -> SSD1677 RAM -> refresh
 
 ## Current architecture diagram
 
-![Current architecture diagram](docs/architecture.png)
+![Current architecture diagram](architecture.png)
 
 ```mermaid
 flowchart TD
