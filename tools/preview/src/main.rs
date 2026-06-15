@@ -1751,6 +1751,7 @@ fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u8) -> s
         line_spacing: display::font::LineSpacing::Normal,
         selection,
         chapter: 2,
+        chapter_title: "",
         page: 141,
         page_count: 380,
         battery_percent: 82,

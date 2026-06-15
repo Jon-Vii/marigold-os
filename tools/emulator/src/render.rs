@@ -125,6 +125,7 @@ fn demo_model<'a>(
         },
         library_entries,
         chapters: &DEMO_CHAPTERS,
+        chapter_title: "",
     }
 }
 

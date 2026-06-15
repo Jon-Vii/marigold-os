@@ -75,6 +75,15 @@ fn ui_model<'a>(
     let (title, author) =
         sd_library.active_book_labels(request.book_id, fallback_book.title, fallback_book.author);
 
+    // The firmware-resolved current-chapter title, but only for the book that
+    // is actually loaded -- so a colophon never names another book's chapter.
+    let chapter_title = if sd_library.loaded_index == ReaderStore::selected_book_index(request.book_id)
+    {
+        sd_library.current_chapter_title()
+    } else {
+        ""
+    };
+
     UiRenderModel {
         active_book: UiBook {
             title,
@@ -92,6 +101,7 @@ fn ui_model<'a>(
         library_status: ui_library_status(sd_library.status),
         library_entries: &library_entries[..library_count],
         chapters: &chapters[..chapter_count],
+        chapter_title,
     }
 }
 

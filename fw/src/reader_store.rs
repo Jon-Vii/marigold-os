@@ -9,6 +9,13 @@ use proto::text::{TextAlign, TextRole};
 
 pub(crate) const MAX_LIBRARY_BOOKS: usize = 16;
 pub(crate) const MAX_SD_TOC_ITEMS: usize = 128;
+/// Chapter-page map covering the whole on-disk TOC (not the 128-capped
+/// resident/event arrays), so the current chapter tracks reading position
+/// through a long book. One u16 page per chapter; 512 bytes resident.
+pub(crate) const MAX_OVERVIEW_CHAPTERS: usize = 256;
+/// Longest current-chapter title kept resident for the Home/sleep colophon;
+/// read on demand from TOC.BIN as the chapter changes.
+const MAX_CURRENT_CHAPTER_TITLE: usize = 48;
 // ~14 pages per 16 KB section at the default size, so 320 covers ~4,500
 // pages -- enough for very long books (e.g. HPMOR) to cache whole rather
 // than tripping book_partial partway. The two persistent arrays this sizes
@@ -144,6 +151,23 @@ pub(crate) struct ReaderStore {
     /// While the Chapters view is open, `text` holds the on-disk TOC records
     /// instead of section content; the reading section is reloaded on exit.
     pub(crate) text_holds_toc: bool,
+    /// Start page of every chapter in the book (chapter -> page_for_spine),
+    /// filled once at open from TOC.BIN. Covers the whole TOC, so the current
+    /// chapter never gets stuck at the 128-entry cap.
+    pub(crate) chapter_page: [u16; MAX_OVERVIEW_CHAPTERS],
+    /// Number of valid entries in `chapter_page`; independent of the overview's
+    /// `toc_total` so the current-chapter map survives a Chapters visit.
+    pub(crate) chapter_page_count: usize,
+    /// `(source_hash, source_size, font_config)` the `chapter_page` map was
+    /// built for. The book index reloads every section crossing, so this token
+    /// keeps the map from being re-read from disk except on a new book or a
+    /// repaginating settings change.
+    pub(crate) chapter_page_token: (u32, u32, u16),
+    /// Current chapter and its title, resolved by the firmware from
+    /// `chapter_page` + the reading page on each section load, for the
+    /// Home/sleep colophon and the overview's starting selection.
+    pub(crate) current_chapter: u16,
+    pub(crate) current_chapter_title: String<MAX_CURRENT_CHAPTER_TITLE>,
     pub(crate) text: [u8; MAX_READER_TEXT_BYTES],
     pub(crate) text_len: usize,
     pub(crate) blocks: [BlockRecord; MAX_READER_BLOCKS],
@@ -192,6 +216,11 @@ impl ReaderStore {
             toc_count: 0,
             toc_total: 0,
             text_holds_toc: false,
+            chapter_page: [0; MAX_OVERVIEW_CHAPTERS],
+            chapter_page_count: 0,
+            chapter_page_token: (0, 0, 0),
+            current_chapter: 0,
+            current_chapter_title: String::new(),
             text: [0; MAX_READER_TEXT_BYTES],
             text_len: 0,
             blocks: [EMPTY_BLOCK_RECORD; MAX_READER_BLOCKS],
@@ -793,6 +822,39 @@ impl ReaderStore {
             return 0;
         }
         self.page_for_spine(spine as u16).min(u16::MAX as u32) as u16
+    }
+
+    /// The chapter a page falls in, over the full chapter-page map -- so it
+    /// keeps advancing past the 128-entry resident/event caps.
+    pub(crate) fn current_chapter_for_page(&self, page: u32) -> u16 {
+        let count = self.chapter_page_count.min(MAX_OVERVIEW_CHAPTERS);
+        let mut selected = 0u16;
+        for index in 0..count {
+            if u32::from(self.chapter_page[index]) <= page {
+                selected = index as u16;
+            } else {
+                break;
+            }
+        }
+        selected
+    }
+
+    pub(crate) fn set_current_chapter(&mut self, chapter: u16, title: &str) {
+        self.current_chapter = chapter;
+        self.current_chapter_title.clear();
+        for ch in title.chars() {
+            if self.current_chapter_title.push(ch).is_err() {
+                break;
+            }
+        }
+    }
+
+    pub(crate) fn current_chapter(&self) -> u16 {
+        self.current_chapter
+    }
+
+    pub(crate) fn current_chapter_title(&self) -> &str {
+        self.current_chapter_title.as_str()
     }
 
     fn append_toc_text(&mut self, value: &str) -> bool {

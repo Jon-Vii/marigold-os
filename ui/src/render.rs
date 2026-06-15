@@ -98,6 +98,7 @@ fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         fb,
         shell.chapters,
         shell.chapter,
+        shell.chapter_title,
         CONTENT_X,
         312,
         CONTENT_RIGHT - CONTENT_X,
@@ -111,14 +112,12 @@ pub(crate) fn draw_chapter_colophon(
     fb: &mut Framebuffer,
     chapters: &[UiTocItem<'_>],
     chapter: u8,
+    title_override: &str,
     x: i16,
     baseline: i16,
     max_w: i16,
 ) -> i16 {
-    let chapter_name = chapters
-        .get(chapter as usize)
-        .map(|item| item.title)
-        .unwrap_or("");
+    let chapter_name = colophon_chapter_name(chapters, chapter, title_override);
     if chapter_name.is_empty() {
         let mut numeral = [0u8; 16];
         let mut cursor = 0;
@@ -139,12 +138,30 @@ pub(crate) fn draw_chapter_colophon(
     }
 }
 
-/// Width the colophon will occupy, for centered layouts.
-pub(crate) fn chapter_colophon_width(chapters: &[UiTocItem<'_>], chapter: u8, max_w: i16) -> i16 {
-    let chapter_name = chapters
+/// The chapter name the colophon shows: the firmware-resolved title when
+/// present (covers the whole book), else the resident list entry.
+fn colophon_chapter_name<'a>(
+    chapters: &'a [UiTocItem<'a>],
+    chapter: u8,
+    title_override: &'a str,
+) -> &'a str {
+    if !title_override.is_empty() {
+        return title_override;
+    }
+    chapters
         .get(chapter as usize)
         .map(|item| item.title)
-        .unwrap_or("");
+        .unwrap_or("")
+}
+
+/// Width the colophon will occupy, for centered layouts.
+pub(crate) fn chapter_colophon_width(
+    chapters: &[UiTocItem<'_>],
+    chapter: u8,
+    title_override: &str,
+    max_w: i16,
+) -> i16 {
+    let chapter_name = colophon_chapter_name(chapters, chapter, title_override);
     if chapter_name.is_empty() {
         let mut numeral = [0u8; 16];
         let mut cursor = 0;

@@ -256,6 +256,7 @@ fn library_event_affects_view(state: &ReaderState, event: &crate::LibraryEvent) 
             book_id,
             pages: _,
             chapters: _,
+            current_chapter: _,
             chapter_pages: _,
         } => state.book_id == book_id,
         crate::LibraryEvent::ChapterPage {

@@ -365,6 +365,11 @@ pub enum LibraryEvent {
         book_id: u32,
         pages: u32,
         chapters: u8,
+        /// The chapter the reading page currently sits in, computed by the
+        /// firmware over the whole book. Unlike `chapter_pages` (capped at
+        /// `MAX_SD_CHAPTERS`), this tracks position into a long book so the
+        /// colophon and chapter cursor do not stick past the cap.
+        current_chapter: u16,
         chapter_pages: [u16; MAX_SD_CHAPTERS],
     },
     ChapterPage {
@@ -624,11 +629,10 @@ impl ReaderState {
             }
             (AppView::Reading, Some(Button::Confirm)) => {
                 next.view = AppView::Chapters;
-                next.selection = if ReaderSource::from_book_id(self.book_id).is_sd() {
-                    self.sd_chapter_for_page(self.page)
-                } else {
-                    self.chapter
-                };
+                // `chapter` already tracks the reading position (kept current
+                // by the firmware's Loaded event, un-capped); opening the list
+                // lands the cursor there rather than on the saturated guess.
+                next.selection = self.chapter;
             }
             (AppView::Reading, Some(Button::Back)) => {
                 next.view = AppView::Home;
@@ -737,6 +741,7 @@ impl ReaderState {
                 book_id,
                 pages,
                 chapters,
+                current_chapter,
                 chapter_pages,
             } => {
                 if self.book_id == book_id {
@@ -744,6 +749,10 @@ impl ReaderState {
                     self.sd_chapter_count = chapters.max(1);
                     self.sd_chapter_pages = chapter_pages;
                     self.page = self.page.min(self.sd_page_count.saturating_sub(1));
+                    // The firmware owns the true current chapter over the whole
+                    // book; adopt it so the cursor tracks past the cap that the
+                    // page-turn recompute (sd_chapter_for_page) saturates at.
+                    self.chapter = current_chapter.min(u8::MAX as u16) as u8;
                     self.dirty = Rect::FULL;
                 }
             }

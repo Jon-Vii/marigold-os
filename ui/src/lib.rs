@@ -90,6 +90,10 @@ pub struct UiShell<'a> {
     pub line_spacing: display::font::LineSpacing,
     pub selection: u8,
     pub chapter: u8,
+    /// The current chapter's title resolved over the whole book (past the
+    /// resident `chapters` cap). When non-empty the colophon prefers it over
+    /// `chapters[chapter]`; empty falls back to the list or a numeral.
+    pub chapter_title: &'a str,
     pub page: u32,
     pub page_count: u32,
     pub battery_percent: u8,

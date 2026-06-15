@@ -499,6 +499,13 @@ where
             ) {
                 CacheLoadResult::Hit { pages, .. } => {
                     reader_layout::rebuild_toc_page_targets(library);
+                    refresh_chapter_tracking(
+                        root,
+                        cache_key,
+                        source_identity,
+                        requested_global_page,
+                        library,
+                    );
                     let cover = reader_cache_files::load_v2_cover_cache(root, cache_key, library);
                     esp_println::println!(
                         "epub: v2 {label} book cache ready after {} ms (total={} section_pages={} toc={} cover={:?})",
@@ -524,6 +531,53 @@ where
             esp_println::println!("epub: v2 {label} book index miss");
             false
         }
+    }
+}
+
+/// Keep the resident current-chapter index and title pointed at the page just
+/// loaded. The full chapter-page map is read from TOC.BIN once per book (or
+/// after a repaginating settings change); the title is a single 48-byte record
+/// re-read only when the chapter actually changes.
+fn refresh_chapter_tracking<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    cache_key: &str,
+    source_identity: (u32, u32),
+    global_page: u32,
+    library: &mut ReaderStore,
+) where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let config = reader_layout::reader_layout_config(library.type_settings());
+    let token = (source_identity.0, source_identity.1, config);
+    if library.chapter_page_count == 0 || library.chapter_page_token != token {
+        if reader_cache_files::load_v2_toc_page_map(root, cache_key, source_identity, library) {
+            library.chapter_page_token = token;
+        } else {
+            return;
+        }
+    }
+    let current = library.current_chapter_for_page(global_page);
+    let needs_refresh =
+        current != library.current_chapter() || library.current_chapter_title().is_empty();
+    if needs_refresh
+        && !reader_cache_files::read_v2_toc_chapter_title(
+            root,
+            cache_key,
+            source_identity,
+            current,
+            library,
+        )
+    {
+        // No title on the card (or a short read): still advance the index so
+        // the cursor tracks; the colophon falls back to a numeral.
+        library.set_current_chapter(current, "");
     }
 }
 
@@ -938,6 +992,13 @@ where
             }
         }
         reader_layout::rebuild_toc_page_targets(library);
+        refresh_chapter_tracking(
+            root,
+            cache_key,
+            source_identity,
+            requested_global_page.min(total_pages.saturating_sub(1)),
+            library,
+        );
         let cover = reader_cache_files::load_v2_cover_cache(root, cache_key, library);
         esp_println::println!("epub: stage PublishLoaded");
         esp_println::println!(

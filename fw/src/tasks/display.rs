@@ -362,6 +362,7 @@ fn handle_storage_command(
                     book_id,
                     pages: sd_library.advertised_page_count(),
                     chapters: sd_library.chapter_count_for_ui(),
+                    current_chapter: sd_library.current_chapter(),
                     chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
                 });
                 if resumed {
@@ -392,6 +393,7 @@ fn handle_storage_command(
                 book_id,
                 pages: sd_library.advertised_page_count(),
                 chapters: sd_library.chapter_count_for_ui(),
+                current_chapter: sd_library.current_chapter(),
                 chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
             });
             if resumed {
@@ -425,6 +427,7 @@ fn handle_storage_command(
                 book_id,
                 pages: sd_library.advertised_page_count(),
                 chapters: sd_library.chapter_count_for_ui(),
+                current_chapter: sd_library.current_chapter(),
                 chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
             });
         }
@@ -456,6 +459,7 @@ fn handle_storage_command(
                 book_id,
                 pages: sd_library.advertised_page_count(),
                 chapters: sd_library.chapter_count_for_ui(),
+                current_chapter: sd_library.current_chapter(),
                 chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
             });
             send_resumed_position(book_id, chapter, target_page, last_request);

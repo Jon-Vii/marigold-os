@@ -246,6 +246,7 @@ fn parse_library_event(kind: &str, step: &Step) -> Result<LibraryEvent, String> 
             book_id: step.book_id.unwrap_or(2),
             pages: step.pages.unwrap_or(1),
             chapters: step.chapters.unwrap_or(1),
+            current_chapter: u16::from(step.chapter.unwrap_or(0)),
             chapter_pages: [0; app_core::MAX_SD_CHAPTERS],
         }),
         "ChapterPage" | "chapter-page" | "chapter_page" => Ok(LibraryEvent::ChapterPage {

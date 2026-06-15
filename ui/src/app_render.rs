@@ -16,6 +16,9 @@ pub struct UiRenderModel<'a> {
     pub library_status: UiLibraryStatus,
     pub library_entries: &'a [&'a str],
     pub chapters: &'a [UiTocItem<'a>],
+    /// Current chapter title resolved over the whole book; empty for built-in
+    /// books or before a book is open. See `UiShell::chapter_title`.
+    pub chapter_title: &'a str,
 }
 
 pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRenderModel<'_>) {
@@ -32,6 +35,7 @@ pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRe
         line_spacing: request.line_spacing,
         selection: request.selection,
         chapter: request.chapter,
+        chapter_title: model.chapter_title,
         page: request.page,
         page_count: request.page_count,
         battery_percent: request.battery_percent,
@@ -101,11 +105,13 @@ pub fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, model: &UiRend
     };
     crate::render::progress_rule(fb, 280, 302, 240, permille);
 
-    let colophon_w = crate::render::chapter_colophon_width(model.chapters, request.chapter, 600);
+    let colophon_w =
+        crate::render::chapter_colophon_width(model.chapters, request.chapter, model.chapter_title, 600);
     crate::render::draw_chapter_colophon(
         fb,
         model.chapters,
         request.chapter,
+        model.chapter_title,
         400 - colophon_w / 2,
         340,
         600,

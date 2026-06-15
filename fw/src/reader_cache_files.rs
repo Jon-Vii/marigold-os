@@ -1,7 +1,7 @@
 use crate::reader_layout;
 use crate::reader_store::{
-    ReaderStore, EMPTY_BOOK_SECTION_RECORD, EMPTY_TOC_RECORD, MAX_BOOK_SECTIONS, MAX_SD_TOC_ITEMS,
-    MAX_SD_TOC_TEXT_BYTES,
+    ReaderStore, EMPTY_BOOK_SECTION_RECORD, EMPTY_TOC_RECORD, MAX_BOOK_SECTIONS,
+    MAX_OVERVIEW_CHAPTERS, MAX_SD_TOC_ITEMS, MAX_SD_TOC_TEXT_BYTES,
 };
 use display::font::FontStyle;
 use embedded_sdmmc::{Directory, File, Mode, TimeSource};
@@ -10,7 +10,8 @@ use proto::cache::{
     decode_block, decode_book_v2_header, decode_book_v2_section, decode_cover_header, decode_page,
     decode_section_header, decode_section_v2_header, decode_toc, encode_block,
     encode_book_v2_header, encode_book_v2_section, encode_page, encode_section_v2_header,
-    decode_toc_file_header, encode_toc, encode_toc_file_header, section_file_name, BookV2Header,
+    decode_toc_chapter, decode_toc_file_header, encode_toc, encode_toc_file_header,
+    section_file_name, BookV2Header,
     BookV2SectionRecord, SectionV2Header, TocFileHeader, BLOCK_RECORD_BYTES, BOOK_V2_HEADER_BYTES,
     BOOK_V2_SECTION_RECORD_BYTES, CACHE_BOOK_FILE, CACHE_COVER_FILE, CACHE_DIR, CACHE_ROOT_DIR,
     CACHE_SECTIONS_DIR, CACHE_SECTION_FILE_BYTES, CACHE_STATE_FILE, CACHE_TOC_FILE, CACHE_V2_DIR,
@@ -933,6 +934,118 @@ where
             return false;
         }
         library.set_toc_in_text(header.chapter_count as usize);
+        true
+    })
+    .unwrap_or(false)
+}
+
+/// Fill the resident `chapter_page` map (chapter -> global start page) from
+/// TOC.BIN, so the firmware can resolve the current chapter for any reading
+/// page across the whole book -- past the 128-entry resident/event caps. The
+/// book index must already be loaded so `page_for_spine` resolves.
+pub(crate) fn load_v2_toc_page_map<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    key: &str,
+    source_identity: (u32, u32),
+    library: &mut ReaderStore,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    with_v2_toc_file(root, key, Mode::ReadOnly, |file| {
+        let mut header_bytes = [0u8; TOC_FILE_HEADER_BYTES];
+        if read_exact_file(file, &mut header_bytes).is_err() {
+            return false;
+        }
+        let Ok(header) = decode_toc_file_header(&header_bytes) else {
+            return false;
+        };
+        if header.source_hash != source_identity.0 || header.source_size != source_identity.1 {
+            return false;
+        }
+        let count = (header.chapter_count as usize).min(MAX_OVERVIEW_CHAPTERS);
+        if !read_records_batched(
+            file,
+            TOC_CHAPTER_RECORD_BYTES,
+            header.chapter_count as usize,
+            |index, bytes| {
+                if index >= MAX_OVERVIEW_CHAPTERS {
+                    // Drain the rest of the file but keep only the first
+                    // MAX_OVERVIEW_CHAPTERS starts.
+                    return true;
+                }
+                let spine = i16::from_le_bytes([bytes[0], bytes[1]]);
+                let page = if spine < 0 {
+                    0
+                } else {
+                    library.page_for_spine(spine as u16).min(u16::MAX as u32) as u16
+                };
+                library.chapter_page[index] = page;
+                true
+            },
+        ) {
+            return false;
+        }
+        library.chapter_page_count = count;
+        true
+    })
+    .unwrap_or(false)
+}
+
+/// Read one chapter's title straight from its TOC.BIN record (a single seek
+/// and 48-byte read) into the resident current-chapter slot, so the Home and
+/// sleep colophons can name a chapter the 128-entry resident list omits.
+pub(crate) fn read_v2_toc_chapter_title<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    key: &str,
+    source_identity: (u32, u32),
+    chapter: u16,
+    library: &mut ReaderStore,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    with_v2_toc_file(root, key, Mode::ReadOnly, |file| {
+        let mut header_bytes = [0u8; TOC_FILE_HEADER_BYTES];
+        if read_exact_file(file, &mut header_bytes).is_err() {
+            return false;
+        }
+        let Ok(header) = decode_toc_file_header(&header_bytes) else {
+            return false;
+        };
+        if header.source_hash != source_identity.0
+            || header.source_size != source_identity.1
+            || chapter >= header.chapter_count
+        {
+            return false;
+        }
+        let offset =
+            (TOC_FILE_HEADER_BYTES + chapter as usize * TOC_CHAPTER_RECORD_BYTES) as u32;
+        if file.seek_from_start(offset).is_err() {
+            return false;
+        }
+        let mut record = [0u8; TOC_CHAPTER_RECORD_BYTES];
+        if read_exact_file(file, &mut record).is_err() {
+            return false;
+        }
+        let Ok(parsed) = decode_toc_chapter(&record) else {
+            return false;
+        };
+        library.set_current_chapter(chapter, parsed.title_str());
         true
     })
     .unwrap_or(false)
