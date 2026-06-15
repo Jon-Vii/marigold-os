@@ -183,9 +183,14 @@ fn draw_sd_reader_page(fb: &mut Framebuffer, request: RenderRequest, sd_library:
             size: request.font_size,
             spacing: request.line_spacing,
         };
-    let selected_book_loaded = layout_current
-        && sd_library.loaded_index == ReaderStore::selected_book_index(request.book_id);
-    match (sd_library.reader_status(), selected_book_loaded) {
+    // While the Chapters overview borrows the reading text buffer for the
+    // on-disk TOC, page/block records still point at the old section but the
+    // bytes underneath are TOC records -- drawing the body now paints garbage
+    // glyphs. Hold the bookplate until the reading section reloads on exit.
+    let reading_buffer_ready = layout_current
+        && sd_library.loaded_index == ReaderStore::selected_book_index(request.book_id)
+        && !sd_library.text_holds_toc();
+    match (sd_library.reader_status(), reading_buffer_ready) {
         (_, false) | (BookLoadStatus::Empty | BookLoadStatus::Loading, _) => {
             draw_sd_reader_loading(fb, request, sd_library);
         }
