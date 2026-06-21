@@ -32,7 +32,10 @@ const COLOPHON_RIGHT: i16 = 760;
 const HEADING_CX: i16 = 480;
 const ROW_STEP: i16 = 56;
 const FIRST_ROW_Y: i16 = 118;
-const VISIBLE_ROWS: usize = 6;
+/// Rows the Library list shows at once. Public so the firmware sizes the
+/// resident catalog window to cover the visible range it must stream in.
+pub const LIBRARY_VISIBLE_ROWS: usize = 6;
+const VISIBLE_ROWS: usize = LIBRARY_VISIBLE_ROWS;
 const FOOTER_Y: i16 = 456;
 /// Baseline-to-baseline leading for the wrapped 46px display title,
 /// tighter than the face's default 62px line height as title blocks
@@ -237,29 +240,35 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         }
         UiLibraryStatus::Ready => {}
     }
-    if shell.library_entries.is_empty() {
+    let total = shell.library_total as usize;
+    if total == 0 || shell.library_entries.is_empty() {
         centered_note(fb, "no books \u{2014} add EPUB files to /books");
         finish_working_screen(fb, shell);
         return;
     }
 
-    let selected_index = shell.selection as usize;
-    let start = if selected_index >= VISIBLE_ROWS {
-        selected_index + 1 - VISIBLE_ROWS
-    } else {
-        0
-    }
-    .min(shell.library_entries.len().saturating_sub(VISIBLE_ROWS));
+    // `selection` and `start` are absolute catalog indices; rows are read out
+    // of the resident window, which the firmware guarantees covers the visible
+    // range. A miss (stale window mid-refill) leaves that row blank rather than
+    // drawing the wrong book.
+    let selected_index = (shell.selection as usize).min(total.saturating_sub(1));
+    let start = library_scroll_start(selected_index, total);
+    let window_start = shell.library_window_start as usize;
     let body = literata(FontStyle::Regular);
     let mut y = FIRST_ROW_Y;
-    for (index, entry) in shell
-        .library_entries
-        .iter()
-        .enumerate()
-        .skip(start)
-        .take(VISIBLE_ROWS)
-    {
-        if index == selected_index {
+    for row in 0..VISIBLE_ROWS {
+        let abs = start + row;
+        if abs >= total {
+            break;
+        }
+        let Some(entry) = abs
+            .checked_sub(window_start)
+            .and_then(|offset| shell.library_entries.get(offset))
+        else {
+            y += ROW_STEP;
+            continue;
+        };
+        if abs == selected_index {
             selection_arrow(fb, y);
         }
         draw_text_truncated(
@@ -274,8 +283,20 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         y += ROW_STEP;
     }
 
-    position_footer(fb, selected_index + 1, shell.library_entries.len());
+    position_footer(fb, selected_index + 1, total);
     finish_working_screen(fb, shell);
+}
+
+/// Absolute catalog index of the first visible Library row that keeps
+/// `selection` on screen. Shared by the renderer and the firmware's window
+/// loader so both agree on which slice of the catalog is resident.
+pub fn library_scroll_start(selection: usize, total: usize) -> usize {
+    let start = if selection >= VISIBLE_ROWS {
+        selection + 1 - VISIBLE_ROWS
+    } else {
+        0
+    };
+    start.min(total.saturating_sub(VISIBLE_ROWS))
 }
 
 // The contents page uses tight index rows — a real table of contents,

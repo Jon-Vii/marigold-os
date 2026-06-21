@@ -8,18 +8,16 @@ use embedded_sdmmc::{Directory, File, Mode, TimeSource};
 use heapless::String;
 use proto::cache::{
     decode_block, decode_book_v2_header, decode_book_v2_section, decode_cover_header, decode_page,
-    decode_section_header, decode_section_v2_header, decode_toc, encode_block,
+    decode_section_v2_header, decode_toc, encode_block,
     encode_book_v2_header, encode_book_v2_section, encode_page, encode_section_v2_header,
     decode_toc_chapter, decode_toc_file_header, encode_toc, encode_toc_file_header,
     section_file_name, BookV2Header,
     BookV2SectionRecord, SectionV2Header, TocFileHeader, BLOCK_RECORD_BYTES, BOOK_V2_HEADER_BYTES,
-    BOOK_V2_SECTION_RECORD_BYTES, CACHE_BOOK_FILE, CACHE_COVER_FILE, CACHE_DIR, CACHE_ROOT_DIR,
+    BOOK_V2_SECTION_RECORD_BYTES, CACHE_BOOK_FILE, CACHE_COVER_FILE, CACHE_ROOT_DIR,
     CACHE_SECTIONS_DIR, CACHE_SECTION_FILE_BYTES, CACHE_STATE_FILE, CACHE_TOC_FILE, CACHE_V2_DIR,
-    COVER_HEADER_BYTES, PAGE_RECORD_BYTES, SECTION_HEADER_BYTES, SECTION_V2_HEADER_BYTES,
+    COVER_HEADER_BYTES, PAGE_RECORD_BYTES, SECTION_V2_HEADER_BYTES,
     TOC_CHAPTER_RECORD_BYTES, TOC_FILE_HEADER_BYTES, TOC_RECORD_BYTES,
 };
-
-const MIGRATE_MAX_SECTIONS: u16 = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CacheLoadResult {
@@ -40,13 +38,6 @@ pub(crate) enum BookIndexLoadResult {
 pub(crate) enum CoverLoadResult {
     Hit,
     Miss,
-    Invalid,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MigrationResult {
-    Migrated,
-    Skipped,
     Invalid,
 }
 
@@ -716,145 +707,6 @@ where
     })
 }
 
-pub(crate) fn migrate_v1_cache_for_entry<
-    D,
-    T,
-    const MAX_DIRS: usize,
-    const MAX_FILES: usize,
-    const MAX_VOLUMES: usize,
->(
-    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    key: &str,
-    source_identity: (u32, u32),
-) -> MigrationResult
-where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    let mut migrated = false;
-    let mut invalid = false;
-    for spine in 0..MIGRATE_MAX_SECTIONS {
-        if with_v2_section_file(root, key, spine, Mode::ReadOnly, |_| ()).is_some() {
-            continue;
-        }
-        let Some(result) = with_v1_section_file(root, key, spine, Mode::ReadOnly, |v1_file| {
-            migrate_v1_section_file(root, key, source_identity, spine, v1_file)
-        }) else {
-            continue;
-        };
-        match result {
-            MigrationResult::Migrated => migrated = true,
-            MigrationResult::Invalid => invalid = true,
-            MigrationResult::Skipped => {}
-        }
-    }
-    if migrated {
-        MigrationResult::Migrated
-    } else if invalid {
-        MigrationResult::Invalid
-    } else {
-        // saw_v1 and the no-state case both land on Skipped.
-        MigrationResult::Skipped
-    }
-}
-
-fn migrate_v1_section_file<
-    D,
-    T,
-    const MAX_DIRS: usize,
-    const MAX_FILES: usize,
-    const MAX_VOLUMES: usize,
->(
-    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    key: &str,
-    source_identity: (u32, u32),
-    spine: u16,
-    v1_file: &File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-) -> MigrationResult
-where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    let mut header_bytes = [0u8; SECTION_HEADER_BYTES];
-    if read_exact_file(v1_file, &mut header_bytes).is_err() {
-        return MigrationResult::Invalid;
-    }
-    let Ok(v1) = decode_section_header(&header_bytes) else {
-        return MigrationResult::Invalid;
-    };
-    let body_bytes = v1.page_count as usize * PAGE_RECORD_BYTES
-        + v1.block_count as usize * BLOCK_RECORD_BYTES
-        + v1.block_count as usize
-        + v1.text_bytes as usize;
-    if body_bytes > 24_576 {
-        return MigrationResult::Invalid;
-    }
-    if ensure_v2_cache_dirs(root, key).is_err() {
-        return MigrationResult::Skipped;
-    }
-    let v2 = SectionV2Header {
-        source_hash: source_identity.0,
-        source_size: source_identity.1,
-        spine,
-        page_count: v1.page_count,
-        block_count: v1.block_count,
-        text_bytes: v1.text_bytes,
-        viewport_width: v1.viewport_width,
-        viewport_height: v1.viewport_height,
-        font_config: v1.font_config,
-        bytes_consumed: v1.bytes_consumed,
-        total_bytes: v1.total_bytes,
-        partial: v1.partial,
-    };
-    with_v2_section_file(
-        root,
-        key,
-        spine,
-        Mode::ReadWriteCreateOrTruncate,
-        |v2_file| {
-            let mut v2_header = [0u8; SECTION_V2_HEADER_BYTES];
-            if encode_section_v2_header(v2, &mut v2_header).is_err()
-                || v2_file.write(&v2_header).is_err()
-            {
-                return MigrationResult::Skipped;
-            }
-            if copy_file_bytes(v1_file, v2_file, body_bytes).is_err() {
-                return MigrationResult::Invalid;
-            }
-            MigrationResult::Migrated
-        },
-    )
-    .unwrap_or(MigrationResult::Skipped)
-}
-
-fn with_v1_section_file<
-    R,
-    D,
-    T,
-    const MAX_DIRS: usize,
-    const MAX_FILES: usize,
-    const MAX_VOLUMES: usize,
->(
-    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    key: &str,
-    spine: u16,
-    mode: Mode,
-    f: impl for<'a> FnOnce(&File<'a, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>) -> R,
-) -> Option<R>
-where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    let xteink = root.open_dir(CACHE_ROOT_DIR).ok()?;
-    let cache = xteink.open_dir(CACHE_DIR).ok()?;
-    let book_dir = cache.open_dir(key).ok()?;
-    let sections = book_dir.open_dir(CACHE_SECTIONS_DIR).ok()?;
-    let mut name = String::<CACHE_SECTION_FILE_BYTES>::new();
-    section_file_name(spine, &mut name);
-    let file = sections.open_file_in_dir(name.as_str(), mode).ok()?;
-    Some(f(&file))
-}
-
 fn with_v2_section_file<
     R,
     D,
@@ -1303,8 +1155,7 @@ where
 }
 
 /// Staging size for batched record reads. Kept small: this sits on the
-/// stack inside the EPUB open path, alongside copy_file_bytes' 512-byte
-/// scratch in the same budget region.
+/// stack inside the EPUB open path, in the same tight budget region.
 const RECORD_STAGE_BYTES: usize = 256;
 
 /// Read `count` fixed-size records through one staging buffer instead of
@@ -1362,25 +1213,6 @@ where
         }
         let tmp = out;
         out = &mut tmp[read..];
-    }
-    Ok(())
-}
-
-fn copy_file_bytes<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
-    source: &File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    target: &File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    mut bytes: usize,
-) -> Result<(), ()>
-where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    let mut scratch = [0u8; 512];
-    while bytes > 0 {
-        let count = bytes.min(scratch.len());
-        read_exact_file(source, &mut scratch[..count])?;
-        target.write(&scratch[..count]).map_err(|_| ())?;
-        bytes -= count;
     }
     Ok(())
 }

@@ -1704,7 +1704,7 @@ fn stroke_rect_direct(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
     fill_rect(fb, Rect::new(x + w - 1, y, 1, h), false);
 }
 
-fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u8) -> std::io::Result<()> {
+fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u16) -> std::io::Result<()> {
     let mut fb = Framebuffer::new();
     let entries = [
         "/books/Flowers for Algernon.epub",
@@ -1763,6 +1763,8 @@ fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u8) -> s
         },
         library_status: UiLibraryStatus::Ready,
         library_entries: &entries,
+        library_window_start: 0,
+        library_total: entries.len() as u16,
         chapters: &chapters,
         sync_status: ui::UiSyncStatus::Idle,
     };

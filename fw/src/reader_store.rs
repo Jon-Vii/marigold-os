@@ -7,7 +7,12 @@ use proto::cache::{
 };
 use proto::text::{TextAlign, TextRole};
 
-pub(crate) const MAX_LIBRARY_BOOKS: usize = 16;
+/// Resident slice of the on-disk catalog kept for the Library list. The full
+/// catalog lives in CATALOG.BIN and is streamed a window at a time around the
+/// selection, so the book count is bounded by the card, not by RAM. Sized a
+/// little above `ui::render::LIBRARY_VISIBLE_ROWS` so ordinary scrolling stays
+/// inside one loaded window and only crossings re-read the card.
+pub(crate) const LIBRARY_WINDOW: usize = 16;
 pub(crate) const MAX_SD_TOC_ITEMS: usize = 128;
 /// Chapter-page map covering the whole on-disk TOC (not the 128-capped
 /// resident/event arrays), so the current chapter tracks reading position
@@ -117,8 +122,19 @@ pub(crate) struct TocItem<'a> {
 
 pub(crate) struct ReaderStore {
     pub(crate) status: LibraryScanStatus,
-    pub(crate) entries: [LibraryBookEntry; MAX_LIBRARY_BOOKS],
-    pub(crate) count: usize,
+    /// Full book count across CATALOG.BIN (the source of truth), independent of
+    /// what is resident.
+    total: u16,
+    /// Resident list window: `window[i]` is the book at absolute index
+    /// `window_start + i`, for `i < window_len`.
+    window: [LibraryBookEntry; LIBRARY_WINDOW],
+    window_start: usize,
+    window_len: usize,
+    /// The one book currently being opened/read. Held apart from the list
+    /// window so the reading path never depends on where the Library list
+    /// happens to be scrolled; `catalog_entry` returns it for `active_index`.
+    active_entry: LibraryBookEntry,
+    active_index: Option<usize>,
     pub(crate) current_index: Option<usize>,
     pub(crate) loaded_index: Option<usize>,
     pub(crate) loaded_chapter: u8,
@@ -191,8 +207,12 @@ impl ReaderStore {
     pub(crate) const fn new() -> Self {
         Self {
             status: LibraryScanStatus::NotScanned,
-            entries: [const { LibraryBookEntry::new() }; MAX_LIBRARY_BOOKS],
-            count: 0,
+            total: 0,
+            window: [const { LibraryBookEntry::new() }; LIBRARY_WINDOW],
+            window_start: 0,
+            window_len: 0,
+            active_entry: LibraryBookEntry::new(),
+            active_index: None,
             current_index: None,
             loaded_index: None,
             loaded_chapter: 0,
@@ -260,42 +280,113 @@ impl ReaderStore {
     }
 
     pub(crate) fn clear_catalog(&mut self) {
-        self.count = 0;
-        for entry in self.entries.iter_mut() {
-            entry.display_name.clear();
-            entry.display_label.clear();
-            entry.open_name.clear();
-            entry.in_books_dir = false;
-            entry.byte_size = 0;
-            entry.source_hash = 0;
-        }
+        self.total = 0;
+        self.window_start = 0;
+        self.window_len = 0;
+        self.active_index = None;
         self.current_index = None;
     }
 
     pub(crate) fn catalog_count(&self) -> usize {
-        self.count
+        self.total as usize
     }
 
-    pub(crate) fn catalog_count_u8(&self) -> u8 {
-        self.count.min(u8::MAX as usize) as u8
+    pub(crate) fn catalog_count_u16(&self) -> u16 {
+        self.total
+    }
+
+    pub(crate) fn set_catalog_total(&mut self, total: u16) {
+        self.total = total;
     }
 
     pub(crate) fn catalog_is_empty(&self) -> bool {
-        self.count == 0
+        self.total == 0
     }
 
-    pub(crate) fn catalog_entries(&self) -> &[LibraryBookEntry] {
-        &self.entries[..self.count]
+    /// The resident list window and its absolute start, for the Library view.
+    pub(crate) fn catalog_window(&self) -> &[LibraryBookEntry] {
+        &self.window[..self.window_len]
+    }
+
+    pub(crate) fn catalog_window_start(&self) -> usize {
+        self.window_start
+    }
+
+    /// True when the loaded window already covers `[start, start+len)`, so the
+    /// firmware can skip a re-read while scrolling inside it.
+    pub(crate) fn window_covers(&self, start: usize, len: usize) -> bool {
+        self.window_len > 0
+            && start >= self.window_start
+            && start + len <= self.window_start + self.window_len
+    }
+
+    /// Begin filling a fresh window at `start`; `push_window_entry` appends.
+    pub(crate) fn begin_window(&mut self, start: usize) {
+        self.window_start = start;
+        self.window_len = 0;
+    }
+
+    pub(crate) fn push_window_entry(
+        &mut self,
+        display_name: &str,
+        open_name: &str,
+        in_books_dir: bool,
+        byte_size: u32,
+        source_hash: u32,
+    ) {
+        if self.window_len >= self.window.len() {
+            return;
+        }
+        let slot = self.window_len;
+        fill_entry(
+            &mut self.window[slot],
+            display_name,
+            open_name,
+            in_books_dir,
+            byte_size,
+            source_hash,
+        );
+        self.window_len += 1;
+    }
+
+    /// Adopt `index` as the active book whose entry the reading path reads
+    /// through `catalog_entry`. Read once from CATALOG.BIN at open/restore.
+    pub(crate) fn set_active_entry(
+        &mut self,
+        index: usize,
+        display_name: &str,
+        open_name: &str,
+        in_books_dir: bool,
+        byte_size: u32,
+        source_hash: u32,
+    ) {
+        fill_entry(
+            &mut self.active_entry,
+            display_name,
+            open_name,
+            in_books_dir,
+            byte_size,
+            source_hash,
+        );
+        self.active_index = Some(index);
     }
 
     pub(crate) fn catalog_entry(&self, index: usize) -> Option<&LibraryBookEntry> {
-        self.entries.get(index).filter(|_| index < self.count)
+        if self.active_index == Some(index) {
+            return Some(&self.active_entry);
+        }
+        if index >= self.window_start {
+            if let Some(entry) = self.window.get(index - self.window_start) {
+                if index - self.window_start < self.window_len {
+                    return Some(entry);
+                }
+            }
+        }
+        None
     }
 
-    pub(crate) fn set_catalog_entry_source_hash(&mut self, index: usize, source_hash: u32) {
-        if let Some(entry) = self.entries.get_mut(index).filter(|_| index < self.count) {
-            entry.source_hash = source_hash;
-        }
+    pub(crate) fn active_index(&self) -> Option<usize> {
+        self.active_index
     }
 
     pub(crate) fn selected_book_index(book_id: u32) -> Option<usize> {
@@ -311,25 +402,6 @@ impl ReaderStore {
             return (0, 0);
         };
         (entry.source_hash, entry.byte_size)
-    }
-
-    /// Map a stored (path-hash, byte-size) identity back to its catalog
-    /// index: the reverse of `source_identity`, used by boot restore.
-    pub(crate) fn catalog_index_for_identity(
-        &self,
-        source_hash: u32,
-        byte_size: u32,
-    ) -> Option<u8> {
-        if source_hash == 0 && byte_size == 0 {
-            return None;
-        }
-        (0..self.catalog_count().min(u8::MAX as usize))
-            .find(|&index| {
-                self.catalog_entry(index)
-                    .map(|entry| entry.source_hash == source_hash && entry.byte_size == byte_size)
-                    .unwrap_or(false)
-            })
-            .map(|index| index as u8)
     }
 
     pub(crate) fn clear_toc(&mut self) {
@@ -960,31 +1032,8 @@ impl ReaderStore {
         count.min(u8::MAX as usize).max(1) as u8
     }
 
-    pub(crate) fn push(
-        &mut self,
-        display_name: &str,
-        open_name: &str,
-        in_books_dir: bool,
-        byte_size: u32,
-    ) {
-        if self.count >= self.entries.len() {
-            return;
-        }
-        let entry = &mut self.entries[self.count];
-        entry.display_name.clear();
-        entry.display_label.clear();
-        entry.open_name.clear();
-        let _ = entry.display_name.push_str(display_name);
-        push_catalog_label(display_name, open_name, &mut entry.display_label);
-        let _ = entry.open_name.push_str(open_name);
-        entry.in_books_dir = in_books_dir;
-        entry.byte_size = byte_size;
-        entry.source_hash = source_hash(display_name, byte_size);
-        self.count += 1;
-    }
-
     pub(crate) fn set_current_index(&mut self, index: usize) {
-        if index < self.count {
+        if index < self.total as usize {
             self.current_index = Some(index);
         }
     }
@@ -1025,6 +1074,34 @@ impl ReaderStore {
         self.block_count += 1;
         true
     }
+}
+
+/// Populate a catalog entry slot from a record's fields, deriving the display
+/// label. Shared by the list window and the active-book entry; both are read
+/// straight from CATALOG.BIN, which already carries the stored `source_hash`.
+fn fill_entry(
+    entry: &mut LibraryBookEntry,
+    display_name: &str,
+    open_name: &str,
+    in_books_dir: bool,
+    byte_size: u32,
+    source_hash: u32,
+) {
+    entry.display_name.clear();
+    entry.display_label.clear();
+    entry.open_name.clear();
+    let _ = entry.display_name.push_str(display_name);
+    push_catalog_label(display_name, open_name, &mut entry.display_label);
+    let _ = entry.open_name.push_str(open_name);
+    entry.in_books_dir = in_books_dir;
+    entry.byte_size = byte_size;
+    entry.source_hash = source_hash;
+}
+
+/// The list label a catalog record shows, derived from its file name. Exposed
+/// for the streamed browser-shelf listing, which has only the on-disk record.
+pub(crate) fn derive_catalog_label(display_name: &str, open_name: &str, out: &mut String<64>) {
+    push_catalog_label(display_name, open_name, out);
 }
 
 fn push_catalog_label(display_name: &str, open_name: &str, out: &mut String<64>) {

@@ -15,6 +15,9 @@ pub struct UiRenderModel<'a> {
     pub active_book: UiBook<'a>,
     pub library_status: UiLibraryStatus,
     pub library_entries: &'a [&'a str],
+    /// Absolute catalog index of `library_entries[0]`; the resident window
+    /// the firmware streamed in around the current selection.
+    pub library_window_start: u16,
     pub chapters: &'a [UiTocItem<'a>],
     /// Current chapter title resolved over the whole book; empty for built-in
     /// books or before a book is open. See `UiShell::chapter_title`.
@@ -42,6 +45,8 @@ pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRe
         active_book: model.active_book,
         library_status: model.library_status,
         library_entries: model.library_entries,
+        library_window_start: model.library_window_start,
+        library_total: request.library_count,
         chapters: model.chapters,
         sync_status: ui_sync_status(request.sync_status),
     };

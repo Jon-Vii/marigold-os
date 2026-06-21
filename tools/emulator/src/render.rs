@@ -124,6 +124,9 @@ fn demo_model<'a>(
             UiLibraryStatus::Ready
         },
         library_entries,
+        // The emulator keeps the whole catalog resident, so the window is the
+        // full list starting at index 0.
+        library_window_start: 0,
         chapters: &DEMO_CHAPTERS,
         chapter_title: "",
     }

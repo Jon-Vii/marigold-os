@@ -88,7 +88,7 @@ pub struct UiShell<'a> {
     pub refresh_policy: UiRefreshPolicy,
     pub font_size: display::font::FontSize,
     pub line_spacing: display::font::LineSpacing,
-    pub selection: u8,
+    pub selection: u16,
     pub chapter: u8,
     /// The current chapter's title resolved over the whole book (past the
     /// resident `chapters` cap). When non-empty the colophon prefers it over
@@ -99,7 +99,15 @@ pub struct UiShell<'a> {
     pub battery_percent: u8,
     pub active_book: UiBook<'a>,
     pub library_status: UiLibraryStatus,
+    /// The resident slice of the on-disk catalog the Library list draws from:
+    /// `library_entries[i]` is the book at absolute index
+    /// `library_window_start + i`. The full catalog is streamed from the card,
+    /// so this window holds only the rows around the selection.
     pub library_entries: &'a [&'a str],
+    pub library_window_start: u16,
+    /// Total book count across the whole catalog, independent of the resident
+    /// window — drives the "x of N" footer and the scroll math.
+    pub library_total: u16,
     pub chapters: &'a [UiTocItem<'a>],
     pub sync_status: UiSyncStatus,
 }

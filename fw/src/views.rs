@@ -1,5 +1,5 @@
 use crate::reader_layout::{self, READER_LEFT_X, READER_RIGHT_X};
-use crate::reader_store::{BookLoadStatus, LibraryScanStatus, ReaderStore, MAX_LIBRARY_BOOKS};
+use crate::reader_store::{BookLoadStatus, LibraryScanStatus, ReaderStore, LIBRARY_WINDOW};
 use crate::{catalog, AppView, ReaderSource, RenderRequest};
 use core::fmt::Write;
 use display::fb::Framebuffer;
@@ -23,7 +23,7 @@ pub(crate) fn render(fb: &mut Framebuffer, request: RenderRequest, sd_library: &
         draw_sd_reader_page(fb, request, sd_library);
         fb.flip_vertical();
     } else {
-        let mut library_entries = [""; MAX_LIBRARY_BOOKS];
+        let mut library_entries = [""; LIBRARY_WINDOW];
         let mut chapters = [UiTocItem {
             title: "",
             level: 1,
@@ -39,7 +39,7 @@ pub(crate) fn render(fb: &mut Framebuffer, request: RenderRequest, sd_library: &
 }
 
 pub(crate) fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, sd_library: &ReaderStore) {
-    let mut library_entries = [""; MAX_LIBRARY_BOOKS];
+    let mut library_entries = [""; LIBRARY_WINDOW];
     let mut chapters = [UiTocItem {
         title: "",
         level: 1,
@@ -52,18 +52,19 @@ pub(crate) fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, sd_libr
 fn ui_model<'a>(
     request: RenderRequest,
     sd_library: &'a ReaderStore,
-    library_entries: &'a mut [&'a str; MAX_LIBRARY_BOOKS],
+    library_entries: &'a mut [&'a str; LIBRARY_WINDOW],
     chapters: &'a mut [UiTocItem<'a>; MAX_UI_CHAPTERS],
 ) -> UiRenderModel<'a> {
-    let library_count = sd_library.catalog_count().min(library_entries.len());
-    for (index, entry) in sd_library
-        .catalog_entries()
-        .iter()
-        .take(library_count)
-        .enumerate()
-    {
-        library_entries[index] =
-            if sd_library.loaded_index == Some(index) && !sd_library.title.is_empty() {
+    // The resident list window over the streamed catalog: `library_entries[i]`
+    // is the book at absolute index `window_start + i`. The firmware refills
+    // this window from the card before each Library render.
+    let window = sd_library.catalog_window();
+    let window_start = sd_library.catalog_window_start();
+    let library_count = window.len().min(library_entries.len());
+    for (i, entry) in window.iter().take(library_count).enumerate() {
+        let absolute = window_start + i;
+        library_entries[i] =
+            if sd_library.loaded_index == Some(absolute) && !sd_library.title.is_empty() {
                 sd_library.title.as_str()
             } else {
                 entry.display_label.as_str()
@@ -103,6 +104,7 @@ fn ui_model<'a>(
         },
         library_status: ui_library_status(sd_library.status),
         library_entries: &library_entries[..library_count],
+        library_window_start: window_start as u16,
         chapters: &chapters[..chapter_count],
         chapter_title,
     }

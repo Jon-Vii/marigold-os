@@ -84,6 +84,32 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                     .last_request()
                     .map(|last| (last.view, last.book_id))
                     != Some((request.view, request.book_id));
+                // The catalog is streamed from the card, so make the slice this
+                // view needs resident before the (pure) render reads it. Library
+                // pulls the list window around the selection; other views need
+                // the active book's entry, refreshed only when the book changes.
+                // Skipped once the card is loaned to the sync session.
+                if !sync_loaned {
+                    if request.view == AppView::Library {
+                        crate::library_sd::ensure_library_window(
+                            &mut epd,
+                            &mut sd_cs,
+                            sd_library,
+                            request.selection,
+                        );
+                    } else if content_context_changed
+                        && ReaderSource::from_book_id(request.book_id).is_sd()
+                    {
+                        if let Some(index) = ReaderStore::selected_book_index(request.book_id) {
+                            crate::library_sd::load_active_entry(
+                                &mut epd,
+                                &mut sd_cs,
+                                sd_library,
+                                index,
+                            );
+                        }
+                    }
+                }
                 let layout_start = Instant::now();
                 crate::views::render(fb, request, sd_library);
                 let layout_ms = layout_start.elapsed().as_millis();
@@ -286,7 +312,7 @@ fn handle_storage_command(
                     password_len: record.password_len,
                 }
             });
-            loan.catalog_len = write_catalog_listing(sd_library, loan.http_b);
+            loan.catalog_len = crate::library_sd::write_catalog_listing(epd, sd_cs, loan.http_b);
             if crate::SYNC_LOANS.try_send(loan).is_err() {
                 // Unreachable in practice: the wifi task requests exactly
                 // one loan per boot. The memory is gone either way.
@@ -299,7 +325,7 @@ fn handle_storage_command(
                 // already shows the saved book; the Scanned default then
                 // sees an SD book active and leaves it alone.
                 restore_saved_state(epd, sd_cs, sd_library, state_restored);
-                let count = sd_library.catalog_count_u8();
+                let count = sd_library.catalog_count_u16();
                 send_library_event(&LibraryEvent::Scanned { count });
             } else {
                 let _ = STORAGE_COMMANDS.try_send(StorageCommand::RefreshCatalog);
@@ -309,7 +335,7 @@ fn handle_storage_command(
             crate::library_sd::scan_books(epd, sd_cs, sd_library);
             restore_saved_state(epd, sd_cs, sd_library, state_restored);
             send_library_event(&LibraryEvent::Scanned {
-                count: sd_library.catalog_count_u8(),
+                count: sd_library.catalog_count_u16(),
             });
         }
         StorageCommand::OpenBook {
@@ -338,6 +364,11 @@ fn handle_storage_command(
                 );
                 return;
             }
+            // Read this book's catalog record into the active-entry slot so the
+            // reader pipeline (load_position, build_or_load) resolves it from
+            // the card rather than the list window. A failure leaves the entry
+            // unset and the open falls through to the usual bad-index error.
+            crate::library_sd::load_active_entry(epd, sd_cs, sd_library, index as usize);
             // Adopt the command's type settings before the RAM fast path:
             // a settings change drops the loaded page coverage, so the
             // request falls through to the cache load/rebuild below.
@@ -431,6 +462,7 @@ fn handle_storage_command(
             if request_id != LATEST_READER_REQUEST_ID.load(Ordering::Relaxed) {
                 return;
             }
+            crate::library_sd::load_active_entry(epd, sd_cs, sd_library, index as usize);
             let ok = reader_cache::load_chapters_into_store(epd, sd_cs, sd_library, index as usize);
             esp_println::println!(
                 "storage: chapters loaded book_id={} ok={} count={}",
@@ -458,6 +490,7 @@ fn handle_storage_command(
             if request_id != LATEST_READER_REQUEST_ID.load(Ordering::Relaxed) {
                 return;
             }
+            crate::library_sd::load_active_entry(epd, sd_cs, sd_library, index as usize);
             sd_library.set_type_settings(type_settings);
             // The TOC is still in the buffer; resolve the chapter's start page
             // before loading the section overwrites it.
@@ -625,33 +658,6 @@ fn send_resumed_position(
     });
 }
 
-/// Writes `flag|open_name|label` lines for the shelf page into the
-/// loaned buffer: B marks /BOOKS entries (deletable over the air), R
-/// marks card-root ones.
-fn write_catalog_listing(sd_library: &ReaderStore, out: &mut [u8]) -> usize {
-    let mut at = 0;
-    for entry in sd_library.catalog_entries() {
-        let label = entry.display_label.as_str();
-        let line_len = 1 + 1 + entry.open_name.len() + 1 + label.len() + 1;
-        if at + line_len > out.len() {
-            break;
-        }
-        out[at] = if entry.in_books_dir { b'B' } else { b'R' };
-        at += 1;
-        out[at] = b'|';
-        at += 1;
-        out[at..at + entry.open_name.len()].copy_from_slice(entry.open_name.as_bytes());
-        at += entry.open_name.len();
-        out[at] = b'|';
-        at += 1;
-        out[at..at + label.len()].copy_from_slice(label.as_bytes());
-        at += label.len();
-        out[at] = b'\n';
-        at += 1;
-    }
-    at
-}
-
 /// The saved book's kosync identity and position, gathered while this
 /// task still owns SD access and the scratch. Loads the book through the
 /// ordinary cache path if this boot has not yet (a v2 cache hit costs
@@ -664,9 +670,18 @@ fn gather_sync_book_info(
     epub_scratch: &mut Option<&'static mut ReaderCacheScratch<'static>>,
 ) -> Option<crate::sync_mem::SyncBookInfo> {
     let record = reader_cache::load_app_state(epd, sd_cs)?;
-    let catalog_index =
-        sd_library.catalog_index_for_identity(record.source_hash, record.source_size)?;
+    let hint = ReaderSource::from_book_id(record.book_id).sd_index();
+    let catalog_index = crate::library_sd::find_index_by_identity(
+        epd,
+        sd_cs,
+        record.source_hash,
+        record.source_size,
+        hint,
+    )?;
     let index = usize::from(catalog_index);
+    // Stage the book's catalog entry so the cache path and partial_md5 below
+    // resolve it from the card, not the list window.
+    crate::library_sd::load_active_entry(epd, sd_cs, sd_library, index);
     if sd_library.loaded_index != Some(index) {
         let scratch = ensure_epub_scratch(epub_scratch);
         reader_cache::build_or_load_book_cache(
@@ -762,8 +777,14 @@ fn restore_saved_state(
         esp_println::println!("restore: no usable STATE.BIN");
         return;
     };
-    let Some(index) = library.catalog_index_for_identity(record.source_hash, record.source_size)
-    else {
+    let hint = ReaderSource::from_book_id(record.book_id).sd_index();
+    let Some(index) = crate::library_sd::find_index_by_identity(
+        epd,
+        sd_cs,
+        record.source_hash,
+        record.source_size,
+        hint,
+    ) else {
         esp_println::println!(
             "restore: no catalog match hash={:08x} size={}",
             record.source_hash,
@@ -777,6 +798,9 @@ fn restore_saved_state(
         record.chapter,
         record.screen
     );
+    // Stage the restored book's catalog entry so the colophon/page-count reads
+    // below resolve it, and so the first Home paint names it before any open.
+    crate::library_sd::load_active_entry(epd, sd_cs, library, usize::from(index));
     // Resolve the chapter title now so wake-to-Home (rendered before the book
     // is opened) names the chapter; without this the colophon shows a numeral
     // until the book is first opened this session.

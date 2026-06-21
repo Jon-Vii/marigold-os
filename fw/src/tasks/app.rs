@@ -491,7 +491,7 @@ fn storage_command_for_transition(
     None
 }
 
-fn open_book_command(state: &ReaderState, index: u8) -> StorageCommand {
+fn open_book_command(state: &ReaderState, index: u16) -> StorageCommand {
     let request_id = next_reader_request_id();
     StorageCommand::OpenBook {
         request_id,
@@ -503,7 +503,7 @@ fn open_book_command(state: &ReaderState, index: u8) -> StorageCommand {
     }
 }
 
-fn extend_section_command(state: &ReaderState, index: u8) -> StorageCommand {
+fn extend_section_command(state: &ReaderState, index: u16) -> StorageCommand {
     let request_id = next_reader_request_id();
     StorageCommand::ExtendSection {
         request_id,
@@ -515,7 +515,7 @@ fn extend_section_command(state: &ReaderState, index: u8) -> StorageCommand {
     }
 }
 
-fn load_chapters_command(state: &ReaderState, index: u8) -> StorageCommand {
+fn load_chapters_command(state: &ReaderState, index: u16) -> StorageCommand {
     StorageCommand::LoadChapters {
         request_id: next_reader_request_id(),
         book_id: state.book_id,
@@ -523,7 +523,7 @@ fn load_chapters_command(state: &ReaderState, index: u8) -> StorageCommand {
     }
 }
 
-fn jump_chapter_command(state: &ReaderState, index: u8) -> StorageCommand {
+fn jump_chapter_command(state: &ReaderState, index: u16) -> StorageCommand {
     StorageCommand::JumpChapter {
         request_id: next_reader_request_id(),
         book_id: state.book_id,

@@ -11,21 +11,21 @@ pub const FIRST_SD_BOOK_ID: u32 = 2;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReaderSource {
     BuiltIn { book_id: u32 },
-    Sd { index: u8 },
+    Sd { index: u16 },
 }
 
 impl ReaderSource {
     pub fn from_book_id(book_id: u32) -> Self {
         if book_id >= FIRST_SD_BOOK_ID {
             Self::Sd {
-                index: book_id.saturating_sub(FIRST_SD_BOOK_ID).min(u8::MAX as u32) as u8,
+                index: book_id.saturating_sub(FIRST_SD_BOOK_ID).min(u16::MAX as u32) as u16,
             }
         } else {
             Self::BuiltIn { book_id }
         }
     }
 
-    pub const fn sd(index: u8) -> Self {
+    pub const fn sd(index: u16) -> Self {
         Self::Sd { index }
     }
 
@@ -36,7 +36,7 @@ impl ReaderSource {
         }
     }
 
-    pub const fn sd_index(self) -> Option<u8> {
+    pub const fn sd_index(self) -> Option<u16> {
         match self {
             Self::BuiltIn { .. } => None,
             Self::Sd { index } => Some(index),
@@ -235,7 +235,7 @@ pub struct RenderRequest {
     pub page: u32,
     pub page_count: u32,
     pub chapter: u8,
-    pub selection: u8,
+    pub selection: u16,
     pub book_id: u32,
     pub orientation: DisplayOrientation,
     pub refresh_policy: RefreshPolicy,
@@ -247,7 +247,7 @@ pub struct RenderRequest {
     pub page_raw: u16,
     pub battery_mv: u16,
     pub battery_percent: u8,
-    pub library_count: u8,
+    pub library_count: u16,
     pub sync_status: SyncStatus,
     pub dirty: Rect,
 }
@@ -265,7 +265,7 @@ pub enum StorageCommand {
     OpenBook {
         request_id: u32,
         book_id: u32,
-        index: u8,
+        index: u16,
         chapter: u8,
         target_pages: u16,
         type_settings: TypeSettings,
@@ -273,7 +273,7 @@ pub enum StorageCommand {
     ExtendSection {
         request_id: u32,
         book_id: u32,
-        index: u8,
+        index: u16,
         chapter: u8,
         target_pages: u16,
         type_settings: TypeSettings,
@@ -283,7 +283,7 @@ pub enum StorageCommand {
     LoadChapters {
         request_id: u32,
         book_id: u32,
-        index: u8,
+        index: u16,
     },
     /// Jump to a chapter from the overview. The display task resolves the
     /// chapter's start page from the on-disk TOC (the reducer's chapter-page
@@ -291,7 +291,7 @@ pub enum StorageCommand {
     JumpChapter {
         request_id: u32,
         book_id: u32,
-        index: u8,
+        index: u16,
         chapter: u8,
         type_settings: TypeSettings,
     },
@@ -359,7 +359,7 @@ pub enum DisplayEvent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LibraryEvent {
     Scanned {
-        count: u8,
+        count: u16,
     },
     Loaded {
         book_id: u32,
@@ -511,7 +511,7 @@ impl ReducerContext {
 pub struct ReaderState {
     pub view: AppView,
     pub page: u32,
-    pub selection: u8,
+    pub selection: u16,
     pub chapter: u8,
     pub book_id: u32,
     pub orientation: DisplayOrientation,
@@ -524,7 +524,7 @@ pub struct ReaderState {
     pub page_raw: u16,
     pub battery_mv: u16,
     pub battery_percent: u8,
-    pub library_count: u8,
+    pub library_count: u16,
     pub sd_page_count: u32,
     pub sd_chapter_count: u8,
     pub sd_chapter_pages: [u16; MAX_SD_CHAPTERS],
@@ -619,10 +619,12 @@ impl ReaderState {
                         next.page = self.sd_page_count.saturating_sub(1);
                     }
                     next.chapter = next.sd_chapter_for_page(next.page);
-                    next.selection = next.chapter;
+                    next.selection = next.chapter as u16;
                 } else {
-                    next.chapter = wrap_next(self.chapter, ctx.builtin_chapter_count.max(1));
-                    next.selection = next.chapter;
+                    next.chapter =
+                        wrap_next(self.chapter as u16, (ctx.builtin_chapter_count as u16).max(1))
+                            as u8;
+                    next.selection = next.chapter as u16;
                     next.page = 0;
                 }
             }
@@ -632,10 +634,12 @@ impl ReaderState {
                         next.page = self.page - 1;
                     }
                     next.chapter = next.sd_chapter_for_page(next.page);
-                    next.selection = next.chapter;
+                    next.selection = next.chapter as u16;
                 } else {
-                    next.chapter = wrap_prev(self.chapter, ctx.builtin_chapter_count.max(1));
-                    next.selection = next.chapter;
+                    next.chapter =
+                        wrap_prev(self.chapter as u16, (ctx.builtin_chapter_count as u16).max(1))
+                            as u8;
+                    next.selection = next.chapter as u16;
                     next.page = 0;
                 }
             }
@@ -644,20 +648,20 @@ impl ReaderState {
                 // `chapter` already tracks the reading position (kept current
                 // by the firmware's Loaded event, un-capped); opening the list
                 // lands the cursor there rather than on the saturated guess.
-                next.selection = self.chapter;
+                next.selection = self.chapter as u16;
             }
             (AppView::Reading, Some(Button::Back)) => {
                 next.view = AppView::Home;
                 next.selection = 0;
             }
             (AppView::Chapters, Some(Button::Next)) => {
-                next.selection = wrap_next(self.selection, self.chapter_item_count(ctx));
+                next.selection = wrap_next(self.selection, self.chapter_item_count(ctx) as u16);
             }
             (AppView::Chapters, Some(Button::Previous)) => {
-                next.selection = wrap_prev(self.selection, self.chapter_item_count(ctx));
+                next.selection = wrap_prev(self.selection, self.chapter_item_count(ctx) as u16);
             }
             (AppView::Chapters, Some(Button::Confirm)) => {
-                next.chapter = self.selection;
+                next.chapter = self.selection as u8;
                 next.page = if ReaderSource::from_book_id(self.book_id).is_sd() {
                     u32::from(
                         self.sd_chapter_pages
@@ -701,10 +705,10 @@ impl ReaderState {
             }
             (AppView::Sync, Some(Button::Previous | Button::Next)) => {}
             (AppView::Settings, Some(Button::Next)) => {
-                next.selection = wrap_next(self.selection, SETTINGS_ITEMS);
+                next.selection = wrap_next(self.selection, SETTINGS_ITEMS as u16);
             }
             (AppView::Settings, Some(Button::Previous)) => {
-                next.selection = wrap_prev(self.selection, SETTINGS_ITEMS);
+                next.selection = wrap_prev(self.selection, SETTINGS_ITEMS as u16);
             }
             (AppView::Settings, Some(Button::Confirm)) => {
                 next = apply_setting(next);
@@ -812,7 +816,7 @@ impl ReaderState {
                 }
                 if self.read_request_pending {
                     self.view = AppView::Reading;
-                    self.selection = chapter;
+                    self.selection = chapter as u16;
                 } else if self.view == AppView::Library {
                     let restored_index =
                         ReaderSource::from_book_id(book_id).sd_index().unwrap_or(0);
@@ -820,7 +824,7 @@ impl ReaderState {
                 } else if self.view == AppView::Chapters {
                     // Home/Settings keep their own key selection; only the
                     // chapter list tracks the restored chapter cursor.
-                    self.selection = chapter;
+                    self.selection = chapter as u16;
                 }
                 self.read_request_pending = false;
                 if let Some(orientation) = display_orientation_from_u8(reading_orientation) {
@@ -909,8 +913,8 @@ impl ReaderState {
         }
     }
 
-    pub fn library_item_count(self, ctx: ReducerContext) -> u8 {
-        self.library_count.max(ctx.builtin_book_count).max(1)
+    pub fn library_item_count(self, ctx: ReducerContext) -> u16 {
+        self.library_count.max(ctx.builtin_book_count as u16).max(1)
     }
 
     pub fn chapter_item_count(self, ctx: ReducerContext) -> u8 {
@@ -953,7 +957,7 @@ pub fn refresh_policy_from_u8(value: u8) -> Option<RefreshPolicy> {
     }
 }
 
-fn wrap_next(value: u8, len: u8) -> u8 {
+fn wrap_next(value: u16, len: u16) -> u16 {
     if value + 1 >= len {
         0
     } else {
@@ -961,7 +965,7 @@ fn wrap_next(value: u8, len: u8) -> u8 {
     }
 }
 
-fn wrap_prev(value: u8, len: u8) -> u8 {
+fn wrap_prev(value: u16, len: u16) -> u16 {
     if value == 0 {
         len - 1
     } else {
@@ -1000,7 +1004,7 @@ fn apply_home_action(
         HomeAction::Read => {
             if ReaderSource::from_book_id(state.book_id).is_sd() {
                 state.view = AppView::Reading;
-                state.selection = state.chapter;
+                state.selection = state.chapter as u16;
             } else if state.library_count > 0 {
                 state.view = AppView::Library;
             } else {
