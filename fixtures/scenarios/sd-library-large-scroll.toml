@@ -1,0 +1,79 @@
+# A library far larger than one resident window (40 > LIBRARY_WINDOW=16),
+# scrolled deep enough to cross several window refills. Proves the cursor
+# walks the whole catalog and the rendered window tracks the selection.
+[[steps]]
+button = "Back"
+
+[[steps]]
+library = "Scanned"
+count = 40
+
+# Walk 30 books down. On hardware this crosses the resident window twice;
+# in the emulator the whole catalog is resident, so it exercises the shared
+# scroll math and the windowed render offset.
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+
+[expect]
+view = "Library"
+library_count = 40
+selection = 30
+last_button = "Next"
