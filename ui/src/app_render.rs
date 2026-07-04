@@ -19,6 +19,10 @@ pub struct UiRenderModel<'a> {
     /// the firmware streamed in around the current selection.
     pub library_window_start: u16,
     pub chapters: &'a [UiTocItem<'a>],
+    /// Absolute TOC index of `chapters[0]` and the full on-disk chapter
+    /// count; long TOCs stream a window around the visible rows.
+    pub chapters_window_start: u16,
+    pub chapters_total: u16,
     /// Current chapter title resolved over the whole book; empty for built-in
     /// books or before a book is open. See `UiShell::chapter_title`.
     pub chapter_title: &'a str,
@@ -48,6 +52,8 @@ pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRe
         library_window_start: model.library_window_start,
         library_total: request.library_count,
         chapters: model.chapters,
+        chapters_window_start: model.chapters_window_start,
+        chapters_total: model.chapters_total,
         sync_status: ui_sync_status(request.sync_status),
     };
     render_shell(fb, &shell);

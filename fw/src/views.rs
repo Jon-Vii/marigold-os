@@ -70,7 +70,8 @@ fn ui_model<'a>(
                 entry.display_label.as_str()
             };
     }
-    let chapter_count = fill_chapters(chapters, request, sd_library);
+    let (chapter_count, chapters_window_start, chapters_total) =
+        fill_chapters(chapters, request, sd_library);
 
     let fallback_book = catalog::active_book(request.book_id);
     let (title, author) =
@@ -106,27 +107,35 @@ fn ui_model<'a>(
         library_entries: &library_entries[..library_count],
         library_window_start: window_start as u16,
         chapters: &chapters[..chapter_count],
+        chapters_window_start: chapters_window_start as u16,
+        chapters_total: chapters_total.min(u16::MAX as usize) as u16,
         chapter_title,
     }
 }
 
+/// Fill the UI chapter rows and return `(resident_len, window_start, total)`
+/// — the Contents page draws absolute indices out of this resident window.
 fn fill_chapters<'a>(
     chapters: &mut [UiTocItem<'a>; MAX_UI_CHAPTERS],
     request: RenderRequest,
     sd_library: &'a ReaderStore,
-) -> usize {
-    // The full chapter list, read from the card into the section buffer
-    // while the overview is open.
+) -> (usize, usize, usize) {
+    // The on-disk chapter list, windowed from the card into the section
+    // buffer while the overview is open: row `i` is absolute chapter
+    // `window_start + i`.
     if ReaderSource::from_book_id(request.book_id).is_sd() && sd_library.text_holds_toc() {
-        let count = sd_library.overview_chapter_count().min(chapters.len());
-        for (index, item) in chapters.iter_mut().take(count).enumerate() {
+        let total = sd_library.overview_chapter_count();
+        let window_start = sd_library.toc_window_start();
+        let count = total.saturating_sub(window_start).min(chapters.len());
+        for (offset, item) in chapters.iter_mut().take(count).enumerate() {
+            let index = window_start + offset;
             *item = UiTocItem {
                 title: sd_library.overview_title_at(index),
                 level: sd_library.overview_level_at(index),
                 page: u32::from(sd_library.overview_page_at(index)),
             };
         }
-        return count;
+        return (count, window_start, total);
     }
     if ReaderSource::from_book_id(request.book_id).is_sd() && sd_library.toc_count() > 0 {
         let count = sd_library.toc_count().min(chapters.len());
@@ -139,7 +148,7 @@ fn fill_chapters<'a>(
                 };
             }
         }
-        return count;
+        return (count, 0, count);
     }
     if ReaderSource::from_book_id(request.book_id).is_sd() {
         let count = sd_library
@@ -154,7 +163,7 @@ fn fill_chapters<'a>(
                 page: 0,
             };
         }
-        return count;
+        return (count, 0, count);
     }
 
     let count = (catalog::chapter_count() as usize).min(chapters.len());
@@ -167,7 +176,7 @@ fn fill_chapters<'a>(
             };
         }
     }
-    count
+    (count, 0, count)
 }
 
 fn ui_library_status(status: LibraryScanStatus) -> UiLibraryStatus {

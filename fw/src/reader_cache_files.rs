@@ -1053,6 +1053,7 @@ pub(crate) fn load_v2_toc_into_text<
     key: &str,
     source_identity: (u32, u32),
     library: &mut ReaderStore,
+    window_start: usize,
 ) -> bool
 where
     D: embedded_sdmmc::BlockDevice,
@@ -1061,22 +1062,34 @@ where
     with_v2_toc_file(root, key, Mode::ReadOnly, |file| {
         let mut header_bytes = [0u8; TOC_FILE_HEADER_BYTES];
         if read_exact_file(file, &mut header_bytes).is_err() {
+            esp_println::println!("toc window: header read failed");
             return false;
         }
         let Ok(header) = decode_toc_file_header(&header_bytes) else {
+            esp_println::println!("toc window: header decode failed");
             return false;
         };
         if header.source_hash != source_identity.0 || header.source_size != source_identity.1 {
+            esp_println::println!("toc window: identity mismatch");
             return false;
         }
-        let bytes = (header.chapter_count as usize).saturating_mul(TOC_CHAPTER_RECORD_BYTES);
+        let total = header.chapter_count as usize;
+        let start = window_start.min(total.saturating_sub(1));
+        let len = (total - start).min(crate::reader_store::TOC_WINDOW_CAPACITY);
+        let offset = TOC_FILE_HEADER_BYTES + start * TOC_CHAPTER_RECORD_BYTES;
+        if file.seek_from_start(offset as u32).is_err() {
+            esp_println::println!("toc window: seek failed");
+            return false;
+        }
+        let bytes = len.saturating_mul(TOC_CHAPTER_RECORD_BYTES);
         let Some(buf) = library.cached_text_mut(bytes) else {
             return false;
         };
         if read_exact_file(file, buf).is_err() {
+            esp_println::println!("toc window: body read failed");
             return false;
         }
-        library.set_toc_in_text(header.chapter_count as usize);
+        library.set_toc_window(start, len, total);
         true
     })
     .unwrap_or(false)

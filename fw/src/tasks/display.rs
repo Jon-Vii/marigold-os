@@ -96,16 +96,27 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                             sd_library,
                             request.selection,
                         );
-                    } else if content_context_changed
-                        && ReaderSource::from_book_id(request.book_id).is_sd()
-                    {
+                    } else if ReaderSource::from_book_id(request.book_id).is_sd() {
                         if let Some(index) = ReaderStore::selected_book_index(request.book_id) {
-                            crate::library_sd::load_active_entry(
-                                &mut epd,
-                                &mut sd_cs,
-                                sd_library,
-                                index,
-                            );
+                            if content_context_changed {
+                                crate::library_sd::load_active_entry(
+                                    &mut epd,
+                                    &mut sd_cs,
+                                    sd_library,
+                                    index,
+                                );
+                            }
+                            // Long TOCs are windowed like the catalog; slide
+                            // the window over the rows this render will show.
+                            if request.view == AppView::Chapters && sd_library.text_holds_toc() {
+                                reader_cache::ensure_toc_window(
+                                    &mut epd,
+                                    &mut sd_cs,
+                                    sd_library,
+                                    index,
+                                    request.selection as usize,
+                                );
+                            }
                         }
                     }
                 }
@@ -451,7 +462,15 @@ fn handle_storage_command(
                 return;
             }
             crate::library_sd::load_active_entry(epd, sd_cs, sd_library, index as usize);
-            let ok = reader_cache::load_chapters_into_store(epd, sd_cs, sd_library, index as usize);
+            // The overview opens with the cursor on the current chapter, so
+            // center the first TOC window there.
+            let ok = reader_cache::load_chapters_into_store(
+                epd,
+                sd_cs,
+                sd_library,
+                index as usize,
+                sd_library.current_chapter() as usize,
+            );
             esp_println::println!(
                 "storage: chapters loaded book_id={} ok={} count={}",
                 book_id,
@@ -481,7 +500,9 @@ fn handle_storage_command(
             crate::library_sd::load_active_entry(epd, sd_cs, sd_library, index as usize);
             sd_library.set_type_settings(type_settings);
             // The TOC is still in the buffer; resolve the chapter's start page
-            // before loading the section overwrites it.
+            // before loading the section overwrites it. Re-ensure the window
+            // covers the selection in case it slid since the overview render.
+            reader_cache::ensure_toc_window(epd, sd_cs, sd_library, index as usize, chapter as usize);
             let target_page = sd_library.overview_page_at(chapter as usize);
             let scratch = ensure_epub_scratch(epub_scratch);
             reader_cache::build_or_load_book_cache(

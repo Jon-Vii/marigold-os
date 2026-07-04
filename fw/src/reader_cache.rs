@@ -423,16 +423,43 @@ pub(crate) fn load_chapters_into_store(
     sd_cs: &mut Output<'static>,
     library: &mut ReaderStore,
     index: usize,
+    selection: usize,
 ) -> bool {
     let Some(entry) = library.catalog_entry(index) else {
         return false;
     };
     let source_identity = (entry.source_hash, entry.byte_size);
     let key = proto::cache::cache_key_for(entry.display_name.as_str(), source_identity.1);
+    // Center the window on the selection so scrolling either way has slack
+    // before the next reload.
+    let window_start = selection.saturating_sub(crate::reader_store::TOC_WINDOW_CAPACITY / 2);
     sd_session::with_root(epd, sd_cs, |root| {
-        reader_cache_files::load_v2_toc_into_text(root, key.as_str(), source_identity, library)
+        reader_cache_files::load_v2_toc_into_text(
+            root,
+            key.as_str(),
+            source_identity,
+            library,
+            window_start,
+        )
     })
     .unwrap_or(false)
+}
+
+/// Make the TOC window cover the Chapters rows visible around `selection`,
+/// reloading it from TOC.BIN only on a miss — the overview analogue of
+/// `ensure_library_window`. Cheap when the window already covers.
+pub(crate) fn ensure_toc_window(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    library: &mut ReaderStore,
+    index: usize,
+    selection: usize,
+) -> bool {
+    let first_visible = ui::render::toc_scroll_start(selection, library.overview_chapter_count());
+    if library.toc_window_covers(first_visible, ui::render::TOC_VISIBLE_ROWS) {
+        return true;
+    }
+    load_chapters_into_store(epd, sd_cs, library, index, selection)
 }
 
 #[inline(never)]

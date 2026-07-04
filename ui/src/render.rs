@@ -302,7 +302,19 @@ pub fn library_scroll_start(selection: usize, total: usize) -> usize {
 // The contents page uses tight index rows — a real table of contents,
 // not a menu: title, dot leaders, the chapter's book page right-aligned.
 const TOC_ROW_STEP: i16 = 36;
-const TOC_VISIBLE_ROWS: usize = 9;
+pub const TOC_VISIBLE_ROWS: usize = 9;
+
+/// Absolute TOC index of the first visible Contents row that keeps
+/// `selection` on screen. Shared by the renderer and the firmware's TOC
+/// window loader so both agree on which slice must be resident.
+pub fn toc_scroll_start(selection: usize, total: usize) -> usize {
+    let start = if selection >= TOC_VISIBLE_ROWS {
+        selection + 1 - TOC_VISIBLE_ROWS
+    } else {
+        0
+    };
+    start.min(total.saturating_sub(TOC_VISIBLE_ROWS))
+}
 
 fn render_chapters(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     fb.clear(true);
@@ -312,7 +324,8 @@ fn render_chapters(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     dash_key(fb, 3, "next", false);
     heading(fb, "Contents");
 
-    if shell.chapters.is_empty() {
+    let total = shell.chapters_total as usize;
+    if total == 0 || shell.chapters.is_empty() {
         centered_note(fb, "no chapters found");
         finish_working_screen(fb, shell);
         return;
@@ -323,35 +336,40 @@ fn render_chapters(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     // past its end must not snap back to the last resident row -- that paints
     // a wrong chapter that "jumps" forward on the first key. Hold a note until
     // the real list arrives and the selection is in range.
-    if shell.selection as usize >= shell.chapters.len() {
+    if shell.selection as usize >= total {
         centered_note(fb, "loading contents\u{2026}");
         finish_working_screen(fb, shell);
         return;
     }
 
-    let selected = (shell.selection as usize).min(shell.chapters.len().saturating_sub(1));
-    let start = if selected >= TOC_VISIBLE_ROWS {
-        selected + 1 - TOC_VISIBLE_ROWS
-    } else {
-        0
-    }
-    .min(shell.chapters.len().saturating_sub(TOC_VISIBLE_ROWS));
+    // `selected` and `start` are absolute TOC indices; rows are read out of
+    // the resident window, which the firmware slides over the visible range
+    // before each render. A miss (stale window mid-refill) leaves that row
+    // blank rather than drawing the wrong chapter.
+    let selected = (shell.selection as usize).min(total - 1);
+    let start = toc_scroll_start(selected, total);
+    let window_start = shell.chapters_window_start as usize;
     let mut y = FIRST_ROW_Y;
-    for (index, item) in shell
-        .chapters
-        .iter()
-        .enumerate()
-        .skip(start)
-        .take(TOC_VISIBLE_ROWS)
-    {
-        if index == selected {
+    for row in 0..TOC_VISIBLE_ROWS {
+        let abs = start + row;
+        if abs >= total {
+            break;
+        }
+        let Some(item) = abs
+            .checked_sub(window_start)
+            .and_then(|offset| shell.chapters.get(offset))
+        else {
+            y += TOC_ROW_STEP;
+            continue;
+        };
+        if abs == selected {
             selection_arrow(fb, y);
         }
-        draw_toc_row(fb, item, index, y);
+        draw_toc_row(fb, item, abs, y);
         y += TOC_ROW_STEP;
     }
 
-    position_footer(fb, selected + 1, shell.chapters.len());
+    position_footer(fb, selected + 1, total);
     finish_working_screen(fb, shell);
 }
 

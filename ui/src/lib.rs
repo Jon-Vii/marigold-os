@@ -108,6 +108,12 @@ pub struct UiShell<'a> {
     /// Total book count across the whole catalog, independent of the resident
     /// window — drives the "x of N" footer and the scroll math.
     pub library_total: u16,
+    /// The resident slice of the on-disk TOC the Contents page draws from:
+    /// `chapters[i]` is the chapter at absolute index
+    /// `chapters_window_start + i`. Long TOCs are windowed like the catalog.
     pub chapters: &'a [UiTocItem<'a>],
+    pub chapters_window_start: u16,
+    /// Full chapter count on disk, independent of the resident window.
+    pub chapters_total: u16,
     pub sync_status: UiSyncStatus,
 }

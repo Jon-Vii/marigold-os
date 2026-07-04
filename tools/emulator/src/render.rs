@@ -128,6 +128,8 @@ fn demo_model<'a>(
         // full list starting at index 0.
         library_window_start: 0,
         chapters: &DEMO_CHAPTERS,
+        chapters_window_start: 0,
+        chapters_total: DEMO_CHAPTERS.len() as u16,
         chapter_title: "",
     }
 }

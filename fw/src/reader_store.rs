@@ -36,6 +36,10 @@ pub(crate) const MAX_SD_TOC_TEXT_BYTES: usize = 4096;
 pub(crate) const MAX_READER_BLOCKS: usize = 384;
 pub(crate) const MAX_READER_PAGES: usize = 96;
 pub(crate) const MAX_READER_TEXT_BYTES: usize = 16_384;
+/// TOC records the `text` buffer can hold at once for the Chapters overview;
+/// longer TOCs are windowed around the visible rows (HPMOR-sized lists fit
+/// whole, but e.g. a 322-entry trade-book TOC does not).
+pub(crate) const TOC_WINDOW_CAPACITY: usize = MAX_READER_TEXT_BYTES / TOC_CHAPTER_RECORD_BYTES;
 pub(crate) const MAX_READER_BLOCK_TEXT: usize = 768;
 pub(crate) const EMPTY_BLOCK_RECORD: BlockRecord = BlockRecord {
     text_offset: 0,
@@ -166,7 +170,13 @@ pub(crate) struct ReaderStore {
     pub(crate) toc_total: usize,
     /// While the Chapters view is open, `text` holds the on-disk TOC records
     /// instead of section content; the reading section is reloaded on exit.
+    /// The buffer fits `TOC_WINDOW_CAPACITY` records, so for longer TOCs it
+    /// holds a window: `text` record `i` is chapter `toc_window_start + i`,
+    /// for `i < toc_window_len`. Slid around the visible rows before each
+    /// Chapters render, like the Library's catalog window.
     pub(crate) text_holds_toc: bool,
+    pub(crate) toc_window_start: usize,
+    pub(crate) toc_window_len: usize,
     /// Start page of every chapter in the book (chapter -> page_for_spine),
     /// filled once at open from TOC.BIN. Covers the whole TOC, so the current
     /// chapter never gets stuck at the 128-entry cap.
@@ -241,6 +251,8 @@ impl ReaderStore {
             toc_count: 0,
             toc_total: 0,
             text_holds_toc: false,
+            toc_window_start: 0,
+            toc_window_len: 0,
             chapter_page: [0; MAX_OVERVIEW_CHAPTERS],
             chapter_page_count: 0,
             chapter_page_token: (0, 0, 0),
@@ -860,16 +872,46 @@ impl ReaderStore {
         true
     }
 
-    /// Mark `text` as holding the on-disk TOC records (full chapter list),
-    /// loaded for the Chapters overview. The reading section is reloaded on
+    /// Mark `text` as holding a window of the on-disk TOC records, loaded for
+    /// the Chapters overview: `len` records starting at absolute chapter
+    /// `start`, out of `total` on disk. The reading section is reloaded on
     /// exit because its content was overwritten.
-    pub(crate) fn set_toc_in_text(&mut self, total: usize) {
+    pub(crate) fn set_toc_window(&mut self, start: usize, len: usize, total: usize) {
+        self.toc_window_start = start;
+        self.toc_window_len = len;
         self.toc_total = total;
         self.text_holds_toc = true;
     }
 
     pub(crate) fn text_holds_toc(&self) -> bool {
         self.text_holds_toc
+    }
+
+    pub(crate) fn toc_window_start(&self) -> usize {
+        self.toc_window_start
+    }
+
+    /// Whether the resident TOC window covers `need` chapters from absolute
+    /// index `start` (clamped to the on-disk total).
+    pub(crate) fn toc_window_covers(&self, start: usize, need: usize) -> bool {
+        let end = (start + need).min(self.toc_total);
+        self.text_holds_toc
+            && start >= self.toc_window_start
+            && end <= self.toc_window_start + self.toc_window_len
+    }
+
+    /// TOC record byte range in `text` for absolute chapter `index`, when the
+    /// resident window holds it.
+    fn toc_record_base(&self, index: usize) -> Option<usize> {
+        if !self.text_holds_toc {
+            return None;
+        }
+        let rel = index.checked_sub(self.toc_window_start)?;
+        if rel >= self.toc_window_len {
+            return None;
+        }
+        let base = rel * TOC_CHAPTER_RECORD_BYTES;
+        (base + TOC_CHAPTER_RECORD_BYTES <= self.text.len()).then_some(base)
     }
 
     /// Chapters to show in the overview: the full on-disk count when the TOC
@@ -882,34 +924,28 @@ impl ReaderStore {
         }
     }
 
-    /// Title of overview chapter `index`, read straight from the TOC records
-    /// in `text` (borrowed, no copy).
+    /// Title of overview chapter `index` (absolute), read straight from the
+    /// TOC records in `text` (borrowed, no copy).
     pub(crate) fn overview_title_at(&self, index: usize) -> &str {
-        if !self.text_holds_toc {
+        let Some(base) = self.toc_record_base(index) else {
             return "";
-        }
-        let base = index * TOC_CHAPTER_RECORD_BYTES;
-        if base + TOC_CHAPTER_RECORD_BYTES > self.text.len() {
-            return "";
-        }
+        };
         let title_len = (self.text[base + 3] as usize).min(TOC_CHAPTER_TITLE_BYTES);
         core::str::from_utf8(&self.text[base + 4..base + 4 + title_len]).unwrap_or("")
     }
 
     pub(crate) fn overview_level_at(&self, index: usize) -> u8 {
-        let base = index * TOC_CHAPTER_RECORD_BYTES;
-        if !self.text_holds_toc || base + 3 >= self.text.len() {
-            return 1;
+        match self.toc_record_base(index) {
+            Some(base) => self.text[base + 2],
+            None => 1,
         }
-        self.text[base + 2]
     }
 
     pub(crate) fn overview_spine_at(&self, index: usize) -> i16 {
-        let base = index * TOC_CHAPTER_RECORD_BYTES;
-        if !self.text_holds_toc || base + 2 > self.text.len() {
-            return -1;
+        match self.toc_record_base(index) {
+            Some(base) => i16::from_le_bytes([self.text[base], self.text[base + 1]]),
+            None => -1,
         }
-        i16::from_le_bytes([self.text[base], self.text[base + 1]])
     }
 
     /// Global page a chapter starts on, computed from the section index by

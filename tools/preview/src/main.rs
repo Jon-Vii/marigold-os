@@ -1767,6 +1767,8 @@ fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u16) -> 
         library_window_start: 0,
         library_total: entries.len() as u16,
         chapters: &chapters,
+        chapters_window_start: 0,
+        chapters_total: chapters.len() as u16,
         sync_status: ui::UiSyncStatus::Idle,
     };
     render_shell(&mut fb, &shell);
