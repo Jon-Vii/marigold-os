@@ -13,29 +13,27 @@ your browser. There is no heap allocation in the reading path.
 *Frames in this README are rendered by the host emulator, pixel-identical
 to what the firmware writes to the panel.*
 
-## What it does
+## Features
 
-- **Landscape** — every surface renders landscape; the X4 is held
-  sideways for its page buttons.
-- **EPUB reading** — streaming ZIP → XHTML parse into a bounded
-  whole-book pagination cache on the card; a cached book reopens in tens
-  of milliseconds.
-- **Typography** — Literata in four styles, pre-rendered to bitmap
-  glyphs on the host; adjustable size and line spacing, and a spacing
-  change repaginates without reparsing the book.
-- **Library** — the shelf streams from a catalog snapshot on the card;
-  library size is not bounded by RAM.
-- **Wireless** — the device joins your Wi-Fi and serves a shelf page on
-  your LAN: list, upload, and delete books from any browser. The radio
-  needs ~100 KB of heap the firmware does not have, so a session loans it
-  out of the reader's own scratch buffers and ends with a reset that
-  hands them back.
-- **Onboarding** — with no stored credentials, the device raises an open
-  `XTEINK-X4` hotspot with a captive portal and an on-screen QR code.
-- **Power** — idle ends in a sleep screen, then the panel and the SoC
-  enter deep sleep; the power button takes the same path.
+- Every surface renders landscape; the X4 is held sideways for its page
+  buttons.
+- EPUBs parse once, streaming ZIP and XHTML into a whole-book pagination
+  cache on the card. A cached book reopens in tens of milliseconds.
+- Literata in four styles, pre-rendered to bitmap glyphs on the host.
+  Font size and line spacing are adjustable, and a spacing change
+  repaginates without reparsing the book.
+- The library streams from a catalog snapshot on the card, so its size
+  is not bounded by RAM.
+- The device joins your Wi-Fi and serves a shelf page on your LAN: list,
+  upload, and delete books from any browser. The radio needs ~100 KB of
+  heap the firmware does not have, so a session loans it out of the
+  reader's scratch buffers and ends with a reset that hands them back.
+- With no stored credentials, the device raises an open `XTEINK-X4`
+  hotspot with a captive portal and an on-screen QR code.
+- Idle ends in a sleep screen, then the panel and the SoC enter deep
+  sleep. The power button takes the same path.
 
-## The numbers
+## Performance
 
 | | |
 |---|---|
@@ -49,7 +47,7 @@ to what the firmware writes to the panel.*
 
 Internals: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
-## Build, flash, test
+## Development
 
 ```sh
 cargo run -p fw --release                                       # build, flash, serial monitor
