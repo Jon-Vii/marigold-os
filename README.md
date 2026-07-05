@@ -10,6 +10,11 @@ SD-card slot prefitted with a 16 GB card. This firmware reads
 full-length EPUBs from the card; books are added and removed through
 your browser. There is no heap allocation in the reading path.
 
+If you would like to explore the firmware without flashing a device,
+visit <https://jon-vii.github.io/xteink-x4-os/> — the same code
+compiled to WebAssembly, with simulated e-ink and a small shelf of
+public-domain books.
+
 *Frames in this README are rendered by the host emulator, pixel-identical
 to what the firmware writes to the panel.*
 
