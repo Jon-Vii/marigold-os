@@ -12,23 +12,27 @@
   :root {
     --paper: #eeece2;
     --ink: #161614;
-    --desk: #d7d2c6;
-    --desk-deep: #c8c2b3;
-    --bezel: #f6f4ee;
-    --bezel-edge: #ffffff;
-    --bezel-line: #c9c4b8;
-    --key: #f1efe8;
-    --key-edge: #fbfaf6;
-    --key-line: #bdb8ac;
-    --label: #6d675c;
+    /* The desk is dark enough that the Mist Gray shell reads as an
+       object on it, not a patch of the same page. */
+    --desk: #a49d90;
+    --desk-deep: #8f8779;
+    --bezel: #d9d7d2;
+    --bezel-edge: #efeeeb;
+    --bezel-line: #a3a099;
+    --key: #d0cec8;
+    --key-edge: #e6e4df;
+    --key-line: #9a978f;
+    --edgekey: #c2bfb8;
+    --edgekey-deep: #aeaba3;
+    --label: #57534a;
     --led: #c98a2b;
     --body: "Literata", Georgia, serif;
     --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --desk: #211e1a;
-      --desk-deep: #191713;
+      --desk: #23211d;
+      --desk-deep: #181613;
       --label: #8a8375;
     }
   }
@@ -80,28 +84,47 @@
      with the legend row the firmware draws for it; Power alone at the far
      right of the top long edge. Keys carry no printed labels, as on the
      hardware — the screen's rail names them in context. */
+  /* A 5.9 mm slab in Mist Gray: thin, even bezel, credit-card corners,
+     and the page rocker + power as slivers on the bottom edge itself,
+     protruding from the silhouette the way they do on the hardware. */
   .device {
+    position: relative;
     width: min(920px, 100%);
-    background: linear-gradient(168deg, var(--bezel-edge), var(--bezel) 30%);
+    background:
+      linear-gradient(173deg, var(--bezel-edge) 0%, var(--bezel) 34%, var(--bezel) 82%, #cbc9c3 100%);
     border: 1px solid var(--bezel-line);
-    border-radius: 30px;
-    padding: clamp(16px, 2.8vw, 28px) clamp(16px, 2.8vw, 28px) clamp(8px, 1.4vw, 14px);
+    border-radius: 22px;
+    padding: clamp(12px, 2vw, 20px);
     box-shadow:
-      0 1px 0 rgba(255,255,255,.9) inset,
-      0 2px 6px rgba(90,84,70,.18),
-      0 24px 60px -18px rgba(90,84,70,.45);
+      0 1px 0 rgba(255,255,255,.75) inset,
+      0 -1px 0 rgba(70,66,58,.14) inset,
+      0 2px 6px rgba(50,46,38,.28),
+      0 26px 60px -16px rgba(40,36,28,.55);
+    margin-bottom: 14px;
   }
-  .bottomedge {
-    display: grid;
-    grid-template-columns: 1fr auto 1fr;
-    align-items: center;
-    padding: clamp(8px, 1.4vw, 14px) 2px 2px;
-  }
-  .bottomedge .right {
+  .edgetab {
+    position: absolute;
+    bottom: -9px;
+    height: 10px;
+    background: linear-gradient(180deg, var(--edgekey-deep), var(--edgekey) 45%, var(--edgekey-deep));
+    border: 1px solid color-mix(in srgb, var(--key-line) 75%, #000 14%);
+    border-top: 0;
+    border-radius: 0 0 4px 4px;
+    box-shadow:
+      0 -2px 2px rgba(40,36,28,.25) inset,
+      0 2px 3px rgba(40,36,28,.4);
     display: flex;
-    justify-content: flex-end;
-    align-items: center;
-    gap: 12px;
+    overflow: hidden;
+  }
+  .edgetab:active { bottom: -7px; height: 8px; }
+  .edgetab.pagerocker {
+    left: 50%;
+    transform: translateX(-50%);
+    width: clamp(150px, 25vw, 230px);
+  }
+  .edgetab.powertab {
+    right: clamp(28px, 5vw, 56px);
+    width: clamp(48px, 7vw, 68px);
   }
   .body {
     display: flex;
@@ -136,7 +159,7 @@
   .rocker.r1 { top: 33.33%; }
   .rocker.r2 { top: 66.67%; }
   .rocker button,
-  .pagerocker button {
+  .edgetab button {
     appearance: none;
     flex: 1;
     border: 0;
@@ -146,34 +169,32 @@
     padding: 0;
   }
   .rocker button + button { border-top: 1px solid color-mix(in srgb, var(--key-line) 55%, transparent); }
-  .rocker button:active, .pagerocker button:active { background: rgba(90,84,70,.10); }
-  .rocker button:focus-visible, .pagerocker button:focus-visible { outline: 2px solid var(--led); outline-offset: -3px; }
-  /* The centered page rocker on the bottom long edge: right half turns
-     forward, as on the hardware. */
-  .pagerocker {
-    display: flex;
-    width: clamp(140px, 24vw, 220px);
-    height: clamp(16px, 2.2vw, 20px);
-    background: linear-gradient(180deg, var(--key-edge), var(--key) 60%);
-    border: 1px solid var(--key-line);
-    border-radius: 999px;
-    box-shadow:
-      0 1px 0 rgba(255,255,255,.85) inset,
-      0 2px 3px rgba(90,84,70,.30);
-    overflow: hidden;
-  }
-  .pagerocker button + button { border-left: 1px solid color-mix(in srgb, var(--key-line) 55%, transparent); }
+  .rocker button:active, .edgetab button:active { background: rgba(60,56,48,.14); }
+  .rocker button:focus-visible, .edgetab button:focus-visible { outline: 2px solid var(--led); outline-offset: -3px; }
+  .edgetab.pagerocker button + button { border-left: 1px solid color-mix(in srgb, var(--key-line) 55%, transparent); }
+  /* Aluminosilicate glass over the module: a slightly darker glass
+     margin around the active area, a dark hairline at the panel edge,
+     and the paper recessed a touch below the lip. */
   .screen {
     position: relative;
-    border-radius: 4px;
+    border-radius: 3px;
     overflow: hidden;
     flex: 1;
     min-width: 0;
-    /* recessed panel: glass sits below the white bezel lip */
+    margin: clamp(7px, 1.1vw, 11px);
     box-shadow:
-      0 0 0 1px #8f8a7e,
-      0 2px 10px rgba(40,36,28,.5) inset;
+      0 0 0 1px #6e6b64,
+      0 0 0 clamp(6px, 1vw, 10px) #cbc9c3,
+      0 0 0 calc(clamp(6px, 1vw, 10px) + 1px) #a7a49d,
+      0 2px 9px rgba(40,36,28,.45) inset;
     background: var(--paper);
+  }
+  .screen::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background: linear-gradient(112deg, rgba(255,255,255,.10) 0%, rgba(255,255,255,0) 22%);
   }
   canvas {
     display: block;
@@ -182,40 +203,18 @@
     image-rendering: pixelated;
   }
   .led {
-    width: 6px; height: 6px;
+    position: absolute;
+    right: clamp(14px, 2.2vw, 22px);
+    bottom: clamp(7px, 1vw, 10px);
+    width: 5px; height: 5px;
     border-radius: 50%;
-    background: #d4cfc2;
-    box-shadow: 0 0 1px rgba(0,0,0,.25) inset;
+    background: #b3b0a9;
+    box-shadow: 0 0 1px rgba(0,0,0,.35) inset;
     transition: background .12s, box-shadow .12s;
-    flex: none;
   }
   .led.on {
     background: var(--led);
     box-shadow: 0 0 6px 1px color-mix(in srgb, var(--led) 70%, transparent);
-  }
-  button.key {
-    appearance: none;
-    background: linear-gradient(180deg, var(--key-edge), var(--key) 60%);
-    border: 1px solid var(--key-line);
-    border-radius: 999px;
-    width: clamp(28px, 4.2vw, 40px);
-    height: clamp(44px, 6.8vw, 68px);
-    cursor: pointer;
-    box-shadow:
-      0 1px 0 rgba(255,255,255,.85) inset,
-      0 2px 3px rgba(90,84,70,.30);
-    transition: transform .05s;
-    touch-action: manipulation;
-  }
-  button.key:active {
-    transform: translateY(1px);
-    box-shadow: 0 1px 0 rgba(255,255,255,.5) inset, 0 1px 1px rgba(90,84,70,.25);
-  }
-  button.key:focus-visible { outline: 2px solid var(--led); outline-offset: 2px; }
-  button.key.power {
-    width: clamp(48px, 7vw, 68px);
-    height: clamp(16px, 2.2vw, 20px);
-    border-radius: 999px;
   }
 
   /* ------------------------------------------------ page matter */
@@ -260,7 +259,6 @@
   .colophon .row span:last-child { text-align: right; }
 
   @media (max-width: 560px) {
-    button.key { font-size: 9.5px; letter-spacing: .08em; }
     .hints .kbonly { display: none; }
   }
 </style>
@@ -286,17 +284,14 @@
     </div>
     <div class="screen"><canvas id="panel" width="800" height="480"></canvas></div>
   </div>
-  <div class="bottomedge">
-    <span></span>
-    <div class="pagerocker">
-      <button id="p-prev" title="Page back" aria-label="Page back"></button>
-      <button id="p-next" title="Page forward" aria-label="Page forward"></button>
-    </div>
-    <div class="right">
-      <span class="led" id="led" aria-hidden="true"></span>
-      <button class="key power" id="k-power" title="Power — sleep and wake" aria-label="Power"></button>
-    </div>
+  <div class="edgetab pagerocker" aria-label="Page rocker on the bottom edge">
+    <button id="p-prev" title="Page back" aria-label="Page back"></button>
+    <button id="p-next" title="Page forward" aria-label="Page forward"></button>
   </div>
+  <div class="edgetab powertab">
+    <button id="k-power" title="Power — sleep and wake" aria-label="Power"></button>
+  </div>
+  <span class="led" id="led" aria-hidden="true"></span>
 </div>
 
 <div class="hints">
