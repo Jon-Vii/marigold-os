@@ -1,7 +1,5 @@
 # xteink-x4-os
 
-A light OS for the Xteink X4 e-reader.
-
 ![Home screen](docs/home.png)
 
 The Xteink X4 is my daily driver for reading ebooks. It is pocket-sized,
