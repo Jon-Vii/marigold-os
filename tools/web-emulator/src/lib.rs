@@ -131,17 +131,14 @@ impl WebEmulator {
         if self.state.sync_status == SyncStatus::Starting
             && previous.sync_status != SyncStatus::Starting
         {
+            // The real session joins the network and then serves the book
+            // upload page until the user finishes; there is no separate
+            // progress-exchange step to pretend at.
             self.ops.push((now + 500.0, Op::Sync(SyncEvent::Connecting)));
             self.ops
                 .push((now + 1600.0, Op::Sync(SyncEvent::Connected([192, 168, 1, 27]))));
-            self.ops.push((now + 2300.0, Op::Sync(SyncEvent::Syncing)));
-            self.ops.push((
-                now + 3700.0,
-                Op::Sync(SyncEvent::Done {
-                    pushed: true,
-                    pulled: true,
-                }),
-            ));
+            self.ops
+                .push((now + 2600.0, Op::Sync(SyncEvent::Serving([192, 168, 1, 27]))));
         }
         if self.state.view != AppView::Sync {
             self.ops.retain(|(_, op)| !matches!(op, Op::Sync(_)));

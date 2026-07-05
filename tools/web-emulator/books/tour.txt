@@ -28,8 +28,8 @@ The face is Literata, rendered to bitmaps at each size and weight at build time.
 
 # Wireless
 
-The real device syncs reading progress over Wi-Fi with a KOReader-compatible sync server, and serves a small browser page for uploading books straight to the card.
+The real device joins your Wi-Fi and serves a small page in your browser for putting books on the card and taking them off again. No cable, no card reader: the reader is briefly a tiny web server.
 
-In this simulation the radio is pretend, but the screens are real: open Sync from Home and press Confirm to watch a session connect, exchange progress, and land back at Done.
+In this simulation the radio is pretend, but the screens are real: open Sync from Home and press Confirm to watch the session join the network and start serving the upload page.
 
 That is the whole tour. The other three books on the shelf are better company than this one. Press Back, then open the Library.

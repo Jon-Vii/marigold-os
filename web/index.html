@@ -92,11 +92,16 @@
       0 24px 60px -18px rgba(90,84,70,.45);
   }
   .bottomedge {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    align-items: center;
+    padding: clamp(8px, 1.4vw, 14px) 2px 2px;
+  }
+  .bottomedge .right {
     display: flex;
     justify-content: flex-end;
     align-items: center;
     gap: 12px;
-    padding: clamp(8px, 1.4vw, 14px) 2px 2px;
   }
   .body {
     display: flex;
@@ -105,17 +110,59 @@
   }
   .sidekeys {
     position: relative;
-    width: clamp(30px, 4.6vw, 44px);
+    width: clamp(16px, 2.4vw, 22px);
     flex: none;
   }
-  /* The firmware draws the key legend at panel rows 120/200/280/360 of
-     480; each physical key sits level with its row. */
-  .sidekeys .key { position: absolute; left: 0; transform: translateY(-50%); }
-  .sidekeys .key:nth-child(1) { top: 25%; }
-  .sidekeys .key:nth-child(2) { top: 41.67%; }
-  .sidekeys .key:nth-child(3) { top: 58.33%; }
-  .sidekeys .key:nth-child(4) { top: 75%; }
-  .sidekeys .key:active { transform: translateY(calc(-50% + 1px)); }
+  /* Two long two-in-one bars. The firmware draws the key legend at panel
+     rows 120/200/280/360 of 480; each rocker half sits level with its
+     row, so the bars center at 33.3% and 66.7% and each spans a third of
+     the panel height. */
+  .rocker {
+    position: absolute;
+    left: 0;
+    width: 100%;
+    height: 33.4%;
+    transform: translateY(-50%);
+    display: flex;
+    flex-direction: column;
+    background: linear-gradient(180deg, var(--key-edge), var(--key) 60%);
+    border: 1px solid var(--key-line);
+    border-radius: 999px;
+    box-shadow:
+      0 1px 0 rgba(255,255,255,.85) inset,
+      0 2px 3px rgba(90,84,70,.30);
+    overflow: hidden;
+  }
+  .rocker.r1 { top: 33.33%; }
+  .rocker.r2 { top: 66.67%; }
+  .rocker button,
+  .pagerocker button {
+    appearance: none;
+    flex: 1;
+    border: 0;
+    background: transparent;
+    cursor: pointer;
+    touch-action: manipulation;
+    padding: 0;
+  }
+  .rocker button + button { border-top: 1px solid color-mix(in srgb, var(--key-line) 55%, transparent); }
+  .rocker button:active, .pagerocker button:active { background: rgba(90,84,70,.10); }
+  .rocker button:focus-visible, .pagerocker button:focus-visible { outline: 2px solid var(--led); outline-offset: -3px; }
+  /* The centered page rocker on the bottom long edge: right half turns
+     forward, as on the hardware. */
+  .pagerocker {
+    display: flex;
+    width: clamp(140px, 24vw, 220px);
+    height: clamp(16px, 2.2vw, 20px);
+    background: linear-gradient(180deg, var(--key-edge), var(--key) 60%);
+    border: 1px solid var(--key-line);
+    border-radius: 999px;
+    box-shadow:
+      0 1px 0 rgba(255,255,255,.85) inset,
+      0 2px 3px rgba(90,84,70,.30);
+    overflow: hidden;
+  }
+  .pagerocker button + button { border-left: 1px solid color-mix(in srgb, var(--key-line) 55%, transparent); }
   .screen {
     position: relative;
     border-radius: 4px;
@@ -228,16 +275,27 @@
 <div class="device" aria-label="Simulated Xteink X4 e-reader">
   <div class="body">
     <div class="sidekeys">
-      <button class="key" id="k-back" title="Top key — the screen names it" aria-label="Top key"></button>
-      <button class="key" id="k-ok" title="Second key — the screen names it" aria-label="Second key"></button>
-      <button class="key" id="k-prev" title="Third key — the screen names it" aria-label="Third key"></button>
-      <button class="key" id="k-next" title="Bottom key — the screen names it" aria-label="Bottom key"></button>
+      <div class="rocker r1">
+        <button id="k-back" title="Upper half — the screen names it" aria-label="Top rocker, upper half"></button>
+        <button id="k-ok" title="Lower half — the screen names it" aria-label="Top rocker, lower half"></button>
+      </div>
+      <div class="rocker r2">
+        <button id="k-prev" title="Upper half — the screen names it" aria-label="Bottom rocker, upper half"></button>
+        <button id="k-next" title="Lower half — the screen names it" aria-label="Bottom rocker, lower half"></button>
+      </div>
     </div>
     <div class="screen"><canvas id="panel" width="800" height="480"></canvas></div>
   </div>
   <div class="bottomedge">
-    <span class="led" id="led" aria-hidden="true"></span>
-    <button class="key power" id="k-power" title="Power — sleep and wake" aria-label="Power"></button>
+    <span></span>
+    <div class="pagerocker">
+      <button id="p-prev" title="Page back" aria-label="Page back"></button>
+      <button id="p-next" title="Page forward" aria-label="Page forward"></button>
+    </div>
+    <div class="right">
+      <span class="led" id="led" aria-hidden="true"></span>
+      <button class="key power" id="k-power" title="Power — sleep and wake" aria-label="Power"></button>
+    </div>
   </div>
 </div>
 
@@ -406,6 +464,7 @@
   for (const [id, code] of [
     ["k-power", BTN.power], ["k-back", BTN.back], ["k-ok", BTN.ok],
     ["k-prev", BTN.prev], ["k-next", BTN.next],
+    ["p-prev", BTN.prev], ["p-next", BTN.next],
   ]) {
     document.getElementById(id).addEventListener("click", () => press(code));
   }
