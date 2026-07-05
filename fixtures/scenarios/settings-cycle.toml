@@ -44,7 +44,7 @@ button = "Back"
 [expect]
 view = "Home"
 selection = 0
-font_family = "Bookerly"
+font_family = "Merriweather"
 font_size = "Large"
 font_weight = "Heavy"
 line_spacing = "Relaxed"

@@ -1189,8 +1189,8 @@ fn apply_setting(mut state: ReaderState) -> ReaderState {
     match state.selection {
         0 => {
             state.font_family = match state.font_family {
-                FontFamily::Literata => FontFamily::Bookerly,
-                FontFamily::Bookerly => FontFamily::Literata,
+                FontFamily::Literata => FontFamily::Merriweather,
+                FontFamily::Merriweather => FontFamily::Literata,
             };
         }
         1 => {
@@ -1623,7 +1623,7 @@ mod tests {
         let state = press(ReaderState::boot(), Button::Next);
         assert_eq!(state.selection, 0);
         let state = press(state, Button::Confirm);
-        assert_eq!(state.font_family, FontFamily::Bookerly);
+        assert_eq!(state.font_family, FontFamily::Merriweather);
         let state = press(state, Button::Confirm);
         assert_eq!(state.font_family, FontFamily::Literata);
 

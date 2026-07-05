@@ -126,20 +126,20 @@ impl FontWeight {
 }
 
 /// Reader body typeface behind the Font setting. Literata is the shipped
-/// default; Bookerly is the Kindle reading face. UI furniture stays
+/// default; Merriweather is the open second face. UI furniture stays
 /// Literata — only reading content changes family.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FontFamily {
     #[default]
     Literata,
-    Bookerly,
+    Merriweather,
 }
 
 impl FontFamily {
     pub fn from_u8(value: u8) -> Option<Self> {
         match value {
             0 => Some(Self::Literata),
-            1 => Some(Self::Bookerly),
+            1 => Some(Self::Merriweather),
             _ => None,
         }
     }
@@ -209,29 +209,30 @@ pub fn literata_weighted(
     }
 }
 
-/// The Bookerly reading face at a user-selected size: 19px, 22px, or 26px.
-pub fn bookerly_sized(size: FontSize, style: FontStyle) -> &'static BitmapFont {
-    use crate::bookerly_generated as bk;
+/// The Merriweather reading face at a user-selected size: 19px, 22px, or 26px.
+pub fn merriweather_sized(size: FontSize, style: FontStyle) -> &'static BitmapFont {
+    use crate::merriweather_generated as mw;
     match (size, style) {
-        (FontSize::Small, FontStyle::Regular) => &bk::BOOKERLY_19_REGULAR,
-        (FontSize::Small, FontStyle::Italic) => &bk::BOOKERLY_19_ITALIC,
-        (FontSize::Small, FontStyle::Bold) => &bk::BOOKERLY_19_BOLD,
-        (FontSize::Small, FontStyle::BoldItalic) => &bk::BOOKERLY_19_BOLD_ITALIC,
-        (FontSize::Medium, FontStyle::Regular) => &bk::BOOKERLY_22_REGULAR,
-        (FontSize::Medium, FontStyle::Italic) => &bk::BOOKERLY_22_ITALIC,
-        (FontSize::Medium, FontStyle::Bold) => &bk::BOOKERLY_22_BOLD,
-        (FontSize::Medium, FontStyle::BoldItalic) => &bk::BOOKERLY_22_BOLD_ITALIC,
-        (FontSize::Large, FontStyle::Regular) => &bk::BOOKERLY_26_REGULAR,
-        (FontSize::Large, FontStyle::Italic) => &bk::BOOKERLY_26_ITALIC,
-        (FontSize::Large, FontStyle::Bold) => &bk::BOOKERLY_26_BOLD,
-        (FontSize::Large, FontStyle::BoldItalic) => &bk::BOOKERLY_26_BOLD_ITALIC,
+        (FontSize::Small, FontStyle::Regular) => &mw::MERRIWEATHER_19_REGULAR,
+        (FontSize::Small, FontStyle::Italic) => &mw::MERRIWEATHER_19_ITALIC,
+        (FontSize::Small, FontStyle::Bold) => &mw::MERRIWEATHER_19_BOLD,
+        (FontSize::Small, FontStyle::BoldItalic) => &mw::MERRIWEATHER_19_BOLD_ITALIC,
+        (FontSize::Medium, FontStyle::Regular) => &mw::MERRIWEATHER_22_REGULAR,
+        (FontSize::Medium, FontStyle::Italic) => &mw::MERRIWEATHER_22_ITALIC,
+        (FontSize::Medium, FontStyle::Bold) => &mw::MERRIWEATHER_22_BOLD,
+        (FontSize::Medium, FontStyle::BoldItalic) => &mw::MERRIWEATHER_22_BOLD_ITALIC,
+        (FontSize::Large, FontStyle::Regular) => &mw::MERRIWEATHER_26_REGULAR,
+        (FontSize::Large, FontStyle::Italic) => &mw::MERRIWEATHER_26_ITALIC,
+        (FontSize::Large, FontStyle::Bold) => &mw::MERRIWEATHER_26_BOLD,
+        (FontSize::Large, FontStyle::BoldItalic) => &mw::MERRIWEATHER_26_BOLD_ITALIC,
     }
 }
 
-/// The reading body face for the full type settings and a style run. Bookerly
-/// ships no SemiBold, so its `Heavy` promotes regular and italic prose to the
-/// Bold face — emphasis then blends into the body, which is the same tradeoff
-/// Kindle's boldness slider makes at its top steps.
+/// The reading body face for the full type settings and a style run. The
+/// Merriweather set carries no SemiBold, so its `Heavy` promotes regular and
+/// italic prose to the Bold face; bold emphasis then blends into the heavier
+/// body, the same tradeoff the Literata path makes only at Bold rather than a
+/// dedicated SemiBold.
 pub fn family_weighted(
     family: FontFamily,
     size: FontSize,
@@ -240,12 +241,12 @@ pub fn family_weighted(
 ) -> &'static BitmapFont {
     match family {
         FontFamily::Literata => literata_weighted(size, weight, style),
-        FontFamily::Bookerly => match weight {
-            FontWeight::Normal => bookerly_sized(size, style),
+        FontFamily::Merriweather => match weight {
+            FontWeight::Normal => merriweather_sized(size, style),
             FontWeight::Heavy => match style {
-                FontStyle::Regular => bookerly_sized(size, FontStyle::Bold),
-                FontStyle::Italic => bookerly_sized(size, FontStyle::BoldItalic),
-                _ => bookerly_sized(size, style),
+                FontStyle::Regular => merriweather_sized(size, FontStyle::Bold),
+                FontStyle::Italic => merriweather_sized(size, FontStyle::BoldItalic),
+                _ => merriweather_sized(size, style),
             },
         },
     }

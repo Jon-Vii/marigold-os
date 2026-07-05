@@ -93,7 +93,7 @@ Current code status:
   path now streams compressed deflate input in chunks, and XHTML spine entries
   can decode a bounded prefix for the first section cache instead of failing
   just because the section is larger than the XHTML scratch buffer.
-- `proto::text` defines Literata/Bookerly-ready font/style roles and a
+- `proto::text` defines Literata/Merriweather-ready font/style roles and a
   deterministic one-screen paginator over bounded styled runs.
 - `proto::cache` defines bounded binary cache records for book, TOC, section,
   page, line, word, and block data.

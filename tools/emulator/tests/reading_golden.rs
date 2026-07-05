@@ -271,18 +271,18 @@ fn reading_page_bodies_match_goldens_heavy() {
     assert_page_matches_golden(&source, 0, "reading-page-heavy-0");
 }
 
-/// The default size and weight in Bookerly: every glyph comes from the
-/// Bookerly faces and its advances shift wrap points, so the frame differs
+/// The default size and weight in Merriweather: every glyph comes from the
+/// Merriweather faces and its advances shift wrap points, so the frame differs
 /// from the Literata page; page 0 is pinned.
 #[test]
-fn reading_page_bodies_match_goldens_bookerly() {
+fn reading_page_bodies_match_goldens_merriweather() {
     let source = fixture(TypeSettings {
         size: FontSize::Medium,
         spacing: LineSpacing::Normal,
         weight: FontWeight::Normal,
-        family: FontFamily::Bookerly,
+        family: FontFamily::Merriweather,
     });
-    assert_page_matches_golden(&source, 0, "reading-page-bookerly-0");
+    assert_page_matches_golden(&source, 0, "reading-page-merriweather-0");
 }
 
 /// The default grid holds exactly seventeen body lines: a paragraph

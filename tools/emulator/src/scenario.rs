@@ -348,7 +348,7 @@ fn parse_font_weight(value: &str) -> Result<display::font::FontWeight, String> {
 fn parse_font_family(value: &str) -> Result<display::font::FontFamily, String> {
     match value {
         "Literata" | "literata" => Ok(display::font::FontFamily::Literata),
-        "Bookerly" | "bookerly" => Ok(display::font::FontFamily::Bookerly),
+        "Merriweather" | "merriweather" => Ok(display::font::FontFamily::Merriweather),
         _ => Err(format!("unknown font family: {value}")),
     }
 }

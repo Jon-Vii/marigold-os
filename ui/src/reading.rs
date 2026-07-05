@@ -302,10 +302,13 @@ pub const READER_WRAP_SAFETY: i16 = 4;
 /// v13: the Type Weight setting joins the layout config. Heavier (SemiBold)
 /// body glyphs are wider than Regular, so wrap points change with weight;
 /// existing caches rebuild on a weight change.
-/// v14: the Font setting joins the layout config. Bookerly advances differ
-/// from Literata's at every size, so wrap points change with family;
+/// v14: the Font setting joins the layout config. The second family's advances
+/// differ from Literata's at every size, so wrap points change with family;
 /// existing caches rebuild on a family change.
-const READER_LAYOUT_VERSION: u16 = 14;
+/// v15: the second family changed from Bookerly to Merriweather. Its advances
+/// differ, but the family bit (1) does not, so a version bump is what retires
+/// any pagination cached under the old face.
+const READER_LAYOUT_VERSION: u16 = 15;
 
 /// Section cache layout config: the wrap-rule version plus the type
 /// settings the section was paginated under. Stored in cache headers; a

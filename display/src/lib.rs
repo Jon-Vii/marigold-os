@@ -1,7 +1,7 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
-pub mod bookerly_generated;
+pub mod merriweather_generated;
 pub mod epd;
 pub mod fb;
 pub mod font;

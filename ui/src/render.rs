@@ -30,6 +30,11 @@ const CONTENT_RIGHT: i16 = 740;
 /// (matching the centered sleep colophon's edge) before a long name truncates.
 const COLOPHON_RIGHT: i16 = 760;
 const HEADING_CX: i16 = 480;
+/// Right edge for the footer battery readout. It sits in the panel corner
+/// with nothing beside it, so it tucks to the same 24px inset as the reading
+/// page counter (READER_RIGHT_X - 16 = 776) rather than the content column's
+/// value margin — the corner then reads the same in a menu as when reading.
+const FOOTER_RIGHT: i16 = 776;
 const ROW_STEP: i16 = 56;
 const FIRST_ROW_Y: i16 = 118;
 /// Rows the Library list shows at once. Public so the firmware sizes the
@@ -474,13 +479,6 @@ fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
                 HEADING_CX,
                 hint_y,
             );
-            draw_text_centered(
-                fb,
-                literata_small(FontStyle::Italic),
-                "reading pauses until the device restarts",
-                HEADING_CX,
-                hint_y + 34,
-            );
         }
         UiSyncStatus::ForgetPending => {
             let mut buf = [0u8; 48];
@@ -802,7 +800,7 @@ fn draw_battery_percent(fb: &mut Framebuffer, percent: u8) {
     let label = core::str::from_utf8(&buf[..cursor]).unwrap_or("");
     let small = literata_small(FontStyle::Regular);
     let width = measure_text(small, label) as i16;
-    draw_text(fb, small, label, CONTENT_RIGHT - width, FOOTER_Y, false);
+    draw_text(fb, small, label, FOOTER_RIGHT - width, FOOTER_Y, false);
 }
 
 fn finish_working_screen(fb: &mut Framebuffer, shell: &UiShell<'_>) {
@@ -964,7 +962,7 @@ fn font_weight_label(weight: display::font::FontWeight) -> &'static str {
 fn font_family_label(family: display::font::FontFamily) -> &'static str {
     match family {
         display::font::FontFamily::Literata => "literata",
-        display::font::FontFamily::Bookerly => "bookerly",
+        display::font::FontFamily::Merriweather => "merriweather",
     }
 }
 

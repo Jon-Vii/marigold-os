@@ -62,7 +62,7 @@ covers the paths: web flasher, SD card, and the in-app update from the card.
 
 ## Credits
 
-- [Literata](https://github.com/googlefonts/literata) (OFL) for the reading typeface
+- [Literata](https://github.com/googlefonts/literata) and [Merriweather](https://github.com/SorkinType/Merriweather) (both OFL) for the reading typefaces
 - [esp-hal](https://github.com/esp-rs/esp-hal) and [Embassy](https://embassy.dev) underneath everything
 - The OpenX4 community SDK for the panel's addressing behavior
 
