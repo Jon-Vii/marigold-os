@@ -15,6 +15,7 @@ pub struct AppStateRecord {
     pub font_size: u8,
     pub line_spacing: u8,
     pub font_weight: u8,
+    pub font_family: u8,
     pub source_hash: u32,
     pub source_size: u32,
 }
@@ -33,6 +34,7 @@ impl AppStateRecord {
     const DEFAULT_FONT_SIZE: u8 = 1;
     const DEFAULT_LINE_SPACING: u8 = 1;
     const DEFAULT_FONT_WEIGHT: u8 = 0;
+    const DEFAULT_FONT_FAMILY: u8 = 0;
 
     pub const fn new(book_id: u32) -> Self {
         Self {
@@ -45,6 +47,7 @@ impl AppStateRecord {
             font_size: Self::DEFAULT_FONT_SIZE,
             line_spacing: Self::DEFAULT_LINE_SPACING,
             font_weight: Self::DEFAULT_FONT_WEIGHT,
+            font_family: Self::DEFAULT_FONT_FAMILY,
             source_hash: 0,
             source_size: 0,
         }
@@ -64,9 +67,12 @@ impl AppStateRecord {
         write_u32(&mut out, 22, self.source_size);
         out[26] = self.font_size;
         out[27] = self.line_spacing;
-        // V4 adds the type weight at byte 28; bytes 29-31 stay reserved zero,
-        // and the checksum span grows to cover them.
+        // V4 adds the type weight at byte 28; the checksum span covers the
+        // reserved tail. The font family later took reserved byte 29: records
+        // written before it carry zero there, which is the Literata default,
+        // so no version bump was needed. Bytes 30-31 stay reserved zero.
         out[28] = self.font_weight;
+        out[29] = self.font_family;
         let checksum = checksum(&out[..32]);
         write_u32(&mut out, 32, checksum);
         out
@@ -98,6 +104,7 @@ impl AppStateRecord {
                     font_size: bytes[26],
                     line_spacing: bytes[27],
                     font_weight: bytes[28],
+                    font_family: bytes[29],
                     source_hash: read_u32(bytes, 18),
                     source_size: read_u32(bytes, 22),
                 })
@@ -125,6 +132,7 @@ impl AppStateRecord {
                     font_size,
                     line_spacing,
                     font_weight: Self::DEFAULT_FONT_WEIGHT,
+                    font_family: Self::DEFAULT_FONT_FAMILY,
                     source_hash: read_u32(bytes, 18),
                     source_size: read_u32(bytes, 22),
                 })
@@ -144,6 +152,7 @@ impl AppStateRecord {
                     font_size: Self::DEFAULT_FONT_SIZE,
                     line_spacing: Self::DEFAULT_LINE_SPACING,
                     font_weight: Self::DEFAULT_FONT_WEIGHT,
+                    font_family: Self::DEFAULT_FONT_FAMILY,
                     source_hash: 0,
                     source_size: 0,
                 })
@@ -266,6 +275,7 @@ mod tests {
             font_size: 2,
             line_spacing: 0,
             font_weight: 1,
+            font_family: 1,
             source_hash: 0xDEAD_BEEF,
             source_size: 123_456,
         }
@@ -313,6 +323,20 @@ mod tests {
         assert_eq!(decoded.font_weight, AppStateRecord::DEFAULT_FONT_WEIGHT);
         assert_eq!(decoded.book_id, 7);
         assert_eq!(decoded.source_hash, 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn pre_family_v4_records_decode_as_literata() {
+        // V4 records written before the Font setting carry the reserved zero
+        // at byte 29; that must decode as the default (Literata) family.
+        let mut encoded = record().encode();
+        encoded[29] = 0;
+        let checksum = checksum(&encoded[..32]);
+        write_u32(&mut encoded, 32, checksum);
+
+        let decoded = AppStateRecord::decode(&encoded).expect("pre-family v4 decodes");
+        assert_eq!(decoded.font_family, AppStateRecord::DEFAULT_FONT_FAMILY);
+        assert_eq!(decoded.font_weight, 1);
     }
 
     #[test]

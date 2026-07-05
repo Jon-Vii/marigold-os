@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 
 use display::fb::Framebuffer;
 use display::font::{
-    style_marker_code, FontSize, FontStyle, FontWeight, LineSpacing, TypeSettings, STYLE_MARKER,
+    style_marker_code, FontFamily, FontSize, FontStyle, FontWeight, LineSpacing, TypeSettings,
+    STYLE_MARKER,
 };
 use proto::cache::BlockRecord;
 use proto::text::{TextAlign, TextRole};
@@ -242,6 +243,7 @@ fn reading_page_bodies_match_goldens_large_relaxed() {
         size: FontSize::Large,
         spacing: LineSpacing::Relaxed,
         weight: FontWeight::Normal,
+        family: FontFamily::Literata,
     });
     let default_pages =
         paginate_block_pages(&fixture(TypeSettings::DEFAULT), READER_PAGE_TOP, READER_PAGE_BOTTOM);
@@ -264,8 +266,23 @@ fn reading_page_bodies_match_goldens_heavy() {
         size: FontSize::Medium,
         spacing: LineSpacing::Normal,
         weight: FontWeight::Heavy,
+        family: FontFamily::Literata,
     });
     assert_page_matches_golden(&source, 0, "reading-page-heavy-0");
+}
+
+/// The default size and weight in Bookerly: every glyph comes from the
+/// Bookerly faces and its advances shift wrap points, so the frame differs
+/// from the Literata page; page 0 is pinned.
+#[test]
+fn reading_page_bodies_match_goldens_bookerly() {
+    let source = fixture(TypeSettings {
+        size: FontSize::Medium,
+        spacing: LineSpacing::Normal,
+        weight: FontWeight::Normal,
+        family: FontFamily::Bookerly,
+    });
+    assert_page_matches_golden(&source, 0, "reading-page-bookerly-0");
 }
 
 /// The default grid holds exactly seventeen body lines: a paragraph
@@ -307,6 +324,7 @@ fn small_compact_paginates_no_worse_than_default() {
         size: FontSize::Small,
         spacing: LineSpacing::Compact,
         weight: FontWeight::Normal,
+        family: FontFamily::Literata,
     });
     let default_pages =
         paginate_block_pages(&fixture(TypeSettings::DEFAULT), READER_PAGE_TOP, READER_PAGE_BOTTOM);

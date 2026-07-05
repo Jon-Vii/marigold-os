@@ -89,6 +89,7 @@ pub struct UiShell<'a> {
     pub font_size: display::font::FontSize,
     pub line_spacing: display::font::LineSpacing,
     pub font_weight: display::font::FontWeight,
+    pub font_family: display::font::FontFamily,
     pub selection: u16,
     pub chapter: u8,
     /// The current chapter's title resolved over the whole book (past the

@@ -51,7 +51,7 @@ struct WebEmulator {
     ops: Vec<(f64, Op)>,
     frame_seq: u32,
     last_refresh: u32,
-    snapshot: [u32; 8],
+    snapshot: [u32; 9],
 }
 
 impl WebEmulator {
@@ -69,7 +69,7 @@ impl WebEmulator {
             ops: Vec::new(),
             frame_seq: 0,
             last_refresh: 0,
-            snapshot: [0; 8],
+            snapshot: [0; 9],
         };
         emu.state = emu.state.apply_library_event(
             emu.ctx,
@@ -207,7 +207,7 @@ impl WebEmulator {
         self.render(RenderKind::Page);
     }
 
-    fn restore(&mut self, snapshot: [u32; 8]) {
+    fn restore(&mut self, snapshot: [u32; 9]) {
         self.state = self.state.apply_library_event(
             self.ctx,
             LibraryEvent::Restored {
@@ -220,6 +220,7 @@ impl WebEmulator {
                 font_size: snapshot[5] as u8,
                 line_spacing: snapshot[6] as u8,
                 font_weight: snapshot[7] as u8,
+                font_family: snapshot[8] as u8,
             },
         );
         self.render(RenderKind::Page);
@@ -236,6 +237,7 @@ impl WebEmulator {
             u32::from(persisted.font_size),
             u32::from(persisted.line_spacing),
             u32::from(persisted.font_weight),
+            u32::from(persisted.font_family),
         ];
     }
 
@@ -498,9 +500,10 @@ pub extern "C" fn x4_restore(
     size: u32,
     spacing: u32,
     weight: u32,
+    family: u32,
 ) {
     emulator().restore([
-        book_id, chapter, page, orientation, policy, size, spacing, weight,
+        book_id, chapter, page, orientation, policy, size, spacing, weight, family,
     ]);
 }
 

@@ -349,8 +349,9 @@
   // Restore the shelf position saved by a previous visit.
   try {
     const saved = JSON.parse(localStorage.getItem(SAVE_KEY));
-    if (Array.isArray(saved) && saved.length === 8) {
-      wasm.x4_restore(...saved);
+    if (Array.isArray(saved) && (saved.length === 8 || saved.length === 9)) {
+      // Length-8 saves predate the Font setting; default it to Literata.
+      wasm.x4_restore(...saved, ...(saved.length === 8 ? [0] : []));
     }
   } catch (_) { /* fresh start */ }
 
@@ -457,7 +458,7 @@
   }
 
   function save() {
-    const snap = new Uint32Array(wasm.memory.buffer, wasm.x4_snapshot_ptr(), 8);
+    const snap = new Uint32Array(wasm.memory.buffer, wasm.x4_snapshot_ptr(), 9);
     localStorage.setItem(SAVE_KEY, JSON.stringify([...snap]));
   }
 

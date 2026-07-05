@@ -356,6 +356,7 @@ fn open_loading_plate_request(
     request.font_size = type_settings.size;
     request.line_spacing = type_settings.spacing;
     request.font_weight = type_settings.weight;
+    request.font_family = type_settings.family;
     Some(request)
 }
 
@@ -663,6 +664,7 @@ fn handle_storage_command(
                 font_size: record.font_size,
                 line_spacing: record.line_spacing,
                 font_weight: record.font_weight,
+                font_family: record.font_family,
                 source_hash,
                 source_size,
             };
@@ -765,6 +767,7 @@ fn send_resumed_position(
         font_size: request.font_size as u8,
         line_spacing: request.line_spacing as u8,
         font_weight: request.font_weight as u8,
+        font_family: request.font_family as u8,
     });
 }
 
@@ -833,6 +836,7 @@ fn gather_sync_book_info(
             font_size: record.font_size,
             line_spacing: record.line_spacing,
             font_weight: record.font_weight,
+            font_family: record.font_family,
             source_hash: record.source_hash,
             source_size: record.source_size,
         },
@@ -929,6 +933,7 @@ fn restore_saved_state(
         font_size: record.font_size,
         line_spacing: record.line_spacing,
         font_weight: record.font_weight,
+        font_family: record.font_family,
     });
 }
 

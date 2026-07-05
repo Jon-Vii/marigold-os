@@ -416,6 +416,13 @@ fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         FIRST_ROW_Y + 256,
         shell.selection == 4,
     );
+    index_row(
+        fb,
+        "Font",
+        font_family_label(shell.font_family),
+        FIRST_ROW_Y + 320,
+        shell.selection == 5,
+    );
 
     finish_working_screen(fb, shell);
 }
@@ -938,6 +945,13 @@ fn font_weight_label(weight: display::font::FontWeight) -> &'static str {
     match weight {
         display::font::FontWeight::Normal => "regular",
         display::font::FontWeight::Heavy => "heavier",
+    }
+}
+
+fn font_family_label(family: display::font::FontFamily) -> &'static str {
+    match family {
+        display::font::FontFamily::Literata => "literata",
+        display::font::FontFamily::Bookerly => "bookerly",
     }
 }
 

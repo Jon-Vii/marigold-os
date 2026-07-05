@@ -125,14 +125,35 @@ impl FontWeight {
     }
 }
 
+/// Reader body typeface behind the Font setting. Literata is the shipped
+/// default; Bookerly is the Kindle reading face. UI furniture stays
+/// Literata — only reading content changes family.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FontFamily {
+    #[default]
+    Literata,
+    Bookerly,
+}
+
+impl FontFamily {
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Literata),
+            1 => Some(Self::Bookerly),
+            _ => None,
+        }
+    }
+}
+
 /// The reader type settings that change page layout. Carried from the app
 /// reducer through storage commands into the cache build, so pagination,
-/// cached sections, and drawing always agree on one pair.
+/// cached sections, and drawing always agree on one set.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TypeSettings {
     pub size: FontSize,
     pub spacing: LineSpacing,
     pub weight: FontWeight,
+    pub family: FontFamily,
 }
 
 impl TypeSettings {
@@ -140,6 +161,7 @@ impl TypeSettings {
         size: FontSize::Medium,
         spacing: LineSpacing::Normal,
         weight: FontWeight::Normal,
+        family: FontFamily::Literata,
     };
 }
 
@@ -183,6 +205,48 @@ pub fn literata_weighted(
             FontStyle::Italic => semibold_sized(size, true),
             FontStyle::Bold => literata_sized(size, FontStyle::Bold),
             FontStyle::BoldItalic => literata_sized(size, FontStyle::BoldItalic),
+        },
+    }
+}
+
+/// The Bookerly reading face at a user-selected size: 19px, 22px, or 26px.
+pub fn bookerly_sized(size: FontSize, style: FontStyle) -> &'static BitmapFont {
+    use crate::bookerly_generated as bk;
+    match (size, style) {
+        (FontSize::Small, FontStyle::Regular) => &bk::BOOKERLY_19_REGULAR,
+        (FontSize::Small, FontStyle::Italic) => &bk::BOOKERLY_19_ITALIC,
+        (FontSize::Small, FontStyle::Bold) => &bk::BOOKERLY_19_BOLD,
+        (FontSize::Small, FontStyle::BoldItalic) => &bk::BOOKERLY_19_BOLD_ITALIC,
+        (FontSize::Medium, FontStyle::Regular) => &bk::BOOKERLY_22_REGULAR,
+        (FontSize::Medium, FontStyle::Italic) => &bk::BOOKERLY_22_ITALIC,
+        (FontSize::Medium, FontStyle::Bold) => &bk::BOOKERLY_22_BOLD,
+        (FontSize::Medium, FontStyle::BoldItalic) => &bk::BOOKERLY_22_BOLD_ITALIC,
+        (FontSize::Large, FontStyle::Regular) => &bk::BOOKERLY_26_REGULAR,
+        (FontSize::Large, FontStyle::Italic) => &bk::BOOKERLY_26_ITALIC,
+        (FontSize::Large, FontStyle::Bold) => &bk::BOOKERLY_26_BOLD,
+        (FontSize::Large, FontStyle::BoldItalic) => &bk::BOOKERLY_26_BOLD_ITALIC,
+    }
+}
+
+/// The reading body face for the full type settings and a style run. Bookerly
+/// ships no SemiBold, so its `Heavy` promotes regular and italic prose to the
+/// Bold face — emphasis then blends into the body, which is the same tradeoff
+/// Kindle's boldness slider makes at its top steps.
+pub fn family_weighted(
+    family: FontFamily,
+    size: FontSize,
+    weight: FontWeight,
+    style: FontStyle,
+) -> &'static BitmapFont {
+    match family {
+        FontFamily::Literata => literata_weighted(size, weight, style),
+        FontFamily::Bookerly => match weight {
+            FontWeight::Normal => bookerly_sized(size, style),
+            FontWeight::Heavy => match style {
+                FontStyle::Regular => bookerly_sized(size, FontStyle::Bold),
+                FontStyle::Italic => bookerly_sized(size, FontStyle::BoldItalic),
+                _ => bookerly_sized(size, style),
+            },
         },
     }
 }

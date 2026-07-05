@@ -9,8 +9,8 @@
 
 use display::fb::Framebuffer;
 use display::font::{
-    draw_text, literata_weighted, measure_text, style_from_marker_code, BitmapFont, FontSize,
-    FontStyle, FontWeight, LineSpacing, TypeSettings, STYLE_MARKER,
+    draw_text, family_weighted, measure_text, style_from_marker_code, BitmapFont, FontSize,
+    FontStyle, LineSpacing, TypeSettings, STYLE_MARKER,
 };
 use proto::cache::{BlockRecord, PageRecord};
 use proto::text::{TextAlign, TextRole};
@@ -302,17 +302,21 @@ pub const READER_WRAP_SAFETY: i16 = 4;
 /// v13: the Type Weight setting joins the layout config. Heavier (SemiBold)
 /// body glyphs are wider than Regular, so wrap points change with weight;
 /// existing caches rebuild on a weight change.
-const READER_LAYOUT_VERSION: u16 = 13;
+/// v14: the Font setting joins the layout config. Bookerly advances differ
+/// from Literata's at every size, so wrap points change with family;
+/// existing caches rebuild on a family change.
+const READER_LAYOUT_VERSION: u16 = 14;
 
 /// Section cache layout config: the wrap-rule version plus the type
 /// settings the section was paginated under. Stored in cache headers; a
 /// mismatch on load invalidates the cached pagination and rebuilds it.
 /// Bit layout: spacing in bits 0-1 (a spacing change only re-walks heights,
 /// so the load check masks these off), size in bits 2-3, weight in bit 4,
-/// version above. Size and weight both change wrap points, so a change in
-/// either forces a full rebuild.
+/// family in bit 5, version above. Size, weight, and family all change wrap
+/// points, so a change in any forces a full rebuild.
 pub fn reader_layout_config(settings: TypeSettings) -> u16 {
-    (READER_LAYOUT_VERSION << 5)
+    (READER_LAYOUT_VERSION << 6)
+        | ((settings.family as u16) << 5)
         | ((settings.weight as u16) << 4)
         | ((settings.size as u16) << 2)
         | settings.spacing as u16
@@ -320,7 +324,7 @@ pub fn reader_layout_config(settings: TypeSettings) -> u16 {
 
 /// The reading body face for the given settings and style run.
 pub fn body_font(settings: TypeSettings, style: FontStyle) -> &'static BitmapFont {
-    literata_weighted(settings.size, settings.weight, style)
+    family_weighted(settings.family, settings.size, settings.weight, style)
 }
 
 /// Baseline-to-baseline advance. Body values per (size, spacing); H1/H2
@@ -448,8 +452,7 @@ pub fn text_ink_width(font: &'static BitmapFont, text: &str) -> i16 {
 #[derive(Clone, Copy)]
 pub struct StyledInkCursor {
     ink: InkCursor,
-    size: FontSize,
-    weight: FontWeight,
+    settings: TypeSettings,
     font: &'static BitmapFont,
 }
 
@@ -457,9 +460,8 @@ impl StyledInkCursor {
     pub fn new(settings: TypeSettings, default_style: FontStyle) -> Self {
         Self {
             ink: InkCursor::new(),
-            size: settings.size,
-            weight: settings.weight,
-            font: literata_weighted(settings.size, settings.weight, default_style),
+            settings,
+            font: body_font(settings, default_style),
         }
     }
 
@@ -470,9 +472,8 @@ impl StyledInkCursor {
         while let Some(ch) = chars.next() {
             if ch == STYLE_MARKER {
                 if let Some(code) = chars.next() {
-                    self.font = literata_weighted(
-                        self.size,
-                        self.weight,
+                    self.font = body_font(
+                        self.settings,
                         style_from_marker_code(code).unwrap_or(FontStyle::Regular),
                     );
                 }
@@ -788,7 +789,7 @@ fn draw_justified_line(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use display::font::style_marker_code;
+    use display::font::{style_marker_code, FontFamily, FontWeight};
 
     /// Minimal blocks for exercising the indent predicate: roles, aligns, and
     /// paragraph-end flags, with the default `paragraph_start` derivation.
@@ -979,6 +980,7 @@ mod tests {
                     size: sizes[i],
                     spacing: spacings[j],
                     weight: FontWeight::Normal,
+                    family: FontFamily::Literata,
                 };
                 j += 1;
             }

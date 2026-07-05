@@ -1,10 +1,10 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
-use display::font::{FontSize, FontWeight, LineSpacing, TypeSettings};
+use display::font::{FontFamily, FontSize, FontWeight, LineSpacing, TypeSettings};
 use display::{epd::RefreshMode, Rect};
 
-pub const SETTINGS_ITEMS: u8 = 5;
+pub const SETTINGS_ITEMS: u8 = 6;
 pub const MAX_SD_CHAPTERS: usize = 128;
 pub const FIRST_SD_BOOK_ID: u32 = 2;
 
@@ -191,6 +191,7 @@ impl RefreshPlanner {
             || request.font_size != last.font_size
             || request.line_spacing != last.line_spacing
             || request.font_weight != last.font_weight
+            || request.font_family != last.font_family
             || Self::needs_clean_library_refresh(request, last)
         {
             return RefreshMode::FastClean;
@@ -243,6 +244,7 @@ pub struct RenderRequest {
     pub font_size: FontSize,
     pub line_spacing: LineSpacing,
     pub font_weight: FontWeight,
+    pub font_family: FontFamily,
     pub last_button: Option<Button>,
     pub aux_raw: u16,
     pub nav_raw: u16,
@@ -446,6 +448,7 @@ pub enum LibraryEvent {
         font_size: u8,
         line_spacing: u8,
         font_weight: u8,
+        font_family: u8,
     },
 }
 
@@ -530,6 +533,7 @@ pub struct PersistedAppState {
     pub font_size: u8,
     pub line_spacing: u8,
     pub font_weight: u8,
+    pub font_family: u8,
     pub source_hash: u32,
     pub source_size: u32,
 }
@@ -569,6 +573,7 @@ pub struct ReaderState {
     pub font_size: FontSize,
     pub line_spacing: LineSpacing,
     pub font_weight: FontWeight,
+    pub font_family: FontFamily,
     pub last_button: Option<Button>,
     pub aux_raw: u16,
     pub nav_raw: u16,
@@ -597,6 +602,7 @@ impl ReaderState {
             font_size: FontSize::Medium,
             line_spacing: LineSpacing::Normal,
             font_weight: FontWeight::Normal,
+            font_family: FontFamily::Literata,
             last_button: None,
             aux_raw: 0,
             nav_raw: 0,
@@ -858,6 +864,7 @@ impl ReaderState {
                 font_size,
                 line_spacing,
                 font_weight,
+                font_family,
             } => {
                 self.book_id = book_id;
                 self.chapter = chapter;
@@ -894,6 +901,9 @@ impl ReaderState {
                 }
                 if let Some(weight) = FontWeight::from_u8(font_weight) {
                     self.font_weight = weight;
+                }
+                if let Some(family) = FontFamily::from_u8(font_family) {
+                    self.font_family = family;
                 }
                 self.dirty = Rect::FULL;
             }
@@ -936,6 +946,7 @@ impl ReaderState {
             font_size: self.font_size,
             line_spacing: self.line_spacing,
             font_weight: self.font_weight,
+            font_family: self.font_family,
             last_button: self.last_button,
             aux_raw: self.aux_raw,
             nav_raw: self.nav_raw,
@@ -959,6 +970,7 @@ impl ReaderState {
             font_size: self.font_size as u8,
             line_spacing: self.line_spacing as u8,
             font_weight: self.font_weight as u8,
+            font_family: self.font_family as u8,
             source_hash: 0,
             source_size: 0,
         }
@@ -969,6 +981,7 @@ impl ReaderState {
             size: self.font_size,
             spacing: self.line_spacing,
             weight: self.font_weight,
+            family: self.font_family,
         }
     }
 
@@ -1120,10 +1133,16 @@ fn apply_setting(mut state: ReaderState) -> ReaderState {
                 LineSpacing::Relaxed => LineSpacing::Compact,
             };
         }
-        _ => {
+        4 => {
             state.font_weight = match state.font_weight {
                 FontWeight::Normal => FontWeight::Heavy,
                 FontWeight::Heavy => FontWeight::Normal,
+            };
+        }
+        _ => {
+            state.font_family = match state.font_family {
+                FontFamily::Literata => FontFamily::Bookerly,
+                FontFamily::Bookerly => FontFamily::Literata,
             };
         }
     }
@@ -1404,6 +1423,7 @@ mod tests {
                 font_size: FontSize::Medium as u8,
                 line_spacing: LineSpacing::Normal as u8,
                 font_weight: FontWeight::Normal as u8,
+                font_family: FontFamily::Literata as u8,
             },
         );
         assert_eq!(state.book_id, ReaderSource::sd(2).book_id());
@@ -1437,6 +1457,7 @@ mod tests {
                 font_size: FontSize::Medium as u8,
                 line_spacing: LineSpacing::Normal as u8,
                 font_weight: FontWeight::Normal as u8,
+                font_family: FontFamily::Literata as u8,
             },
         );
         assert_eq!(state.selection, home_selection);
@@ -1491,6 +1512,13 @@ mod tests {
         assert_eq!(state.font_weight, FontWeight::Normal);
 
         let state = press(state, Button::Next);
+        assert_eq!(state.selection, 5);
+        let state = press(state, Button::Confirm);
+        assert_eq!(state.font_family, FontFamily::Bookerly);
+        let state = press(state, Button::Confirm);
+        assert_eq!(state.font_family, FontFamily::Literata);
+
+        let state = press(state, Button::Next);
         assert_eq!(state.selection, 0, "selection wraps after the last row");
     }
 
@@ -1508,6 +1536,7 @@ mod tests {
                 font_size: FontSize::Large as u8,
                 line_spacing: LineSpacing::Compact as u8,
                 font_weight: FontWeight::Normal as u8,
+                font_family: FontFamily::Literata as u8,
             },
         );
         assert_eq!(state.book_id, 2);
@@ -1645,6 +1674,7 @@ mod tests {
             font_size: 0,
             line_spacing: 0,
             font_weight: 0,
+            font_family: 0,
             source_hash: 0,
             source_size: 0,
         };
