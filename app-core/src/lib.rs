@@ -1098,9 +1098,38 @@ fn apply_home_action(
     state
 }
 
+/// Settings rows, top to bottom: the type block first (typeface, then its
+/// size, weight, and spacing — broadest choice to finest adjustment), then
+/// the set-and-forget device rows.
 fn apply_setting(mut state: ReaderState) -> ReaderState {
     match state.selection {
         0 => {
+            state.font_family = match state.font_family {
+                FontFamily::Literata => FontFamily::Bookerly,
+                FontFamily::Bookerly => FontFamily::Literata,
+            };
+        }
+        1 => {
+            state.font_size = match state.font_size {
+                FontSize::Small => FontSize::Medium,
+                FontSize::Medium => FontSize::Large,
+                FontSize::Large => FontSize::Small,
+            };
+        }
+        2 => {
+            state.font_weight = match state.font_weight {
+                FontWeight::Normal => FontWeight::Heavy,
+                FontWeight::Heavy => FontWeight::Normal,
+            };
+        }
+        3 => {
+            state.line_spacing = match state.line_spacing {
+                LineSpacing::Compact => LineSpacing::Normal,
+                LineSpacing::Normal => LineSpacing::Relaxed,
+                LineSpacing::Relaxed => LineSpacing::Compact,
+            };
+        }
+        4 => {
             state.orientation = match state.orientation {
                 DisplayOrientation::LandscapeButtonsBottom => {
                     DisplayOrientation::LandscapeButtonsTop
@@ -1112,37 +1141,11 @@ fn apply_setting(mut state: ReaderState) -> ReaderState {
                 }
             };
         }
-        1 => {
+        _ => {
             state.refresh_policy = match state.refresh_policy {
                 RefreshPolicy::FastOnly => RefreshPolicy::FullOnWake,
                 RefreshPolicy::FullOnWake => RefreshPolicy::FullEveryTen,
                 RefreshPolicy::FullEveryTen => RefreshPolicy::FastOnly,
-            };
-        }
-        2 => {
-            state.font_size = match state.font_size {
-                FontSize::Small => FontSize::Medium,
-                FontSize::Medium => FontSize::Large,
-                FontSize::Large => FontSize::Small,
-            };
-        }
-        3 => {
-            state.line_spacing = match state.line_spacing {
-                LineSpacing::Compact => LineSpacing::Normal,
-                LineSpacing::Normal => LineSpacing::Relaxed,
-                LineSpacing::Relaxed => LineSpacing::Compact,
-            };
-        }
-        4 => {
-            state.font_weight = match state.font_weight {
-                FontWeight::Normal => FontWeight::Heavy,
-                FontWeight::Heavy => FontWeight::Normal,
-            };
-        }
-        _ => {
-            state.font_family = match state.font_family {
-                FontFamily::Literata => FontFamily::Bookerly,
-                FontFamily::Bookerly => FontFamily::Literata,
             };
         }
     }
@@ -1479,10 +1482,12 @@ mod tests {
 
     #[test]
     fn settings_change_key_cycles_orientation_and_refresh_policy() {
-        let state = press(ReaderState::boot(), Button::Next);
+        let mut state = press(ReaderState::boot(), Button::Next);
+        state.selection = 4;
         let state = press(state, Button::Confirm);
         assert_eq!(state.orientation, DisplayOrientation::LandscapeButtonsTop);
         let state = press(state, Button::Next);
+        assert_eq!(state.selection, 5);
         let state = press(state, Button::Confirm);
         assert_eq!(state.refresh_policy, RefreshPolicy::FullEveryTen);
         let state = press(state, Button::Back);
@@ -1492,32 +1497,33 @@ mod tests {
     #[test]
     fn settings_change_key_cycles_type_size_spacing_and_weight() {
         let state = press(ReaderState::boot(), Button::Next);
-        let state = press(press(state, Button::Next), Button::Next);
-        assert_eq!(state.selection, 2);
+        assert_eq!(state.selection, 0);
+        let state = press(state, Button::Confirm);
+        assert_eq!(state.font_family, FontFamily::Bookerly);
+        let state = press(state, Button::Confirm);
+        assert_eq!(state.font_family, FontFamily::Literata);
+
+        let state = press(state, Button::Next);
+        assert_eq!(state.selection, 1);
         let state = press(state, Button::Confirm);
         assert_eq!(state.font_size, FontSize::Large);
         let state = press(press(state, Button::Confirm), Button::Confirm);
         assert_eq!(state.font_size, FontSize::Medium);
 
         let state = press(state, Button::Next);
-        assert_eq!(state.selection, 3);
-        let state = press(state, Button::Confirm);
-        assert_eq!(state.line_spacing, LineSpacing::Relaxed);
-
-        let state = press(state, Button::Next);
-        assert_eq!(state.selection, 4);
+        assert_eq!(state.selection, 2);
         let state = press(state, Button::Confirm);
         assert_eq!(state.font_weight, FontWeight::Heavy);
         let state = press(state, Button::Confirm);
         assert_eq!(state.font_weight, FontWeight::Normal);
 
         let state = press(state, Button::Next);
-        assert_eq!(state.selection, 5);
+        assert_eq!(state.selection, 3);
         let state = press(state, Button::Confirm);
-        assert_eq!(state.font_family, FontFamily::Bookerly);
-        let state = press(state, Button::Confirm);
-        assert_eq!(state.font_family, FontFamily::Literata);
+        assert_eq!(state.line_spacing, LineSpacing::Relaxed);
 
+        let state = press(press(state, Button::Next), Button::Next);
+        assert_eq!(state.selection, 5);
         let state = press(state, Button::Next);
         assert_eq!(state.selection, 0, "selection wraps after the last row");
     }

@@ -383,22 +383,22 @@ fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
 
     index_row(
         fb,
-        "Orientation",
-        orientation_label(shell.orientation),
+        "Typeface",
+        font_family_label(shell.font_family),
         FIRST_ROW_Y,
         shell.selection == 0,
     );
     index_row(
         fb,
-        "Refresh",
-        refresh_policy_label(shell.refresh_policy),
+        "Type size",
+        font_size_label(shell.font_size),
         FIRST_ROW_Y + 64,
         shell.selection == 1,
     );
     index_row(
         fb,
-        "Type size",
-        font_size_label(shell.font_size),
+        "Type weight",
+        font_weight_label(shell.font_weight),
         FIRST_ROW_Y + 128,
         shell.selection == 2,
     );
@@ -411,15 +411,15 @@ fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     );
     index_row(
         fb,
-        "Type weight",
-        font_weight_label(shell.font_weight),
+        "Orientation",
+        orientation_label(shell.orientation),
         FIRST_ROW_Y + 256,
         shell.selection == 4,
     );
     index_row(
         fb,
-        "Font",
-        font_family_label(shell.font_family),
+        "Refresh",
+        refresh_policy_label(shell.refresh_policy),
         FIRST_ROW_Y + 320,
         shell.selection == 5,
     );

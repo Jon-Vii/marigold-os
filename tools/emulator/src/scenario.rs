@@ -43,6 +43,8 @@ struct Expect {
     refresh_policy: Option<String>,
     font_size: Option<String>,
     line_spacing: Option<String>,
+    font_weight: Option<String>,
+    font_family: Option<String>,
     sleeping: Option<bool>,
     library_count: Option<u16>,
     last_button: Option<String>,
@@ -128,6 +130,24 @@ impl Scenario {
                 return Err(format!(
                     "expected line spacing {expected:?}, got {:?}",
                     state.line_spacing
+                ));
+            }
+        }
+        if let Some(weight) = &self.expect.font_weight {
+            let expected = parse_font_weight(weight)?;
+            if state.font_weight != expected {
+                return Err(format!(
+                    "expected font weight {expected:?}, got {:?}",
+                    state.font_weight
+                ));
+            }
+        }
+        if let Some(family) = &self.expect.font_family {
+            let expected = parse_font_family(family)?;
+            if state.font_family != expected {
+                return Err(format!(
+                    "expected font family {expected:?}, got {:?}",
+                    state.font_family
                 ));
             }
         }
@@ -317,6 +337,22 @@ fn parse_line_spacing(value: &str) -> Result<display::font::LineSpacing, String>
         "Normal" | "normal" => Ok(display::font::LineSpacing::Normal),
         "Relaxed" | "relaxed" => Ok(display::font::LineSpacing::Relaxed),
         _ => Err(format!("unknown line spacing: {value}")),
+    }
+}
+
+fn parse_font_weight(value: &str) -> Result<display::font::FontWeight, String> {
+    match value {
+        "Normal" | "normal" => Ok(display::font::FontWeight::Normal),
+        "Heavy" | "heavy" => Ok(display::font::FontWeight::Heavy),
+        _ => Err(format!("unknown font weight: {value}")),
+    }
+}
+
+fn parse_font_family(value: &str) -> Result<display::font::FontFamily, String> {
+    match value {
+        "Literata" | "literata" => Ok(display::font::FontFamily::Literata),
+        "Bookerly" | "bookerly" => Ok(display::font::FontFamily::Bookerly),
+        _ => Err(format!("unknown font family: {value}")),
     }
 }
 

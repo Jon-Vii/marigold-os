@@ -1,6 +1,18 @@
-# Walk every Settings row with the change key: orientation, refresh
-# policy, type size, and line spacing each advance one step, then Back
-# returns home.
+# Walk every Settings row with the change key: typeface, type size, type
+# weight, line spacing, orientation, and refresh policy each advance one
+# step, then Back returns home.
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Confirm"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Confirm"
 
 [[steps]]
 button = "Next"
@@ -32,8 +44,10 @@ button = "Back"
 [expect]
 view = "Home"
 selection = 0
+font_family = "Bookerly"
+font_size = "Large"
+font_weight = "Heavy"
+line_spacing = "Relaxed"
 orientation = "LandscapeButtonsTop"
 refresh_policy = "FullEveryTen"
-font_size = "Large"
-line_spacing = "Relaxed"
 last_refresh = "FastClean"

@@ -1,8 +1,5 @@
 # The settings screen resting on the type rows: cursor on Line spacing
-# after bumping Type size to large, pinning the new rows' golden frame.
-
-[[steps]]
-button = "Next"
+# after bumping Type size to large, pinning the type block's golden frame.
 
 [[steps]]
 button = "Next"
@@ -12,6 +9,9 @@ button = "Next"
 
 [[steps]]
 button = "Confirm"
+
+[[steps]]
+button = "Next"
 
 [[steps]]
 button = "Next"
