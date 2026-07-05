@@ -1,5 +1,9 @@
+# Flash to the stock-compatible dual-OTA layout (partitions.csv) so the app
+# lands in app0/ota_0 at 0x10000 — the same slot the stock bootloader boots and
+# the release firmware.bin targets. --ignore-app-descriptor skips espflash's own
+# descriptor validator; our descriptor is still emitted at image offset 0x20.
 [target.riscv32imc-unknown-none-elf]
-runner = "espflash flash --monitor --ignore-app-descriptor"
+runner = "espflash flash --monitor --ignore-app-descriptor --flash-size 16mb --partition-table partitions.csv"
 rustflags = [
   "-C", "link-arg=-Tlinkall.x",
   # Required to work with portable-atomic for CAS operations on single-core riscv32

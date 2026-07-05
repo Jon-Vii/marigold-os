@@ -1,0 +1,15 @@
+# Xteink X4 stock-compatible dual-OTA layout (16 MB flash).
+#
+# This mirrors the partition table a stock/locked X4 already has in flash, so
+# our app boots under the *stock* second-stage bootloader (which just boots
+# whatever `otadata` selects) and so both OTA slots exist for in-app updates
+# and a recovery hatch. Our app image goes in ota_0 at 0x10000 — the same
+# offset the web flasher and `esptool write_flash 0x10000` target.
+#
+# Name,   Type, SubType,  Offset,   Size, Flags
+nvs,      data, nvs,      0x9000,   0x5000,
+otadata,  data, ota,      0xe000,   0x2000,
+app0,     app,  ota_0,    0x10000,  0x640000,
+app1,     app,  ota_1,    0x650000, 0x640000,
+spiffs,   data, spiffs,   0xc90000, 0x360000,
+coredump, data, coredump, 0xff0000, 0x10000,
