@@ -4,7 +4,7 @@
 
 If you would like to explore the OS without flashing a device,
 you may [try it in your browser](https://jon-vii.github.io/xteink-x4-os/),
-the same code compiled to WebAssembly, with simulated e-ink and a selection of public-domain books.
+the firmware's app and rendering code compiled to WebAssembly, with simulated e-ink and a selection of public-domain books.
 
 ## Features
 
