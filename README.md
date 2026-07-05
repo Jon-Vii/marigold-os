@@ -3,7 +3,7 @@
 ![The X4 home screen in the browser emulator, showing Alice's Adventures in Wonderland](docs/home.png)
 
 If you would like to explore the OS without flashing a device,
-you may [try it in your browser](https://jon-vii.github.io/xteink-x4-os/),
+you may do so [in your browser](https://jon-vii.github.io/xteink-x4-os/),
 the firmware's app and rendering code compiled to WebAssembly, with simulated e-ink and a selection of public-domain books.
 
 ## Features
