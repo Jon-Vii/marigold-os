@@ -609,8 +609,19 @@ version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e4cd70abe47945c9116972781b5c05277ad855a5f5569fe2afd3e2e61a103cc0"
 dependencies = [
- "esp-build",
+ "esp-build 0.2.0",
  "esp-println",
+]
+
+[[package]]
+name = "esp-build"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b94a4b8d74e7cc7baabcca5b2277b41877e039ad9cd49959d48ef94dac7eab4b"
+dependencies = [
+ "quote",
+ "syn",
+ "termcolor",
 ]
 
 [[package]]
@@ -658,7 +669,7 @@ dependencies = [
  "embedded-io",
  "embedded-io-async",
  "enumset",
- "esp-build",
+ "esp-build 0.2.0",
  "esp-config",
  "esp-hal-procmacros",
  "esp-metadata",
@@ -692,7 +703,7 @@ dependencies = [
  "embassy-time",
  "embassy-time-driver",
  "embassy-time-queue-utils",
- "esp-build",
+ "esp-build 0.2.0",
  "esp-config",
  "esp-hal",
  "esp-hal-procmacros",
@@ -736,7 +747,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "960703930f9f3c899ddedd122ea27a09d6a612c22323157e524af5b18876448e"
 dependencies = [
  "critical-section",
- "esp-build",
+ "esp-build 0.2.0",
  "log",
  "portable-atomic",
 ]
@@ -750,6 +761,17 @@ dependencies = [
  "document-features",
  "riscv",
  "riscv-rt-macros",
+]
+
+[[package]]
+name = "esp-storage"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b475dc7bd3b5c33718a5e65c9f192ba4493f1244bf696e8b3a8743dff795bc3f"
+dependencies = [
+ "critical-section",
+ "embedded-storage",
+ "esp-build 0.1.0",
 ]
 
 [[package]]
@@ -767,7 +789,7 @@ dependencies = [
  "embedded-io-async",
  "enumset",
  "esp-alloc",
- "esp-build",
+ "esp-build 0.2.0",
  "esp-config",
  "esp-hal",
  "esp-metadata",
@@ -859,11 +881,13 @@ dependencies = [
  "embedded-hal 1.0.0",
  "embedded-hal-async",
  "embedded-sdmmc",
+ "embedded-storage",
  "esp-alloc",
  "esp-backtrace",
  "esp-hal",
  "esp-hal-embassy",
  "esp-println",
+ "esp-storage",
  "esp-wifi",
  "hal-ext",
  "heapless 0.8.0",

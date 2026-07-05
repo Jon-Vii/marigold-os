@@ -36,3 +36,5 @@ embassy-net       = { version = "0.6.0", features = ["proto-ipv4", "tcp", "udp",
 # Prints registers + backtrace over USB on CPU exceptions, then halts in
 # place instead of silently resetting. Keep: crash evidence beats reboots.
 esp-backtrace     = { version = "0.15.0", features = ["esp32c3", "println", "exception-handler"] }
+esp-storage = { version = "0.3.1", features = ["esp32c3", "nor-flash"] }
+embedded-storage = "0.3.1"

@@ -245,6 +245,28 @@ impl SelectEntry {
     }
 }
 
+/// The app OTA slot the bootloader is currently selecting, derived from the two
+/// otadata sectors. `None` means otadata is uninitialised (erased), in which
+/// case the bootloader falls back to the first app partition — treat it as slot
+/// 0. Used to pick the *inactive* slot as an update's destination.
+pub fn active_app_slot(
+    sector0: &[u8; SELECT_ENTRY_LEN],
+    sector1: &[u8; SELECT_ENTRY_LEN],
+    ota_count: u32,
+) -> Option<u32> {
+    let e0 = SelectEntry::from_bytes(sector0);
+    let e1 = SelectEntry::from_bytes(sector1);
+    let s0 = e0.is_valid().then_some(e0.ota_seq);
+    let s1 = e1.is_valid().then_some(e1.ota_seq);
+    let active_seq = match (s0, s1) {
+        (None, None) => return None,
+        (Some(a), None) => a,
+        (None, Some(b)) => b,
+        (Some(a), Some(b)) => a.max(b),
+    };
+    Some((active_seq - 1) % ota_count.max(1))
+}
+
 /// The single otadata write that makes `dest_slot` the next boot target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OtaSwitch {
@@ -550,6 +572,24 @@ mod tests {
         assert!(sw.entry.ota_seq > 3, "new seq must exceed the active seq");
         assert_eq!((sw.entry.ota_seq - 1) % 2, 1, "must map to slot 1");
         assert!(sw.entry.is_valid());
+    }
+
+    #[test]
+    fn active_slot_tracks_highest_valid_seq() {
+        let erased = [0xFFu8; SELECT_ENTRY_LEN];
+        assert_eq!(active_app_slot(&erased, &erased, 2), None);
+
+        // seq 3 -> slot (3-1)%2 == 0
+        let s3 = SelectEntry::new(3, OTA_IMG_NEW).to_bytes();
+        assert_eq!(active_app_slot(&s3, &erased, 2), Some(0));
+
+        // higher seq 4 in the other sector -> slot (4-1)%2 == 1 wins
+        let s4 = SelectEntry::new(4, OTA_IMG_NEW).to_bytes();
+        assert_eq!(active_app_slot(&s3, &s4, 2), Some(1));
+
+        // an aborted higher seq is ignored -> falls back to seq 3
+        let s9_aborted = SelectEntry::new(9, OTA_IMG_ABORTED).to_bytes();
+        assert_eq!(active_app_slot(&s3, &s9_aborted, 2), Some(0));
     }
 
     #[test]

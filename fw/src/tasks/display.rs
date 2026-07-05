@@ -76,6 +76,22 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
     esp_println::println!("display: init start");
     display_flush::init_panel(&mut epd).await;
     esp_println::println!("display: init complete");
+
+    // One-shot firmware self-update: if the card holds a pending image, flash it
+    // into the inactive OTA slot and reboot into it before the reader starts.
+    // Runs here because SD access lives behind this task's shared SPI bus, and
+    // the radio is still idle so the flash writes are safe.
+    match crate::sd_session::with_root(&mut epd, &mut sd_cs, crate::ota_update::apply_pending_update)
+    {
+        Ok(true) => {
+            esp_println::println!("display: firmware update staged; resetting");
+            embassy_time::Timer::after(embassy_time::Duration::from_millis(50)).await;
+            esp_hal::reset::software_reset();
+        }
+        Ok(false) => {}
+        Err(e) => esp_println::println!("display: update check skipped: {:?}", e),
+    }
+
     loop {
         match select(DISPLAY_COMMANDS.receive(), STORAGE_COMMANDS.receive()).await {
             Either::First(DisplayCommand::Render(request)) => {

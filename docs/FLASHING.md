@@ -112,6 +112,26 @@ Two mechanisms exist, both pioneered by CrossPoint:
    separate desktop tools, out of scope for this repo; they officially support
    only CrossPoint/CrossInk.
 
+## In-app update (the recovery net)
+
+Once *any* build of this firmware is running, it can update itself from the card
+with no computer — this is what keeps a locked unit from being a one-way trip:
+
+1. Copy a new app image to the card root as **`FWUPDATE.BIN`** (the `firmware.bin`
+   / `update.bin` an `tools/build-release.sh` produces; the `FWUPDATE.BIN` name
+   is the one-shot trigger, kept distinct from a permanent `update.bin` you may
+   also keep on the card).
+2. Reboot. At boot, before the reader starts, the firmware validates the image
+   (`proto::ota::validate_image`), writes it into the **inactive** OTA slot,
+   flips `otadata` to select it (`proto::ota::plan_switch`), deletes
+   `FWUPDATE.BIN` so it runs only once, and resets into the new firmware.
+
+Only the inactive slot and inactive `otadata` sector are written, so a bad or
+half-copied image never harms the running firmware — the bootloader keeps
+booting the current slot until a complete, valid image flips `otadata`. This
+works on an unlocked unit too (espflash's bootloader is ESP-IDF and honours
+`otadata`), which is how to test it without a locked device.
+
 ## Status
 
 Implemented and verified on host tooling:
@@ -127,25 +147,28 @@ Implemented and verified on host tooling:
       (magic / segment walk / XOR checksum / SHA-256 trailer) that must pass
       before any candidate `.bin` is written to the inactive slot. Streaming,
       no heap; host-tested against synthetic valid and corrupt images.
-- [x] **otadata layer** (`proto::ota`: `seq_crc`, `SelectEntry`, `plan_switch`)
-      — the OTA-slot select-entry format, the seq CRC (verified against the
-      esp-bootloader-esp-idf algorithm *and* a real on-device value:
-      `seq_crc(1) == 0x4743989A`), and the slot-switch math. Host-tested.
+- [x] **otadata layer** (`proto::ota`: `seq_crc`, `SelectEntry`, `plan_switch`,
+      `active_app_slot`) — the OTA-slot select-entry format, the seq CRC
+      (verified against the esp-bootloader-esp-idf algorithm *and* a real
+      on-device value: `seq_crc(1) == 0x4743989A`), and the slot-switch math.
+      Host-tested.
+- [x] **Boot-time SD updater** (`fw::ota_update`) — on boot, `/FWUPDATE.BIN` is
+      validated, written to the inactive OTA slot with `esp-storage`, selected
+      via `otadata`, deleted, and the device resets into it. Only the inactive
+      slot/sector are touched. Compiles for the target; **not yet run on
+      hardware**.
 
-Not yet done (needed before locked-device install is safe):
+Not yet done:
 
-- [ ] **Flash wiring** — connect the validator + `plan_switch` to real flash
-      access (`esp-storage`): stream a validated image into the inactive OTA
-      slot, then write the planned `otadata` entry and reset. The logic is done
-      and tested; this is the hardware I/O around it. (Consider adopting
-      `esp-bootloader-esp-idf`'s `Ota` directly instead, since our `plan_switch`
-      already matches it.)
-- [ ] **SD update activity** — pick a `.bin` from the card, validate, flash,
-      switch, reset. This is the anti-brick net; it is the single most
-      important remaining piece.
+- [ ] **On-device validation** — run the boot updater on the unlocked unit
+      (write `FWUPDATE.BIN`, confirm it flashes the inactive slot and reboots
+      into it). Watch for a rollback loop: we write `otadata` state NEW like
+      CrossPoint does and never call `esp_ota_mark_app_valid`; if the stock/IDF
+      bootloader has rollback enabled, switch the written state to UNDEFINED
+      (`0xFFFFFFFF`) in `plan_switch`.
 - [ ] **Boot-time recovery combo** (hold a combo at reset → repoint otadata at
-      `ota_0`), mirroring the SDK's `RecoveryBoot`.
-- [ ] **On-device validation** — confirm on a real *locked* unit that our
-      app-descriptor eFuse range satisfies the stock gate and that the OEM
-      updater accepts our `update.bin`. Untested so far: the author's unit is
-      unlocked.
+      `ota_0`), mirroring the SDK's `RecoveryBoot`, plus optional on-panel
+      progress during the update.
+- [ ] **Locked-unit confirmation** — that our app-descriptor eFuse range
+      satisfies the stock gate and the OEM SD updater accepts our `update.bin`.
+      Needs a locked device; the author's is unlocked.

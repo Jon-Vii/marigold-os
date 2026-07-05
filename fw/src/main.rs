@@ -77,6 +77,7 @@ use tasks::input::InputPins;
 pub mod catalog;
 mod display_flush;
 mod library_sd;
+mod ota_update;
 mod reader_cache;
 mod reader_cache_files;
 mod reader_layout;
