@@ -253,6 +253,37 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                 esp_println::println!("storage: upload refused outside sync");
             }
             Either::Second(command) => {
+                // A layout change re-paginates the book, which blocks this
+                // task for the whole rebuild. Paint the title/author plate
+                // first so the wait reads as loading, not frozen: the store
+                // still reports the old settings here, so the reader view
+                // lands on the loading branch. A same-layout open already
+                // shows the plate through the normal render path (the book
+                // isn't loaded yet), so it is skipped here.
+                if refresh_planner.screen_on() {
+                    if let Some(loading_request) =
+                        open_loading_plate_request(&command, sd_library, refresh_planner.last_request())
+                    {
+                        crate::views::render(fb, loading_request, sd_library);
+                        let mode = refresh_planner.mode_for(loading_request);
+                        if display_flush::flush(
+                            &mut epd,
+                            fb,
+                            prev_fb,
+                            tx_band,
+                            refresh_planner.screen_on(),
+                            mode,
+                            red_prestaged,
+                        )
+                        .await
+                        .is_ok()
+                        {
+                            refresh_planner.record_render(loading_request, mode);
+                            prev_fb.copy_from(fb);
+                            red_prestaged = false;
+                        }
+                    }
+                }
                 handle_storage_command(
                     command,
                     &mut epd,
@@ -274,6 +305,48 @@ pub(crate) fn send_library_event(event: &LibraryEvent) {
     if LIBRARY_EVENTS.try_send(*event).is_err() {
         esp_println::println!("display: library event queue full");
     }
+}
+
+/// The reader-view render to paint as a loading plate before an open that
+/// re-paginates the book, or `None` when no plate is needed here. Only a
+/// layout change qualifies: the store still reports the old type settings at
+/// this point, so rendering the reader view lands on the title/author loading
+/// branch. A same-layout open of a different book already shows the plate
+/// through the normal render path (its pages are not loaded yet), and a
+/// same-book same-layout resume answers from RAM and must not flash the plate.
+fn open_loading_plate_request(
+    command: &StorageCommand,
+    sd_library: &ReaderStore,
+    last_request: Option<RenderRequest>,
+) -> Option<RenderRequest> {
+    let (book_id, type_settings) = match *command {
+        StorageCommand::OpenBook {
+            book_id,
+            type_settings,
+            ..
+        }
+        | StorageCommand::ExtendSection {
+            book_id,
+            type_settings,
+            ..
+        } => (book_id, type_settings),
+        _ => return None,
+    };
+    // Only SD books re-paginate and route to the reader loading plate; the
+    // built-in book renders from embedded content and never rebuilds.
+    if !ReaderSource::from_book_id(book_id).is_sd() {
+        return None;
+    }
+    if sd_library.type_settings() == type_settings {
+        return None;
+    }
+    let mut request = last_request?;
+    request.view = AppView::Reading;
+    request.book_id = book_id;
+    request.font_size = type_settings.size;
+    request.line_spacing = type_settings.spacing;
+    request.font_weight = type_settings.weight;
+    Some(request)
 }
 
 /// Kept out of line so the task loop's poll frame stays small; the storage
