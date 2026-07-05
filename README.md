@@ -9,7 +9,7 @@ full-length EPUBs from the card; books are added and removed through
 your browser. There is no heap allocation in the reading path.
 
 If you would like to explore the OS without flashing a device,
-[try it in your browser](https://jon-vii.github.io/xteink-x4-os/),
+you may [try it in your browser](https://jon-vii.github.io/xteink-x4-os/),
 the same code compiled to WebAssembly, with simulated e-ink and a selection of public-domain books.
 
 ## Features
