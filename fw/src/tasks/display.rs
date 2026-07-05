@@ -427,7 +427,10 @@ fn handle_storage_command(
                     bytes: record.ssid,
                     len: record.ssid_len,
                 };
+                esp_println::println!("wifi: saved network '{}'", ssid.as_str());
                 let _ = crate::SYNC_EVENTS.try_send(crate::SyncEvent::NetworkSaved(ssid));
+            } else {
+                esp_println::println!("wifi: no saved network");
             }
             if crate::library_sd::load_catalog_cache(epd, sd_cs, sd_library) {
                 // Restored goes out first so the very next Home repaint
