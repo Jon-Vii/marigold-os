@@ -12,12 +12,14 @@
   :root {
     --paper: #eeece2;
     --ink: #161614;
-    --desk: #dcd8cd;
-    --desk-deep: #cfcabd;
-    --bezel: #1b1917;
-    --bezel-edge: #34302b;
-    --key: #262320;
-    --key-edge: #3d3833;
+    --desk: #d7d2c6;
+    --desk-deep: #c8c2b3;
+    --bezel: #f6f4ee;
+    --bezel-edge: #ffffff;
+    --bezel-line: #c9c4b8;
+    --key: #f1efe8;
+    --key-edge: #fbfaf6;
+    --key-line: #bdb8ac;
     --label: #6d675c;
     --led: #c98a2b;
     --body: "Literata", Georgia, serif;
@@ -74,24 +76,56 @@
   header a:hover, header a:focus-visible { color: inherit; border-color: currentColor; }
 
   /* ------------------------------------------------ the device */
+  /* White shell: four blank keys on the short side, each sitting level
+     with the legend row the firmware draws for it; Power alone at the far
+     right of the top long edge. Keys carry no printed labels, as on the
+     hardware — the screen's rail names them in context. */
   .device {
-    width: min(880px, 100%);
-    background: linear-gradient(174deg, var(--bezel-edge), var(--bezel) 22%);
-    border-radius: 22px;
-    padding: clamp(14px, 2.6vw, 26px) clamp(14px, 2.6vw, 26px) clamp(10px, 2vw, 18px);
+    width: min(920px, 100%);
+    background: linear-gradient(168deg, var(--bezel-edge), var(--bezel) 30%);
+    border: 1px solid var(--bezel-line);
+    border-radius: 26px;
+    padding: clamp(10px, 1.8vw, 18px) clamp(14px, 2.6vw, 26px) clamp(14px, 2.6vw, 26px);
     box-shadow:
-      0 1px 0 rgba(255,255,255,.06) inset,
-      0 2px 6px rgba(10,8,5,.35),
-      0 24px 60px -18px rgba(10,8,5,.55);
+      0 1px 0 rgba(255,255,255,.9) inset,
+      0 2px 6px rgba(90,84,70,.18),
+      0 24px 60px -18px rgba(90,84,70,.45);
   }
+  .topedge {
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 12px;
+    padding: 2px 2px clamp(8px, 1.4vw, 14px);
+  }
+  .body {
+    display: flex;
+    gap: clamp(10px, 1.8vw, 18px);
+    align-items: stretch;
+  }
+  .sidekeys {
+    position: relative;
+    width: clamp(30px, 4.6vw, 44px);
+    flex: none;
+  }
+  /* The firmware draws the key legend at panel rows 120/200/280/360 of
+     480; each physical key sits level with its row. */
+  .sidekeys .key { position: absolute; left: 0; transform: translateY(-50%); }
+  .sidekeys .key:nth-child(1) { top: 25%; }
+  .sidekeys .key:nth-child(2) { top: 41.67%; }
+  .sidekeys .key:nth-child(3) { top: 58.33%; }
+  .sidekeys .key:nth-child(4) { top: 75%; }
+  .sidekeys .key:active { transform: translateY(calc(-50% + 1px)); }
   .screen {
     position: relative;
-    border-radius: 6px;
+    border-radius: 4px;
     overflow: hidden;
-    /* recessed panel: glass sits below the bezel lip */
+    flex: 1;
+    min-width: 0;
+    /* recessed panel: glass sits below the white bezel lip */
     box-shadow:
-      0 0 0 1px #0c0b0a,
-      0 2px 10px rgba(0,0,0,.65) inset;
+      0 0 0 1px #8f8a7e,
+      0 2px 10px rgba(40,36,28,.5) inset;
     background: var(--paper);
   }
   canvas {
@@ -100,17 +134,11 @@
     height: auto;
     image-rendering: pixelated;
   }
-  .keys {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding-top: clamp(10px, 1.8vw, 16px);
-  }
   .led {
     width: 6px; height: 6px;
     border-radius: 50%;
-    background: #3a352e;
-    margin-right: 6px;
+    background: #d4cfc2;
+    box-shadow: 0 0 1px rgba(0,0,0,.25) inset;
     transition: background .12s, box-shadow .12s;
     flex: none;
   }
@@ -118,29 +146,29 @@
     background: var(--led);
     box-shadow: 0 0 6px 1px color-mix(in srgb, var(--led) 70%, transparent);
   }
-  .keys .spacer { flex: 1; }
   button.key {
-    font-family: var(--mono);
-    font-size: 10.5px;
-    letter-spacing: 0.14em;
-    color: #a49c8d;
-    background: linear-gradient(180deg, var(--key-edge), var(--key) 55%);
-    border: 1px solid #121110;
-    border-radius: 8px;
-    padding: 10px 0;
-    width: clamp(58px, 9vw, 84px);
+    appearance: none;
+    background: linear-gradient(180deg, var(--key-edge), var(--key) 60%);
+    border: 1px solid var(--key-line);
+    border-radius: 10px;
+    width: clamp(30px, 4.6vw, 44px);
+    height: clamp(34px, 5.2vw, 52px);
     cursor: pointer;
-    box-shadow: 0 1px 0 rgba(255,255,255,.07) inset, 0 2px 3px rgba(0,0,0,.4);
+    box-shadow:
+      0 1px 0 rgba(255,255,255,.85) inset,
+      0 2px 3px rgba(90,84,70,.30);
     transition: transform .05s;
     touch-action: manipulation;
   }
-  button.key:active { transform: translateY(1px); box-shadow: 0 1px 0 rgba(255,255,255,.05) inset; }
+  button.key:active {
+    transform: translateY(1px);
+    box-shadow: 0 1px 0 rgba(255,255,255,.5) inset, 0 1px 1px rgba(90,84,70,.25);
+  }
   button.key:focus-visible { outline: 2px solid var(--led); outline-offset: 2px; }
   button.key.power {
-    width: 40px;
-    border-radius: 50%;
-    height: 40px;
-    padding: 0;
+    width: clamp(44px, 6.5vw, 62px);
+    height: clamp(20px, 2.8vw, 26px);
+    border-radius: 999px;
   }
 
   /* ------------------------------------------------ page matter */
@@ -198,15 +226,18 @@
 </header>
 
 <div class="device" aria-label="Simulated Xteink X4 e-reader">
-  <div class="screen"><canvas id="panel" width="800" height="480"></canvas></div>
-  <div class="keys">
+  <div class="topedge">
     <span class="led" id="led" aria-hidden="true"></span>
-    <button class="key power" id="k-power" title="Power — sleep and wake">⏻</button>
-    <span class="spacer"></span>
-    <button class="key" id="k-back">BACK</button>
-    <button class="key" id="k-prev">PREV</button>
-    <button class="key" id="k-ok">OK</button>
-    <button class="key" id="k-next">NEXT</button>
+    <button class="key power" id="k-power" title="Power — sleep and wake" aria-label="Power"></button>
+  </div>
+  <div class="body">
+    <div class="sidekeys">
+      <button class="key" id="k-back" title="Top key — the screen names it" aria-label="Top key"></button>
+      <button class="key" id="k-ok" title="Second key — the screen names it" aria-label="Second key"></button>
+      <button class="key" id="k-prev" title="Third key — the screen names it" aria-label="Third key"></button>
+      <button class="key" id="k-next" title="Bottom key — the screen names it" aria-label="Bottom key"></button>
+    </div>
+    <div class="screen"><canvas id="panel" width="800" height="480"></canvas></div>
   </div>
 </div>
 
@@ -309,16 +340,18 @@
       ghosting = false;
       putFinal(pixels);
     } else if (mode === 2) {
-      // Remember the outgoing page before it is replaced.
+      // A fast update does not flash: changed pixels just redraw, and a
+      // faint imprint of the outgoing page stays behind until a cleaning
+      // refresh. The panel is still busy for the rated 421 ms.
       workCtx.drawImage(canvas, 0, 0);
       ghostCtx.drawImage(work, 0, 0);
-      putInverted(pixels);
-      await sleep(130);
       ghosting = true;
       putFinal(pixels);
-      await sleep(290);
+      await sleep(420);
     } else {
-      const flashes = mode === 1 ? 3 : 2;
+      // FastClean is the panel's one-flicker cleaning waveform; full runs
+      // several inversion passes.
+      const flashes = mode === 1 ? 3 : 1;
       for (let i = 0; i < flashes; i++) {
         putInverted(pixels);
         await sleep(150);
