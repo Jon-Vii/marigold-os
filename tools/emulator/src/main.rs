@@ -221,7 +221,7 @@ impl Emulator {
         // no-network screen stays reachable through the forget flow (or
         // pinned by app-core unit tests).
         emu.state = emu.state.apply_sync_event(app_core::SyncEvent::NetworkSaved(
-            app_core::WifiSsid::from_str("HOME-WIFI").unwrap(),
+            app_core::WifiSsid::new("HOME-WIFI").unwrap(),
         ));
         emu.render(app_core::RenderKind::Boot);
         emu

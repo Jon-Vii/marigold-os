@@ -30,6 +30,9 @@ const STREAM_CHUNK: usize = 512;
 /// whole buffer from the current offset or report an error (a short read at EOF
 /// is an error — the validator already knows the expected length).
 pub trait ImageSource {
+    /// The error is deliberately unit: the validator maps any read failure
+    /// to `ImageError::Read`, so a richer type would only be discarded.
+    #[allow(clippy::result_unit_err)]
     fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), ()>;
 }
 

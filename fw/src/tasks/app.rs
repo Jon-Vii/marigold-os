@@ -20,7 +20,7 @@ pub async fn run() {
     // display task's boot probe of /XTEINK/WIFI.BIN arrives later and
     // overrides, matching the wifi task's stored-beats-built-in order.
     if let Some((ssid, _)) = crate::tasks::wifi::credentials() {
-        if let Some(ssid) = app_core::WifiSsid::from_str(ssid) {
+        if let Some(ssid) = app_core::WifiSsid::new(ssid) {
             state = state.apply_sync_event(app_core::SyncEvent::NetworkSaved(ssid));
         }
     }

@@ -667,6 +667,7 @@ pub fn draw_centered_wrapped_literata(
     baseline_y
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn draw_wrapped_literata(
     fb: &mut Framebuffer,
     font: &'static BitmapFont,
@@ -702,6 +703,7 @@ pub fn draw_wrapped_literata(
     baseline_y
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn draw_justified_wrapped_literata(
     fb: &mut Framebuffer,
     font: &'static BitmapFont,

@@ -223,11 +223,11 @@ fn parse_sync_event(kind: &str, step: &Step) -> Result<SyncEvent, String> {
         "PortalUp" | "portal-up" => Ok(SyncEvent::PortalUp),
         "Serving" | "serving" => Ok(SyncEvent::Serving(step.ip.unwrap_or([192, 168, 0, 233]))),
         "NetworkSaved" | "network-saved" => Ok(SyncEvent::NetworkSaved(
-            app_core::WifiSsid::from_str(step.ssid.as_deref().unwrap_or("HOME-WIFI"))
+            app_core::WifiSsid::new(step.ssid.as_deref().unwrap_or("HOME-WIFI"))
                 .ok_or_else(|| "bad ssid".to_string())?,
         )),
         "CredentialsSaved" | "credentials-saved" => Ok(SyncEvent::CredentialsSaved(
-            app_core::WifiSsid::from_str(step.ssid.as_deref().unwrap_or("HOME-WIFI"))
+            app_core::WifiSsid::new(step.ssid.as_deref().unwrap_or("HOME-WIFI"))
                 .ok_or_else(|| "bad ssid".to_string())?,
         )),
         "Failed" | "failed" => Ok(SyncEvent::Failed(parse_sync_error(

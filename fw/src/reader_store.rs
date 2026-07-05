@@ -371,6 +371,7 @@ impl ReaderStore {
 
     /// Adopt `index` as the active book whose entry the reading path reads
     /// through `catalog_entry`. Read once from CATALOG.BIN at open/restore.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn set_active_entry(
         &mut self,
         index: usize,

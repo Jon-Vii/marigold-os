@@ -421,7 +421,7 @@ pub struct WifiSsid {
 }
 
 impl WifiSsid {
-    pub fn from_str(ssid: &str) -> Option<Self> {
+    pub fn new(ssid: &str) -> Option<Self> {
         if ssid.is_empty() || ssid.len() > 32 {
             return None;
         }
@@ -1283,7 +1283,7 @@ mod tests {
 
     fn with_saved_network(state: ReaderState) -> ReaderState {
         state.apply_sync_event(SyncEvent::NetworkSaved(
-            WifiSsid::from_str("latent.space").unwrap(),
+            WifiSsid::new("latent.space").unwrap(),
         ))
     }
 
@@ -1300,7 +1300,7 @@ mod tests {
         let state = press(state, Button::Confirm);
         assert_eq!(state.sync_status, SyncStatus::PortalUp);
         let state = state.apply_sync_event(SyncEvent::CredentialsSaved(
-            WifiSsid::from_str("latent.space").unwrap(),
+            WifiSsid::new("latent.space").unwrap(),
         ));
         assert_eq!(state.sync_status, SyncStatus::CredentialsSaved);
         // The portal's capture names the network for the rest of the boot.

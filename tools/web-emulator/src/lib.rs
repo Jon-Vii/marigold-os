@@ -394,7 +394,7 @@ impl WebEmulator {
 }
 
 fn home_network() -> WifiSsid {
-    WifiSsid::from_str("HOME-WIFI").unwrap()
+    WifiSsid::new("HOME-WIFI").unwrap()
 }
 
 fn draw_centered(fb: &mut Framebuffer, font: &'static display::font::BitmapFont, text: &str, y: i16) {
