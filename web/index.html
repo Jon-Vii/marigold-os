@@ -94,7 +94,7 @@
       linear-gradient(173deg, var(--bezel-edge) 0%, var(--bezel) 34%, var(--bezel) 82%, #cbc9c3 100%);
     border: 1px solid var(--bezel-line);
     border-radius: 22px;
-    padding: clamp(12px, 2vw, 20px);
+    padding: clamp(12px, 2vw, 20px) clamp(12px, 2vw, 20px) clamp(12px, 2vw, 20px) clamp(7px, 1.1vw, 12px);
     box-shadow:
       0 1px 0 rgba(255,255,255,.75) inset,
       0 -1px 0 rgba(70,66,58,.14) inset,
@@ -128,12 +128,26 @@
   }
   .body {
     display: flex;
-    gap: clamp(20px, 3.2vw, 34px);
+    gap: clamp(40px, 6.4vw, 68px);
     align-items: stretch;
   }
+  /* Construction seams at the ends of the key band: the chassis gap
+     that reads as a short line near the top and bottom edges — the
+     "feet" visible in the hardware line drawing. */
+  .foot {
+    position: absolute;
+    left: clamp(9px, 1.4vw, 15px);
+    width: clamp(46px, 7vw, 66px);
+    height: 2px;
+    border-radius: 2px;
+    background: color-mix(in srgb, var(--bezel-line) 75%, transparent);
+    box-shadow: 0 1px 0 rgba(255,255,255,.55);
+  }
+  .foot.top { top: clamp(5px, .8vw, 8px); }
+  .foot.bottom { bottom: clamp(5px, .8vw, 8px); box-shadow: 0 -1px 0 rgba(255,255,255,.55); }
   .sidekeys {
     position: relative;
-    width: clamp(20px, 3vw, 27px);
+    width: clamp(13px, 2vw, 18px);
     flex: none;
   }
   /* Two long two-in-one bars, each seated in a recessed notch that
@@ -143,9 +157,9 @@
     position: absolute;
     left: 0;
     width: 100%;
-    height: 34%;
+    height: 40%;
     transform: translateY(-50%);
-    padding: 3px;
+    padding: 2px;
     box-sizing: border-box;
     border-radius: 999px;
     background: linear-gradient(180deg, #c3c0ba, #cfccc6 20%, #cfccc6 80%, #d8d6d1);
@@ -153,8 +167,8 @@
       0 1px 3px rgba(50,46,38,.28) inset,
       0 1px 0 rgba(255,255,255,.65);
   }
-  .slot.s1 { top: 32%; }
-  .slot.s2 { top: 68%; }
+  .slot.s1 { top: 27.5%; }
+  .slot.s2 { top: 72.5%; }
   .rocker {
     position: relative;
     width: 100%;
@@ -282,6 +296,8 @@
 </header>
 
 <div class="device" aria-label="Simulated Xteink X4 e-reader">
+  <span class="foot top" aria-hidden="true"></span>
+  <span class="foot bottom" aria-hidden="true"></span>
   <div class="body">
     <div class="sidekeys">
       <div class="slot s1"><div class="rocker">
