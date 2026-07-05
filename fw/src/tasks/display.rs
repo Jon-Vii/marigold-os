@@ -92,6 +92,16 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
         Err(e) => esp_println::println!("display: update check skipped: {:?}", e),
     }
 
+    // Flash-path self-test (feature `ota-selftest` only, off in release): copy
+    // the running image into the inactive slot and boot into it, once. A card-
+    // reader-free way to re-validate the esp-storage + otadata path on device.
+    #[cfg(feature = "ota-selftest")]
+    if crate::ota_update::run_selftest() {
+        esp_println::println!("selftest: staged; resetting");
+        embassy_time::Timer::after(embassy_time::Duration::from_millis(50)).await;
+        esp_hal::reset::software_reset();
+    }
+
     loop {
         match select(DISPLAY_COMMANDS.receive(), STORAGE_COMMANDS.receive()).await {
             Either::First(DisplayCommand::Render(request)) => {

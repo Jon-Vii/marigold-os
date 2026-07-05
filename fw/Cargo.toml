@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 default-run = "fw"
 
+[features]
+# Temporary on-device validation of the flash + otadata path without an SD card:
+# on first boot, copy the running image into the inactive slot and switch
+# otadata to it. Never enabled in a release build. See fw::ota_update.
+ota-selftest = []
+
 [dependencies]
 app-core = { path = "../app-core" }
 display = { path = "../display" }

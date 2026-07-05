@@ -138,6 +138,69 @@ fn try_apply(root: &SdRoot) -> Result<(), UpdateError> {
     Ok(())
 }
 
+/// On-device validation of the flash + otadata path when no SD card reader is
+/// available to place `FWUPDATE.BIN`. On the first boot (running from slot 0)
+/// it copies the running image into the inactive slot and switches otadata to
+/// it, so the next boot runs from the other slot — exercising esp-storage
+/// erase/write, the seq CRC, the otadata switch, and the bootloader honouring
+/// it, all without an SD file. One-shot: once running from the far slot it
+/// no-ops. Compiled only under the `ota-selftest` feature.
+#[cfg(feature = "ota-selftest")]
+pub fn run_selftest() -> bool {
+    // 3 MiB comfortably covers the ~2.5 MiB app image; the copy is self-
+    // delimiting (the bootloader reads the header/segments and ignores the
+    // trailing bytes), so an over-copy is harmless.
+    const COPY_LEN: u32 = 0x0030_0000;
+
+    let mut flash = FlashStorage::new();
+    let (s0, s1) = match read_otadata(&mut flash) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let active = ota::active_app_slot(&s0, &s1, OTA_COUNT).unwrap_or(0);
+    if active != 0 {
+        esp_println::println!("selftest: already running from slot {}; done", active);
+        return false;
+    }
+
+    let src = OTA_SLOT_OFFSET[0];
+    let dst = OTA_SLOT_OFFSET[1];
+    esp_println::println!("selftest: copy slot 0 -> slot 1 ({} bytes)", COPY_LEN);
+    if flash.erase(dst, dst + COPY_LEN).is_err() {
+        esp_println::println!("selftest: erase failed");
+        return false;
+    }
+    let mut buf = [0u8; SECTOR];
+    let mut off = 0u32;
+    while off < COPY_LEN {
+        if flash.read(src + off, &mut buf).is_err() {
+            esp_println::println!("selftest: read failed @{:#x}", off);
+            return false;
+        }
+        if flash.write(dst + off, &buf).is_err() {
+            esp_println::println!("selftest: write failed @{:#x}", off);
+            return false;
+        }
+        off += SECTOR as u32;
+    }
+
+    let (s0, s1) = match read_otadata(&mut flash) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let switch = ota::plan_switch(&s0, &s1, 1, OTA_COUNT);
+    if write_select_entry(&mut flash, switch.target_sector, &switch.entry).is_err() {
+        esp_println::println!("selftest: otadata write failed");
+        return false;
+    }
+    esp_println::println!(
+        "selftest: otadata sector {} -> seq {} (slot 1)",
+        switch.target_sector,
+        switch.entry.ota_seq
+    );
+    true
+}
+
 fn read_otadata(
     flash: &mut FlashStorage,
 ) -> Result<([u8; SELECT_ENTRY_LEN], [u8; SELECT_ENTRY_LEN]), UpdateError> {

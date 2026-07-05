@@ -155,17 +155,25 @@ Implemented and verified on host tooling:
 - [x] **Boot-time SD updater** (`fw::ota_update`) — on boot, `/FWUPDATE.BIN` is
       validated, written to the inactive OTA slot with `esp-storage`, selected
       via `otadata`, deleted, and the device resets into it. Only the inactive
-      slot/sector are touched. Compiles for the target; **not yet run on
-      hardware**.
+      slot/sector are touched.
+- [x] **Flash + otadata path validated on hardware** (2026-07-05, unlocked X4).
+      A one-shot self-test (`fw::ota_update::run_selftest`, `ota-selftest`
+      feature) copied the running image into the inactive slot with `esp-storage`
+      and switched `otadata`; the device rebooted and the ESP-IDF bootloader
+      loaded the app **from the far slot** (`Loaded app from partition at offset
+      0x650000`) — proving the erase/write, the seq CRC (a wrong CRC would be
+      ignored), and the switch. It settled on the new slot with **no rollback
+      loop**, so `otadata` state NEW is fine here; no `UNDEFINED` change needed.
+      The SD read path is separately confirmed from normal boot logs, and
+      `validate_image` is host-tested — so every constituent of the SD updater
+      is now exercised even though a full `FWUPDATE.BIN` run awaits a card
+      reader (the author's machine has none).
 
 Not yet done:
 
-- [ ] **On-device validation** — run the boot updater on the unlocked unit
-      (write `FWUPDATE.BIN`, confirm it flashes the inactive slot and reboots
-      into it). Watch for a rollback loop: we write `otadata` state NEW like
-      CrossPoint does and never call `esp_ota_mark_app_valid`; if the stock/IDF
-      bootloader has rollback enabled, switch the written state to UNDEFINED
-      (`0xFFFFFFFF`) in `plan_switch`.
+- [ ] **End-to-end `FWUPDATE.BIN` run** — the whole SD trigger in one go (drop
+      the file, reboot, watch it flash + delete + reboot). Needs a way to write
+      the card root; blocked only by the missing card reader, not by code.
 - [ ] **Boot-time recovery combo** (hold a combo at reset → repoint otadata at
       `ota_0`), mirroring the SDK's `RecoveryBoot`, plus optional on-panel
       progress during the update.
