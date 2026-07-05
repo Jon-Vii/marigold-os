@@ -9,6 +9,9 @@ miniz_oxide = { version = "0.9.1", default-features = false }
 # SHA-256 for OTA image validation (no_std, no heap). asm is off so it builds
 # for both the riscv32 target and host tests.
 sha2 = { version = "0.10.8", default-features = false }
+# otadata seq CRC. Same crate + algorithm esp-bootloader-esp-idf uses, so our
+# CRC is identical to the ROM's crc32_le(u32::MAX, ..) by construction.
+crc = "3.2.1"
 
 [dev-dependencies]
 # Tests deflate their own fixtures; firmware builds never see this feature.

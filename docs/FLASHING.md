@@ -57,13 +57,23 @@ tools/build-release.sh
 
 Produces, in `target/release-images/`:
 
-- **`firmware.bin`** — app-only image for `ota_0`. Flash to `0x10000`. Updates
-  the app in place and leaves the bootloader untouched. This is what the web
+- **`firmware.bin`** — app image for `ota_0`. Flash to `0x10000`. Updates the
+  app in place and leaves the bootloader untouched. This is what the web
   flasher, `esptool write_flash 0x10000`, and (once implemented) the in-app
   updater consume.
-- **`update.bin`** — merged full-flash 16 MB image (bootloader + partition table
-  + app). For programming a whole unlocked unit from scratch. It replaces the
-  bootloader too, so it is the **riskier** artifact on a locked unit.
+- **`update.bin`** — byte-identical to `firmware.bin`, under the filename the
+  stock OEM SD-card updater looks for. The OEM updater writes it to the app
+  slot at `0x10000`, so it is an **app image, not a full-flash image**.
+- **`full-flash.bin`** — merged 16 MB image (bootloader + partition table +
+  app) for programming a whole *unlocked* unit from scratch with
+  `esptool write_flash 0x0`.
+
+> [!CAUTION]
+> Never put `full-flash.bin` on an SD card and never write it to `0x10000`. The
+> OEM SD updater writes whatever it finds to the app slot; a full-flash image
+> there lands a bootloader in the middle of the app partition and bricks the
+> device. Writing to `0x0` is the fastest brick on any unit. The SD card and the
+> app slot only ever take `update.bin`/`firmware.bin`.
 
 ## Flashing an unlocked unit
 
@@ -75,7 +85,7 @@ cargo run -p fw --release
 esptool.py --chip esp32c3 write_flash 0x10000 target/release-images/firmware.bin
 
 # Whole flash from scratch:
-esptool.py --chip esp32c3 write_flash 0x0 target/release-images/update.bin
+esptool.py --chip esp32c3 write_flash 0x0 target/release-images/full-flash.bin
 ```
 
 ## Flashing a locked unit
@@ -89,12 +99,13 @@ esptool.py --chip esp32c3 write_flash 0x0 target/release-images/update.bin
 
 Two mechanisms exist, both pioneered by CrossPoint:
 
-1. **Stock SD-card updater.** The stock Xteink app can update itself from an
-   image on the SD card: copy the image to the card root, power on holding
-   **Power + Up** while on USB power, and the stock firmware writes it. This is
-   the least invasive path (no bootloader replacement). What container the stock
-   updater expects for a *replacement* image is defined by closed stock firmware
-   and is **not yet confirmed** for our build — see [Status](#status).
+1. **Stock SD-card updater.** The OEM bootloader/app updates from an image on
+   the SD card: copy **`update.bin`** to the card root, power on holding
+   **Power + Up** while on USB power, and it writes the image to the app slot at
+   `0x10000` (no bootloader replacement). Some builds also auto-flash a file
+   named `force_update.bin` on boot with no button combo — handy as a recovery
+   file to keep on the card. This path does **not** re-enable USB flashing. It
+   is the standard install route for locked/AliExpress units.
 
 2. **External unlocker tools** (CrossPoint's USB Unlocker / OTA Unlocker) that
    re-enable USB flashing or intercept the official OTA channel. These are
@@ -108,27 +119,33 @@ Implemented and verified on host tooling:
 - [x] Stock-compatible dual-OTA partition table (`partitions.csv`).
 - [x] App descriptor with the open eFuse range at offset `0x20` (bootloader-gate
       workaround), verified present in the built image.
-- [x] Reproducible `firmware.bin` + `update.bin` release images
-      (`tools/build-release.sh`).
+- [x] Reproducible `firmware.bin` / `update.bin` / `full-flash.bin` release
+      images (`tools/build-release.sh`). The SD `update.bin` is an app image
+      written to `0x10000`, matching the OEM updater.
 - [x] `cargo run` flashes the stock-compatible layout.
 - [x] **Image validator** (`proto::ota::validate_image`) — the integrity gate
       (magic / segment walk / XOR checksum / SHA-256 trailer) that must pass
       before any candidate `.bin` is written to the inactive slot. Streaming,
       no heap; host-tested against synthetic valid and corrupt images.
+- [x] **otadata layer** (`proto::ota`: `seq_crc`, `SelectEntry`, `plan_switch`)
+      — the OTA-slot select-entry format, the seq CRC (verified against the
+      esp-bootloader-esp-idf algorithm *and* a real on-device value:
+      `seq_crc(1) == 0x4743989A`), and the slot-switch math. Host-tested.
 
 Not yet done (needed before locked-device install is safe):
 
-- [ ] **Flash + otadata write** — wire `proto::ota::validate_image` to real
-      flash access (`esp-storage`) and an otadata switch so a validated image
-      can be written to the inactive slot and selected. Prefer the official
-      `esp-bootloader-esp-idf` crate for the otadata CRC/seq handling over a
-      hand-rolled copy, and validate the switch against the device's real
-      `otadata` (the CRC convention must match the ROM exactly).
+- [ ] **Flash wiring** — connect the validator + `plan_switch` to real flash
+      access (`esp-storage`): stream a validated image into the inactive OTA
+      slot, then write the planned `otadata` entry and reset. The logic is done
+      and tested; this is the hardware I/O around it. (Consider adopting
+      `esp-bootloader-esp-idf`'s `Ota` directly instead, since our `plan_switch`
+      already matches it.)
 - [ ] **SD update activity** — pick a `.bin` from the card, validate, flash,
       switch, reset. This is the anti-brick net; it is the single most
       important remaining piece.
 - [ ] **Boot-time recovery combo** (hold a combo at reset → repoint otadata at
       `ota_0`), mirroring the SDK's `RecoveryBoot`.
-- [ ] **Confirm the stock SD-updater container** and the eFuse-gate assumption
-      on a real locked unit. Both are currently unverified because the author's
-      device is unlocked and the stock updater format is closed.
+- [ ] **On-device validation** — confirm on a real *locked* unit that our
+      app-descriptor eFuse range satisfies the stock gate and that the OEM
+      updater accepts our `update.bin`. Untested so far: the author's unit is
+      unlocked.

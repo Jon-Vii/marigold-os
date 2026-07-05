@@ -13,6 +13,7 @@
 //! header flags it). It streams the image in fixed chunks so it needs no heap
 //! and only a few hundred bytes of stack — the whole image never sits in RAM.
 
+use crc::{Algorithm, Crc};
 use sha2::{Digest, Sha256};
 
 /// First byte of every ESP-IDF application image.
@@ -147,6 +148,154 @@ pub fn validate_image<S: ImageSource>(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// otadata / OTA slot selection
+//
+// The stock bootloader chooses the app partition from `otadata`: two 32-byte
+// "select entries", one per flash sector. The entry with the highest *valid*
+// `ota_seq` wins, and `(ota_seq - 1) % ota_partition_count` is the app slot to
+// boot. An in-app update writes the freshly-flashed slot's entry into the
+// *other* otadata sector with a higher seq, so the next boot selects it —
+// without the ROM's `esp_image_verify` (which rejects our wide-eFuse image).
+//
+// This mirrors `esp-bootloader-esp-idf`'s `Ota` and the FreeInk SDK's
+// `RecoveryBoot`/`OtaBootSwitch`. Keeping a host-testable copy here lets the
+// seq/CRC/slot math be verified without hardware.
+// ---------------------------------------------------------------------------
+
+/// Length of one otadata select entry, and of each otadata flash sector's used
+/// prefix. 32 bytes is also flash-encryption friendly.
+pub const SELECT_ENTRY_LEN: usize = 32;
+
+/// A never-written otadata seq (erased flash).
+pub const UNINITIALIZED_SEQ: u32 = 0xFFFF_FFFF;
+
+// esp_ota_img_states_t values we care about.
+/// Freshly written, not yet marked valid. What we write on a new flash — this
+/// is the state the FreeInk SDK / CrossPoint switch uses and it boots on the X4.
+pub const OTA_IMG_NEW: u32 = 0x0;
+pub const OTA_IMG_INVALID: u32 = 0x3;
+pub const OTA_IMG_ABORTED: u32 = 0x4;
+
+// esp-bootloader-esp-idf's otadata CRC: reflected CRC-32, poly 0x04C11DB7,
+// init 0, xorout 0xFFFFFFFF, over the little-endian `ota_seq` bytes. Identical
+// to the ROM's `crc32_le(u32::MAX, ..)`. Verified: seq 1 -> 0x4743989A, which
+// matches a real on-device otadata dump.
+const OTADATA_CRC: Algorithm<u32> = Algorithm {
+    width: 32,
+    poly: 0x04c1_1db7,
+    init: 0,
+    refin: true,
+    refout: true,
+    xorout: 0xffff_ffff,
+    check: 0,
+    residue: 0,
+};
+
+/// CRC of a 4-byte little-endian `ota_seq`, as the bootloader stores and checks.
+pub fn seq_crc(ota_seq: u32) -> u32 {
+    Crc::<u32>::new(&OTADATA_CRC).checksum(&ota_seq.to_le_bytes())
+}
+
+/// The fields of an otadata select entry we act on. `seq_label` (20 bytes,
+/// unused by the bootloader) is written as 0xFF and otherwise ignored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelectEntry {
+    pub ota_seq: u32,
+    pub ota_state: u32,
+    pub crc: u32,
+}
+
+impl SelectEntry {
+    /// A fresh entry with a correct CRC.
+    pub fn new(ota_seq: u32, ota_state: u32) -> Self {
+        Self {
+            ota_seq,
+            ota_state,
+            crc: seq_crc(ota_seq),
+        }
+    }
+
+    pub fn from_bytes(b: &[u8; SELECT_ENTRY_LEN]) -> Self {
+        Self {
+            ota_seq: u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+            ota_state: u32::from_le_bytes([b[24], b[25], b[26], b[27]]),
+            crc: u32::from_le_bytes([b[28], b[29], b[30], b[31]]),
+        }
+    }
+
+    pub fn to_bytes(&self) -> [u8; SELECT_ENTRY_LEN] {
+        let mut b = [0u8; SELECT_ENTRY_LEN];
+        b[0..4].copy_from_slice(&self.ota_seq.to_le_bytes());
+        b[4..24].copy_from_slice(&[0xFF; 20]); // seq_label, unused
+        b[24..28].copy_from_slice(&self.ota_state.to_le_bytes());
+        b[28..32].copy_from_slice(&self.crc.to_le_bytes());
+        b
+    }
+
+    /// A bootable entry: initialised, CRC intact, and not marked bad — exactly
+    /// the bootloader's own validity test.
+    pub fn is_valid(&self) -> bool {
+        self.ota_seq != UNINITIALIZED_SEQ
+            && self.crc == seq_crc(self.ota_seq)
+            && self.ota_state != OTA_IMG_INVALID
+            && self.ota_state != OTA_IMG_ABORTED
+    }
+}
+
+/// The single otadata write that makes `dest_slot` the next boot target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OtaSwitch {
+    /// Which otadata sector (0 or 1) to erase and overwrite.
+    pub target_sector: usize,
+    /// The 32-byte entry to write there.
+    pub entry: SelectEntry,
+}
+
+/// Plan the otadata write that boots `dest_slot` (0-based app OTA index) next.
+///
+/// `sector0`/`sector1` are the two raw otadata entries as read from flash, and
+/// `ota_count` is the number of OTA app partitions (2 for our layout). Mirrors
+/// `OtaBootSwitch::switchTo`: find the active entry (highest valid seq), pick
+/// the smallest higher seq that maps to `dest_slot`, and write it into the
+/// *other* sector so the bootloader sees a newer, valid entry there.
+pub fn plan_switch(
+    sector0: &[u8; SELECT_ENTRY_LEN],
+    sector1: &[u8; SELECT_ENTRY_LEN],
+    dest_slot: u32,
+    ota_count: u32,
+) -> OtaSwitch {
+    let e0 = SelectEntry::from_bytes(sector0);
+    let e1 = SelectEntry::from_bytes(sector1);
+    let s0 = e0.is_valid().then_some(e0.ota_seq);
+    let s1 = e1.is_valid().then_some(e1.ota_seq);
+
+    let (active_sector, active_seq) = match (s0, s1) {
+        (None, None) => (None, 0),
+        (Some(a), None) => (Some(0usize), a),
+        (None, Some(b)) => (Some(1usize), b),
+        (Some(a), Some(b)) if a >= b => (Some(0usize), a),
+        (Some(_), Some(b)) => (Some(1usize), b),
+    };
+
+    let ota_count = ota_count.max(1);
+    let mut new_seq = active_seq + 1;
+    while (new_seq - 1) % ota_count != dest_slot % ota_count {
+        new_seq += 1;
+    }
+
+    let target_sector = match active_sector {
+        Some(0) => 1,
+        Some(_) => 0,
+        None => 0,
+    };
+
+    OtaSwitch {
+        target_sector,
+        entry: SelectEntry::new(new_seq, OTA_IMG_NEW),
+    }
 }
 
 #[cfg(test)]
@@ -336,5 +485,82 @@ mod tests {
             validate_image(&mut cursor(img), len, None),
             Err(ImageError::BadSegments)
         );
+    }
+
+    // --- otadata -----------------------------------------------------------
+
+    #[test]
+    fn seq_crc_matches_rom_and_device() {
+        // seq 1 -> 0x4743989A is a real on-device otadata CRC and the value the
+        // authoritative esp-bootloader-esp-idf algorithm produces. The others
+        // are independently computed from the same CRC parameters.
+        assert_eq!(seq_crc(1), 0x4743_989A);
+        assert_eq!(seq_crc(2), 0x55F6_3774);
+        assert_eq!(seq_crc(3), 0xED4A_5011);
+    }
+
+    #[test]
+    fn select_entry_round_trips_with_valid_crc() {
+        let e = SelectEntry::new(5, OTA_IMG_NEW);
+        let bytes = e.to_bytes();
+        let back = SelectEntry::from_bytes(&bytes);
+        assert_eq!(back, e);
+        assert!(back.is_valid());
+        // seq_label region is 0xFF, CRC sits in the last 4 bytes.
+        assert_eq!(&bytes[4..24], &[0xFF; 20]);
+        assert_eq!(u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]), seq_crc(5));
+    }
+
+    #[test]
+    fn uninitialised_and_corrupt_entries_are_invalid() {
+        let erased = [0xFFu8; SELECT_ENTRY_LEN];
+        assert!(!SelectEntry::from_bytes(&erased).is_valid());
+
+        let mut bad = SelectEntry::new(7, OTA_IMG_NEW).to_bytes();
+        bad[28] ^= 0xFF; // corrupt the stored CRC
+        assert!(!SelectEntry::from_bytes(&bad).is_valid());
+
+        let aborted = SelectEntry::new(7, OTA_IMG_ABORTED);
+        assert!(!aborted.is_valid());
+    }
+
+    #[test]
+    fn switch_from_erased_otadata_targets_requested_slot() {
+        let erased = [0xFFu8; SELECT_ENTRY_LEN];
+        // First boot from erased otadata into slot 0.
+        let sw0 = plan_switch(&erased, &erased, 0, 2);
+        assert_eq!(sw0.target_sector, 0);
+        assert_eq!(sw0.entry.ota_seq, 1); // (1-1)%2 == 0
+        assert!(sw0.entry.is_valid());
+
+        // ...or into slot 1.
+        let sw1 = plan_switch(&erased, &erased, 1, 2);
+        assert_eq!(sw1.entry.ota_seq, 2); // (2-1)%2 == 1
+        assert_eq!((sw1.entry.ota_seq - 1) % 2, 1);
+    }
+
+    #[test]
+    fn switch_writes_other_sector_with_higher_seq() {
+        // sector0 active at seq=3 (slot (3-1)%2 == 0). Switch to slot 1.
+        let active = SelectEntry::new(3, OTA_IMG_NEW).to_bytes();
+        let erased = [0xFFu8; SELECT_ENTRY_LEN];
+        let sw = plan_switch(&active, &erased, 1, 2);
+
+        assert_eq!(sw.target_sector, 1, "must write the inactive sector");
+        assert!(sw.entry.ota_seq > 3, "new seq must exceed the active seq");
+        assert_eq!((sw.entry.ota_seq - 1) % 2, 1, "must map to slot 1");
+        assert!(sw.entry.is_valid());
+    }
+
+    #[test]
+    fn switch_ignores_invalidated_higher_seq() {
+        // sector1 has a higher seq but is ABORTED, so sector0 (seq 3) is active.
+        let active = SelectEntry::new(3, OTA_IMG_NEW).to_bytes();
+        let aborted = SelectEntry::new(9, OTA_IMG_ABORTED).to_bytes();
+        let sw = plan_switch(&active, &aborted, 0, 2);
+        // Active is sector0, so we write sector1, seq just above 3 mapping slot 0.
+        assert_eq!(sw.target_sector, 1);
+        assert_eq!(sw.entry.ota_seq, 5); // 4->(3)%2=1 no; 5->(4)%2=0 yes
+        assert_eq!((sw.entry.ota_seq - 1) % 2, 0);
     }
 }
