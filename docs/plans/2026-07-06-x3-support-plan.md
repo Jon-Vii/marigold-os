@@ -37,11 +37,20 @@ half scrub, prestage→DTM1). Added `EpdBus::wait_two_phase` for the X3's low-th
 BUSY. Every panel-facing value is transcribed from the reference and is a Phase-6
 bench-iteration point (orientation, BUSY timing, waveform behavior at clock).
 
+### Phase 3 — BQ27220 battery — DONE (2026-07-06, unverified on hardware)
+
+`hal-ext/src/bq27220.rs` is a small generic async gauge driver (SOC / voltage / charging
+sign). `main.rs` cfg-swaps GPIO0 from the aux ADC to I2C0 SCL (SDA=GPIO20, 400 kHz) on
+the X3 and builds the gauge; `tasks/input.rs` cfg-splits the power read — X4 aux ADC path
+byte-identical, X3 reads the gauge. Button ladders (GPIO1/2) untouched. Not yet wired:
+a charging indicator (the gauge exposes `charging()`, but the UI has no such element on
+either device — add together if wanted). Phase-6 note: confirm the I2C pins park safely
+before deep sleep (µA leak against the always-powered gauge).
+
 ### Still open
 
-- **Phase 3 — BQ27220 battery + bring-up.** The last new-code core: an I2C gauge driver
-  and the `main.rs` GPIO0/20 I2C swap. Untested without hardware but writable now.
-- **Phase 6 — on-device validation.** Needs the X3 + 4-pin pogo cable.
+- **Phase 6 — on-device validation.** The only remaining work; needs the X3 + 4-pin pogo
+  cable. All existing-code and new-code scaffolding is now in place and building.
 
 ### The X3 button layout is a redesign, not a reposition (researched 2026-07-06)
 
