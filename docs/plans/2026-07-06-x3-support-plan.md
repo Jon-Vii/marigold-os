@@ -27,12 +27,38 @@ eyeballed in the preview tool (apparatus back in the corner, nothing clipped):
   manifests; the SD firmware trigger filename is per-panel (`FWUPDATE.BIN` vs
   `FWUPDX3.BIN`) so a card is safe to move between devices; FLASHING.md updated.
 
-Still open (see phases below): **the UC8253 driver bodies (Phase 2)** and **BQ27220 +
-bring-up (Phase 3)** — the new-code core — plus **Phase 6** on-device validation. Two
-small Phase-5 tails deferred deliberately: there is no build/test CI to extend (only a
-Pages deploy workflow), so a "build both feature sets" job needs a CI pipeline decision;
-and the left-bezel key rows (`KEY_YS` in `ui/src/render.rs`) still sit at X4 positions
-because they align to physical buttons whose X3 placement needs the device.
+### UC8253 driver — DONE (2026-07-06, unverified on hardware)
+
+Phase 2 bodies are ported from CrossPoint's `Uc8253X3Driver` (MIT), BW path only:
+`display/src/epd/uc8253.rs` (command set, 4 BW LUT banks, init/resolution bytes,
+vertical-flip orientation, 16 MHz SPI) and `fw/src/display_flush/uc8253.rs` (the refresh
+flow — Fast=DTM2-vs-DTM1 turbo, Full=white-DTM1 baseline + settle, FastClean=absolute
+half scrub, prestage→DTM1). Added `EpdBus::wait_two_phase` for the X3's low-then-high
+BUSY. Every panel-facing value is transcribed from the reference and is a Phase-6
+bench-iteration point (orientation, BUSY timing, waveform behavior at clock).
+
+### Still open
+
+- **Phase 3 — BQ27220 battery + bring-up.** The last new-code core: an I2C gauge driver
+  and the `main.rs` GPIO0/20 I2C swap. Untested without hardware but writable now.
+- **Phase 6 — on-device validation.** Needs the X3 + 4-pin pogo cable.
+
+### The X3 button layout is a redesign, not a reposition (researched 2026-07-06)
+
+`KEY_YS` cannot simply move. The X3's physical buttons differ from the X4's four-down-the-
+left: **four main buttons along the bottom chin + one page-turn button on each long side**
+(left=Prev, right=Next), confirmed by both the official X3 user guide and CrossPoint's
+`BaseTheme.cpp`. CrossPoint renders X3 hints in two groups — a bottom row of four
+(`x3ButtonPositions = {38,154,268,384}`, w106×h40 at `y=pageHeight-40`) plus one 30×80
+side label per edge (`x=4` left, `x=screenWidth-34` right, `y=155`). Our Imprint shell
+puts em-dash margin-note keys down the left; adapting it to the bottom+sides topology is a
+design decision on the shell's key-hint language, not a coordinate port. Left for a design
+pass with the user. Reference coordinates recorded here so it needn't be re-researched.
+
+### Deferred
+
+No build/test CI exists (only a Pages deploy workflow), so a "build both feature sets"
+job needs a CI-pipeline decision rather than a mechanical edit.
 
 ---
 
