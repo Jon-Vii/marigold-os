@@ -28,7 +28,16 @@ use crate::sd_session::SdRoot;
 /// One-shot trigger file at the card root. 8.3-safe so it opens without long
 /// filename support, and distinct from the `update.bin` a user may keep on the
 /// card as a permanent recovery image.
+///
+/// Device-specific so a card is safe to move between an X4 and an X3: each
+/// build only picks up an image named for its own panel, so an X4 image
+/// (`FWUPDATE.BIN`) is invisible to an X3 and vice versa. Flashing the wrong
+/// build wouldn't brick (same SoC and partition table) but would drive the
+/// wrong panel and battery gauge — a black screen, not a recoverable state.
+#[cfg(not(feature = "device-x3"))]
 const TRIGGER_FILE: &str = "FWUPDATE.BIN";
+#[cfg(feature = "device-x3")]
+const TRIGGER_FILE: &str = "FWUPDX3.BIN";
 
 // Absolute flash offsets — must match `partitions.csv`.
 const OTADATA_OFFSET: u32 = 0x0000_e000;

@@ -120,7 +120,11 @@ with no computer — this is what keeps a locked unit from being a one-way trip:
 1. Copy a new app image to the card root as **`FWUPDATE.BIN`** (the `firmware.bin`
    / `update.bin` an `tools/build-release.sh` produces; the `FWUPDATE.BIN` name
    is the one-shot trigger, kept distinct from a permanent `update.bin` you may
-   also keep on the card).
+   also keep on the card). On the **X3** the trigger is **`FWUPDX3.BIN`**
+   instead — each build only picks up an image named for its own panel, so a
+   card is safe to carry between an X4 and an X3 without either grabbing the
+   other's image (they share a SoC and partition table, but not a display
+   controller or battery gauge, so a cross-flash is a black screen).
 2. Reboot. At boot, before the reader starts, the firmware validates the image
    (`proto::ota::validate_image`), writes it into the **inactive** OTA slot,
    flips `otadata` to select it (`proto::ota::plan_switch`), deletes
