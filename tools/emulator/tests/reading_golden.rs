@@ -2,9 +2,12 @@
 //! synthetic cached blocks through `ui::reading` — the exact code firmware
 //! uses for SD reading pages — and compare against checked-in frames.
 //!
+//! Golden images are pinned per-board (X4's 800x480 and X3's 792x528 each
+//! get their own files, see `golden_path`); pixel comparisons run on both.
+//!
 //! Regenerate after intentional typography changes with:
 //! `REGEN_READING_GOLDEN=1 cargo test --manifest-path tools/emulator/Cargo.toml --target <host> --test reading_golden`
-
+//! (repeat with `--features device-x3` to refresh the X3 frames too).
 use std::path::{Path, PathBuf};
 
 use display::fb::Framebuffer;
@@ -14,10 +17,8 @@ use display::font::{
 };
 use proto::cache::BlockRecord;
 use proto::text::{TextAlign, TextRole};
-use ui::reading::{
-    draw_reading_page_body, page_record_at, paginate_block_pages, ReadingBlocks,
-    READER_PAGE_BOTTOM, READER_PAGE_TOP,
-};
+use ui::reading::{draw_reading_page_body, page_record_at};
+use ui::reading::{paginate_block_pages, ReadingBlocks, READER_PAGE_BOTTOM, READER_PAGE_TOP};
 
 struct FixtureBlock {
     record: BlockRecord,
@@ -193,9 +194,10 @@ fn encode_png(fb: &Framebuffer) -> Vec<u8> {
 }
 
 fn golden_path(name: &str) -> PathBuf {
+    let suffix = if cfg!(feature = "device-x3") { "-x3" } else { "" };
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/golden")
-        .join(format!("{name}.png"))
+        .join(format!("{name}{suffix}.png"))
 }
 
 fn assert_page_matches_golden(source: &FixtureBlocks, page_index: usize, name: &str) {
@@ -285,13 +287,12 @@ fn reading_page_bodies_match_goldens_merriweather() {
     assert_page_matches_golden(&source, 0, "reading-page-merriweather-0");
 }
 
-/// The default grid holds exactly seventeen body lines: a paragraph
-/// split into seventeen one-line blocks (no inner paragraph gaps) fills
-/// one page, and an eighteenth line spills. Pins both the 26px default
-/// advance and the ink-height fit rule that stops charging a trailing
-/// paragraph gap against the page edge.
+/// The default grid fills the selected panel height: seventeen body lines on
+/// X4 or nineteen on the 48-row-taller X3, with the next line spilling. Pins
+/// both the 26px default advance and the ink-height fit rule that stops
+/// charging a trailing paragraph gap against the page edge.
 #[test]
-fn default_grid_fits_seventeen_body_lines() {
+fn default_grid_uses_selected_panel_height() {
     let paragraph_of = |lines: usize| -> FixtureBlocks {
         let blocks = (0..lines)
             .map(|index| FixtureBlock {
@@ -307,12 +308,21 @@ fn default_grid_fits_seventeen_body_lines() {
             settings: TypeSettings::DEFAULT,
         }
     };
+    let fitting_lines = if cfg!(feature = "device-x3") { 19 } else { 17 };
     assert_eq!(
-        paginate_block_pages(&paragraph_of(17), READER_PAGE_TOP, READER_PAGE_BOTTOM),
+        paginate_block_pages(
+            &paragraph_of(fitting_lines),
+            READER_PAGE_TOP,
+            READER_PAGE_BOTTOM
+        ),
         1
     );
     assert_eq!(
-        paginate_block_pages(&paragraph_of(18), READER_PAGE_TOP, READER_PAGE_BOTTOM),
+        paginate_block_pages(
+            &paragraph_of(fitting_lines + 1),
+            READER_PAGE_TOP,
+            READER_PAGE_BOTTOM
+        ),
         2
     );
 }
