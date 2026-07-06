@@ -66,15 +66,43 @@ const POSITION_MAGIC: &[u8; 4] = b"X4PS";
 const POSITION_VERSION: u8 = 1;
 const POSITION_BYTES: usize = 15;
 
+/// Panel-geometry salt mixed into the position checksum. The stored screen
+/// is a page-within-chapter index under this panel's pagination, so a
+/// position written on a differently sized panel (an SD card moved between
+/// an X4 and an X3) is meaningless. Zero on the X4 keeps every existing
+/// POS.BIN validating byte-for-byte; the X3's non-zero salt makes an
+/// X4-written record fail the checksum, so the reader resumes at book start
+/// rather than a stale page. The chapter would survive, but there is no
+/// separate progress source to reconcile it against, so full reset is the
+/// honest fallback.
+const POSITION_GEOMETRY_SALT: u32 =
+    (display::WIDTH as u32 ^ display::HEIGHT as u32) ^ (800 ^ 480);
+
+// The salt must vanish on the X4 or an upgrade would reject every existing
+// POS.BIN; guard the backward-compat guarantee at compile time.
+#[cfg(not(feature = "device-x3"))]
+const _: () = assert!(POSITION_GEOMETRY_SALT == 0);
+
 fn encode_position(chapter: u16, screen: u32) -> [u8; POSITION_BYTES] {
     let mut out = [0u8; POSITION_BYTES];
     out[..4].copy_from_slice(POSITION_MAGIC);
     out[4] = POSITION_VERSION;
     out[5..7].copy_from_slice(&chapter.to_le_bytes());
     out[7..11].copy_from_slice(&screen.to_le_bytes());
-    let sum: u32 = out[..11].iter().map(|byte| *byte as u32).sum();
+    let sum = position_checksum(&out[..11]);
     out[11..15].copy_from_slice(&sum.to_le_bytes());
     out
+}
+
+/// Byte sum salted with the panel geometry. Salt is 0 on the X4 (its
+/// `WIDTH ^ HEIGHT` cancels the `800 ^ 480` term) so historical checksums
+/// are unchanged; any other geometry shifts every checksum.
+fn position_checksum(bytes: &[u8]) -> u32 {
+    bytes
+        .iter()
+        .map(|byte| *byte as u32)
+        .sum::<u32>()
+        .wrapping_add(POSITION_GEOMETRY_SALT)
 }
 
 fn decode_position(bytes: &[u8]) -> Option<(u16, u32)> {
@@ -82,7 +110,7 @@ fn decode_position(bytes: &[u8]) -> Option<(u16, u32)> {
     {
         return None;
     }
-    let sum: u32 = bytes[..11].iter().map(|byte| *byte as u32).sum();
+    let sum = position_checksum(&bytes[..11]);
     if bytes[11..15] != sum.to_le_bytes() {
         return None;
     }
