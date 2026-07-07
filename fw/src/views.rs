@@ -276,8 +276,9 @@ fn draw_sd_reader_loading(fb: &mut Framebuffer, request: RenderRequest, sd_libra
     let (title, author) =
         sd_library.active_book_labels(request.book_id, fallback.title, fallback.author);
 
-    // Vertically center title + author block within the reader page region.
-    let title_y = 232i16;
+    // Vertically center title + author block within the reader page region
+    // (panel-relative, so the X3's taller page carries the plate down).
+    let title_y = display::HEIGHT as i16 / 2 - 8;
     let author_y = title_y + 36;
     draw_text_centered_truncated_local(
         fb,
