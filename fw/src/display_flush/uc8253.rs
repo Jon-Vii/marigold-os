@@ -204,6 +204,9 @@ async fn send_plane(
 }
 
 /// Fill a RAM plane with a constant byte (0xFF = white), row by row.
+///
+/// Deliberately does NOT send DATA_STOP, for the same reason as `send_plane`
+/// above: callers add it where the reference driver does.
 async fn fill_plane(epd: &mut Epd, ram_cmd: u8, fill: u8) -> Result<(), SpiError> {
     let mut row = [0u8; ROW_BYTES];
     row.fill(fill);
