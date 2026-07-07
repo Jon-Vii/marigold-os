@@ -2,7 +2,9 @@
 
 MarigoldOS is a lightweight, open-source firmware for the XTEink X4 and X3 e-readers.
 
-**[Try the emulator](https://jon-vii.github.io/MarigoldOS/) · [Flashing](docs/FLASHING.md) · [Architecture](docs/ARCHITECTURE.md)**
+[![Try the emulator](https://img.shields.io/badge/Try_the_emulator-E9A319?style=for-the-badge&logo=rust&logoColor=white)](https://jon-vii.github.io/MarigoldOS/)
+[![Flashing](https://img.shields.io/badge/Flashing-2b2b2b?style=for-the-badge)](docs/FLASHING.md)
+[![Architecture](https://img.shields.io/badge/Architecture-2b2b2b?style=for-the-badge)](docs/ARCHITECTURE.md)
 
 ![The X4 home screen in the browser emulator, showing Alice's Adventures in Wonderland](docs/home.png)
 
