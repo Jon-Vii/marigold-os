@@ -18,7 +18,7 @@
 //! from the reference, but mirrored or offset output is the expected first
 //! symptom to chase here.
 
-use super::{fill_transformed_band_impl, RefreshMode};
+use super::{fill_transformed_band_impl, RefreshMode, SpiOp};
 use crate::{fb::Framebuffer, BAND_BYTES};
 
 // --- UC8253 command set (subset used by the BW path) ---
@@ -89,22 +89,51 @@ pub struct LutBank {
 }
 
 /// The controller init byte stream (`fw::display_flush::uc8253` replays it
-/// after reset). Each entry is `(command, data)`. RAM-plane clears are done
-/// separately by the driver, which has the framebuffer geometry.
-pub static INIT_SEQUENCE: &[(u8, &[u8])] = &[
-    (CMD_PANEL_SETTING, &[0x3F, 0x0A]),
+/// after reset, same as `ssd1677::INIT_SEQUENCE`). Reset happens outside this
+/// table (the driver issues it before replaying), so every entry is a plain
+/// `SpiOp::Command`. RAM-plane clears are done separately by the driver,
+/// which has the framebuffer geometry.
+pub static INIT_SEQUENCE: &[SpiOp] = &[
+    SpiOp::Command {
+        cmd: CMD_PANEL_SETTING,
+        data: &[0x3F, 0x0A],
+    },
     // Resolution register: HRES 0x0318 (792), VRES 0x0258 (600). The panel
     // shows 528 rows; the controller's gate driver spans 600 and the extra
     // lines fall off-screen. Verbatim from the reference — do not "correct"
     // 600 to 528 without hardware to prove it.
-    (CMD_RESOLUTION, &[0x03, 0x18, 0x02, 0x58]),
-    (CMD_GATE_SOURCE_START, &[0x00, 0x00, 0x00, 0x00]),
-    (CMD_POWER_OFF_SEQ, &[0x20]),
-    (CMD_POWER_SETTING, &[0x07, 0x17, 0x3F, 0x3F, 0x17]),
-    (CMD_VCOM_DC, &[0x24]),
-    (CMD_BOOSTER_SOFT_START, &[0x25, 0x25, 0x3C, 0x37]),
-    (CMD_PLL_CONTROL, &[0x09]),
-    (CMD_LV_SELECTION, &[0x02]),
+    SpiOp::Command {
+        cmd: CMD_RESOLUTION,
+        data: &[0x03, 0x18, 0x02, 0x58],
+    },
+    SpiOp::Command {
+        cmd: CMD_GATE_SOURCE_START,
+        data: &[0x00, 0x00, 0x00, 0x00],
+    },
+    SpiOp::Command {
+        cmd: CMD_POWER_OFF_SEQ,
+        data: &[0x20],
+    },
+    SpiOp::Command {
+        cmd: CMD_POWER_SETTING,
+        data: &[0x07, 0x17, 0x3F, 0x3F, 0x17],
+    },
+    SpiOp::Command {
+        cmd: CMD_VCOM_DC,
+        data: &[0x24],
+    },
+    SpiOp::Command {
+        cmd: CMD_BOOSTER_SOFT_START,
+        data: &[0x25, 0x25, 0x3C, 0x37],
+    },
+    SpiOp::Command {
+        cmd: CMD_PLL_CONTROL,
+        data: &[0x09],
+    },
+    SpiOp::Command {
+        cmd: CMD_LV_SELECTION,
+        data: &[0x02],
+    },
 ];
 
 /// The four BW banks the refresh flow uses. `full` writes a quality frame

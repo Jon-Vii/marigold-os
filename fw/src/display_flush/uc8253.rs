@@ -21,7 +21,7 @@ use display::epd::uc8253::{
     CMD_LUT_BB, CMD_LUT_BW, CMD_LUT_VCOM, CMD_LUT_WB, CMD_LUT_WW, CMD_POWER_OFF, CMD_POWER_ON,
     CMD_VCOM_DATA_INTERVAL, DEEP_SLEEP_CHECK, INIT_SEQUENCE, PRESTAGE_STEPS,
 };
-use display::epd::RefreshMode;
+use display::epd::{RefreshMode, SpiOp};
 use display::fb::Framebuffer;
 use display::{BAND_BYTES, BAND_ROWS, HEIGHT, ROW_BYTES};
 use embassy_time::Timer;
@@ -43,8 +43,10 @@ pub(crate) async fn init_panel(epd: &mut Epd) {
     // The X3 needs an extra settle after reset beyond the shared pulse.
     Timer::after_millis(50).await;
 
-    for (cmd, data) in INIT_SEQUENCE {
-        let _ = epd.command(*cmd, data).await;
+    for op in INIT_SEQUENCE {
+        if let SpiOp::Command { cmd, data } = *op {
+            let _ = epd.command(cmd, data).await;
+        }
     }
     esp_println::println!("display: x3 busy post-init high={:?}", epd.busy_is_high());
 

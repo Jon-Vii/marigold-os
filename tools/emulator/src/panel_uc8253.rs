@@ -12,7 +12,7 @@ use display::epd::{
     CMD_LUT_BW, CMD_LUT_VCOM, CMD_LUT_WB, CMD_LUT_WW, CMD_LV_SELECTION, CMD_PANEL_SETTING,
     CMD_PLL_CONTROL, CMD_POWER_OFF, CMD_POWER_OFF_SEQ, CMD_POWER_ON, CMD_POWER_SETTING,
     CMD_RESOLUTION, CMD_VCOM_DATA_INTERVAL, CMD_VCOM_DC, DEEP_SLEEP_CHECK, INIT_SEQUENCE, LUT_LEN,
-    PRESTAGE_STEPS,
+    PRESTAGE_STEPS, SpiOp,
 };
 use display::fb::Framebuffer;
 use display::{BAND_BYTES, BAND_ROWS, FB_BYTES, HEIGHT, ROW_BYTES, WIDTH};
@@ -63,8 +63,10 @@ impl PanelModel {
 
     pub fn init_sequence(&mut self) -> Result<(), String> {
         self.reset();
-        for (cmd, data) in INIT_SEQUENCE {
-            self.command(*cmd, data)?;
+        for op in INIT_SEQUENCE {
+            if let SpiOp::Command { cmd, data } = *op {
+                self.command(cmd, data)?;
+            }
         }
         self.initialized = true;
         self.write_fill(RamPlane::Old, 0xFF)?;
