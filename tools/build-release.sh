@@ -3,7 +3,8 @@
 #
 # Usage: tools/build-release.sh [x4|x3]   (default x4)
 #
-# Produces, in target/release-images/ (X3 images carry an -x3 suffix):
+# Produces local development images in target/release-images/ (X3 images carry an
+# -x3 suffix):
 #   firmware.bin    app image for OTA slot app0/ota_0. Flash to 0x10000. This is
 #                   what the web flasher, `esptool write_flash 0x10000`, and the
 #                   in-app SD/OTA updater consume. Leaves the bootloader intact.
@@ -15,6 +16,9 @@
 #                   `esptool write_flash 0x0`. NEVER put this on an SD card and
 #                   NEVER write it to 0x10000 — it would land a bootloader in the
 #                   app slot and brick the device.
+#
+# GitHub releases publish only app/SD images: firmware-x4.bin, firmware-x3.bin,
+# update.bin, and FWUPDX3.BIN. full-flash*.bin remains local-only.
 #
 # The app images carry our app descriptor (magic 0xABCD5432 at image offset
 # 0x20) with the wide-open eFuse-revision range, which is what lets the stock

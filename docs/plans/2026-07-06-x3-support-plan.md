@@ -1,9 +1,15 @@
 # Xteink X3 Support — Implementation Plan
 
-Status: **the existing-code scaffolding is done and committed** (Phases 1, 4, 5, and the
-Phase 2 *seam*); the remaining work is the new X3 drivers (UC8253 panel, BQ27220 battery)
-and on-device validation. Blocked on hardware for final validation (an X3 plus its 4-pin
-magnetic pogo cable — the 2-pin cable is charge-only and cannot flash).
+Status: **hardware-verified.** The `device-x3` build has working UC8253 panel and
+BQ27220 battery support, and the release path now publishes X3 app/SD images beside the
+X4 images. The 4-pin magnetic pogo cable is still required for USB serial/flashing; the
+2-pin cable is charge-only and cannot flash.
+
+## Validation update (2026-07-07)
+
+The X3 path is no longer speculative: panel bring-up and battery reads have been validated
+on real hardware. The remaining release-site work treats X3 as first-class: `firmware-x3.bin`
+for app-only flashing and `FWUPDX3.BIN` for SD updates.
 
 ## Progress (2026-07-06)
 
@@ -27,17 +33,17 @@ eyeballed in the preview tool (apparatus back in the corner, nothing clipped):
   manifests; the SD firmware trigger filename is per-panel (`FWUPDATE.BIN` vs
   `FWUPDX3.BIN`) so a card is safe to move between devices; FLASHING.md updated.
 
-### UC8253 driver — DONE (2026-07-06, unverified on hardware)
+### UC8253 driver — DONE (2026-07-06), hardware-verified (2026-07-07)
 
 Phase 2 bodies are ported from CrossPoint's `Uc8253X3Driver` (MIT), BW path only:
 `display/src/epd/uc8253.rs` (command set, 4 BW LUT banks, init/resolution bytes,
 vertical-flip orientation, 16 MHz SPI) and `fw/src/display_flush/uc8253.rs` (the refresh
 flow — Fast=DTM2-vs-DTM1 turbo, Full=white-DTM1 baseline + settle, FastClean=absolute
 half scrub, prestage→DTM1). Added `EpdBus::wait_two_phase` for the X3's low-then-high
-BUSY. Every panel-facing value is transcribed from the reference and is a Phase-6
-bench-iteration point (orientation, BUSY timing, waveform behavior at clock).
+BUSY. The port started from the CrossPoint reference and has since been exercised on the
+X3 panel.
 
-### Phase 3 — BQ27220 battery — DONE (2026-07-06, unverified on hardware)
+### Phase 3 — BQ27220 battery — DONE (2026-07-06), hardware-verified (2026-07-07)
 
 `hal-ext/src/bq27220.rs` is a small generic async gauge driver (SOC / voltage / charging
 sign). `main.rs` cfg-swaps GPIO0 from the aux ADC to I2C0 SCL (SDA=GPIO20, 400 kHz) on
@@ -49,8 +55,8 @@ before deep sleep (µA leak against the always-powered gauge).
 
 ### Still open
 
-- **Phase 6 — on-device validation.** The only remaining work; needs the X3 + 4-pin pogo
-  cable. All existing-code and new-code scaffolding is now in place and building.
+- **Release smoke.** Build the tagged X3 release asset and run one app-only flash plus one
+  `FWUPDX3.BIN` SD update before calling the public release fully exercised.
 
 ### Key-hint positions — DONE (2026-07-06)
 

@@ -1,7 +1,7 @@
-# xteink-x4-os architecture
+# MarigoldOS architecture
 
-This firmware is a bare-metal Rust reader OS for the Xteink X4 e-ink reader:
-ESP32-C3, SSD1677, 800x480 monochrome panel, no PSRAM.
+This firmware is a bare-metal Rust reader OS for the Xteink X4 and X3 e-ink
+readers: ESP32-C3, monochrome e-paper panels, no PSRAM.
 
 The design goal is not to imitate a desktop OS. It is a small data pipeline:
 
@@ -441,6 +441,7 @@ cargo test -p app-core -p proto --target aarch64-apple-darwin
 cargo test --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --no-default-features
 cargo run --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --no-default-features -- --scenario fixtures/scenarios --check fixtures/golden
 cargo run --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --no-default-features -- --scenario fixtures/scenarios --dump target/emulator
+cargo run --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --no-default-features -- --scenario fixtures/scenarios --present-dump target/emulator-presented
 cargo run --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --features gui -- --gui
 ```
 
@@ -475,9 +476,11 @@ cp tools/web-emulator/target/wasm32-unknown-unknown/release/x4_web_emulator.wasm
 python3 -m http.server -d web   # local check
 ```
 
-`.github/workflows/pages.yml` runs the same build and publishes `web/` to
-GitHub Pages on every push to main that touches `web/`, the wasm crate, or the
-shared crates. The built `.wasm` is gitignored; only sources are committed.
+`.github/workflows/pages.yml` runs the same build, checks the golden frames,
+exports browser-presented scenario screenshots into `images/screens/`, and
+publishes `web/` to GitHub Pages on every push to main that touches `web/`, the
+wasm crate, shared crates, or scenario fixtures. The built `.wasm` is
+gitignored; only sources are committed.
 
 ## Reader app model
 

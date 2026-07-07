@@ -10,6 +10,8 @@ on:
       - "display/**"
       - "ui/**"
       - "proto/**"
+      - "fixtures/scenarios/**"
+      - "fixtures/golden/**"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
@@ -34,11 +36,15 @@ jobs:
       - name: Build wasm emulator
         working-directory: tools/web-emulator
         run: cargo +nightly-2025-10-01 build --target wasm32-unknown-unknown --release
+      - name: Check emulator golden frames
+        run: cargo +nightly-2025-10-01 run --manifest-path tools/emulator/Cargo.toml --target x86_64-unknown-linux-gnu --no-default-features -- --scenario fixtures/scenarios --check fixtures/golden
       - name: Assemble site
         run: |
           mkdir -p _site
-          cp web/index.html _site/
+          cp -R web/. _site/
           cp tools/web-emulator/target/wasm32-unknown-unknown/release/x4_web_emulator.wasm _site/
+      - name: Generate presented screen gallery frames
+        run: cargo +nightly-2025-10-01 run --manifest-path tools/emulator/Cargo.toml --target x86_64-unknown-linux-gnu --no-default-features -- --scenario fixtures/scenarios --present-dump _site/images/screens
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _site

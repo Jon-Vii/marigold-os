@@ -1,4 +1,4 @@
-# xteink-x4-os Context
+# MarigoldOS Context
 
 ## Glossary
 

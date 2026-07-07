@@ -1,0 +1,16 @@
+{
+  "name": "MarigoldOS X3",
+  "version": "latest",
+  "new_install_prompt_erase": false,
+  "builds": [
+    {
+      "chipFamily": "ESP32-C3",
+      "parts": [
+        {
+          "path": "https://github.com/Jon-Vii/MarigoldOS/releases/latest/download/firmware-x3.bin",
+          "offset": 65536
+        }
+      ]
+    }
+  ]
+}

@@ -1,22 +1,23 @@
 # Flashing & release images
 
 This firmware ships as a standard ESP32-C3 application image that boots under
-the Xteink X4's **stock second-stage bootloader**. That's what makes it
+the Xteink X4/X3 **stock second-stage bootloader**. That's what makes it
 installable the same way the other community firmwares (CrossPoint, CrossInk)
 are — including, in principle, on *locked* units.
 
 ## Unlocked vs. locked units
 
-Some X4s — typically the ones bought from third-party sellers (AliExpress) —
+Some X4s and X3s — typically the ones bought from third-party sellers (AliExpress) —
 ship with **USB flashing disabled in eFuse at the factory**. Units bought
 directly from xteink.com are not locked.
 
-To tell which you have: connect over USB-C and try to flash (`cargo run` or the
-web flasher). If the device never appears as a serial port even after trying
-another cable/port/browser, assume it's locked.
+To tell which you have: connect over USB (USB-C on X4, the 4-pin pogo cable on
+X3) and try to flash (`cargo run` or the web flasher). If the device never
+appears as a serial port even after trying another cable/port/browser, assume
+it's locked.
 
-The author's own unit is unlocked, and **the locked-device path below has not
-yet been validated on real locked silicon** — see [Status](#status).
+The author's own X4 is unlocked, so the locked-device path still needs a real
+locked-unit confirmation — see [Status](#status).
 
 ## The layout
 
@@ -53,43 +54,44 @@ xxd -s 0x20 -l 4 target/release-images/firmware.bin   # -> 3254 cdab (0xABCD5432
 
 ```sh
 tools/build-release.sh        # X4 (default)
-tools/build-release.sh x3     # X3 — see the experimental section below
+tools/build-release.sh x3     # X3
 ```
 
-Produces, in `target/release-images/`:
+Produces local images in `target/release-images/`:
 
 - **`firmware.bin`** — app image for `ota_0`. Flash to `0x10000`. Updates the
   app in place and leaves the bootloader untouched. This is what the web
   flasher, `esptool write_flash 0x10000`, and (once implemented) the in-app
   updater consume.
+- **`firmware-x3.bin`** — the same app image contract for X3 builds.
 - **`update.bin`** — byte-identical to `firmware.bin`, under the filename the
   stock OEM SD-card updater looks for. The OEM updater writes it to the app
   slot at `0x10000`, so it is an **app image, not a full-flash image**.
-- **`full-flash.bin`** — merged 16 MB image (bootloader + partition table +
-  app) for programming a whole *unlocked* unit from scratch with
-  `esptool write_flash 0x0`.
+- **`FWUPDX3.BIN`** — the X3 SD-card trigger filename.
+- **`full-flash*.bin`** — merged 16 MB images (bootloader + partition table +
+  app) for local bench recovery on unlocked units only.
+
+Tagged GitHub releases publish only the four public app/SD assets:
+`firmware-x4.bin`, `firmware-x3.bin`, `update.bin`, and `FWUPDX3.BIN`.
+`firmware-x4.bin` is the release-time name for the default X4
+`target/release-images/firmware.bin`.
 
 > [!CAUTION]
-> Never put `full-flash.bin` on an SD card and never write it to `0x10000`. The
+> Never put `full-flash*.bin` on an SD card and never write it to `0x10000`. The
 > OEM SD updater writes whatever it finds to the app slot; a full-flash image
 > there lands a bootloader in the middle of the app partition and bricks the
 > device. Writing to `0x0` is the fastest brick on any unit. The SD card and the
-> app slot only ever take `update.bin`/`firmware.bin`.
+> app slot only ever take `update.bin`/`FWUPDX3.BIN` or the app-only
+> `firmware-*.bin` images.
 
-## Xteink X3 (experimental — unverified on hardware)
+## Xteink X3
 
 The X3 is the X4's sibling: same ESP32-C3, same 16 MB flash, same partition
 table and bootloader path, on a smaller 792×528 UC8253 panel with a BQ27220
 battery gauge instead of the X4's ADC divider. Support lives behind the
-`device-x3` feature; the default build is unchanged and byte-identical for the
-X4.
-
-> [!WARNING]
-> Every panel- and gauge-facing value is transcribed from the CrossPoint
-> reference and **has not been run on real X3 silicon**. A mirrored, offset, or
-> blank first boot is expected and diagnosable — not a brick (same SoC and
-> partition table as the X4). See `docs/plans/2026-07-06-x3-support-plan.md`
-> for the Phase 6 bring-up checklist.
+`device-x3` feature; the default build is unchanged for the X4. X3 support has
+now been validated on hardware, so the web flasher and release pipeline publish
+first-class X3 images alongside X4 images.
 
 Build the X3 images:
 
@@ -100,8 +102,9 @@ tools/build-release.sh x3
 Produces, in `target/release-images/`: **`firmware-x3.bin`** (flash to
 `0x10000`), **`FWUPDX3.BIN`** (SD-card trigger — a *device-specific* name, so a
 card can't cross-flash an X4 image onto an X3 or vice versa), and
-**`full-flash-x3.bin`** (whole-flash, unlocked units only). The flash paths are
-the same as the X4 below, with the `-x3` image names.
+**`full-flash-x3.bin`** (local whole-flash image for unlocked bench units only).
+The app-only flash paths are the same as the X4 below, with the `-x3` image
+names.
 
 > [!NOTE]
 > The X3 charges and flashes through a **4-pin magnetic pogo connector**, not
@@ -121,8 +124,9 @@ cargo run -p fw --release
 
 # App-only, with esptool:
 esptool.py --chip esp32c3 write_flash 0x10000 target/release-images/firmware.bin
+esptool.py --chip esp32c3 write_flash 0x10000 target/release-images/firmware-x3.bin
 
-# Whole flash from scratch:
+# Whole flash from scratch, local unlocked bench units only:
 esptool.py --chip esp32c3 write_flash 0x0 target/release-images/full-flash.bin
 ```
 
@@ -188,9 +192,10 @@ Implemented and verified on host tooling:
 - [x] Stock-compatible dual-OTA partition table (`partitions.csv`).
 - [x] App descriptor with the open eFuse range at offset `0x20` (bootloader-gate
       workaround), verified present in the built image.
-- [x] Reproducible `firmware.bin` / `update.bin` / `full-flash.bin` release
-      images (`tools/build-release.sh`). The SD `update.bin` is an app image
-      written to `0x10000`, matching the OEM updater.
+- [x] Reproducible app/SD images (`firmware.bin`, `firmware-x3.bin`,
+      `update.bin`, `FWUPDX3.BIN`) plus local-only `full-flash*.bin` bench
+      images (`tools/build-release.sh`). The SD images are app images written to
+      `0x10000`, matching the OEM updater.
 - [x] `cargo run` flashes the stock-compatible layout.
 - [x] **Image validator** (`proto::ota::validate_image`) — the integrity gate
       (magic / segment walk / XOR checksum / SHA-256 trailer) that must pass
@@ -237,7 +242,6 @@ Not yet done:
 - [ ] **Locked-unit confirmation** — that our app-descriptor eFuse range
       satisfies the stock gate and the OEM SD updater accepts our `update.bin`.
       Needs a locked device; the author's is unlocked.
-- [ ] **Xteink X3 bring-up** — the `device-x3` build compiles and the X4 build is
-      byte-identical, but the UC8253 panel driver and BQ27220 gauge are ported
-      from reference and unproven on real X3 silicon. See the experimental
-      section above and `docs/plans/2026-07-06-x3-support-plan.md` Phase 6.
+- [x] **Xteink X3 bring-up** — the `device-x3` build now has hardware-verified
+      UC8253 panel and BQ27220 gauge support, and release tooling publishes X3
+      app/SD images beside the X4 images.

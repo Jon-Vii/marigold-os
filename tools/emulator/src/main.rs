@@ -10,9 +10,9 @@ use display::{HEIGHT, WIDTH};
 #[cfg(feature = "gui")]
 use eframe::egui;
 use panel::PanelModel;
-use render::write_png;
 #[cfg(feature = "gui")]
 use render::framebuffer_to_color_image;
+use render::{write_png, write_presented_png};
 use scenario::Scenario;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -31,6 +31,7 @@ struct Args {
     scenario: Option<PathBuf>,
     sd_root: Option<PathBuf>,
     dump: Option<PathBuf>,
+    present_dump: Option<PathBuf>,
     check: Option<PathBuf>,
     gui: bool,
 }
@@ -40,6 +41,7 @@ impl Args {
         let mut scenario = None;
         let mut sd_root = None;
         let mut dump = None;
+        let mut present_dump = None;
         let mut check = None;
         let mut gui = false;
         let mut iter = env::args().skip(1);
@@ -52,13 +54,18 @@ impl Args {
                     sd_root = Some(PathBuf::from(iter.next().ok_or("--sd-root needs a path")?))
                 }
                 "--dump" => dump = Some(PathBuf::from(iter.next().ok_or("--dump needs a path")?)),
+                "--present-dump" => {
+                    present_dump = Some(PathBuf::from(
+                        iter.next().ok_or("--present-dump needs a path")?,
+                    ))
+                }
                 "--check" => {
                     check = Some(PathBuf::from(iter.next().ok_or("--check needs a path")?))
                 }
                 "--gui" => gui = true,
                 "--help" | "-h" => {
                     return Err(
-                        "usage: x4-emulator [--gui] [--scenario PATH] [--sd-root PATH] [--dump out.png] [--check golden.png]"
+                        "usage: x4-emulator [--gui] [--scenario PATH] [--sd-root PATH] [--dump out.png] [--present-dump out.png] [--check golden.png]"
                             .into(),
                     );
                 }
@@ -69,6 +76,7 @@ impl Args {
             scenario,
             sd_root,
             dump,
+            present_dump,
             check,
             gui,
         })
@@ -81,6 +89,9 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         let emu = Emulator::boot(args.sd_root);
         if let Some(path) = args.dump {
             write_png(&path, emu.framebuffer())?;
+        }
+        if let Some(path) = args.present_dump {
+            write_presented_png(&path, emu.framebuffer())?;
         }
         if let Some(path) = args.check {
             compare_png(&path, emu.framebuffer())?;
@@ -101,6 +112,11 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             let path = output_path(dump, &path)?;
             write_png(&path, emu.framebuffer())?;
             println!("dumped {}", path.display());
+        }
+        if let Some(dump) = &args.present_dump {
+            let path = output_path(dump, &path)?;
+            write_presented_png(&path, emu.framebuffer())?;
+            println!("presented {}", path.display());
         }
         if let Some(check) = &args.check {
             let path = output_path(check, &path)?;
@@ -220,9 +236,11 @@ impl Emulator {
         // scenarios must be able to walk the whole connect flow. The
         // no-network screen stays reachable through the forget flow (or
         // pinned by app-core unit tests).
-        emu.state = emu.state.apply_sync_event(app_core::SyncEvent::NetworkSaved(
-            app_core::WifiSsid::new("HOME-WIFI").unwrap(),
-        ));
+        emu.state = emu
+            .state
+            .apply_sync_event(app_core::SyncEvent::NetworkSaved(
+                app_core::WifiSsid::new("HOME-WIFI").unwrap(),
+            ));
         emu.render(app_core::RenderKind::Boot);
         emu
     }
@@ -446,7 +464,10 @@ impl eframe::App for EmulatorApp {
             ui.label(format!("Page: {}", state.page));
             ui.label(format!("Selection: {}", state.selection));
             ui.label(format!("Battery: {}%", state.battery_percent));
-            ui.label(format!("Refresh: {:?}", self.emulator.panel().last_refresh()));
+            ui.label(format!(
+                "Refresh: {:?}",
+                self.emulator.panel().last_refresh()
+            ));
             ui.separator();
             ui.label("Keys");
             ui.label("Q Power");

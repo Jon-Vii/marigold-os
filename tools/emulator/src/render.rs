@@ -7,7 +7,9 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use ui::{
-    app_render::{render_request as render_shared_request, render_sleep as render_shared_sleep, UiRenderModel},
+    app_render::{
+        render_request as render_shared_request, render_sleep as render_shared_sleep, UiRenderModel,
+    },
     UiBook, UiLibraryStatus, UiTocItem,
 };
 
@@ -84,6 +86,19 @@ pub fn write_png(path: &Path, fb: &Framebuffer) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
+pub fn write_presented_png(
+    path: &Path,
+    fb: &Framebuffer,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+    encode_presented_png(&mut writer, fb)?;
+    Ok(())
+}
+
 pub fn encode_png<W: Write>(writer: W, fb: &Framebuffer) -> Result<(), png::EncodingError> {
     let mut encoder = png::Encoder::new(writer, display::WIDTH as u32, display::HEIGHT as u32);
     encoder.set_color(png::ColorType::Grayscale);
@@ -93,6 +108,27 @@ pub fn encode_png<W: Write>(writer: W, fb: &Framebuffer) -> Result<(), png::Enco
     for y in 0..display::HEIGHT {
         for x in 0..display::WIDTH {
             data.push(if fb.pixel(x, y) { 0xEE } else { 0x18 });
+        }
+    }
+    writer.write_image_data(&data)
+}
+
+pub fn encode_presented_png<W: Write>(
+    writer: W,
+    fb: &Framebuffer,
+) -> Result<(), png::EncodingError> {
+    let mut encoder = png::Encoder::new(writer, display::WIDTH as u32, display::HEIGHT as u32);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header()?;
+    let mut data = Vec::with_capacity(display::WIDTH * display::HEIGHT * 4);
+    for y in 0..display::HEIGHT {
+        for x in 0..display::WIDTH {
+            if fb.pixel(x, y) {
+                data.extend_from_slice(&[238, 236, 226, 255]);
+            } else {
+                data.extend_from_slice(&[22, 22, 20, 255]);
+            }
         }
     }
     writer.write_image_data(&data)

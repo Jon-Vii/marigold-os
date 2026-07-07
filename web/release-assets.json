@@ -1,0 +1,11 @@
+{
+  "releaseNotes": "https://github.com/Jon-Vii/MarigoldOS/releases/latest",
+  "webFlasher": {
+    "x4Manifest": "manifest-x4.json",
+    "x3Manifest": "manifest-x3.json"
+  },
+  "sdInstall": {
+    "x4": "https://github.com/Jon-Vii/MarigoldOS/releases/latest/download/update.bin",
+    "x3": "https://github.com/Jon-Vii/MarigoldOS/releases/latest/download/FWUPDX3.BIN"
+  }
+}
