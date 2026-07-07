@@ -13,12 +13,16 @@ use esp_hal::time::RateExtU32;
 use esp_hal::Async;
 
 /// SD SPI-mode identification must run at 100-400 kHz; data transfer is
-/// specced to 25 MHz. The shared bus otherwise runs at the SSD1677's
-/// 40 MHz, which is out of SD spec entirely and what the read-retry
-/// machinery in the EPUB path was quietly absorbing.
+/// specced to 25 MHz. The shared bus otherwise runs at the active panel's
+/// clock, which on the X4 (SSD1677, 40 MHz) is out of SD spec entirely and
+/// what the read-retry machinery in the EPUB path was quietly absorbing.
 const SD_IDENT_FREQ_KHZ: u32 = 400;
 const SD_DATA_FREQ_MHZ: u32 = 20;
-const DISPLAY_FREQ_MHZ: u32 = 40;
+/// Restore frequency after SD access: the active panel's SPI clock. This
+/// MUST be per-panel — the UC8253 (X3) can't decode above ~20 MHz, so
+/// restoring the X4's 40 MHz leaves the panel deaf to every subsequent
+/// command (init included, since the boot catalog read precedes it).
+const DISPLAY_FREQ_HZ: u32 = display::epd::SPI_HZ;
 
 pub(crate) struct StaticTime;
 
@@ -235,7 +239,7 @@ pub(crate) fn with_root<R>(
     sd_cs.set_high();
     let _ = epd
         .spi_mut()
-        .apply_config(&SpiConfig::default().with_frequency(DISPLAY_FREQ_MHZ.MHz()));
+        .apply_config(&SpiConfig::default().with_frequency(DISPLAY_FREQ_HZ.Hz()));
     result
 }
 
