@@ -157,14 +157,17 @@ fn scenario_paths(path: Option<&Path>) -> Result<Vec<PathBuf>, String> {
 }
 
 fn output_path(base: &Path, scenario: &Path) -> Result<PathBuf, String> {
+    let suffix = if cfg!(feature = "device-x3") { "-x3" } else { "" };
     if base.extension().is_some_and(|ext| ext == "png") {
-        return Ok(base.to_owned());
+        let parent = base.parent().unwrap_or(Path::new(""));
+        let stem = base.file_stem().and_then(|s| s.to_str()).ok_or("invalid stem")?;
+        return Ok(parent.join(format!("{stem}{suffix}.png")));
     }
     let name = scenario
         .file_stem()
         .and_then(|name| name.to_str())
         .ok_or_else(|| format!("scenario has no valid file stem: {}", scenario.display()))?;
-    Ok(base.join(format!("{name}.png")))
+    Ok(base.join(format!("{name}{suffix}.png")))
 }
 
 fn compare_png(path: &Path, fb: &display::fb::Framebuffer) -> Result<(), String> {
