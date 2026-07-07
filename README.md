@@ -5,7 +5,7 @@ MarigoldOS is a lightweight, open-source firmware for the Xteink X4 and X3 e-rea
 [![Flashing](https://img.shields.io/badge/Flashing-2b2b2b?style=flat)](docs/FLASHING.md)
 [![Architecture](https://img.shields.io/badge/Architecture-2b2b2b?style=flat)](docs/ARCHITECTURE.md)
 
-![The X4 home screen in the browser emulator, showing Alice's Adventures in Wonderland](docs/home.png)
+![The MarigoldOS site showing the browser emulator home menu with Alice's Adventures in Wonderland selected](docs/home.png)
 
 If you'd like to explore the OS without flashing a device,
 [try the emulator](https://jon-vii.github.io/MarigoldOS/) in your browser — the

@@ -77,12 +77,15 @@ impl WebEmulator {
                 count: SHELF.len() as u16,
             },
         );
+        emu.restore_active_book(ReaderSource::sd(0).book_id(), 0, 0);
         // The firmware's boot probe of /XTEINK/WIFI.BIN, pretended: a saved
         // network so the Wireless screen opens on the connect/forget offer.
         // Forgetting it exposes the portal flow, which "saves" it back.
         emu.state = emu
             .state
             .apply_sync_event(SyncEvent::NetworkSaved(home_network()));
+        emu.hydrate_book_metadata(0);
+        emu.apply_loaded_metadata(0);
         emu.render(RenderKind::Boot);
         emu
     }
@@ -201,12 +204,22 @@ impl WebEmulator {
     }
 
     fn finish_open(&mut self, book_index: u16) {
-        if !self.store_ready_for(book_index) {
-            let source = &SHELF[book_index as usize % SHELF.len()];
-            self.store = Some(BookStore::build(source, self.state.type_settings()));
-            self.store_book = Some(book_index);
+        self.hydrate_book_metadata(book_index);
+        self.apply_loaded_metadata(book_index);
+        self.render(RenderKind::Page);
+    }
+
+    fn hydrate_book_metadata(&mut self, book_index: u16) {
+        if self.store_ready_for(book_index) {
+            return;
         }
+        let source = &SHELF[book_index as usize % SHELF.len()];
+        self.store = Some(BookStore::build(source, self.state.type_settings()));
+        self.store_book = Some(book_index);
         self.load_status = LoadStatus::Ready;
+    }
+
+    fn apply_loaded_metadata(&mut self, book_index: u16) {
         let store = self.store.as_ref().unwrap();
         let mut chapter_pages = [0u16; MAX_SD_CHAPTERS];
         for (slot, chapter) in chapter_pages.iter_mut().zip(store.chapters.iter()) {
@@ -220,7 +233,24 @@ impl WebEmulator {
             chapter_pages,
         };
         self.state = self.state.apply_library_event(self.ctx, event);
-        self.render(RenderKind::Page);
+    }
+
+    fn restore_active_book(&mut self, book_id: u32, chapter: u32, page: u32) {
+        self.state = self.state.apply_library_event(
+            self.ctx,
+            LibraryEvent::Restored {
+                book_id,
+                chapter: chapter.min(u8::MAX as u32) as u8,
+                page,
+                page_count: 0,
+                reading_orientation: self.state.orientation as u8,
+                refresh_policy: self.state.refresh_policy as u8,
+                font_size: self.state.font_size as u8,
+                line_spacing: self.state.line_spacing as u8,
+                font_weight: self.state.font_weight as u8,
+                font_family: self.state.font_family as u8,
+            },
+        );
     }
 
     fn restore(&mut self, snapshot: [u32; 9]) {
@@ -239,6 +269,9 @@ impl WebEmulator {
                 font_family: snapshot[8] as u8,
             },
         );
+        let book_index = ReaderSource::from_book_id(snapshot[0]).sd_index().unwrap_or(0);
+        self.hydrate_book_metadata(book_index);
+        self.apply_loaded_metadata(book_index);
         self.render(RenderKind::Page);
     }
 
