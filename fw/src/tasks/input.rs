@@ -243,7 +243,7 @@ async fn read_power(
         }
         Err(err) => {
             *gauge_failures = gauge_failures.saturating_add(1);
-            if *gauge_failures == 1 || *gauge_failures % GAUGE_ERR_LOG_TICKS == 0 {
+            if *gauge_failures == 1 || (*gauge_failures).is_multiple_of(GAUGE_ERR_LOG_TICKS) {
                 esp_println::println!(
                     "input: bq27220 read failed ({:?}, {} consecutive)",
                     err,
