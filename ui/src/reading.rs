@@ -9,8 +9,8 @@
 
 use display::fb::Framebuffer;
 use display::font::{
-    draw_text, family_weighted, measure_text, style_from_marker_code, BitmapFont, FontSize,
-    FontStyle, LineSpacing, TypeSettings, STYLE_MARKER,
+    draw_text, family_weighted, fixed_ceil, fixed_round, measure_text, style_from_marker_code,
+    BitmapFont, FontSize, FontStyle, LineSpacing, TypeSettings, STYLE_MARKER,
 };
 use proto::cache::{BlockRecord, PageRecord};
 use proto::text::{TextAlign, TextRole};
@@ -314,8 +314,9 @@ pub const READER_WRAP_SAFETY: i16 = 4;
 /// existing caches rebuild on a family change.
 /// v15: the second family changed from Bookerly to Merriweather. Its advances
 /// differ, but the family bit (1) does not, so a version bump is what retires
-/// any pagination cached under the old face.
-const READER_LAYOUT_VERSION: u16 = 15;
+/// any pagination cached under the old face. v16: font advances moved to 12.4
+/// fixed point and generated kerning tables now affect line widths.
+const READER_LAYOUT_VERSION: u16 = 16;
 
 /// Panel-geometry salt folded into the version bits: wrap points and page
 /// heights depend on the page box, so pagination cached on one panel must
@@ -424,15 +425,17 @@ pub fn reader_x_for(role: TextRole) -> i16 {
 /// advance width (italics, some punctuation).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct InkCursor {
-    advance: i16,
+    advance_fp: i32,
     right: i16,
+    previous: Option<u16>,
 }
 
 impl InkCursor {
     pub const fn new() -> Self {
         Self {
-            advance: 0,
+            advance_fp: 0,
             right: 0,
+            previous: None,
         }
     }
 
@@ -444,17 +447,33 @@ impl InkCursor {
             ch as u16
         };
         let Some((metric, _)) = font.glyph(codepoint).or_else(|| font.glyph(b'?' as u16)) else {
-            self.advance += 8;
-            self.right = self.right.max(self.advance);
+            self.advance_fp += 8 << 4;
+            self.right = self.right.max(fixed_ceil(self.advance_fp));
+            self.previous = Some(b'?' as u16);
             return;
         };
-        let glyph_right = self.advance + metric.x_offset as i16 + metric.width as i16;
+        let drawn = if font.glyph(codepoint).is_some() {
+            codepoint
+        } else {
+            b'?' as u16
+        };
+        if let Some(left) = self.previous {
+            self.advance_fp += font.kerning_adjust_fp(left, drawn) as i32;
+        }
+        let advance = fixed_round(self.advance_fp);
+        let glyph_right = advance + metric.x_offset as i16 + metric.width as i16;
         self.right = self.right.max(glyph_right);
-        self.advance += metric.advance as i16;
+        self.advance_fp += metric.advance_fp as i32;
+        self.previous = Some(drawn);
+    }
+
+    #[inline]
+    pub fn reset_pair(&mut self) {
+        self.previous = None;
     }
 
     pub fn width(&self) -> i16 {
-        self.right.max(self.advance)
+        self.right.max(fixed_ceil(self.advance_fp))
     }
 }
 
@@ -493,6 +512,7 @@ impl StyledInkCursor {
         while let Some(ch) = chars.next() {
             if ch == STYLE_MARKER {
                 if let Some(code) = chars.next() {
+                    self.ink.reset_pair();
                     self.font = body_font(
                         self.settings,
                         style_from_marker_code(code).unwrap_or(FontStyle::Regular),
@@ -901,25 +921,34 @@ mod tests {
     /// Reference implementation: measure the whole string from scratch,
     /// exactly as the pre-incremental firmware code did.
     fn naive_text_ink_width(font: &'static BitmapFont, text: &str) -> i16 {
-        let mut advance = 0i16;
+        let mut advance_fp = 0i32;
         let mut right = 0i16;
+        let mut previous = None;
         for ch in text.chars() {
             let codepoint = if ch as u32 > u16::MAX as u32 {
                 b'?' as u16
             } else {
                 ch as u16
             };
-            let Some((metric, _)) = font.glyph(codepoint).or_else(|| font.glyph(b'?' as u16))
-            else {
-                advance += 8;
-                right = right.max(advance);
+            let (drawn, metric) = if let Some((metric, _)) = font.glyph(codepoint) {
+                (codepoint, metric)
+            } else if let Some((metric, _)) = font.glyph(b'?' as u16) {
+                (b'?' as u16, metric)
+            } else {
+                advance_fp += 8 << 4;
+                right = right.max(fixed_ceil(advance_fp));
                 continue;
             };
+            if let Some(left) = previous {
+                advance_fp += font.kerning_adjust_fp(left, drawn) as i32;
+            }
+            let advance = fixed_round(advance_fp);
             let glyph_right = advance + metric.x_offset as i16 + metric.width as i16;
             right = right.max(glyph_right);
-            advance += metric.advance as i16;
+            advance_fp += metric.advance_fp as i32;
+            previous = Some(drawn);
         }
-        right.max(advance)
+        right.max(fixed_ceil(advance_fp))
     }
 
     /// Reference wrap: re-measures every candidate line per word, exactly

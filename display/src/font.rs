@@ -42,7 +42,16 @@ pub struct GlyphMetric {
     pub height: u8,
     pub x_offset: i8,
     pub y_offset: i8,
-    pub advance: u8,
+    /// Horizontal advance in 12.4 fixed-point pixels.
+    pub advance_fp: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KerningEntry {
+    pub left: u16,
+    pub right: u16,
+    /// Kerning adjustment in 12.4 fixed-point pixels.
+    pub adjust_fp: i16,
 }
 
 pub struct BitmapFont {
@@ -51,6 +60,7 @@ pub struct BitmapFont {
     pub baseline: u8,
     pub metrics: &'static [GlyphMetric],
     pub bitmap: &'static [u8],
+    pub kerning: &'static [KerningEntry],
 }
 
 impl BitmapFont {
@@ -61,6 +71,13 @@ impl BitmapFont {
             metric,
             &self.bitmap[metric.offset..metric.offset + metric.len],
         ))
+    }
+
+    pub fn kerning_adjust_fp(&self, left: u16, right: u16) -> i16 {
+        self.kerning
+            .binary_search_by(|entry| (entry.left, entry.right).cmp(&(left, right)))
+            .map(|index| self.kerning[index].adjust_fp)
+            .unwrap_or(0)
     }
 }
 
@@ -289,33 +306,57 @@ pub fn draw_text(
     baseline_y: i16,
     white: bool,
 ) -> i16 {
-    let mut cursor = x;
+    let mut cursor_fp = (x as i32) << 4;
+    let mut previous = None;
     for ch in text.chars() {
         let codepoint = ch as u32;
         if codepoint > u16::MAX as u32 {
             continue;
         }
-        cursor += draw_glyph(fb, font, codepoint as u16, cursor, baseline_y, white);
+        let codepoint = codepoint as u16;
+        let drawn = if font.glyph(codepoint).is_some() {
+            codepoint
+        } else {
+            b'?' as u16
+        };
+        if let Some(left) = previous {
+            cursor_fp += font.kerning_adjust_fp(left, drawn) as i32;
+        }
+        let x = fixed_round(cursor_fp);
+        let (advance_fp, drawn) = draw_glyph(fb, font, codepoint, x, baseline_y, white);
+        cursor_fp += advance_fp as i32;
+        previous = Some(drawn);
     }
-    cursor
+    fixed_round(cursor_fp)
 }
 
 pub fn measure_text(font: &BitmapFont, text: &str) -> u16 {
     let fallback = font
         .glyph(b'?' as u16)
-        .map(|(m, _)| m.advance as u16)
-        .unwrap_or(8);
-    text.chars()
-        .map(|ch| {
-            let codepoint = ch as u32;
-            if codepoint > u16::MAX as u32 {
-                return fallback;
-            }
-            font.glyph(codepoint as u16)
-                .map(|(metric, _)| metric.advance as u16)
-                .unwrap_or(fallback)
-        })
-        .sum()
+        .map(|(m, _)| m.advance_fp)
+        .unwrap_or(8 << 4);
+    let mut advance_fp = 0i32;
+    let mut previous = None;
+    for ch in text.chars() {
+        let codepoint = if ch as u32 > u16::MAX as u32 {
+            b'?' as u16
+        } else {
+            ch as u16
+        };
+        let (advance, measured) = if let Some((metric, _)) = font.glyph(codepoint) {
+            (metric.advance_fp, codepoint)
+        } else if let Some((metric, _)) = font.glyph(b'?' as u16) {
+            (metric.advance_fp, b'?' as u16)
+        } else {
+            (fallback, b'?' as u16)
+        };
+        if let Some(left) = previous {
+            advance_fp += font.kerning_adjust_fp(left, measured) as i32;
+        }
+        advance_fp += advance as i32;
+        previous = Some(measured);
+    }
+    fixed_ceil(advance_fp).max(0) as u16
 }
 
 fn draw_glyph(
@@ -325,9 +366,13 @@ fn draw_glyph(
     x: i16,
     baseline_y: i16,
     white: bool,
-) -> i16 {
-    let Some((metric, bitmap)) = font.glyph(codepoint).or_else(|| font.glyph(b'?' as u16)) else {
-        return 8;
+) -> (u16, u16) {
+    let (drawn, metric, bitmap) = if let Some((metric, bitmap)) = font.glyph(codepoint) {
+        (codepoint, metric, bitmap)
+    } else if let Some((metric, bitmap)) = font.glyph(b'?' as u16) {
+        (b'?' as u16, metric, bitmap)
+    } else {
+        return (8 << 4, b'?' as u16);
     };
 
     let glyph_x = x + metric.x_offset as i16;
@@ -355,5 +400,15 @@ fn draw_glyph(
         }
     }
 
-    metric.advance as i16
+    (metric.advance_fp, drawn)
+}
+
+#[inline]
+pub fn fixed_round(value_fp: i32) -> i16 {
+    ((value_fp + 8) >> 4) as i16
+}
+
+#[inline]
+pub fn fixed_ceil(value_fp: i32) -> i16 {
+    ((value_fp + 15) >> 4) as i16
 }
