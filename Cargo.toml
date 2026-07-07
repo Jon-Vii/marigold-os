@@ -28,3 +28,8 @@ opt-level = 3
 # warns below opt-level 2); the rest of the sync session is network-bound.
 [profile.release.package.esp-radio]
 opt-level = 3
+
+[patch.crates-io]
+# Local 0.8.0 patch: defer channel waker calls until after the RefCell borrow
+# drops, avoiding re-entrant BorrowMutError panics on the mixed executor setup.
+embassy-sync = { path = "vendor/embassy-sync-0.8.0" }
