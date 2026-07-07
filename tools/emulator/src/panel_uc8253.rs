@@ -5,6 +5,9 @@
 //! only models controller state: command lengths, complete RAM-plane writes,
 //! DTM1 data-stop ordering, LUT/CDI readiness, power, refresh, and sleep.
 
+use crate::panel_common::{
+    cmd_history_entry, expect_len, ram_history_entry, HISTORY_DEEP_SLEEP, HISTORY_RESET,
+};
 use display::epd::{
     bank_for, fill_transformed_band, flush_plan, sleep_plan, FlushStep, FrameSource, LutBank,
     RamPlane, RefreshMode, SleepStep, CDI_INTERVAL, CMD_BOOSTER_SOFT_START, CMD_DATA_STOP,
@@ -101,12 +104,7 @@ impl PanelModel {
             _ => None,
         };
         if let Some(expected) = expected {
-            if data.len() != expected {
-                return Err(format!(
-                    "command 0x{cmd:02X} expected {expected} data bytes, got {}",
-                    data.len()
-                ));
-            }
+            expect_len(cmd, data, expected)?;
         }
 
         match cmd {
@@ -151,7 +149,7 @@ impl PanelModel {
             _ => {}
         }
         self.commands.push((cmd, data.len()));
-        self.history.push(format!("cmd 0x{cmd:02X} {:02X?}", data));
+        self.history.push(cmd_history_entry(cmd, data));
         Ok(())
     }
 
@@ -190,7 +188,7 @@ impl PanelModel {
                 SleepStep::DeepSleep => self.command(CMD_DEEP_SLEEP, &[DEEP_SLEEP_CHECK])?,
             }
         }
-        self.history.push("deep_sleep".into());
+        self.history.push(HISTORY_DEEP_SLEEP.into());
         Ok(())
     }
 
@@ -326,8 +324,7 @@ impl PanelModel {
             RamPlane::New => CMD_DTM2,
         };
         self.commands.push((command, state.written));
-        self.history
-            .push(format!("ram 0x{command:02X} {WIDTH}x{HEIGHT}"));
+        self.history.push(ram_history_entry(command, WIDTH, HEIGHT));
         Ok(())
     }
 
@@ -340,7 +337,7 @@ impl PanelModel {
         self.ram_write = None;
         self.plane_complete = [false; 2];
         self.old_needs_stop = false;
-        self.history.push("reset".into());
+        self.history.push(HISTORY_RESET.into());
     }
 }
 

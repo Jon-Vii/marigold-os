@@ -1,3 +1,6 @@
+use crate::panel_common::{
+    cmd_history_entry, expect_len, ram_history_entry, HISTORY_DEEP_SLEEP, HISTORY_RESET,
+};
 use display::epd::{
     fill_transformed_band, ram_x_counter, ram_x_range, ram_y_counter, ram_y_range, RefreshMode,
     SpiOp, CMD_DEEP_SLEEP, CMD_DISPLAY_UPDATE_CTRL1, CMD_DISPLAY_UPDATE_CTRL2,
@@ -61,29 +64,29 @@ impl PanelModel {
             CMD_SET_RAM_X_RANGE => self.copy_exact_4(cmd, data, true)?,
             CMD_SET_RAM_Y_RANGE => self.copy_exact_4(cmd, data, false)?,
             CMD_SET_RAM_X_COUNTER => {
-                self.expect_len(cmd, data, 2)?;
+                expect_len(cmd, data, 2)?;
                 self.x_counter.copy_from_slice(data);
             }
             CMD_SET_RAM_Y_COUNTER => {
-                self.expect_len(cmd, data, 2)?;
+                expect_len(cmd, data, 2)?;
                 self.y_counter.copy_from_slice(data);
             }
             CMD_DISPLAY_UPDATE_CTRL1 => {
-                self.expect_len(cmd, data, 2)?;
+                expect_len(cmd, data, 2)?;
                 self.update_ctrl1.copy_from_slice(data);
             }
             CMD_DISPLAY_UPDATE_CTRL2 => {
-                self.expect_len(cmd, data, 1)?;
+                expect_len(cmd, data, 1)?;
                 self.update_ctrl2 = data[0];
             }
-            CMD_MASTER_ACTIVATION => self.expect_len(cmd, data, 0)?,
+            CMD_MASTER_ACTIVATION => expect_len(cmd, data, 0)?,
             CMD_DEEP_SLEEP => {
-                self.expect_len(cmd, data, 1)?;
+                expect_len(cmd, data, 1)?;
                 self.deep_sleep = true;
             }
             _ => {}
         }
-        self.history.push(format!("cmd 0x{cmd:02X} {:02X?}", data));
+        self.history.push(cmd_history_entry(cmd, data));
         Ok(())
     }
 
@@ -152,7 +155,7 @@ impl PanelModel {
         )?;
         self.command(CMD_MASTER_ACTIVATION, &[])?;
         self.command(CMD_DEEP_SLEEP, &[0x01])?;
-        self.history.push("deep_sleep".into());
+        self.history.push(HISTORY_DEEP_SLEEP.into());
         Ok(())
     }
 
@@ -192,15 +195,14 @@ impl PanelModel {
             target[start..start + len].copy_from_slice(&band[..len]);
             y += display::BAND_ROWS;
         }
-        self.history
-            .push(format!("ram 0x{ram_command:02X} {}x{}", WIDTH, HEIGHT));
+        self.history.push(ram_history_entry(ram_command, WIDTH, HEIGHT));
         Ok(())
     }
 
     fn reset(&mut self) {
         self.deep_sleep = false;
         self.initialized = false;
-        self.history.push("reset".into());
+        self.history.push(HISTORY_RESET.into());
     }
 
     fn wait_busy(&mut self) {
@@ -208,24 +210,13 @@ impl PanelModel {
     }
 
     fn copy_exact_4(&mut self, cmd: u8, data: &[u8], x: bool) -> Result<(), String> {
-        self.expect_len(cmd, data, 4)?;
+        expect_len(cmd, data, 4)?;
         if x {
             self.x_range.copy_from_slice(data);
         } else {
             self.y_range.copy_from_slice(data);
         }
         Ok(())
-    }
-
-    fn expect_len(&self, cmd: u8, data: &[u8], len: usize) -> Result<(), String> {
-        if data.len() == len {
-            Ok(())
-        } else {
-            Err(format!(
-                "command 0x{cmd:02X} expected {len} data bytes, got {}",
-                data.len()
-            ))
-        }
     }
 }
 

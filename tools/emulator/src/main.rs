@@ -3,6 +3,7 @@ mod panel;
 #[cfg(feature = "device-x3")]
 #[path = "panel_uc8253.rs"]
 mod panel;
+mod panel_common;
 mod render;
 mod scenario;
 
