@@ -353,12 +353,16 @@ impl Emulator {
             crate::render::render_request(&mut self.fb, request, &self.library_entries);
         }
         let mode = self.refresh_planner.mode_for(request);
-        self.panel
+        let effective_mode = self
+            .panel
             .flush(&self.fb, &self.prev_fb, mode, self.prev_prestaged)
             .expect("panel flush");
         self.refresh_planner.record_render(request, mode);
         self.prev_fb.copy_from(&self.fb);
-        self.prev_prestaged = self.panel.prestage_previous(&self.fb).is_ok();
+        // A Full flush already writes the old/RED plane with the current
+        // frame, so staging it again here would just repeat that write.
+        self.prev_prestaged = effective_mode == display::epd::RefreshMode::Full
+            || self.panel.prestage_previous(&self.fb).is_ok();
     }
 
     fn sleep_panel(&mut self) {
