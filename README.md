@@ -38,7 +38,7 @@ cargo run --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwi
 ```
 
 Only flashing needs the device on USB; the app logic, parsers, renderer, and
-emulator all build and test on a plain host. The nightly toolchain is pinned in
+emulator all build and test on a plain host. The stable toolchain is configured in
 `rust-toolchain.toml`.
 
 ## Flashing

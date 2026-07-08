@@ -15,13 +15,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (pinned nightly, firmware target)
+      - name: Install Rust (stable, firmware target)
         run: |
-          rustup toolchain install nightly-2025-10-01 --profile minimal
-          rustup target add riscv32imc-unknown-none-elf --toolchain nightly-2025-10-01
+          rustup toolchain install stable --profile minimal
+          rustup target add riscv32imc-unknown-none-elf --toolchain stable
 
       - name: Install espflash
-        run: CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu cargo +nightly-2025-10-01 install espflash --locked
+        run: CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu cargo install espflash --locked
 
       - name: Build X4 release images
         run: tools/build-release.sh x4
