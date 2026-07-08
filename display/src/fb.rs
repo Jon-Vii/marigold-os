@@ -39,6 +39,10 @@ impl FbFrame {
     }
 }
 
+// repr(C) pins the layout to FB_BYTES + 1 (both fields align 1): the
+// firmware links one Framebuffer into an exactly-sized linker slot
+// (fw/build.rs prev_fb_bytes), which must track this size.
+#[repr(C)]
 pub struct Framebuffer {
     data: [u8; FB_BYTES],
     frame: FbFrame,

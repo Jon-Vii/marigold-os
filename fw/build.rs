@@ -7,15 +7,17 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-/// Must equal `size_of::<display::fb::Framebuffer>()` (a bare
-/// `[u8; FB_BYTES]`). The ASSERT in the emitted script fails the link if
-/// the display crate's dimensions drift from this copy.
+/// Must equal `size_of::<display::fb::Framebuffer>()`: the repr(C) pixel
+/// array plus the one-byte drawing-frame field. The ASSERT in the emitted
+/// script fails the link if the display crate's layout drifts from this
+/// copy.
 fn prev_fb_bytes() -> usize {
-    if env::var_os("CARGO_FEATURE_DEVICE_X3").is_some() {
+    let pixels = if env::var_os("CARGO_FEATURE_DEVICE_X3").is_some() {
         792 / 8 * 528 // X3: 792x528 UC8253
     } else {
         800 / 8 * 480 // X4: 800x480 SSD1677
-    }
+    };
+    pixels + 1
 }
 
 /// Floor for `_stack_start - _stack_end`. The reader's deep path (zip
