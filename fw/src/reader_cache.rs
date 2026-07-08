@@ -1325,10 +1325,7 @@ where
         }
         let requested = out.len();
         let remaining_budget = EPUB_OPEN_READ_BYTE_LIMIT.saturating_sub(self.read_bytes) as usize;
-        let read_len = requested
-            .min(EPUB_READ_AT_CHUNK_BYTES)
-            .min(remaining_budget)
-            .min(512);
+        let read_len = requested.min(EPUB_READ_AT_CHUNK_BYTES).min(remaining_budget);
         if read_len == 0 {
             return Err(());
         }
@@ -1338,10 +1335,8 @@ where
                 last_err = Some(err);
                 continue;
             }
-            let mut read_bounce = [0u8; 512];
-            match self.file.read(&mut read_bounce[..read_len]) {
+            match self.file.read(&mut out[..read_len]) {
                 Ok(count) => {
-                    out[..count].copy_from_slice(&read_bounce[..count]);
                     self.read_ops = self.read_ops.saturating_add(1);
                     self.read_bytes = self.read_bytes.saturating_add(count as u32);
                     if attempt > 0 {
