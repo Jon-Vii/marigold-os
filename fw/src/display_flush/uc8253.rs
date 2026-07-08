@@ -24,7 +24,7 @@ use display::epd::uc8253::{
 use display::epd::{RefreshMode, SpiOp};
 use display::fb::Framebuffer;
 use display::{BAND_BYTES, BAND_ROWS, HEIGHT, ROW_BYTES};
-use embassy_time::Timer;
+use embassy_time::{Instant, Timer};
 // riscv32imc has no CAS; portable-atomic provides plain load/store here.
 use portable_atomic::{AtomicBool, Ordering};
 
@@ -76,7 +76,7 @@ pub(crate) async fn flush(
         plan.requested_mode,
         plan.effective_mode
     );
-    execute_steps(epd, fb, prev_fb, tx_band, plan.steps).await
+    execute_steps(epd, fb, prev_fb, tx_band, plan.effective_mode, plan.steps).await
 }
 
 /// Stage the just-shown frame into DTM1 ("old" RAM) so the next fast turn's
@@ -87,14 +87,26 @@ pub(crate) async fn prestage_previous(
     fb: &Framebuffer,
     tx_band: &mut [u8; BAND_BYTES],
 ) -> Result<(), SpiError> {
-    execute_steps(epd, fb, fb, tx_band, PRESTAGE_STEPS).await
+    execute_steps(epd, fb, fb, tx_band, RefreshMode::Fast, PRESTAGE_STEPS).await
 }
 
 pub(crate) async fn sleep_panel(epd: &mut Epd) -> Result<(), SpiError> {
+    let start = Instant::now();
+    esp_println::println!(
+        "bench: sleep phase=power_down_start t_ms={}",
+        start.as_millis()
+    );
     for step in sleep_plan(SCREEN_POWERED.load(Ordering::Relaxed)) {
         match step {
-            SleepStep::PowerOff => power_off(epd).await?,
-            SleepStep::DeepSleep => epd.command(CMD_DEEP_SLEEP, &[DEEP_SLEEP_CHECK]).await?,
+            SleepStep::PowerOff => power_off(epd, start).await?,
+            SleepStep::DeepSleep => {
+                epd.command(CMD_DEEP_SLEEP, &[DEEP_SLEEP_CHECK]).await?;
+                esp_println::println!(
+                    "bench: sleep phase=deep_sleep elapsed_ms={} t_ms={}",
+                    start.elapsed().as_millis(),
+                    Instant::now().as_millis()
+                );
+            }
         }
     }
     Ok(())
@@ -105,6 +117,7 @@ async fn execute_steps(
     fb: &Framebuffer,
     prev_fb: &Framebuffer,
     tx_band: &mut [u8; BAND_BYTES],
+    mode: RefreshMode,
     steps: &[FlushStep],
 ) -> Result<(), SpiError> {
     for step in steps {
@@ -126,7 +139,7 @@ async fn execute_steps(
             }
             FlushStep::DataStop => epd.command(CMD_DATA_STOP, &[]).await?,
             FlushStep::PowerOn => power_on(epd).await?,
-            FlushStep::DisplayRefresh => display_refresh(epd).await?,
+            FlushStep::DisplayRefresh => display_refresh(epd, mode).await?,
             FlushStep::DelayMs(ms) => Timer::after_millis(u64::from(ms)).await,
         }
     }
@@ -146,7 +159,8 @@ async fn power_on(epd: &mut Epd) -> Result<(), SpiError> {
     Ok(())
 }
 
-async fn display_refresh(epd: &mut Epd) -> Result<(), SpiError> {
+async fn display_refresh(epd: &mut Epd, mode: RefreshMode) -> Result<(), SpiError> {
+    let start = Instant::now();
     epd.command(CMD_DISPLAY_REFRESH, &[]).await?;
     let (low, ms) = epd.wait_two_phase().await;
     esp_println::println!(
@@ -155,13 +169,29 @@ async fn display_refresh(epd: &mut Epd) -> Result<(), SpiError> {
         ms,
         epd.busy_is_high()
     );
+    esp_println::println!(
+        "bench: refresh mode={:?} busy_ms={} busy_low={} elapsed_ms={} screen_on={} t_ms={}",
+        mode,
+        ms,
+        low,
+        start.elapsed().as_millis(),
+        SCREEN_POWERED.load(Ordering::Relaxed),
+        Instant::now().as_millis(),
+    );
     Ok(())
 }
 
-async fn power_off(epd: &mut Epd) -> Result<(), SpiError> {
+async fn power_off(epd: &mut Epd, start: Instant) -> Result<(), SpiError> {
     epd.command(CMD_POWER_OFF, &[]).await?;
     let (low, ms) = epd.wait_two_phase().await;
     esp_println::println!("display: x3 POF busy_low={} {}ms", low, ms);
+    esp_println::println!(
+        "bench: sleep phase=power_off busy_ms={} busy_low={} elapsed_ms={} t_ms={}",
+        ms,
+        low,
+        start.elapsed().as_millis(),
+        Instant::now().as_millis(),
+    );
     SCREEN_POWERED.store(false, Ordering::Relaxed);
     Ok(())
 }
