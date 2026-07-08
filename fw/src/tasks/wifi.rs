@@ -92,7 +92,19 @@ pub async fn run(spawner: Spawner, wifi: WIFI<'static>) {
 
     let rng = Rng::new();
     let seed = (u64::from(rng.random()) << 32) | u64::from(rng.random());
-    let mut controller = match WifiController::new(wifi, ControllerConfig::default()) {
+    // The radio serves one short kosync exchange, not a throughput
+    // workload. Default buffering (10 static RX bufs at ~1.6 KB each, 32
+    // dynamic, AMPDU on) would blow the loaned heap, which also lost its
+    // dram2 share to the main stack (see sync_mem). These mirror the old
+    // ESP_WIFI_CONFIG_* compile-time trims that esp-radio no longer
+    // reads. Revisit for the AP file-upload phase.
+    let radio_config = ControllerConfig::default()
+        .with_static_rx_buf_num(4)
+        .with_dynamic_rx_buf_num(8)
+        .with_dynamic_tx_buf_num(8)
+        .with_ampdu_rx_enable(false)
+        .with_ampdu_tx_enable(false);
+    let mut controller = match WifiController::new(wifi, radio_config) {
         Ok(controller) => controller,
         Err(err) => {
             esp_println::println!("wifi: init failed: {:?}", err);

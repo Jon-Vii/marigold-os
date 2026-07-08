@@ -209,10 +209,14 @@ fn main() -> ! {
         }
     }
 
-    // One display band must fit a single DMA buffer (X4 fills it exactly;
-    // the X3's 99-byte rows leave 80 bytes slack).
+    // One display band must fit a single TX DMA buffer (X4 fills it
+    // exactly; the X3's 99-byte rows leave 80 bytes slack). The RX side
+    // only ever carries the SD session's bounce chunk - the EPD is
+    // write-only - so it stays at chunk size; every byte saved in .bss
+    // is main-stack headroom now (see build.rs).
     const _: () = assert!(display::BAND_BYTES <= 8000);
-    let (rx_buffer, rx_descriptors, tx_buffer, tx_descriptors) = esp_hal::dma_buffers!(8000);
+    let (rx_buffer, rx_descriptors, tx_buffer, tx_descriptors) =
+        esp_hal::dma_buffers!(sd_session::SD_SPI_CHUNK_BYTES, 8000);
     let dma_rx = esp_hal::dma::DmaRxBuf::new(rx_descriptors, rx_buffer).unwrap();
     let dma_tx = esp_hal::dma::DmaTxBuf::new(tx_descriptors, tx_buffer).unwrap();
     let epd_spi = Spi::new(

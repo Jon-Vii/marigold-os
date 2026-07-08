@@ -3,12 +3,21 @@
 //! The radio blob wants roughly 100 KB of heap that this firmware does
 //! not have while the reader pipeline owns its scratch. Sync is
 //! therefore a terminal mode: the display task dismantles the EPUB
-//! scratch into raw byte regions, the wifi task donates them (plus the
-//! otherwise unused dram2 boot-loader shadow segment) to esp-alloc, and
-//! the only way back to reading is the software reset that ends the
-//! session. Nothing here may be touched by reader code after the loan;
-//! the display task enforces that by refusing scratch-using storage
-//! commands once it has handed the memory over.
+//! scratch into raw byte regions, the wifi task donates them to
+//! esp-alloc, and the only way back to reading is the software reset
+//! that ends the session. Nothing here may be touched by reader code
+//! after the loan; the display task enforces that by refusing
+//! scratch-using storage commands once it has handed the memory over.
+//!
+//! dram2 (the ~64.8 KB boot-loader shadow segment) used to be split
+//! between a radio heap share and the previous-frame framebuffer. The
+//! esp-hal 1.x migration grew .bss/.data by ~13 KB and squeezed the main
+//! stack (which ends at the dram2 boundary) below the reader's ~27 KB
+//! deep-call budget, corrupting .bss. The heap share is stack headroom
+//! now: `fw/build.rs` packs the framebuffer against the segment's top and
+//! raises `_stack_start` over the freed bytes. The radio's loss is
+//! compensated at runtime by the trimmed buffer config in
+//! `tasks/wifi.rs`.
 #![allow(unsafe_code)]
 
 use core::cell::UnsafeCell;
@@ -16,20 +25,6 @@ use core::mem::MaybeUninit;
 use esp_alloc::{HeapRegion, MemoryCapability};
 // riscv32imc has no CAS; portable-atomic provides swap on single-core.
 use portable_atomic::{AtomicBool, Ordering};
-
-/// Bytes claimed from `dram2_seg` for the radio heap. The segment is
-/// ~64.8 KB and also hosts the previous-frame framebuffer (below), which
-/// was moved here so the radio stack's static demand fits in main DRAM without
-/// eating the stack region.
-///
-/// The X3's 792x528 framebuffer is 4.3 KB larger than the X4's, so its
-/// build trims the radio's share to keep both in the segment. The sync
-/// session's heap watermark has NOT been validated at the smaller size —
-/// re-check it on X3 hardware before trusting a sync under load.
-#[cfg(not(feature = "device-x3"))]
-pub const DRAM2_HEAP_BYTES: usize = 16 * 1024;
-#[cfg(feature = "device-x3")]
-pub const DRAM2_HEAP_BYTES: usize = 13 * 1024;
 
 /// A loanable byte region described by raw parts. Heap donations use raw
 /// pointers rather than slices because the scratch-struct region is
@@ -61,26 +56,17 @@ pub struct SyncLoan {
     pub catalog_len: usize,
 }
 
-struct Dram2(UnsafeCell<MaybeUninit<[u8; DRAM2_HEAP_BYTES]>>);
-
-// Safety: access is gated by DRAM2_TAKEN below.
-unsafe impl Sync for Dram2 {}
-
-/// NOLOAD section: never zero-initialized at boot, which a heap region
-/// does not need.
-#[link_section = ".dram2_uninit"]
-static DRAM2_HEAP: Dram2 = Dram2(UnsafeCell::new(MaybeUninit::uninit()));
-static DRAM2_TAKEN: AtomicBool = AtomicBool::new(false);
-
 struct PrevFbSlot(UnsafeCell<MaybeUninit<display::fb::Framebuffer>>);
 
 // Safety: access is gated by PREV_FB_TAKEN below.
 unsafe impl Sync for PrevFbSlot {}
 
-/// The previous-frame framebuffer lives in dram2 instead of .bss so the
-/// radio's static demand fits in main DRAM. NOLOAD, so the display task
-/// claims it through here, which writes a cleared framebuffer first.
-#[link_section = ".dram2_uninit"]
+/// The previous-frame framebuffer lives at the top of dram2 instead of
+/// .bss so the radio's static demand fits in main DRAM and the main stack
+/// can claim the rest of the segment (see `fw/build.rs`, which places
+/// this section and asserts its size). NOLOAD, so the display task claims
+/// it through here, which writes a cleared framebuffer first.
+#[link_section = ".dram2_prev_fb"]
 static PREV_FB_SLOT: PrevFbSlot = PrevFbSlot(UnsafeCell::new(MaybeUninit::uninit()));
 static PREV_FB_TAKEN: AtomicBool = AtomicBool::new(false);
 
@@ -97,23 +83,19 @@ pub fn take_prev_fb() -> Option<&'static mut display::fb::Framebuffer> {
     }
 }
 
-/// Donates dram2 plus the two loaned regions to the esp-alloc heap the
-/// radio blob allocates from. Callable once; esp-alloc supports exactly
-/// three regions, which is precisely what the sync session uses.
+static HEAP_DONATED: AtomicBool = AtomicBool::new(false);
+
+/// Donates the two loaned regions to the esp-alloc heap the radio blob
+/// allocates from. Callable once; esp-alloc supports up to three regions,
+/// so the session's two donations fit with one to spare.
 pub fn donate_heap(heap_a: RawRegion, heap_b: RawRegion) {
-    if DRAM2_TAKEN.swap(true, Ordering::SeqCst) {
+    if HEAP_DONATED.swap(true, Ordering::SeqCst) {
         return;
     }
-    let dram2_ptr = DRAM2_HEAP.0.get().cast::<u8>();
     // Safety: each region is exclusively owned for the rest of the
-    // session (dram2 by the flag above, the loans by the one-way
-    // handoff), 'static by construction, and non-empty.
+    // session (the loans are a one-way handoff), 'static by construction,
+    // and non-empty.
     unsafe {
-        esp_alloc::HEAP.add_region(HeapRegion::new(
-            dram2_ptr,
-            DRAM2_HEAP_BYTES,
-            MemoryCapability::Internal.into(),
-        ));
         esp_alloc::HEAP.add_region(HeapRegion::new(
             heap_a.ptr,
             heap_a.len,

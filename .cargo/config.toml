@@ -13,12 +13,6 @@ rustflags = [
 [build]
 target = "riscv32imc-unknown-none-elf"
 
-# The radio serves one short kosync exchange, not a throughput workload;
-# trimmed buffer counts keep esp-wifi's static and heap demand inside the
-# loaned sync-session memory. Revisit for the AP file-upload phase.
-[env]
-ESP_WIFI_CONFIG_STATIC_RX_BUF_NUM = "4"
-ESP_WIFI_CONFIG_DYNAMIC_RX_BUF_NUM = "8"
-ESP_WIFI_CONFIG_DYNAMIC_TX_BUF_NUM = "8"
-ESP_WIFI_CONFIG_AMPDU_RX_ENABLE = "false"
-ESP_WIFI_CONFIG_AMPDU_TX_ENABLE = "false"
+# Radio buffer trims moved to runtime: esp-radio dropped the old
+# ESP_WIFI_CONFIG_* compile-time options, so the kosync-session sizing now
+# lives in the ControllerConfig built in fw/src/tasks/wifi.rs.
