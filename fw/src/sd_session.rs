@@ -54,7 +54,10 @@ pub(crate) struct SdSpiDevice<'a, SPI, CS> {
     pub(crate) delay: SdDelay,
 }
 
-const SD_SPI_CHUNK_BYTES: usize = 64;
+/// Also sizes the shared bus's RX DMA buffer in main.rs: SD traffic is the
+/// only read path on SPI2 (the EPD is write-only), and every SD operation
+/// bounces through one of these chunks.
+pub(crate) const SD_SPI_CHUNK_BYTES: usize = 64;
 
 #[repr(align(4))]
 struct AlignedSdChunk([u8; SD_SPI_CHUNK_BYTES]);
