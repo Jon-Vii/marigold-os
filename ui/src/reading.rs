@@ -7,13 +7,62 @@
 //! re-measuring a whole candidate line per word, which keeps wrapping O(n)
 //! in text length.
 
-use display::fb::Framebuffer;
+use display::fb::{FbFrame, Framebuffer};
 use display::font::{
     draw_text, family_weighted, fixed_ceil, fixed_round, measure_text, style_from_marker_code,
     BitmapFont, FontSize, FontStyle, LineSpacing, TypeSettings, STYLE_MARKER,
 };
 use proto::cache::{BlockRecord, PageRecord};
 use proto::text::{TextAlign, TextRole};
+
+/// The reading page's text box: wrap edges and the vertical page walk
+/// bounds. Landscape keeps the historical `READER_*` numbers; portrait
+/// stands the panel's long axis upright, so lines wrap at the short axis
+/// and pages run the full long axis. Pagination, cache building, and
+/// drawing all read the box from the [`ReadingBlocks`] source, so a store
+/// can never wrap under one box and paginate under another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageBox {
+    pub left: i16,
+    pub right: i16,
+    pub top: i16,
+    pub bottom: i16,
+}
+
+impl PageBox {
+    pub const LANDSCAPE: Self = Self {
+        left: READER_LEFT_X,
+        right: READER_RIGHT_X,
+        top: READER_PAGE_TOP,
+        bottom: READER_PAGE_BOTTOM,
+    };
+
+    /// Portrait keeps the same insets as landscape — 8 from the wrap
+    /// edges, 6 above, 23 clear of the footer — inside the upright frame.
+    pub const PORTRAIT: Self = Self {
+        left: 8,
+        right: FbFrame::Portrait.width() as i16 - 8,
+        top: 6,
+        bottom: FbFrame::Portrait.height() as i16 - 23,
+    };
+
+    pub const fn for_portrait(portrait: bool) -> Self {
+        if portrait {
+            Self::PORTRAIT
+        } else {
+            Self::LANDSCAPE
+        }
+    }
+
+    /// Left text edge for a role: block quotes indent into the page.
+    pub const fn x_for(self, role: TextRole) -> i16 {
+        if matches!(role, TextRole::BlockQuote) {
+            self.left + 24
+        } else {
+            self.left
+        }
+    }
+}
 
 /// Narrow read model for the reader page plan: bounded block records,
 /// their cached text, and pagination flags. Firmware's ReaderStore and
@@ -42,6 +91,12 @@ pub trait ReadingBlocks {
     /// another.
     fn type_settings(&self) -> TypeSettings {
         TypeSettings::DEFAULT
+    }
+    /// The page box the blocks were laid out into. Reads like
+    /// `type_settings`: heights, pagination, and drawing all follow the
+    /// source's box, which changes with the orientation setting.
+    fn page_box(&self) -> PageBox {
+        PageBox::LANDSCAPE
     }
 }
 
@@ -73,6 +128,7 @@ pub fn block_height(source: &impl ReadingBlocks, index: usize) -> i16 {
             record.align,
             advance,
             block_first_line_indent(source, index),
+            source.page_box(),
         )
     };
     height + paragraph_gap_after(source, index)
@@ -101,7 +157,12 @@ pub fn paragraph_gap_after(source: &impl ReadingBlocks, index: usize) -> i16 {
 
 /// Count the pages the loaded blocks paginate into, using the same height
 /// math as rendering.
-pub fn paginate_block_pages(source: &impl ReadingBlocks, page_top: i16, page_bottom: i16) -> usize {
+pub fn paginate_block_pages(source: &impl ReadingBlocks) -> usize {
+    let PageBox {
+        top: page_top,
+        bottom: page_bottom,
+        ..
+    } = source.page_box();
     let mut pages = 1u32;
     let mut y = page_top;
 
@@ -123,12 +184,12 @@ pub fn paginate_block_pages(source: &impl ReadingBlocks, page_top: i16, page_bot
 }
 
 /// Walk the blocks until `page_index` and return its page record.
-pub fn page_record_at(
-    source: &impl ReadingBlocks,
-    page_index: usize,
-    page_top: i16,
-    page_bottom: i16,
-) -> PageRecord {
+pub fn page_record_at(source: &impl ReadingBlocks, page_index: usize) -> PageRecord {
+    let PageBox {
+        top: page_top,
+        bottom: page_bottom,
+        ..
+    } = source.page_box();
     let mut current = 0usize;
     let mut first_block = 0usize;
     let mut block_count = 0usize;
@@ -167,7 +228,8 @@ pub fn for_each_drawable_block(
     mut visit: impl FnMut(ReaderDrawableBlock<'_>) -> bool,
 ) {
     let settings = source.type_settings();
-    let mut y = READER_PAGE_TOP;
+    let page_box = source.page_box();
+    let mut y = page_box.top;
     for offset in 0..page.block_count as usize {
         let index = page.first_block as usize + offset;
         let Some(record) = source.block(index) else {
@@ -177,7 +239,7 @@ pub fn for_each_drawable_block(
         let advance = line_advance(settings, record.role);
         let style = source.block_style(index);
         let height = block_height(source, index);
-        if y + block_ink_height(source, index) > READER_PAGE_BOTTOM && y > READER_PAGE_TOP {
+        if y + block_ink_height(source, index) > page_box.bottom && y > page_box.top {
             break;
         }
         if !visit(ReaderDrawableBlock {
@@ -199,11 +261,12 @@ pub fn for_each_drawable_block(
 /// reader content shared by firmware views and host tooling.
 pub fn draw_reading_page_body(fb: &mut Framebuffer, source: &impl ReadingBlocks, page: PageRecord) {
     let settings = source.type_settings();
+    let page_box = source.page_box();
     for_each_drawable_block(source, page, |block| {
         let role = block.record.role;
         match block.record.align {
             TextAlign::Left => {
-                let x = reader_x_for(role);
+                let x = page_box.x_for(role);
                 if block.record.line_count == 1 {
                     draw_styled_line(
                         fb,
@@ -220,14 +283,14 @@ pub fn draw_reading_page_body(fb: &mut Framebuffer, source: &impl ReadingBlocks,
                         block.text,
                         x,
                         block.y,
-                        READER_RIGHT_X,
+                        page_box.right,
                         block.advance,
                         block.indent,
                     );
                 }
             }
             TextAlign::Justify => {
-                let x = reader_x_for(role);
+                let x = page_box.x_for(role);
                 if block.record.line_count == 1 {
                     draw_styled_line(
                         fb,
@@ -244,7 +307,7 @@ pub fn draw_reading_page_body(fb: &mut Framebuffer, source: &impl ReadingBlocks,
                         block.text,
                         x,
                         block.y,
-                        READER_RIGHT_X,
+                        page_box.right,
                         block.advance,
                         block.indent,
                     );
@@ -253,8 +316,8 @@ pub fn draw_reading_page_body(fb: &mut Framebuffer, source: &impl ReadingBlocks,
             TextAlign::Center => {
                 if block.record.line_count == 1 {
                     let width = styled_text_ink_width(block.text, settings, block.style)
-                        .min(READER_RIGHT_X - READER_LEFT_X);
-                    let x = ((display::WIDTH as i16 - width) / 2).max(READER_LEFT_X);
+                        .min(page_box.right - page_box.left);
+                    let x = ((page_box.left + page_box.right - width) / 2).max(page_box.left);
                     draw_styled_line(fb, settings, block.text, x, block.y, block.style);
                 } else {
                     draw_centered_wrapped_literata(
@@ -262,7 +325,7 @@ pub fn draw_reading_page_body(fb: &mut Framebuffer, source: &impl ReadingBlocks,
                         block.font,
                         block.text,
                         block.y,
-                        READER_RIGHT_X - READER_LEFT_X,
+                        page_box.right - page_box.left,
                         block.advance,
                     );
                 }
@@ -280,14 +343,19 @@ pub fn draw_reading_page_counter(fb: &mut Framebuffer, label: &str) {
 }
 
 pub fn draw_reading_page_counter_aligned(fb: &mut Framebuffer, label: &str, left: bool) {
+    // Frame-relative, not panel-relative: the portrait page's footer sits
+    // at the bottom of the upright frame. Landscape frames keep the
+    // historical panel numbers.
     let font = display::font::literata_small(FontStyle::Regular);
+    let frame_right = fb.frame_width() as i16 - 8;
+    let baseline = fb.frame_height() as i16 - 3;
     let x = if left {
         READER_LEFT_X + 16
     } else {
         let width = measure_text(font, label) as i16;
-        READER_RIGHT_X - width - 16
+        frame_right - width - 16
     };
-    draw_text(fb, font, label, x, READER_FOOTER_BASELINE_Y, false);
+    draw_text(fb, font, label, x, baseline, false);
 }
 
 pub const READER_PAGE_TOP: i16 = 6;
@@ -340,29 +408,37 @@ pub const READER_WRAP_SAFETY: i16 = 4;
 /// any pagination cached under the old face. v16: font advances moved to 12.4
 /// fixed point and generated kerning tables now affect line widths. v17:
 /// family widened from one bit to two bits so the Custom slot cannot collide
-/// with the version field.
-const READER_LAYOUT_VERSION: u16 = 17;
+/// with the version field. v18: the page box joins the layout config as a
+/// portrait bit — the upright frame wraps at the short axis, so portrait
+/// and landscape pagination cache separately.
+const READER_LAYOUT_VERSION: u16 = 18;
 
 /// Panel-geometry salt folded into the version bits: wrap points and page
 /// heights depend on the page box, so pagination cached on one panel must
 /// read as stale on the other (an SD card can move between an X4 and an
 /// X3). Zero on the X4's 800x480 keeps every existing cache valid; other
 /// geometries claim a disjoint version band well clear of routine bumps.
+/// (128, not the former 256: the config field gained the portrait bit, so
+/// version + salt must stay under 256 to fit the u16.)
 const PANEL_LAYOUT_SALT: u16 = if display::WIDTH == 800 && display::HEIGHT == 480 {
     0
 } else {
-    256
+    128
 };
 
-/// Section cache layout config: the wrap-rule version plus the type
-/// settings the section was paginated under. Stored in cache headers; a
-/// mismatch on load invalidates the cached pagination and rebuilds it.
-/// Bit layout: spacing in bits 0-1 (a spacing change only re-walks heights,
-/// so the load check masks these off), size in bits 2-3, weight in bit 4,
-/// family in bits 5-6, version above. Size, weight, and family all change wrap
-/// points, so a change in any forces a full rebuild.
-pub fn reader_layout_config(settings: TypeSettings) -> u16 {
-    ((READER_LAYOUT_VERSION + PANEL_LAYOUT_SALT) << 7)
+const _: () = assert!(READER_LAYOUT_VERSION + PANEL_LAYOUT_SALT < 256);
+
+/// Section cache layout config: the wrap-rule version plus the layout the
+/// section was paginated under. Stored in cache headers; a mismatch on
+/// load invalidates the cached pagination and rebuilds it. Bit layout:
+/// spacing in bits 0-1 (a spacing change only re-walks heights, so the
+/// load check masks these off), size in bits 2-3, weight in bit 4, family
+/// in bits 5-6, portrait in bit 7, version above. Size, weight, family,
+/// and the page box all change wrap points, so a change in any forces a
+/// full rebuild.
+pub fn reader_layout_config(settings: TypeSettings, portrait: bool) -> u16 {
+    ((READER_LAYOUT_VERSION + PANEL_LAYOUT_SALT) << 8)
+        | ((portrait as u16) << 7)
         | ((settings.family as u16) << 5)
         | ((settings.weight as u16) << 4)
         | ((settings.size as u16) << 2)
@@ -438,11 +514,7 @@ pub fn block_first_line_indent(source: &impl ReadingBlocks, index: usize) -> i16
 }
 
 pub fn reader_x_for(role: TextRole) -> i16 {
-    if matches!(role, TextRole::BlockQuote) {
-        32
-    } else {
-        READER_LEFT_X
-    }
+    PageBox::LANDSCAPE.x_for(role)
 }
 
 /// Running ink measurement: pen advance plus the rightmost inked edge,
@@ -643,6 +715,7 @@ pub fn wrapped_line_count(
     lines
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn wrapped_block_height(
     font: &'static BitmapFont,
     text: &str,
@@ -650,12 +723,13 @@ pub fn wrapped_block_height(
     align: TextAlign,
     line_advance: i16,
     first_indent: i16,
+    page_box: PageBox,
 ) -> i16 {
-    let max_width = READER_RIGHT_X
+    let max_width = page_box.right
         - if align == TextAlign::Center {
-            READER_LEFT_X
+            page_box.left
         } else {
-            reader_x_for(role)
+            page_box.x_for(role)
         };
     wrapped_line_count(font, text, max_width, first_indent).max(1) as i16 * line_advance
 }
@@ -721,7 +795,7 @@ pub fn draw_centered_wrapped_literata(
     {
         let line = &text[line_start..line_end];
         let width = text_ink_width(font, line).min(max_width);
-        let x = ((display::WIDTH as i16 - width) / 2).max(20);
+        let x = ((fb.frame_width() as i16 - width) / 2).max(20);
         draw_text(fb, font, line, x, baseline_y, false);
         baseline_y += line_advance;
         cursor = next_cursor;
@@ -1139,15 +1213,19 @@ mod tests {
     }
 
     #[test]
-    fn layout_configs_are_distinct_per_type_settings() {
-        let mut seen = [0u16; ALL_SETTINGS.len()];
-        for (index, settings) in ALL_SETTINGS.iter().enumerate() {
-            let config = reader_layout_config(*settings);
-            assert!(
-                !seen[..index].contains(&config),
-                "duplicate layout config {config} for {settings:?}"
-            );
-            seen[index] = config;
+    fn layout_configs_are_distinct_per_type_settings_and_page_box() {
+        let mut seen = [0u16; 2 * ALL_SETTINGS.len()];
+        let mut index = 0;
+        for portrait in [false, true] {
+            for settings in ALL_SETTINGS.iter() {
+                let config = reader_layout_config(*settings, portrait);
+                assert!(
+                    !seen[..index].contains(&config),
+                    "duplicate layout config {config} for {settings:?} portrait={portrait}"
+                );
+                seen[index] = config;
+                index += 1;
+            }
         }
     }
 

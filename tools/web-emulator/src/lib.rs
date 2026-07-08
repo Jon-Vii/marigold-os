@@ -195,12 +195,14 @@ impl WebEmulator {
     }
 
     fn store_ready_for(&self, book_index: u16) -> bool {
-        self.store_book == Some(book_index)
-            && self
-                .store
-                .as_ref()
-                .is_some_and(|store| store.type_settings() == self.state.type_settings())
-            && self.load_status == LoadStatus::Ready
+        let layout_current = self.store.as_ref().is_some_and(|store| {
+            store.type_settings() == self.state.type_settings()
+                && ReadingBlocks::page_box(store)
+                    == ui::reading::PageBox::for_portrait(app_core::is_portrait(
+                        self.state.orientation,
+                    ))
+        });
+        self.store_book == Some(book_index) && layout_current && self.load_status == LoadStatus::Ready
     }
 
     fn finish_open(&mut self, book_index: u16) {
@@ -214,7 +216,11 @@ impl WebEmulator {
             return;
         }
         let source = &SHELF[book_index as usize % SHELF.len()];
-        self.store = Some(BookStore::build(source, self.state.type_settings()));
+        self.store = Some(BookStore::build(
+            source,
+            self.state.type_settings(),
+            app_core::is_portrait(self.state.orientation),
+        ));
         self.store_book = Some(book_index);
         self.load_status = LoadStatus::Ready;
     }
@@ -455,6 +461,7 @@ fn storage_command_for_transition(
             chapter: next.chapter,
             target_pages: 5,
             type_settings: next.type_settings(),
+            portrait: app_core::is_portrait(next.orientation),
         });
     }
 
@@ -466,6 +473,7 @@ fn storage_command_for_transition(
             chapter: next.chapter,
             target_pages: next.page.saturating_add(5).min(u16::MAX as u32) as u16,
             type_settings: next.type_settings(),
+            portrait: app_core::is_portrait(next.orientation),
         });
     }
 

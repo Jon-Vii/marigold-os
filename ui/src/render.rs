@@ -814,7 +814,7 @@ fn portrait_key_dash(fb: &mut Framebuffer, layout: ShellLayout, slot: usize) -> 
 /// Previous) high, inner slots (Confirm, Next) low, each centered over
 /// its own dash.
 fn portrait_key_label_y(layout: ShellLayout, slot: usize) -> i16 {
-    if slot % 2 == 0 {
+    if slot.is_multiple_of(2) {
         layout.frame_height - 56
     } else {
         layout.frame_height - 28

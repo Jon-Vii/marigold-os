@@ -219,6 +219,8 @@ pub(crate) struct ReaderStore {
     pub(crate) page_spine: [u16; MAX_READER_PAGES],
     pub(crate) page_count: usize,
     type_settings: TypeSettings,
+    /// Whether the current layout paginates into the portrait page box.
+    portrait: bool,
     custom_font_available: bool,
     custom_font_identity: u64,
     custom_font_name: String<MAX_CUSTOM_FONT_NAME>,
@@ -285,6 +287,7 @@ impl ReaderStore {
             page_spine: [0; MAX_READER_PAGES],
             page_count: 0,
             type_settings: TypeSettings::DEFAULT,
+            portrait: false,
             custom_font_available: false,
             custom_font_identity: 0,
             custom_font_name: String::new(),
@@ -349,15 +352,25 @@ impl ReaderStore {
         self.type_settings
     }
 
-    /// Adopt new type settings and drop the in-RAM section window's page
-    /// coverage, so the next open/extend reloads the section under the new
-    /// layout (a size change rebuilds it from the EPUB) instead of serving
+    pub(crate) fn portrait(&self) -> bool {
+        self.portrait
+    }
+
+    pub(crate) fn page_box(&self) -> ui::reading::PageBox {
+        ui::reading::PageBox::for_portrait(self.portrait)
+    }
+
+    /// Adopt a new reading layout — type settings plus the page box — and
+    /// drop the in-RAM section window's page coverage, so the next
+    /// open/extend reloads the section under the new layout (a size or
+    /// orientation change rebuilds it from the EPUB) instead of serving
     /// pages paginated under the old one.
-    pub(crate) fn set_type_settings(&mut self, settings: TypeSettings) {
-        if self.type_settings == settings {
+    pub(crate) fn set_layout(&mut self, settings: TypeSettings, portrait: bool) {
+        if self.type_settings == settings && self.portrait == portrait {
             return;
         }
         self.type_settings = settings;
+        self.portrait = portrait;
         self.page_count = 0;
         self.current_section_page_count = 0;
     }
@@ -1398,6 +1411,10 @@ impl ui::reading::ReadingBlocks for ReaderStore {
 
     fn type_settings(&self) -> TypeSettings {
         self.type_settings
+    }
+
+    fn page_box(&self) -> ui::reading::PageBox {
+        ReaderStore::page_box(self)
     }
 }
 

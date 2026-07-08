@@ -9,8 +9,7 @@ pub(crate) use display::font::{style_marker_code, STYLE_MARKER};
 use proto::cache::PageRecord;
 use ui::reading::{block_height, page_record_at, paginate_block_pages, ReadingBlocks};
 pub(crate) use ui::reading::{
-    first_styled_line_style, paragraph_indent, reader_layout_config, reader_x_for, READER_LEFT_X,
-    READER_PAGE_BOTTOM, READER_PAGE_TOP, READER_RIGHT_X, READER_WRAP_SAFETY,
+    first_styled_line_style, paragraph_indent, reader_layout_config, READER_WRAP_SAFETY,
 };
 
 pub(crate) struct ReaderPagePlan {
@@ -20,14 +19,9 @@ pub(crate) struct ReaderPagePlan {
 
 impl ReaderPagePlan {
     pub(crate) fn new(sd_library: &ReaderStore, requested_page: u32) -> Self {
-        let page_count = reader_page_count(sd_library, READER_PAGE_TOP, READER_PAGE_BOTTOM);
+        let page_count = reader_page_count(sd_library);
         let requested_page = sd_library.local_page_for_global(requested_page.min(page_count - 1));
-        let page = reader_page_at(
-            sd_library,
-            requested_page,
-            READER_PAGE_TOP,
-            READER_PAGE_BOTTOM,
-        );
+        let page = reader_page_at(sd_library, requested_page);
         Self { page_count, page }
     }
 
@@ -40,34 +34,34 @@ impl ReaderPagePlan {
     }
 }
 
-pub(crate) fn reader_page_count(sd_library: &ReaderStore, page_top: i16, page_bottom: i16) -> u32 {
+pub(crate) fn reader_page_count(sd_library: &ReaderStore) -> u32 {
     if sd_library.book_total_pages > 0 {
         return sd_library.book_total_pages;
     }
     if sd_library.page_count > 0 {
         return sd_library.page_count as u32;
     }
-    paginate_block_pages(sd_library, page_top, page_bottom).max(1) as u32
+    paginate_block_pages(sd_library).max(1) as u32
 }
 
-pub(crate) fn reader_page_at(
-    sd_library: &ReaderStore,
-    page_index: usize,
-    page_top: i16,
-    page_bottom: i16,
-) -> PageRecord {
+pub(crate) fn reader_page_at(sd_library: &ReaderStore, page_index: usize) -> PageRecord {
     if page_index < sd_library.page_count {
         return sd_library.pages[page_index];
     }
-    page_record_at(sd_library, page_index, page_top, page_bottom)
+    page_record_at(sd_library, page_index)
 }
 
-pub(crate) fn rebuild_page_index(library: &mut ReaderStore, page_top: i16, page_bottom: i16) {
+pub(crate) fn rebuild_page_index(library: &mut ReaderStore) {
     library.page_count = 0;
     if library.block_count == 0 {
         return;
     }
 
+    let ui::reading::PageBox {
+        top: page_top,
+        bottom: page_bottom,
+        ..
+    } = library.page_box();
     let mut first_block = 0usize;
     let mut block_count = 0usize;
     let mut y = page_top;

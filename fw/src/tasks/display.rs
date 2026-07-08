@@ -400,21 +400,23 @@ fn open_loading_plate_request(
     sd_library: &ReaderStore,
     last_request: Option<RenderRequest>,
 ) -> Option<RenderRequest> {
-    let (book_id, index, target_pages, type_settings) = match *command {
+    let (book_id, index, target_pages, type_settings, portrait) = match *command {
         StorageCommand::OpenBook {
             book_id,
             index,
             target_pages,
             type_settings,
+            portrait,
             ..
-        } => (book_id, index, target_pages, type_settings),
+        } => (book_id, index, target_pages, type_settings, portrait),
         StorageCommand::ExtendSection {
             book_id,
             index,
             target_pages,
             type_settings,
+            portrait,
             ..
-        } => (book_id, index, target_pages, type_settings),
+        } => (book_id, index, target_pages, type_settings, portrait),
         _ => return None,
     };
     // Only SD books re-paginate and route to the reader loading plate; the
@@ -423,6 +425,7 @@ fn open_loading_plate_request(
         return None;
     }
     if sd_library.type_settings() == type_settings
+        && sd_library.portrait() == portrait
         && sd_library.covers_global_page(index as usize, target_pages as u32)
     {
         return None;
@@ -541,6 +544,7 @@ fn handle_storage_command(
             chapter,
             target_pages,
             type_settings,
+            portrait,
         }
         | StorageCommand::ExtendSection {
             request_id,
@@ -549,6 +553,7 @@ fn handle_storage_command(
             chapter,
             target_pages,
             type_settings,
+            portrait,
         } => {
             let storage_start = Instant::now();
             if request_id != LATEST_READER_REQUEST_ID.load(Ordering::Relaxed) {
@@ -569,7 +574,7 @@ fn handle_storage_command(
             // Adopt the command's type settings before the RAM fast path:
             // a settings change drops the loaded page coverage, so the
             // request falls through to the cache load/rebuild below.
-            sd_library.set_type_settings(type_settings);
+            sd_library.set_layout(type_settings, portrait);
             // A fresh selection (chapter 0, page 0) resumes from the
             // book's own saved position; explicit page requests pass
             // through untouched. Extends never resume.
@@ -710,12 +715,13 @@ fn handle_storage_command(
             index,
             chapter,
             type_settings,
+            portrait,
         } => {
             if request_id != LATEST_READER_REQUEST_ID.load(Ordering::Relaxed) {
                 return;
             }
             crate::library_sd::load_active_entry(epd, sd_cs, sd_library, index as usize);
-            sd_library.set_type_settings(type_settings);
+            sd_library.set_layout(type_settings, portrait);
             // The TOC is still in the buffer; resolve the chapter's start page
             // before loading the section overwrites it. Re-ensure the window
             // covers the selection in case it slid since the overview render.

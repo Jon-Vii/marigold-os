@@ -448,7 +448,7 @@ where
         };
         if header.source_hash != source_identity.0
             || header.source_size != source_identity.1
-            || header.font_config != reader_layout::reader_layout_config(library.type_settings())
+            || header.font_config != reader_layout::reader_layout_config(library.type_settings(), library.portrait())
             || header.custom_font_identity != library.custom_font_identity()
             || header.section_count as usize > MAX_BOOK_SECTIONS
             || header.toc_count as usize > MAX_SD_TOC_ITEMS
@@ -857,7 +857,7 @@ where
             author_text_bytes,
             viewport_width: 800,
             viewport_height: 480,
-            font_config: reader_layout::reader_layout_config(library.type_settings()),
+            font_config: reader_layout::reader_layout_config(library.type_settings(), library.portrait()),
             custom_font_identity: library.custom_font_identity(),
             partial,
         };
@@ -1013,7 +1013,7 @@ where
         {
             return CacheLoadResult::Invalid;
         }
-        let expected_config = reader_layout::reader_layout_config(library.type_settings());
+        let expected_config = reader_layout::reader_layout_config(library.type_settings(), library.portrait());
         if header.custom_font_identity != library.custom_font_identity() {
             return CacheLoadResult::Invalid;
         }
@@ -1028,11 +1028,7 @@ where
             return CacheLoadResult::Invalid;
         }
         if !layout_matches {
-            reader_layout::rebuild_page_index(
-                library,
-                reader_layout::READER_PAGE_TOP,
-                reader_layout::READER_PAGE_BOTTOM,
-            );
+            reader_layout::rebuild_page_index(library);
         }
         let pages = library.page_count;
         if pages < target_pages {
@@ -1483,7 +1479,7 @@ where
         text_bytes: library.text_len.min(u32::MAX as usize) as u32,
         viewport_width: 800,
         viewport_height: 480,
-        font_config: reader_layout::reader_layout_config(library.type_settings()),
+        font_config: reader_layout::reader_layout_config(library.type_settings(), library.portrait()),
         custom_font_identity: library.custom_font_identity(),
         bytes_consumed: 0,
         total_bytes: 0,

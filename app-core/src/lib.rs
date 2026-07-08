@@ -281,6 +281,9 @@ pub enum StorageCommand {
         chapter: u8,
         target_pages: u16,
         type_settings: TypeSettings,
+        /// Paginate into the portrait page box. Rides beside the type
+        /// settings because it changes wrap points the same way.
+        portrait: bool,
     },
     ExtendSection {
         request_id: u32,
@@ -289,6 +292,7 @@ pub enum StorageCommand {
         chapter: u8,
         target_pages: u16,
         type_settings: TypeSettings,
+        portrait: bool,
     },
     /// Load the full chapter list (TOC.BIN) into the reader's section buffer
     /// for the Chapters overview. The reading section reloads on exit.
@@ -306,6 +310,7 @@ pub enum StorageCommand {
         index: u16,
         chapter: u8,
         type_settings: TypeSettings,
+        portrait: bool,
     },
     StoreProgress(PersistedAppState),
     /// Hand the EPUB scratch to the wifi task as sync-session heap. One
@@ -1125,6 +1130,16 @@ impl ReaderState {
         }
         selected
     }
+}
+
+/// Whether an orientation stands the panel's long axis upright. The two
+/// portrait variants share one page geometry, so reading layout keys off
+/// this rather than the exact variant.
+pub fn is_portrait(orientation: DisplayOrientation) -> bool {
+    matches!(
+        orientation,
+        DisplayOrientation::PortraitButtonsLeft | DisplayOrientation::PortraitButtonsRight
+    )
 }
 
 pub fn display_orientation_from_u8(value: u8) -> Option<DisplayOrientation> {
@@ -1978,6 +1993,7 @@ mod tests {
                 chapter: 0,
                 target_pages: 0,
                 type_settings: TypeSettings::DEFAULT,
+                portrait: false,
             },
             StorageCommand::ExtendSection {
                 request_id: 1,
@@ -1986,6 +2002,7 @@ mod tests {
                 chapter: 0,
                 target_pages: 0,
                 type_settings: TypeSettings::DEFAULT,
+                portrait: false,
             },
             StorageCommand::LoadChapters {
                 request_id: 1,
@@ -1998,6 +2015,7 @@ mod tests {
                 index: 0,
                 chapter: 0,
                 type_settings: TypeSettings::DEFAULT,
+                portrait: false,
             },
             StorageCommand::StoreProgress(persisted),
             StorageCommand::LoanSyncMemory,

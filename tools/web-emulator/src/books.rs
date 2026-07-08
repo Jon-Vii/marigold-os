@@ -8,8 +8,7 @@ use proto::cache::{BlockRecord, PageRecord};
 use proto::text::{TextAlign, TextRole};
 use ui::reading::{
     block_first_line_indent, block_height, block_ink_height, body_font, wrapped_line_count,
-    ReadingBlocks, READER_LEFT_X, READER_PAGE_BOTTOM, READER_PAGE_TOP, READER_RIGHT_X,
-    reader_x_for,
+    PageBox, ReadingBlocks,
 };
 
 pub struct BookSource {
@@ -56,6 +55,7 @@ pub struct Chapter {
 pub struct BookStore {
     blocks: Vec<Block>,
     settings: TypeSettings,
+    portrait: bool,
     pub pages: Vec<PageRecord>,
     pub chapters: Vec<Chapter>,
 }
@@ -100,13 +100,18 @@ impl ReadingBlocks for BookStore {
     fn type_settings(&self) -> TypeSettings {
         self.settings
     }
+
+    fn page_box(&self) -> PageBox {
+        PageBox::for_portrait(self.portrait)
+    }
 }
 
 impl BookStore {
-    pub fn build(source: &BookSource, settings: TypeSettings) -> Self {
+    pub fn build(source: &BookSource, settings: TypeSettings, portrait: bool) -> Self {
         let mut store = Self {
             blocks: Vec::new(),
             settings,
+            portrait,
             pages: Vec::new(),
             chapters: Vec::new(),
         };
@@ -163,11 +168,12 @@ impl BookStore {
             let record = self.blocks[index].record;
             let indent = block_first_line_indent(self, index);
             let font = body_font(self.settings, self.blocks[index].style);
-            let max_width = READER_RIGHT_X
+            let page_box = PageBox::for_portrait(self.portrait);
+            let max_width = page_box.right
                 - if record.align == TextAlign::Center {
-                    READER_LEFT_X
+                    page_box.left
                 } else {
-                    reader_x_for(record.role)
+                    page_box.x_for(record.role)
                 };
             let lines =
                 wrapped_line_count(font, &self.blocks[index].text, max_width, indent).max(1);
@@ -183,16 +189,17 @@ impl BookStore {
         if self.blocks.is_empty() {
             return;
         }
+        let page_box = PageBox::for_portrait(self.portrait);
         let mut first_block = 0usize;
         let mut block_count = 0usize;
-        let mut y = READER_PAGE_TOP;
+        let mut y = page_box.top;
         let mut chapter_cursor = 0usize;
 
         for index in 0..self.blocks.len() {
             let height = block_height(self, index);
-            let new_page = (y + block_ink_height(self, index) > READER_PAGE_BOTTOM
+            let new_page = (y + block_ink_height(self, index) > page_box.bottom
                 || self.blocks[index].page_break_before)
-                && y > READER_PAGE_TOP;
+                && y > page_box.top;
             if new_page {
                 self.pages.push(PageRecord {
                     first_block: first_block as u16,
@@ -200,7 +207,7 @@ impl BookStore {
                 });
                 first_block = index;
                 block_count = 0;
-                y = READER_PAGE_TOP;
+                y = page_box.top;
             }
             if chapter_cursor < chapter_blocks.len() && chapter_blocks[chapter_cursor] == index {
                 self.chapters[chapter_cursor].start_page = self.pages.len() as u16;

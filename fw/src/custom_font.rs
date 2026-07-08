@@ -47,6 +47,7 @@ where
         source,
     };
     let settings = source.type_settings();
+    let page_box = ui::reading::ReadingBlocks::page_box(source);
     let mut ok = true;
     ui::reading::for_each_drawable_block(source, page, |block| {
         if block.record.line_count != 1 {
@@ -57,12 +58,10 @@ where
             TextAlign::Center => {
                 let width = font
                     .styled_ink_width(block.text, settings.size, settings.weight, block.style)
-                    .min(ui::reading::READER_RIGHT_X - ui::reading::READER_LEFT_X);
-                ((display::WIDTH as i16 - width) / 2).max(ui::reading::READER_LEFT_X)
+                    .min(page_box.right - page_box.left);
+                ((page_box.left + page_box.right - width) / 2).max(page_box.left)
             }
-            TextAlign::Left | TextAlign::Justify => {
-                ui::reading::reader_x_for(block.record.role) + block.indent
-            }
+            TextAlign::Left | TextAlign::Justify => page_box.x_for(block.record.role) + block.indent,
         };
         if !font.draw_styled_line(
             fb,

@@ -18,7 +18,10 @@ use display::font::{
 use proto::cache::BlockRecord;
 use proto::text::{TextAlign, TextRole};
 use ui::reading::{draw_reading_page_body, draw_reading_page_counter, page_record_at};
-use ui::reading::{paginate_block_pages, ReadingBlocks, READER_PAGE_BOTTOM, READER_PAGE_TOP};
+use ui::reading::{
+    block_first_line_indent, body_font, paginate_block_pages, wrapped_line_count, PageBox,
+    ReadingBlocks,
+};
 
 struct FixtureBlock {
     record: BlockRecord,
@@ -31,6 +34,7 @@ struct FixtureBlock {
 struct FixtureBlocks {
     blocks: Vec<FixtureBlock>,
     settings: TypeSettings,
+    portrait: bool,
 }
 
 impl ReadingBlocks for FixtureBlocks {
@@ -72,6 +76,10 @@ impl ReadingBlocks for FixtureBlocks {
 
     fn type_settings(&self) -> TypeSettings {
         self.settings
+    }
+
+    fn page_box(&self) -> PageBox {
+        PageBox::for_portrait(self.portrait)
     }
 }
 
@@ -169,7 +177,46 @@ fn fixture(settings: TypeSettings) -> FixtureBlocks {
         page_break_before: false,
         paragraph_end: true,
     });
-    FixtureBlocks { blocks, settings }
+    FixtureBlocks {
+        blocks,
+        settings,
+        portrait: false,
+    }
+}
+
+/// The same fixture laid into the portrait page box. Cached line counts
+/// are wrap products, so they re-wrap under the portrait widths exactly as
+/// a device cache rebuild would.
+fn portrait_fixture() -> FixtureBlocks {
+    let mut source = fixture(TypeSettings::DEFAULT);
+    source.portrait = true;
+    let counts: Vec<u8> = (0..source.blocks.len())
+        .map(|index| {
+            // The device sink emits styled runs only as pre-wrapped
+            // single-line blocks, so marker-bearing text stays one line;
+            // wrapping it would paint the markers as glyphs.
+            if source.blocks[index].text.contains(STYLE_MARKER) {
+                return source.blocks[index].record.line_count;
+            }
+            let record = source.blocks[index].record;
+            let font = body_font(source.settings, source.blocks[index].style);
+            let page_box = ReadingBlocks::page_box(&source);
+            let max_width = page_box.right
+                - if record.align == TextAlign::Center {
+                    page_box.left
+                } else {
+                    page_box.x_for(record.role)
+                };
+            let indent = block_first_line_indent(&source, index);
+            wrapped_line_count(font, &source.blocks[index].text, max_width, indent)
+                .max(1)
+                .min(u8::MAX as u16) as u8
+        })
+        .collect();
+    for (block, count) in source.blocks.iter_mut().zip(counts) {
+        block.record.line_count = count;
+    }
+    source
 }
 
 fn encode_png(fb: &Framebuffer) -> Vec<u8> {
@@ -185,7 +232,7 @@ fn encode_png(fb: &Framebuffer) -> Vec<u8> {
         let mut data = Vec::with_capacity(display::WIDTH * display::HEIGHT);
         for y in 0..display::HEIGHT {
             for x in 0..display::WIDTH {
-                data.push(if fb.pixel(x, y) { 0xEE } else { 0x18 });
+                data.push(if fb.native_pixel(x, y) { 0xEE } else { 0x18 });
             }
         }
         writer.write_image_data(&data).expect("png data");
@@ -201,7 +248,7 @@ fn golden_path(name: &str) -> PathBuf {
 }
 
 fn assert_page_matches_golden(source: &FixtureBlocks, page_index: usize, name: &str) {
-    let page = page_record_at(source, page_index, READER_PAGE_TOP, READER_PAGE_BOTTOM);
+    let page = page_record_at(source, page_index);
     assert!(page.block_count > 0, "page {page_index} should hold blocks");
     let mut fb = Framebuffer::new();
     draw_reading_page_body(&mut fb, source, page);
@@ -228,7 +275,7 @@ fn assert_page_matches_golden(source: &FixtureBlocks, page_index: usize, name: &
 #[test]
 fn reading_page_bodies_match_goldens() {
     let source = fixture(TypeSettings::DEFAULT);
-    let pages = paginate_block_pages(&source, READER_PAGE_TOP, READER_PAGE_BOTTOM);
+    let pages = paginate_block_pages(&source);
     assert!(pages >= 2, "fixture should span at least two pages, got {pages}");
 
     for page_index in 0..2 {
@@ -242,7 +289,7 @@ fn reading_page_bodies_match_goldens() {
 #[test]
 fn full_reading_surface_matches_golden() {
     let source = fixture(TypeSettings::DEFAULT);
-    let page = page_record_at(&source, 0, READER_PAGE_TOP, READER_PAGE_BOTTOM);
+    let page = page_record_at(&source, 0);
     let mut fb = Framebuffer::new();
     draw_reading_page_body(&mut fb, &source, page);
     draw_reading_page_counter(&mut fb, "1/2");
@@ -279,8 +326,8 @@ fn reading_page_bodies_match_goldens_large_relaxed() {
         family: FontFamily::Literata,
     });
     let default_pages =
-        paginate_block_pages(&fixture(TypeSettings::DEFAULT), READER_PAGE_TOP, READER_PAGE_BOTTOM);
-    let pages = paginate_block_pages(&source, READER_PAGE_TOP, READER_PAGE_BOTTOM);
+        paginate_block_pages(&fixture(TypeSettings::DEFAULT));
+    let pages = paginate_block_pages(&source);
     assert!(
         pages > default_pages,
         "large/relaxed must need more pages ({pages}) than default ({default_pages})"
@@ -337,23 +384,16 @@ fn default_grid_uses_selected_panel_height() {
         FixtureBlocks {
             blocks,
             settings: TypeSettings::DEFAULT,
+            portrait: false,
         }
     };
     let fitting_lines = if cfg!(feature = "device-x3") { 19 } else { 17 };
     assert_eq!(
-        paginate_block_pages(
-            &paragraph_of(fitting_lines),
-            READER_PAGE_TOP,
-            READER_PAGE_BOTTOM
-        ),
+        paginate_block_pages(&paragraph_of(fitting_lines)),
         1
     );
     assert_eq!(
-        paginate_block_pages(
-            &paragraph_of(fitting_lines + 1),
-            READER_PAGE_TOP,
-            READER_PAGE_BOTTOM
-        ),
+        paginate_block_pages(&paragraph_of(fitting_lines + 1)),
         2
     );
 }
@@ -368,10 +408,50 @@ fn small_compact_paginates_no_worse_than_default() {
         family: FontFamily::Literata,
     });
     let default_pages =
-        paginate_block_pages(&fixture(TypeSettings::DEFAULT), READER_PAGE_TOP, READER_PAGE_BOTTOM);
-    let pages = paginate_block_pages(&source, READER_PAGE_TOP, READER_PAGE_BOTTOM);
+        paginate_block_pages(&fixture(TypeSettings::DEFAULT));
+    let pages = paginate_block_pages(&source);
     assert!(
         pages <= default_pages,
         "small/compact must not need more pages ({pages}) than default ({default_pages})"
+    );
+}
+
+/// Pin the portrait reading surface: the fixture re-wrapped into the
+/// upright page box, drawn through the portrait frame with the counter.
+/// Catches wrap-width, page-walk, and footer placement regressions in the
+/// orientation the panel was not built for.
+#[test]
+fn portrait_reading_surface_matches_golden() {
+    let source = portrait_fixture();
+    let pages = paginate_block_pages(&source);
+    assert!(
+        pages >= 2,
+        "portrait fixture should span at least two pages, got {pages}"
+    );
+
+    let page = page_record_at(&source, 0);
+    let mut fb = Framebuffer::new();
+    fb.set_frame(display::fb::FbFrame::Portrait);
+    fb.clear(true);
+    draw_reading_page_body(&mut fb, &source, page);
+    draw_reading_page_counter(&mut fb, "1/2");
+
+    let actual = encode_png(&fb);
+    let path = golden_path("reading-portrait-surface-0");
+    if std::env::var("REGEN_READING_GOLDEN").is_ok() {
+        std::fs::write(&path, &actual).expect("write golden");
+        return;
+    }
+    let expected = std::fs::read(&path).unwrap_or_else(|err| {
+        panic!(
+            "missing golden {} ({err}); run with REGEN_READING_GOLDEN=1 to create",
+            path.display()
+        )
+    });
+    assert_eq!(
+        actual,
+        expected,
+        "portrait reading surface diverged from {}",
+        path.display()
     );
 }

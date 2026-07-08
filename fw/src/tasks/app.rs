@@ -106,7 +106,10 @@ pub async fn run() {
                 let previous_persisted = state.persisted();
                 state = state.apply_input(ctx, event);
                 let next_persisted = state.persisted();
-                if previous.type_settings() != state.type_settings() {
+                if previous.type_settings() != state.type_settings()
+                    || app_core::is_portrait(previous.orientation)
+                        != app_core::is_portrait(state.orientation)
+                {
                     reader_relayout_pending = true;
                 }
                 let mut storage_command = storage_command_for_transition(&previous, &state);
@@ -540,6 +543,7 @@ fn open_book_command(state: &ReaderState, index: u16) -> StorageCommand {
         chapter: state.chapter,
         target_pages: state.page.min(u16::MAX as u32) as u16,
         type_settings: state.type_settings(),
+        portrait: app_core::is_portrait(state.orientation),
     }
 }
 
@@ -552,6 +556,7 @@ fn extend_section_command(state: &ReaderState, index: u16) -> StorageCommand {
         chapter: state.chapter,
         target_pages: state.page.min(u16::MAX as u32) as u16,
         type_settings: state.type_settings(),
+        portrait: app_core::is_portrait(state.orientation),
     }
 }
 
@@ -570,6 +575,7 @@ fn jump_chapter_command(state: &ReaderState, index: u16) -> StorageCommand {
         index,
         chapter: state.chapter,
         type_settings: state.type_settings(),
+        portrait: app_core::is_portrait(state.orientation),
     }
 }
 

@@ -1,4 +1,4 @@
-use crate::reader_layout::{self, READER_LEFT_X, READER_RIGHT_X};
+use crate::reader_layout;
 use crate::reader_store::{BookLoadStatus, LibraryScanStatus, ReaderStore, LIBRARY_WINDOW};
 use crate::{catalog, AppView, DisplayOrientation, ReaderSource, RenderRequest};
 use core::fmt::Write;
@@ -339,26 +339,15 @@ fn draw_sd_reader_loading(fb: &mut Framebuffer, request: RenderRequest, sd_libra
         sd_library.active_book_labels(request.book_id, fallback.title, fallback.author);
 
     // Vertically center title + author block within the reader page region
-    // (panel-relative, so the X3's taller page carries the plate down).
-    let title_y = display::HEIGHT as i16 / 2 - 8;
+    // (frame-relative, so the X3's taller page and the portrait hold both
+    // carry the plate to their own middle).
+    let left = 8;
+    let right = fb.frame_width() as i16 - 8;
+    let title_y = fb.frame_height() as i16 / 2 - 8;
     let author_y = title_y + 36;
-    draw_text_centered_truncated_local(
-        fb,
-        title_font,
-        title,
-        READER_LEFT_X,
-        READER_RIGHT_X,
-        title_y,
-    );
+    draw_text_centered_truncated_local(fb, title_font, title, left, right, title_y);
     if !author.is_empty() {
-        draw_text_centered_truncated_local(
-            fb,
-            author_font,
-            author,
-            READER_LEFT_X,
-            READER_RIGHT_X,
-            author_y,
-        );
+        draw_text_centered_truncated_local(fb, author_font, author, left, right, author_y);
     }
 }
 
@@ -368,30 +357,18 @@ fn draw_sd_reader_error(fb: &mut Framebuffer, request: RenderRequest, sd_library
     let fallback = catalog::active_book(request.book_id);
     let (title, _) = sd_library.active_book_labels(request.book_id, fallback.title, "");
 
-    let title_y = 224i16;
+    let left = 8;
+    let right = fb.frame_width() as i16 - 8;
+    let title_y = fb.frame_height() as i16 / 2 - 16;
     let message_y = title_y + 40;
-    draw_text_centered_truncated_local(
-        fb,
-        title_font,
-        title,
-        READER_LEFT_X,
-        READER_RIGHT_X,
-        title_y,
-    );
+    draw_text_centered_truncated_local(fb, title_font, title, left, right, title_y);
     let error = sd_library.reader_error();
     let message: &str = if error.is_empty() {
         "Could not open this book."
     } else {
         error
     };
-    draw_text_centered_truncated_local(
-        fb,
-        body_font,
-        message,
-        READER_LEFT_X,
-        READER_RIGHT_X,
-        message_y,
-    );
+    draw_text_centered_truncated_local(fb, body_font, message, left, right, message_y);
 }
 
 fn draw_text_centered_truncated_local(

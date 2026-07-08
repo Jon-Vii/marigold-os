@@ -667,7 +667,7 @@ fn refresh_chapter_tracking<
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let config = reader_layout::reader_layout_config(library.type_settings());
+    let config = reader_layout::reader_layout_config(library.type_settings(), library.portrait());
     let token = (
         source_identity.0,
         source_identity.1,
@@ -1553,11 +1553,7 @@ where
     }
 
     fn flush_section(&mut self, partial: bool, carry_incomplete: bool) -> bool {
-        reader_layout::rebuild_page_index(
-            self.library,
-            reader_layout::READER_PAGE_TOP,
-            reader_layout::READER_PAGE_BOTTOM,
-        );
+        reader_layout::rebuild_page_index(self.library);
         if self.library.block_count() == 0 || self.library.page_count == 0 {
             self.library.clear_lines();
             return true;
@@ -1619,11 +1615,7 @@ where
                 self.library.block_count = full_blocks;
                 self.library.text_len = full_text;
                 self.library.carry_last_page(cut);
-                reader_layout::rebuild_page_index(
-                    self.library,
-                    reader_layout::READER_PAGE_TOP,
-                    reader_layout::READER_PAGE_BOTTOM,
-                );
+                reader_layout::rebuild_page_index(self.library);
             }
             None => self.library.clear_lines(),
         }
@@ -1631,11 +1623,7 @@ where
     }
 
     fn flush_if_full(&mut self) {
-        reader_layout::rebuild_page_index(
-            self.library,
-            reader_layout::READER_PAGE_TOP,
-            reader_layout::READER_PAGE_BOTTOM,
-        );
+        reader_layout::rebuild_page_index(self.library);
         if self.library.page_count >= self.target_pages
             || self.library.block_count() >= self.library.block_capacity().saturating_sub(4)
             || self.library.text_capacity_reached()
@@ -1747,8 +1735,9 @@ fn push_styled_preview_fragment<
 
     normalize_decorative_separator(&mut normalized);
     let align = block_align_for(align, normalized.as_str(), role);
-    let x = reader_layout::reader_x_for(role);
-    let max_x = reader_layout::READER_RIGHT_X;
+    let page_box = sink.library.page_box();
+    let x = page_box.x_for(role);
+    let max_x = page_box.right;
     // Book-style first-line indent: a Body paragraph's opening line wraps
     // against a narrower column. Only Left/Justify Body takes it, matching
     // `ui::reading::block_first_line_indent`, so the built line breaks agree
