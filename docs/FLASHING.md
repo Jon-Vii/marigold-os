@@ -52,6 +52,13 @@ xxd -s 0x20 -l 4 target/release-images/firmware.bin   # -> 3254 cdab (0xABCD5432
 
 ## Building the release images
 
+Release builds require Rust from `rustup`, the firmware target, and `espflash`:
+
+```sh
+rustup target add riscv32imc-unknown-none-elf
+cargo install espflash
+```
+
 ```sh
 tools/build-release.sh        # X4 (default)
 tools/build-release.sh x3     # X3

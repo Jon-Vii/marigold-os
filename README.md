@@ -30,6 +30,14 @@ e-ink display and a selection of public-domain books.
 
 ## Development
 
+Prerequisites: install Rust with `rustup`, then install the firmware target and
+release-image tool:
+
+```sh
+rustup target add riscv32imc-unknown-none-elf
+cargo install espflash
+```
+
 ```sh
 tools/cargo.sh run -p fw --release                              # build, flash, serial monitor
 tools/cargo.sh test -p app-core -p proto --target aarch64-apple-darwin
