@@ -1,0 +1,34 @@
+# Cycle the orientation row to portrait: buttons down -> up (Confirm), then
+# up -> portrait via the physical Previous key, which sits in the change
+# position while the device hangs upside down. The Settings screen re-lays
+# itself out with the key rail along the bottom bezel.
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Confirm"
+
+[[steps]]
+button = "Previous"
+
+[expect]
+view = "Settings"
+selection = 5
+orientation = "portrait-left"
+last_refresh = "FastClean"

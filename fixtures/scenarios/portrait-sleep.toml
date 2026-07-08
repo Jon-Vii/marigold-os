@@ -1,0 +1,35 @@
+# The sleep bookplate in the portrait hold: centered ceremonial furniture
+# narrowed to the upright leaf, no key rail (no key is listening).
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Confirm"
+
+[[steps]]
+button = "Previous"
+
+[[steps]]
+button = "Power"
+
+[expect]
+sleeping = true
+orientation = "portrait-left"
+panel_sleeping = true
+history_contains = "deep_sleep"

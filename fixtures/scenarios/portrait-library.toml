@@ -1,0 +1,41 @@
+# The Library list in the portrait hold: same six visible rows, footer and
+# battery lifted above the bottom key rail.
+
+[[steps]]
+library = "scanned"
+count = 6
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Confirm"
+
+[[steps]]
+button = "Previous"
+
+[[steps]]
+button = "Back"
+
+[[steps]]
+button = "Back"
+
+[expect]
+view = "Library"
+orientation = "portrait-left"
+library_count = 6
