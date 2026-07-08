@@ -1203,19 +1203,32 @@ fn apply_home_action(mut state: ReaderState, action: HomeAction) -> ReaderState 
     state
 }
 
+/// Positional button semantics: after the device rotates, the button
+/// sitting where Back used to be still acts as Back. The 180-degree flip
+/// reverses both the front column and the side pair; the quarter turn to
+/// portrait keeps the front column's order (it reads left-to-right along
+/// the bottom bezel) but stands the side pair on end, so only that pair
+/// swaps to keep "upper button pages back".
 fn orient_button(orientation: DisplayOrientation, button: Option<Button>) -> Option<Button> {
     let button = button?;
-    if orientation != DisplayOrientation::LandscapeButtonsTop {
-        return Some(button);
-    }
-    Some(match button {
-        Button::Power => Button::Power,
-        Button::Back => Button::Next,
-        Button::Confirm => Button::Previous,
-        Button::Previous => Button::Confirm,
-        Button::Next => Button::Back,
-        Button::PagePrevious => Button::PageNext,
-        Button::PageNext => Button::PagePrevious,
+    Some(match orientation {
+        DisplayOrientation::LandscapeButtonsBottom => button,
+        DisplayOrientation::LandscapeButtonsTop => match button {
+            Button::Power => Button::Power,
+            Button::Back => Button::Next,
+            Button::Confirm => Button::Previous,
+            Button::Previous => Button::Confirm,
+            Button::Next => Button::Back,
+            Button::PagePrevious => Button::PageNext,
+            Button::PageNext => Button::PagePrevious,
+        },
+        DisplayOrientation::PortraitButtonsLeft | DisplayOrientation::PortraitButtonsRight => {
+            match button {
+                Button::PagePrevious => Button::PageNext,
+                Button::PageNext => Button::PagePrevious,
+                other => other,
+            }
+        }
     })
 }
 
@@ -1255,9 +1268,16 @@ fn apply_setting(mut state: ReaderState) -> ReaderState {
             };
         }
         5 => {
+            // Three holds are offered: the two landscapes and the one
+            // portrait (front buttons below the screen). The buttons-above
+            // portrait variant stays in the enum for the persistence format
+            // but has no use case, so the cycle skips it.
             state.orientation = match state.orientation {
                 DisplayOrientation::LandscapeButtonsBottom => {
                     DisplayOrientation::LandscapeButtonsTop
+                }
+                DisplayOrientation::LandscapeButtonsTop => {
+                    DisplayOrientation::PortraitButtonsLeft
                 }
                 _ => DisplayOrientation::LandscapeButtonsBottom,
             };
@@ -1691,18 +1711,42 @@ mod tests {
     }
 
     #[test]
-    fn settings_change_key_toggles_landscape_orientation() {
+    fn settings_change_key_cycles_the_three_offered_orientations() {
         let mut state = press(ReaderState::boot(), Button::Next);
         state.selection = 5;
 
         let state = press(state, Button::Confirm);
         assert_eq!(state.orientation, DisplayOrientation::LandscapeButtonsTop);
 
+        // Rotated 180 degrees, the physical Previous key sits where Confirm
+        // was, so it carries the change action.
         let state = press(state, Button::Previous);
+        assert_eq!(state.orientation, DisplayOrientation::PortraitButtonsLeft);
+
+        // Portrait keeps the front column's order: Confirm stays Confirm,
+        // and the cycle wraps back to the default hold (skipping the
+        // unoffered buttons-above portrait).
+        let state = press(state, Button::Confirm);
         assert_eq!(
             state.orientation,
             DisplayOrientation::LandscapeButtonsBottom
         );
+    }
+
+    #[test]
+    fn portrait_keeps_front_buttons_and_swaps_page_buttons() {
+        let mut state = ReaderState::boot();
+        state.orientation = DisplayOrientation::PortraitButtonsLeft;
+
+        assert_eq!(press(state, Button::Back).view, AppView::Library);
+        assert_eq!(press(state, Button::Confirm).view, AppView::Reading);
+
+        let mut library = press(state, Button::Back);
+        library.library_count = 3;
+        let next = press(library, Button::PagePrevious);
+        assert_eq!(next.selection, 1, "side pair stands on end and swaps");
+        let previous = press(next, Button::PageNext);
+        assert_eq!(previous.selection, 0);
     }
 
     #[test]
