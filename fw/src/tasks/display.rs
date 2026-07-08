@@ -390,29 +390,31 @@ fn render_custom_reader(
     .unwrap_or(false)
 }
 
-/// The reader-view render to paint as a loading plate before an open that
-/// re-paginates the book, or `None` when no plate is needed here. Only a
-/// layout change qualifies: the store still reports the old type settings at
-/// this point, so rendering the reader view lands on the title/author loading
-/// branch. A same-layout open of a different book already shows the plate
-/// through the normal render path (its pages are not loaded yet), and a
-/// same-book same-layout resume answers from RAM and must not flash the plate.
+/// The reader-view render to paint as a loading plate before an open/extend
+/// that cannot be answered from the already loaded RAM section. The app sends
+/// a normal Reading render around the same time, but the storage receiver can
+/// win that race; painting here keeps a first cache build from looking frozen
+/// on the previous screen.
 fn open_loading_plate_request(
     command: &StorageCommand,
     sd_library: &ReaderStore,
     last_request: Option<RenderRequest>,
 ) -> Option<RenderRequest> {
-    let (book_id, type_settings) = match *command {
+    let (book_id, index, target_pages, type_settings) = match *command {
         StorageCommand::OpenBook {
             book_id,
+            index,
+            target_pages,
             type_settings,
             ..
-        }
-        | StorageCommand::ExtendSection {
+        } => (book_id, index, target_pages, type_settings),
+        StorageCommand::ExtendSection {
             book_id,
+            index,
+            target_pages,
             type_settings,
             ..
-        } => (book_id, type_settings),
+        } => (book_id, index, target_pages, type_settings),
         _ => return None,
     };
     // Only SD books re-paginate and route to the reader loading plate; the
@@ -420,12 +422,15 @@ fn open_loading_plate_request(
     if !ReaderSource::from_book_id(book_id).is_sd() {
         return None;
     }
-    if sd_library.type_settings() == type_settings {
+    if sd_library.type_settings() == type_settings
+        && sd_library.covers_global_page(index as usize, target_pages as u32)
+    {
         return None;
     }
     let mut request = last_request?;
     request.view = AppView::Reading;
     request.book_id = book_id;
+    request.page = target_pages as u32;
     request.font_size = type_settings.size;
     request.line_spacing = type_settings.spacing;
     request.font_weight = type_settings.weight;

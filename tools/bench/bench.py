@@ -750,6 +750,8 @@ class ChannelStressModel:
         self.rendered_pages: list[int] = []
         self.pending_storage: int | None = None
         self.latest_request_id = 0
+        self.reader_section_loaded = False
+        self.loading_plate_painted = False
         self.checks: list[str] = []
 
     def run(self) -> None:
@@ -771,6 +773,10 @@ class ChannelStressModel:
         assert not self.storage_request_is_current(stale)
         assert self.storage_request_is_current(fresh)
         self.checks.append("stale open/extend requests are rejected by request id")
+
+        self.storage_wins_first_open()
+        assert self.loading_plate_painted
+        self.checks.append("storage-first cold book open paints a loading plate")
 
         self.pending_storage = 1
         self.sleep()
@@ -805,6 +811,13 @@ class ChannelStressModel:
 
     def storage_request_is_current(self, request_id: int) -> bool:
         return request_id == self.latest_request_id
+
+    def storage_wins_first_open(self) -> None:
+        self.loading_plate_painted = False
+        self.reader_section_loaded = False
+        if not self.reader_section_loaded:
+            self.loading_plate_painted = True
+        self.reader_section_loaded = True
 
     def sleep(self) -> None:
         self.rendering = False
