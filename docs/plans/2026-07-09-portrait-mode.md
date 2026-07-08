@@ -10,10 +10,12 @@ receives it renders like ButtonsLeft.
 
 ## Naming
 
-Orientation names follow the landscape convention and refer to the side (page-turn)
-buttons: `PortraitButtonsLeft` is the counter-clockwise device rotation (side buttons on
-the left edge, front-button column below the screen), `PortraitButtonsRight` the
-clockwise one (side buttons right, front buttons above).
+`PortraitButtonsLeft` (persisted value 2, matching the stock firmware's portrait
+shell) is the counter-clockwise device rotation: the front-button column lands below
+the screen and the side (page-turn) pair stands on the right edge. The enum name is
+historical; the value is what the persistence format cares about.
+`PortraitButtonsRight` is the clockwise rotation with the front buttons above the
+screen.
 
 ## 1. Logical frame in `Framebuffer` (display crate)
 

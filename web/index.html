@@ -118,6 +118,10 @@
     transition: transform 420ms cubic-bezier(.2,.8,.2,1);
   }
   .device.buttons-up { transform: rotate(180deg); }
+  /* The portrait hold: a quarter turn counter-clockwise, scaled so the
+     upright device fits roughly the landscape footprint. Same transition
+     as the buttons-up flip. */
+  .device.portrait { transform: rotate(-90deg) scale(.56); }
   @media (prefers-reduced-motion: reduce) {
     .device { transition: none; }
   }
@@ -509,6 +513,8 @@
   const BTN = { power: 0, back: 1, ok: 2, prev: 3, next: 4, pagePrev: 5, pageNext: 6 };
   const SAVE_KEY = "x4-progress-v1";
   const ORIENTATION_BUTTONS_TOP = 1;
+  const ORIENTATION_PORTRAIT_LEFT = 2;
+  const ORIENTATION_PORTRAIT_RIGHT = 3;
 
   const device = document.querySelector(".device");
   const canvas = document.getElementById("panel");
@@ -549,6 +555,10 @@
 
   function syncDeviceOrientation(orientation) {
     device.classList.toggle("buttons-up", orientation === ORIENTATION_BUTTONS_TOP);
+    device.classList.toggle(
+      "portrait",
+      orientation === ORIENTATION_PORTRAIT_LEFT || orientation === ORIENTATION_PORTRAIT_RIGHT,
+    );
   }
 
   // Restore the shelf position saved by a previous visit.
