@@ -3,6 +3,7 @@ use crate::reader_store::{
     derive_catalog_label, source_hash, LibraryScanStatus, ReaderStore, LIBRARY_WINDOW,
 };
 use crate::sd_session;
+use embassy_time::Instant;
 use embedded_sdmmc::{Directory, File, LfnBuffer, Mode, TimeSource};
 use esp_hal::gpio::Output;
 use heapless::String;
@@ -37,6 +38,7 @@ struct CatalogRecord {
 
 #[inline(never)]
 pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &mut ReaderStore) {
+    let start = Instant::now();
     esp_println::println!("sd: scan start");
     library.status = LibraryScanStatus::Scanning;
 
@@ -71,6 +73,13 @@ pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &m
         status
     };
     esp_println::println!("sd: scan complete, {} epub(s)", library.catalog_count());
+    esp_println::println!(
+        "bench: storage_catalog action=scan status={:?} count={} elapsed_ms={} t_ms={}",
+        library.status,
+        library.catalog_count(),
+        start.elapsed().as_millis(),
+        Instant::now().as_millis(),
+    );
 }
 
 #[inline(never)]
@@ -79,6 +88,7 @@ pub(crate) fn load_catalog_cache(
     sd_cs: &mut Output<'static>,
     library: &mut ReaderStore,
 ) -> bool {
+    let start = Instant::now();
     esp_println::println!("sd: catalog cache load start");
     library.clear_catalog();
     // A valid header (even an empty catalog) counts as loaded; a missing or
@@ -102,6 +112,13 @@ pub(crate) fn load_catalog_cache(
     } else {
         esp_println::println!("sd: catalog cache unavailable");
     }
+    esp_println::println!(
+        "bench: storage_catalog action=load ok={} count={} elapsed_ms={} t_ms={}",
+        loaded,
+        library.catalog_count(),
+        start.elapsed().as_millis(),
+        Instant::now().as_millis(),
+    );
     loaded
 }
 

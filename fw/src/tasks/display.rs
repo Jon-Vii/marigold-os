@@ -188,7 +188,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                         .await
                         .is_ok();
                     esp_println::println!(
-                        "bench: render {:?} {:?} page={} ch={} layout={}ms flush={}ms prestage={}ms t={}",
+                        "bench: render view={:?} mode={:?} page={} chapter={} layout_ms={} flush_ms={} prestage_ms={} t_ms={}",
                         request.view,
                         mode,
                         request.page,
@@ -224,6 +224,12 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                 }
             }
             Either::First(DisplayCommand::Sleep) => {
+                let sleep_start = Instant::now();
+                esp_println::println!(
+                    "bench: sleep phase=requested screen_on={} t_ms={}",
+                    refresh_planner.screen_on(),
+                    sleep_start.as_millis(),
+                );
                 flush_pending_progress(
                     &mut epd,
                     &mut sd_cs,
@@ -248,9 +254,19 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                 .is_ok()
                 {
                     prev_fb.copy_from(fb);
+                    esp_println::println!(
+                        "bench: sleep phase=refresh ok=true elapsed_ms={} t_ms={}",
+                        sleep_start.elapsed().as_millis(),
+                        Instant::now().as_millis(),
+                    );
                     true
                 } else {
                     esp_println::println!("display: sleep framebuffer flush failed");
+                    esp_println::println!(
+                        "bench: sleep phase=refresh ok=false elapsed_ms={} t_ms={}",
+                        sleep_start.elapsed().as_millis(),
+                        Instant::now().as_millis(),
+                    );
                     false
                 };
                 prev_prestaged = false;
@@ -260,10 +276,20 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                     }
                     send_required_display_event(&DisplayEvent::Asleep);
                     let _ = POWER_EVENTS.try_send(PowerEvent::DisplayAsleep);
+                    esp_println::println!(
+                        "bench: sleep phase=complete ok=true elapsed_ms={} t_ms={}",
+                        sleep_start.elapsed().as_millis(),
+                        Instant::now().as_millis(),
+                    );
                 } else {
                     esp_println::println!("display: sleep command failed");
                     send_required_display_event(&DisplayEvent::Asleep);
                     let _ = POWER_EVENTS.try_send(PowerEvent::DisplayAsleep);
+                    esp_println::println!(
+                        "bench: sleep phase=complete ok=false elapsed_ms={} t_ms={}",
+                        sleep_start.elapsed().as_millis(),
+                        Instant::now().as_millis(),
+                    );
                 }
             }
             Either::Second(StorageCommand::ReceiveUpload) => {
@@ -478,6 +504,7 @@ fn handle_storage_command(
             target_pages,
             type_settings,
         } => {
+            let storage_start = Instant::now();
             if request_id != LATEST_READER_REQUEST_ID.load(Ordering::Relaxed) {
                 esp_println::println!(
                     "storage: stale open skipped request={} latest={} book_id={} index={}",
@@ -530,6 +557,15 @@ fn handle_storage_command(
                     book_id,
                     target_pages
                 );
+                esp_println::println!(
+                    "bench: storage_open request={} book_id={} index={} ram_hit=true elapsed_ms={} pages={} chapters={}",
+                    request_id,
+                    book_id,
+                    index,
+                    storage_start.elapsed().as_millis(),
+                    sd_library.advertised_page_count(),
+                    sd_library.chapter_count_for_ui(),
+                );
                 send_loaded_library_event(&LibraryEvent::Loaded {
                     book_id,
                     pages: sd_library.advertised_page_count(),
@@ -576,6 +612,16 @@ fn handle_storage_command(
                 sd_library.reader_status(),
                 sd_library.advertised_page_count(),
                 sd_library.chapter_count_for_ui()
+            );
+            esp_println::println!(
+                "bench: storage_open request={} book_id={} index={} ram_hit=false elapsed_ms={} status={:?} pages={} chapters={}",
+                request_id,
+                book_id,
+                index,
+                storage_start.elapsed().as_millis(),
+                sd_library.reader_status(),
+                sd_library.advertised_page_count(),
+                sd_library.chapter_count_for_ui(),
             );
         }
         StorageCommand::LoadChapters {
@@ -732,11 +778,25 @@ fn handle_storage_command(
                 );
             }
             if context_changed || due {
+                let progress_start = Instant::now();
                 reader_cache::store_app_state(epd, sd_cs, sd_library, record);
                 *pending_progress = None;
                 *last_progress_write = Some(Instant::now());
+                esp_println::println!(
+                    "bench: storage_progress action=write book_id={} page={} elapsed_ms={} t_ms={}",
+                    record.book_id,
+                    record.screen,
+                    progress_start.elapsed().as_millis(),
+                    Instant::now().as_millis(),
+                );
             } else {
                 *pending_progress = Some(record);
+                esp_println::println!(
+                    "bench: storage_progress action=coalesce book_id={} page={} t_ms={}",
+                    record.book_id,
+                    record.screen,
+                    Instant::now().as_millis(),
+                );
             }
         }
     }
@@ -906,7 +966,15 @@ fn flush_pending_progress(
     last_progress_write: &mut Option<Instant>,
 ) {
     if let Some(record) = pending_progress.take() {
+        let start = Instant::now();
         reader_cache::store_app_state(epd, sd_cs, sd_library, record);
         *last_progress_write = Some(Instant::now());
+        esp_println::println!(
+            "bench: storage_progress action=flush book_id={} page={} elapsed_ms={} t_ms={}",
+            record.book_id,
+            record.screen,
+            start.elapsed().as_millis(),
+            Instant::now().as_millis(),
+        );
     }
 }

@@ -31,15 +31,21 @@ e-ink display and a selection of public-domain books.
 ## Development
 
 ```sh
-cargo run -p fw --release                                       # build, flash, serial monitor
-cargo test -p app-core -p proto --target aarch64-apple-darwin   # host tests
+tools/cargo.sh run -p fw --release                              # build, flash, serial monitor
+tools/cargo.sh test -p app-core -p proto --target aarch64-apple-darwin
 cargo run --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin \
   --no-default-features -- --scenario fixtures/scenarios --check fixtures/golden
+tools/bench/bench.py channel-stress --host                       # host bench
 ```
 
 Only flashing needs the device on USB; the app logic, parsers, renderer, and
 emulator all build and test on a plain host. The stable toolchain is configured in
 `rust-toolchain.toml`.
+
+Hardware-facing bench runs live in `tools/bench`. Use short `page-turn` and
+`sleep-sync` runs before trusting flashed builds after display, input, sleep,
+reader rendering, SD/cache, or progress-write changes; use longer soak/storage
+runs before risky merges or releases.
 
 ## Flashing
 

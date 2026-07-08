@@ -249,12 +249,22 @@ Current code status:
 ## Verification commands
 
 ```sh
-cargo check --target riscv32imc-unknown-none-elf --release
-cargo test -p app-core -p proto --target aarch64-apple-darwin
+tools/cargo.sh check --target riscv32imc-unknown-none-elf --release
+tools/cargo.sh test -p app-core -p proto --target aarch64-apple-darwin
 cargo test --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --no-default-features
 cargo run --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --no-default-features -- --scenario fixtures/scenarios --check fixtures/golden
 cargo run --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --no-default-features -- --scenario fixtures/scenarios --dump target/emulator
 cargo run --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --features gui -- --gui
-cargo clippy --workspace --target riscv32imc-unknown-none-elf --release -- -D warnings
+tools/cargo.sh clippy --workspace --target riscv32imc-unknown-none-elf --release -- -D warnings
 cargo run --manifest-path tools/preview/Cargo.toml --target aarch64-apple-darwin
+tools/bench/bench.py channel-stress --host
+```
+
+Hardware confidence checks after relevant firmware changes:
+
+```sh
+tools/bench/bench.py page-turn --port /dev/cu.usbmodem101 --turns 50
+tools/bench/bench.py storage-cache --port /dev/cu.usbmodem101 --reset-before --seconds 20 --strict
+tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 5
+tools/bench/bench.py report target/bench/latest.jsonl
 ```

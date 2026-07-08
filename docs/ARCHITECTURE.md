@@ -87,6 +87,9 @@ ui/        shared shell rendering plus ui::reading, the reader page-plan seam
            (page bounds, ink measurement, wrapping) used by fw and host tools
 proto/     bounded book/storage/text/cache models plus ZIP/EPUB/XHTML parser pieces
 tools/emulator/ host-side development emulator and scenario runner
+tools/cargo.sh  rustup-stable Cargo wrapper for firmware builds/checks
+tools/bench/    serial bench harness for hardware timing, storage/cache,
+                sleep, soak, and host channel-stress checks
 ```
 
 ## Embassy tasks
@@ -435,6 +438,37 @@ development:
 It does not model ESP32-C3 CPU timing, ADC noise, SPI DMA edge cases, BUSY
 timings, voltage/temperature behavior, or true e-paper waveform physics. Those
 remain hardware-validation concerns.
+
+## Development bench
+
+`tools/bench/bench.py` is the hardware-facing counterpart to the emulator. It
+captures serial output with the same DTR/RTS behavior as `tools/serial_capture.py`,
+parses structured `bench:` telemetry, writes JSONL logs under `target/bench/`,
+and reports timing/storage/sleep summaries. Current hardware suites are guided
+workflows; the firmware still has no interactive serial command channel.
+
+Use it in tiers:
+
+- `channel-stress --host` in ordinary development when queue/coalescing,
+  refresh-plan, sync-session, reader state, display command, or storage command
+  behavior changes.
+- short `page-turn` and `sleep-sync` runs before trusting a flashed firmware
+  after display, input, sleep, reader rendering, SD session, section cache, or
+  progress-write changes.
+- longer `reader-soak`, `storage-cache`, and `sleep-sync` runs before releases
+  or risky merges.
+- `thermal-run` for targeted refresh, ghosting, sleep-screen, enclosure, power,
+  SD-card, or ambient-temperature investigations.
+
+Typical commands:
+
+```sh
+tools/bench/bench.py channel-stress --host
+tools/bench/bench.py page-turn --port /dev/cu.usbmodem101 --turns 50
+tools/bench/bench.py storage-cache --port /dev/cu.usbmodem101 --reset-before --seconds 20 --strict
+tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 10
+tools/bench/bench.py report target/bench/latest.jsonl
+```
 
 Typical development loop:
 

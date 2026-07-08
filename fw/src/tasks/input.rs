@@ -301,7 +301,7 @@ fn battery_percent(aux_mv: u16) -> u8 {
 
 fn log_input(button: Option<Button>, sample: RawSample) {
     esp_println::println!(
-        "input: {:?} gpio0={} gpio1={} gpio2={} t={}",
+        "bench: input button={:?} aux={} nav={} page_raw={} t_ms={}",
         button,
         sample.aux,
         sample.nav,

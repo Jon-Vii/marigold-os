@@ -1,0 +1,19 @@
+# Initial warning budgets for development bench summaries.
+# The CLI currently reports timings only; these values are the baseline for
+# turning reports into explicit pass/fail checks once several known-good X4/X3
+# runs have been captured.
+
+[page-turn]
+median_press_to_settled_ms = 550
+fast_refresh_busy_warn_ms = 500
+reading_layout_warn_ms = 60
+prestage_warn_ms = 40
+
+[sleep-sync]
+full_refresh_busy_min_ms = 3000
+full_refresh_busy_max_ms = 4300
+
+[storage-cache]
+warm_book_open_warn_ms = 150
+catalog_load_warn_ms = 500
+section_extend_warn_ms = 150

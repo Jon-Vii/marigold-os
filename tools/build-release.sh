@@ -49,9 +49,9 @@ FULL="$OUT/full-flash$SUFFIX.bin"
 
 echo "==> building fw ($DEVICE, release)"
 if ((${#FEATURES[@]})); then
-  cargo build -p fw --release "${FEATURES[@]}"
+  tools/cargo.sh build -p fw --release "${FEATURES[@]}"
 else
-  cargo build -p fw --release
+  tools/cargo.sh build -p fw --release
 fi
 
 mkdir -p "$OUT"

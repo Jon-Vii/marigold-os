@@ -120,7 +120,7 @@ value (BUSY timing → orientation → waveforms → battery) needs adjustment.
 
 ```sh
 # Everyday dev flash + serial monitor:
-cargo run -p fw --release
+tools/cargo.sh run -p fw --release
 
 # App-only, with esptool:
 esptool.py --chip esp32c3 write_flash 0x10000 target/release-images/firmware.bin

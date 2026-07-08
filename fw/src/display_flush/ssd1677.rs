@@ -78,6 +78,12 @@ pub(crate) async fn flush(
     epd.wait_ready().await;
     let elapsed = start.elapsed();
     esp_println::println!("display: refresh busy {} ms", elapsed.as_millis());
+    esp_println::println!(
+        "bench: refresh mode={:?} busy_ms={} screen_on={}",
+        mode,
+        elapsed.as_millis(),
+        screen_on,
+    );
     if mode == RefreshMode::FastClean {
         // Re-load the real sensor temperature so the next Fast partial
         // picks its OTP waveform for the actual ambient temperature
@@ -102,7 +108,12 @@ pub(crate) async fn prestage_previous(
 }
 
 pub(crate) async fn sleep_panel(epd: &mut Epd) -> Result<(), SpiError> {
+    let start = Instant::now();
     esp_println::println!("display: sleep start");
+    esp_println::println!(
+        "bench: sleep phase=power_down_start t_ms={}",
+        start.as_millis()
+    );
     epd.command(
         CMD_DISPLAY_UPDATE_CTRL2,
         &[update_control_2(RefreshMode::PowerDown, true, false)],
@@ -111,6 +122,11 @@ pub(crate) async fn sleep_panel(epd: &mut Epd) -> Result<(), SpiError> {
     epd.command(CMD_MASTER_ACTIVATION, &[]).await?;
     epd.wait_ready().await;
     esp_println::println!("display: sleep deep");
+    esp_println::println!(
+        "bench: sleep phase=power_down_done elapsed_ms={} t_ms={}",
+        start.elapsed().as_millis(),
+        Instant::now().as_millis(),
+    );
     epd.command(CMD_DEEP_SLEEP, &[0x01]).await
 }
 
