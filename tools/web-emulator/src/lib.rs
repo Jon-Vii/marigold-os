@@ -369,6 +369,7 @@ impl WebEmulator {
             chapters_window_start: 0,
             chapters_total: toc.len() as u16,
             chapter_title,
+            custom_font_name: "",
         };
         if sleep {
             render_shared_sleep(&mut self.fb, request, &model);

@@ -4,6 +4,8 @@
 pub mod epd;
 pub mod fb;
 pub mod font;
+#[cfg(feature = "builtin-custom-font")]
+pub mod custom_generated;
 pub mod literata_extra_generated;
 pub mod literata_generated;
 pub mod literata_semibold_generated;

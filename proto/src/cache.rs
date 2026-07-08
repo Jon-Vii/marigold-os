@@ -18,8 +18,12 @@ pub const CACHE_VERSION: u16 = 1;
 // so the bogus chapter list would persist. Rejecting v24 forces the one-time
 // rebuild that re-runs the corrected nav parser; the re-paginate is incidental
 // and chapter-keyed positions carry over.
-pub const CACHE_V2_VERSION: u16 = 25;
-const CACHE_V2_COMPAT_VERSION: u16 = 25;
+//
+// Bumped 25 -> 26 when custom font identity joined v2 book/section headers.
+// A custom pack replacement can keep the same FontFamily::Custom setting while
+// changing metrics, so the cache key needs the pack hash too.
+pub const CACHE_V2_VERSION: u16 = 26;
+const CACHE_V2_COMPAT_VERSION: u16 = 26;
 pub const CACHE_ROOT_DIR: &str = "XTEINK";
 pub const CACHE_DIR: &str = "CACHE";
 pub const CACHE_V2_DIR: &str = "CACHE2";
@@ -33,8 +37,8 @@ pub const BOOK_HEADER_BYTES: usize = 16;
 pub const SPINE_RECORD_BYTES: usize = 12;
 pub const TOC_RECORD_BYTES: usize = 24;
 pub const SECTION_HEADER_BYTES: usize = 40;
-pub const SECTION_V2_HEADER_BYTES: usize = 48;
-pub const BOOK_V2_HEADER_BYTES: usize = 48;
+pub const SECTION_V2_HEADER_BYTES: usize = 56;
+pub const BOOK_V2_HEADER_BYTES: usize = 56;
 pub const BOOK_V2_SECTION_RECORD_BYTES: usize = 16;
 pub const PAGE_HEADER_BYTES: usize = 28;
 pub const PAGE_RECORD_BYTES: usize = 4;
@@ -126,6 +130,7 @@ pub struct SectionV2Header {
     pub viewport_width: u16,
     pub viewport_height: u16,
     pub font_config: u16,
+    pub custom_font_identity: u64,
     pub bytes_consumed: u32,
     pub total_bytes: u32,
     pub partial: bool,
@@ -145,6 +150,7 @@ pub struct BookV2Header {
     pub viewport_width: u16,
     pub viewport_height: u16,
     pub font_config: u16,
+    pub custom_font_identity: u64,
     pub partial: bool,
 }
 
@@ -439,7 +445,8 @@ pub fn encode_section_v2_header(
     write_u32(out, 32, header.total_bytes);
     write_u32(out, 36, header.source_hash);
     write_u32(out, 40, header.source_size);
-    write_u32(out, 44, 0);
+    write_u64(out, 44, header.custom_font_identity);
+    write_u32(out, 52, 0);
     Ok(SECTION_V2_HEADER_BYTES)
 }
 
@@ -460,6 +467,7 @@ pub fn decode_section_v2_header(input: &[u8]) -> Result<SectionV2Header, CacheEr
         viewport_width: read_u16(input, 20)?,
         viewport_height: read_u16(input, 22)?,
         font_config: read_u16(input, 24)?,
+        custom_font_identity: read_u64(input, 44)?,
         bytes_consumed: read_u32(input, 28)?,
         total_bytes: read_u32(input, 32)?,
         source_hash: read_u32(input, 36)?,
@@ -487,6 +495,7 @@ pub fn encode_book_v2_header(header: BookV2Header, out: &mut [u8]) -> Result<usi
     write_u32(out, 36, header.toc_text_bytes);
     write_u32(out, 40, header.title_text_bytes);
     write_u32(out, 44, header.author_text_bytes);
+    write_u64(out, 48, header.custom_font_identity);
     Ok(BOOK_V2_HEADER_BYTES)
 }
 
@@ -512,6 +521,7 @@ pub fn decode_book_v2_header(input: &[u8]) -> Result<BookV2Header, CacheError> {
         viewport_width: read_u16(input, 28)?,
         viewport_height: read_u16(input, 30)?,
         font_config: read_u16(input, 32)?,
+        custom_font_identity: read_u64(input, 48)?,
     })
 }
 
@@ -795,6 +805,20 @@ fn read_u32(input: &[u8], offset: usize) -> Result<u32, CacheError> {
     ]))
 }
 
+fn read_u64(input: &[u8], offset: usize) -> Result<u64, CacheError> {
+    require(&input[offset.min(input.len())..], 8)?;
+    Ok(u64::from_le_bytes([
+        input[offset],
+        input[offset + 1],
+        input[offset + 2],
+        input[offset + 3],
+        input[offset + 4],
+        input[offset + 5],
+        input[offset + 6],
+        input[offset + 7],
+    ]))
+}
+
 fn write_u16(out: &mut [u8], offset: usize, value: u16) {
     out[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
 }
@@ -805,6 +829,10 @@ fn write_i16(out: &mut [u8], offset: usize, value: i16) {
 
 fn write_u32(out: &mut [u8], offset: usize, value: u32) {
     out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u64(out: &mut [u8], offset: usize, value: u64) {
+    out[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
 fn push_hex<const N: usize>(out: &mut String<N>, value: u32, digits: u8) {
@@ -1087,6 +1115,7 @@ mod tests {
             viewport_width: 800,
             viewport_height: 480,
             font_config: 2,
+            custom_font_identity: 0x1122_3344_5566_7788,
             bytes_consumed: 8192,
             total_bytes: 12_000,
             partial: true,
@@ -1123,6 +1152,7 @@ mod tests {
             viewport_width: 800,
             viewport_height: 480,
             font_config: 1,
+            custom_font_identity: 0x8877_6655_4433_2211,
             partial: true,
         };
         let section = BookV2SectionRecord {

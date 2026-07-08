@@ -9,6 +9,9 @@ edition = "2021"
 # feature unification across the workspace can't select two panels: any
 # crate enabling it flips the whole build to X3.
 device-x3 = []
+# Compile a generated custom typeface into firmware. Requires
+# display/src/custom_generated.rs, produced by tools/font_pack_to_rust.py.
+builtin-custom-font = []
 
 [dependencies]
 embedded-hal = "1.0.0"

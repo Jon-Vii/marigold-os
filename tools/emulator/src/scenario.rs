@@ -349,6 +349,7 @@ fn parse_font_family(value: &str) -> Result<display::font::FontFamily, String> {
     match value {
         "Literata" | "literata" => Ok(display::font::FontFamily::Literata),
         "Merriweather" | "merriweather" => Ok(display::font::FontFamily::Merriweather),
+        "Custom" | "custom" => Ok(display::font::FontFamily::Custom),
         _ => Err(format!("unknown font family: {value}")),
     }
 }

@@ -3,7 +3,7 @@ use crate::reader_store::{BookLoadStatus, LibraryScanStatus, ReaderStore, LIBRAR
 use crate::{catalog, AppView, ReaderSource, RenderRequest};
 use core::fmt::Write;
 use display::fb::Framebuffer;
-use display::font::{draw_text, literata, measure_text, FontStyle};
+use display::font::{draw_text, literata, measure_text, FontFamily, FontStyle};
 use display::render::{draw_ascii, fill_rect, stroke_rect};
 use display::Rect;
 use heapless::String;
@@ -36,6 +36,26 @@ pub(crate) fn render(fb: &mut Framebuffer, request: RenderRequest, sd_library: &
     if SHOW_INPUT_DEBUG {
         draw_input_sample(fb, request);
     }
+}
+
+pub(crate) fn render_custom_reader_from_root(
+    fb: &mut Framebuffer,
+    request: RenderRequest,
+    sd_library: &ReaderStore,
+    root: &crate::sd_session::SdRoot<'_>,
+) -> bool {
+    if request.view != AppView::Reading
+        || !ReaderSource::from_book_id(request.book_id).is_sd()
+        || request.font_family != FontFamily::Custom
+        || !sd_library.custom_font_available()
+    {
+        return false;
+    }
+
+    fb.clear(true);
+    draw_sd_reader_page_with_custom_font(fb, request, sd_library, root);
+    fb.flip_vertical();
+    true
 }
 
 pub(crate) fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, sd_library: &ReaderStore) {
@@ -110,6 +130,7 @@ fn ui_model<'a>(
         chapters_window_start: chapters_window_start as u16,
         chapters_total: chapters_total.min(u16::MAX as usize) as u16,
         chapter_title,
+        custom_font_name: sd_library.custom_font_name(),
     }
 }
 
@@ -217,6 +238,40 @@ fn draw_sd_reader_page(fb: &mut Framebuffer, request: RenderRequest, sd_library:
             let plan = reader_layout::ReaderPagePlan::new(sd_library, request.page);
             let page_count = plan.page_count().max(1);
             ui::reading::draw_reading_page_body(fb, sd_library, plan.page());
+            draw_reader_footer(fb, request, sd_library, page_count);
+        }
+    }
+}
+
+fn draw_sd_reader_page_with_custom_font(
+    fb: &mut Framebuffer,
+    request: RenderRequest,
+    sd_library: &ReaderStore,
+    root: &crate::sd_session::SdRoot<'_>,
+) {
+    let layout_current = sd_library.type_settings()
+        == display::font::TypeSettings {
+            size: request.font_size,
+            spacing: request.line_spacing,
+            weight: request.font_weight,
+            family: request.font_family,
+        };
+    let reading_buffer_ready = layout_current
+        && sd_library.loaded_index == ReaderStore::selected_book_index(request.book_id)
+        && !sd_library.text_holds_toc();
+    match (sd_library.reader_status(), reading_buffer_ready) {
+        (_, false) | (BookLoadStatus::Empty | BookLoadStatus::Loading, _) => {
+            draw_sd_reader_loading(fb, request, sd_library);
+        }
+        (BookLoadStatus::Error, _) => {
+            draw_sd_reader_error(fb, request, sd_library);
+        }
+        (BookLoadStatus::Ready, _) => {
+            let plan = reader_layout::ReaderPagePlan::new(sd_library, request.page);
+            let page_count = plan.page_count().max(1);
+            if !crate::custom_font::draw_reading_page_body(root, fb, sd_library, plan.page()) {
+                ui::reading::draw_reading_page_body(fb, sd_library, plan.page());
+            }
             draw_reader_footer(fb, request, sd_library, page_count);
         }
     }

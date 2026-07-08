@@ -26,6 +26,7 @@ pub struct UiRenderModel<'a> {
     /// Current chapter title resolved over the whole book; empty for built-in
     /// books or before a book is open. See `UiShell::chapter_title`.
     pub chapter_title: &'a str,
+    pub custom_font_name: &'a str,
 }
 
 pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRenderModel<'_>) {
@@ -42,6 +43,7 @@ pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRe
         line_spacing: request.line_spacing,
         font_weight: request.font_weight,
         font_family: request.font_family,
+        custom_font_name: model.custom_font_name,
         selection: request.selection,
         chapter: request.chapter,
         chapter_title: model.chapter_title,

@@ -167,6 +167,7 @@ fn demo_model<'a>(
         chapters_window_start: 0,
         chapters_total: DEMO_CHAPTERS.len() as u16,
         chapter_title: "",
+        custom_font_name: "",
     }
 }
 

@@ -79,6 +79,7 @@ use static_cell::StaticCell;
 use tasks::input::InputPins;
 
 pub mod catalog;
+mod custom_font;
 mod display_flush;
 mod library_sd;
 mod ota_update;

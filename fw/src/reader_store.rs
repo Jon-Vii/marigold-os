@@ -21,6 +21,8 @@ pub(crate) const MAX_OVERVIEW_CHAPTERS: usize = 256;
 /// Longest current-chapter title kept resident for the Home/sleep colophon;
 /// read on demand from TOC.BIN as the chapter changes.
 const MAX_CURRENT_CHAPTER_TITLE: usize = 60;
+pub(crate) const MAX_CUSTOM_FONT_NAME: usize = proto::font_pack::FONT_PACK_MAX_NAME_BYTES;
+pub(crate) const MAX_CUSTOM_FONT_FACES: usize = 12;
 // ~14 pages per 16 KB section at the default size, so 320 covers ~4,500
 // pages -- enough for very long books (e.g. HPMOR) to cache whole rather
 // than tripping book_partial partway. The two persistent arrays this sizes
@@ -184,11 +186,12 @@ pub(crate) struct ReaderStore {
     /// Number of valid entries in `chapter_page`; independent of the overview's
     /// `toc_total` so the current-chapter map survives a Chapters visit.
     pub(crate) chapter_page_count: usize,
-    /// `(source_hash, source_size, font_config)` the `chapter_page` map was
-    /// built for. The book index reloads every section crossing, so this token
-    /// keeps the map from being re-read from disk except on a new book or a
-    /// repaginating settings change.
-    pub(crate) chapter_page_token: (u32, u32, u16),
+    /// `(source_hash, source_size, font_config, custom_font_identity)` the
+    /// `chapter_page` map was built for. The book index reloads every section
+    /// crossing, so this token keeps the map from being re-read from disk
+    /// except on a new book, a repaginating settings change, or a custom pack
+    /// replacement.
+    pub(crate) chapter_page_token: (u32, u32, u16, u64),
     /// Current chapter and its title, resolved by the firmware from
     /// `chapter_page` + the reading page on each section load, for the
     /// Home/sleep colophon and the overview's starting selection.
@@ -216,6 +219,11 @@ pub(crate) struct ReaderStore {
     pub(crate) page_spine: [u16; MAX_READER_PAGES],
     pub(crate) page_count: usize,
     type_settings: TypeSettings,
+    custom_font_available: bool,
+    custom_font_identity: u64,
+    custom_font_name: String<MAX_CUSTOM_FONT_NAME>,
+    custom_font_faces: [proto::font_pack::FontPackFaceRecord; MAX_CUSTOM_FONT_FACES],
+    custom_font_face_count: usize,
 }
 
 impl ReaderStore {
@@ -260,7 +268,7 @@ impl ReaderStore {
             toc_window_len: 0,
             chapter_page: [0; MAX_OVERVIEW_CHAPTERS],
             chapter_page_count: 0,
-            chapter_page_token: (0, 0, 0),
+            chapter_page_token: (0, 0, 0, 0),
             current_chapter: 0,
             current_chapter_title: String::new(),
             current_chapter_source: (0, 0),
@@ -277,7 +285,64 @@ impl ReaderStore {
             page_spine: [0; MAX_READER_PAGES],
             page_count: 0,
             type_settings: TypeSettings::DEFAULT,
+            custom_font_available: false,
+            custom_font_identity: 0,
+            custom_font_name: String::new(),
+            custom_font_faces: [proto::font_pack::FontPackFaceRecord::EMPTY; MAX_CUSTOM_FONT_FACES],
+            custom_font_face_count: 0,
         }
+    }
+
+    pub(crate) fn set_custom_font(
+        &mut self,
+        name: Option<&str>,
+        identity: u64,
+        faces: &[proto::font_pack::FontPackFaceRecord],
+    ) {
+        self.custom_font_name.clear();
+        if let Some(name) = name {
+            let _ = self.custom_font_name.push_str(name);
+            self.custom_font_available = true;
+            self.custom_font_identity = identity;
+            self.custom_font_face_count = faces.len().min(MAX_CUSTOM_FONT_FACES);
+            self.custom_font_faces =
+                [proto::font_pack::FontPackFaceRecord::EMPTY; MAX_CUSTOM_FONT_FACES];
+            self.custom_font_faces[..self.custom_font_face_count]
+                .copy_from_slice(&faces[..self.custom_font_face_count]);
+        } else {
+            self.custom_font_available = false;
+            self.custom_font_identity = 0;
+            self.custom_font_face_count = 0;
+            self.custom_font_faces =
+                [proto::font_pack::FontPackFaceRecord::EMPTY; MAX_CUSTOM_FONT_FACES];
+        }
+    }
+
+    pub(crate) fn custom_font_available(&self) -> bool {
+        self.custom_font_available
+    }
+
+    pub(crate) fn custom_font_name(&self) -> &str {
+        self.custom_font_name.as_str()
+    }
+
+    pub(crate) fn custom_font_identity(&self) -> u64 {
+        if self.custom_font_available {
+            self.custom_font_identity
+        } else {
+            0
+        }
+    }
+
+    pub(crate) fn custom_font_face(
+        &self,
+        size_px: u8,
+        style: u8,
+    ) -> Option<proto::font_pack::FontPackFaceRecord> {
+        self.custom_font_faces[..self.custom_font_face_count]
+            .iter()
+            .copied()
+            .find(|face| face.size_px == size_px && face.style == style)
     }
 
     pub(crate) fn type_settings(&self) -> TypeSettings {

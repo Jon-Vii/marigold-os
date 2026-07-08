@@ -17,6 +17,18 @@ use proto::cache::{
     COVER_HEADER_BYTES, PAGE_RECORD_BYTES, SECTION_V2_HEADER_BYTES, TOC_CHAPTER_RECORD_BYTES,
     TOC_FILE_HEADER_BYTES, TOC_RECORD_BYTES,
 };
+use proto::font_pack::{
+    decode_font_pack_name, FontPackFaceRecord, FontPackHeader, FONT_PACK_DIR,
+    FONT_PACK_FACE_RECORD_BYTES, FONT_PACK_FILE, FONT_PACK_HEADER_BYTES,
+};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CustomFontManifest {
+    pub(crate) name: heapless::String<{ crate::reader_store::MAX_CUSTOM_FONT_NAME }>,
+    pub(crate) identity: u64,
+    pub(crate) faces: [FontPackFaceRecord; crate::reader_store::MAX_CUSTOM_FONT_FACES],
+    pub(crate) face_count: usize,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CacheLoadResult {
@@ -216,6 +228,57 @@ where
     hal_ext::nvm::AppStateRecord::decode(&bytes[..len])
 }
 
+pub(crate) fn read_custom_font_manifest<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> Option<CustomFontManifest>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let xteink = root.open_dir(CACHE_ROOT_DIR).ok()?;
+    let fonts = xteink.open_dir(FONT_PACK_DIR).ok()?;
+    let file = fonts
+        .open_file_in_dir(FONT_PACK_FILE, Mode::ReadOnly)
+        .ok()?;
+    let mut header_bytes = [0u8; FONT_PACK_HEADER_BYTES];
+    if file.read(&mut header_bytes).ok()? != FONT_PACK_HEADER_BYTES {
+        return None;
+    }
+    let header = FontPackHeader::decode(&header_bytes).ok()?;
+    if file.length() != header.total_len {
+        return None;
+    }
+    let face_count = usize::from(header.face_count).min(crate::reader_store::MAX_CUSTOM_FONT_FACES);
+    let mut faces = [FontPackFaceRecord::EMPTY; crate::reader_store::MAX_CUSTOM_FONT_FACES];
+    file.seek_from_start(header.face_table_offset).ok()?;
+    let mut face_bytes = [0u8; FONT_PACK_FACE_RECORD_BYTES];
+    for face in faces.iter_mut().take(face_count) {
+        if file.read(&mut face_bytes).ok()? != FONT_PACK_FACE_RECORD_BYTES {
+            return None;
+        }
+        *face = FontPackFaceRecord::decode(&face_bytes).ok()?;
+    }
+    file.seek_from_start(header.name_offset).ok()?;
+    let mut name_bytes = [0u8; proto::font_pack::FONT_PACK_MAX_NAME_BYTES];
+    let name_len = header.name_len as usize;
+    if file.read(&mut name_bytes[..name_len]).ok()? != name_len {
+        return None;
+    }
+    let name = decode_font_pack_name(header, &name_bytes[..name_len]).ok()?;
+    Some(CustomFontManifest {
+        name,
+        identity: header.identity,
+        faces,
+        face_count,
+    })
+}
+
 const WIFI_FILE: &str = "WIFI.BIN";
 
 /// Write the onboarding portal's captured credentials to /XTEINK/WIFI.BIN.
@@ -320,7 +383,7 @@ where
     .unwrap_or(CoverLoadResult::Miss)
 }
 
-/// Read just the book's total page count from the V2 index header (48 bytes),
+/// Read just the book's total page count from the V2 index header,
 /// without loading any section records. Used at boot restore so the Home
 /// progress bar has a denominator before the book is opened. Returns 0 if the
 /// index is missing, stale, or for another book.
@@ -334,6 +397,7 @@ pub(crate) fn read_v2_book_total_pages<
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     key: &str,
     source_identity: (u32, u32),
+    library: &ReaderStore,
 ) -> u32
 where
     D: embedded_sdmmc::BlockDevice,
@@ -347,7 +411,10 @@ where
         let Ok(header) = decode_book_v2_header(&header_bytes) else {
             return 0;
         };
-        if header.source_hash != source_identity.0 || header.source_size != source_identity.1 {
+        if header.source_hash != source_identity.0
+            || header.source_size != source_identity.1
+            || header.custom_font_identity != library.custom_font_identity()
+        {
             return 0;
         }
         header.total_pages
@@ -381,6 +448,8 @@ where
         };
         if header.source_hash != source_identity.0
             || header.source_size != source_identity.1
+            || header.font_config != reader_layout::reader_layout_config(library.type_settings())
+            || header.custom_font_identity != library.custom_font_identity()
             || header.section_count as usize > MAX_BOOK_SECTIONS
             || header.toc_count as usize > MAX_SD_TOC_ITEMS
             || header.toc_text_bytes as usize > MAX_SD_TOC_TEXT_BYTES
@@ -789,6 +858,7 @@ where
             viewport_width: 800,
             viewport_height: 480,
             font_config: reader_layout::reader_layout_config(library.type_settings()),
+            custom_font_identity: library.custom_font_identity(),
             partial,
         };
         let mut bytes = [0u8; BOOK_V2_HEADER_BYTES];
@@ -944,6 +1014,9 @@ where
             return CacheLoadResult::Invalid;
         }
         let expected_config = reader_layout::reader_layout_config(library.type_settings());
+        if header.custom_font_identity != library.custom_font_identity() {
+            return CacheLoadResult::Invalid;
+        }
         // Cached blocks are pre-wrapped lines: they survive a spacing
         // change (heights re-walk below) but not a size change, which
         // alters every wrap point and needs the full EPUB rebuild.
@@ -1411,6 +1484,7 @@ where
         viewport_width: 800,
         viewport_height: 480,
         font_config: reader_layout::reader_layout_config(library.type_settings()),
+        custom_font_identity: library.custom_font_identity(),
         bytes_consumed: 0,
         total_bytes: 0,
         partial: library.section_partial,

@@ -478,6 +478,9 @@ pub enum LibraryEvent {
         book_id: u32,
         current_chapter: u16,
     },
+    CustomFont {
+        available: bool,
+    },
     Restored {
         book_id: u32,
         chapter: u8,
@@ -609,6 +612,7 @@ pub struct ReaderState {
     pub line_spacing: LineSpacing,
     pub font_weight: FontWeight,
     pub font_family: FontFamily,
+    pub custom_font_available: bool,
     pub last_button: Option<Button>,
     pub aux_raw: u16,
     pub nav_raw: u16,
@@ -643,6 +647,7 @@ impl ReaderState {
             line_spacing: LineSpacing::Normal,
             font_weight: FontWeight::Normal,
             font_family: FontFamily::Literata,
+            custom_font_available: false,
             last_button: None,
             aux_raw: 0,
             nav_raw: 0,
@@ -926,6 +931,13 @@ impl ReaderState {
                     self.chapter = current_chapter.min(u8::MAX as u16) as u8;
                 }
             }
+            LibraryEvent::CustomFont { available } => {
+                self.custom_font_available = available;
+                if !available && self.font_family == FontFamily::Custom {
+                    self.font_family = FontFamily::Literata;
+                }
+                self.dirty = Rect::FULL;
+            }
             LibraryEvent::Restored {
                 book_id,
                 chapter,
@@ -975,7 +987,12 @@ impl ReaderState {
                     self.font_weight = weight;
                 }
                 if let Some(family) = FontFamily::from_u8(font_family) {
-                    self.font_family = family;
+                    self.font_family =
+                        if family == FontFamily::Custom && !self.custom_font_available {
+                            FontFamily::Literata
+                        } else {
+                            family
+                        };
                 }
                 self.dirty = Rect::FULL;
             }
@@ -1188,10 +1205,7 @@ fn apply_home_action(mut state: ReaderState, action: HomeAction) -> ReaderState 
 fn apply_setting(mut state: ReaderState) -> ReaderState {
     match state.selection {
         0 => {
-            state.font_family = match state.font_family {
-                FontFamily::Literata => FontFamily::Merriweather,
-                FontFamily::Merriweather => FontFamily::Literata,
-            };
+            state.font_family = next_font_family(state.font_family, state.custom_font_available);
         }
         1 => {
             state.font_size = match state.font_size {
@@ -1223,6 +1237,15 @@ fn apply_setting(mut state: ReaderState) -> ReaderState {
         _ => {}
     }
     state
+}
+
+fn next_font_family(family: FontFamily, custom_available: bool) -> FontFamily {
+    match (family, custom_available) {
+        (FontFamily::Literata, _) => FontFamily::Merriweather,
+        (FontFamily::Merriweather, true) => FontFamily::Custom,
+        (FontFamily::Merriweather, false) => FontFamily::Literata,
+        (FontFamily::Custom, _) => FontFamily::Literata,
+    }
 }
 
 #[cfg(test)]
@@ -1635,6 +1658,29 @@ mod tests {
         assert_eq!(state.selection, 4);
         let state = press(state, Button::Next);
         assert_eq!(state.selection, 0, "selection wraps after the last row");
+    }
+
+    #[test]
+    fn settings_typeface_cycles_custom_only_when_available() {
+        let mut state = press(ReaderState::boot(), Button::Next);
+        state = state.apply_library_event(CTX, LibraryEvent::CustomFont { available: true });
+        assert_eq!(state.selection, 0);
+        let state = press(state, Button::Confirm);
+        assert_eq!(state.font_family, FontFamily::Merriweather);
+        let state = press(state, Button::Confirm);
+        assert_eq!(state.font_family, FontFamily::Custom);
+        let state = press(state, Button::Confirm);
+        assert_eq!(state.font_family, FontFamily::Literata);
+    }
+
+    #[test]
+    fn removing_custom_font_falls_back_to_literata() {
+        let mut state = ReaderState::boot();
+        state.custom_font_available = true;
+        state.font_family = FontFamily::Custom;
+        let state = state.apply_library_event(CTX, LibraryEvent::CustomFont { available: false });
+        assert_eq!(state.font_family, FontFamily::Literata);
+        assert!(!state.custom_font_available);
     }
 
     #[test]

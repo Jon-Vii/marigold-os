@@ -398,7 +398,7 @@ fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     index_row(
         fb,
         "Typeface",
-        font_family_label(shell.font_family),
+        font_family_label(shell.font_family, shell.custom_font_name),
         FIRST_ROW_Y,
         shell.selection == 0,
     );
@@ -938,10 +938,17 @@ fn font_weight_label(weight: display::font::FontWeight) -> &'static str {
     }
 }
 
-fn font_family_label(family: display::font::FontFamily) -> &'static str {
+fn font_family_label<'a>(family: display::font::FontFamily, custom_name: &'a str) -> &'a str {
     match family {
         display::font::FontFamily::Literata => "literata",
         display::font::FontFamily::Merriweather => "merriweather",
+        display::font::FontFamily::Custom => {
+            if custom_name.is_empty() {
+                "custom"
+            } else {
+                custom_name
+            }
+        }
     }
 }
 

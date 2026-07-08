@@ -324,6 +324,7 @@ fn library_event_affects_view(state: &ReaderState, event: &crate::LibraryEvent) 
         // The reducer adopts the new chapter without a repaint (Reading shows
         // page-within-chapter, not the chapter), so it never forces a render.
         crate::LibraryEvent::ChapterCursor { .. } => false,
+        crate::LibraryEvent::CustomFont { .. } => state.view == AppView::Settings,
         crate::LibraryEvent::Restored { .. } => true,
     }
 }

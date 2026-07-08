@@ -336,8 +336,10 @@ pub const READER_WRAP_SAFETY: i16 = 4;
 /// v15: the second family changed from Bookerly to Merriweather. Its advances
 /// differ, but the family bit (1) does not, so a version bump is what retires
 /// any pagination cached under the old face. v16: font advances moved to 12.4
-/// fixed point and generated kerning tables now affect line widths.
-const READER_LAYOUT_VERSION: u16 = 16;
+/// fixed point and generated kerning tables now affect line widths. v17:
+/// family widened from one bit to two bits so the Custom slot cannot collide
+/// with the version field.
+const READER_LAYOUT_VERSION: u16 = 17;
 
 /// Panel-geometry salt folded into the version bits: wrap points and page
 /// heights depend on the page box, so pagination cached on one panel must
@@ -355,10 +357,10 @@ const PANEL_LAYOUT_SALT: u16 = if display::WIDTH == 800 && display::HEIGHT == 48
 /// mismatch on load invalidates the cached pagination and rebuilds it.
 /// Bit layout: spacing in bits 0-1 (a spacing change only re-walks heights,
 /// so the load check masks these off), size in bits 2-3, weight in bit 4,
-/// family in bit 5, version above. Size, weight, and family all change wrap
+/// family in bits 5-6, version above. Size, weight, and family all change wrap
 /// points, so a change in any forces a full rebuild.
 pub fn reader_layout_config(settings: TypeSettings) -> u16 {
-    ((READER_LAYOUT_VERSION + PANEL_LAYOUT_SALT) << 6)
+    ((READER_LAYOUT_VERSION + PANEL_LAYOUT_SALT) << 7)
         | ((settings.family as u16) << 5)
         | ((settings.weight as u16) << 4)
         | ((settings.size as u16) << 2)
@@ -1037,24 +1039,38 @@ mod tests {
         FontStyle::BoldItalic,
     ];
 
-    const ALL_SETTINGS: [TypeSettings; 9] = {
+    const ALL_SETTINGS: [TypeSettings; 54] = {
         let sizes = [FontSize::Small, FontSize::Medium, FontSize::Large];
         let spacings = [
             LineSpacing::Compact,
             LineSpacing::Normal,
             LineSpacing::Relaxed,
         ];
-        let mut out = [TypeSettings::DEFAULT; 9];
+        let weights = [FontWeight::Normal, FontWeight::Heavy];
+        let families = [
+            FontFamily::Literata,
+            FontFamily::Merriweather,
+            FontFamily::Custom,
+        ];
+        let mut out = [TypeSettings::DEFAULT; 54];
         let mut i = 0;
         while i < 3 {
             let mut j = 0;
             while j < 3 {
-                out[i * 3 + j] = TypeSettings {
-                    size: sizes[i],
-                    spacing: spacings[j],
-                    weight: FontWeight::Normal,
-                    family: FontFamily::Literata,
-                };
+                let mut k = 0;
+                while k < 2 {
+                    let mut l = 0;
+                    while l < 3 {
+                        out[((i * 3 + j) * 2 + k) * 3 + l] = TypeSettings {
+                            size: sizes[i],
+                            spacing: spacings[j],
+                            weight: weights[k],
+                            family: families[l],
+                        };
+                        l += 1;
+                    }
+                    k += 1;
+                }
                 j += 1;
             }
             i += 1;
@@ -1122,7 +1138,7 @@ mod tests {
 
     #[test]
     fn layout_configs_are_distinct_per_type_settings() {
-        let mut seen = [0u16; 9];
+        let mut seen = [0u16; ALL_SETTINGS.len()];
         for (index, settings) in ALL_SETTINGS.iter().enumerate() {
             let config = reader_layout_config(*settings);
             assert!(
@@ -1135,8 +1151,55 @@ mod tests {
 
     #[test]
     fn line_advances_grow_with_size_and_spacing() {
+        let settings = [
+            TypeSettings {
+                size: FontSize::Small,
+                spacing: LineSpacing::Compact,
+                ..TypeSettings::DEFAULT
+            },
+            TypeSettings {
+                size: FontSize::Small,
+                spacing: LineSpacing::Normal,
+                ..TypeSettings::DEFAULT
+            },
+            TypeSettings {
+                size: FontSize::Small,
+                spacing: LineSpacing::Relaxed,
+                ..TypeSettings::DEFAULT
+            },
+            TypeSettings {
+                size: FontSize::Medium,
+                spacing: LineSpacing::Compact,
+                ..TypeSettings::DEFAULT
+            },
+            TypeSettings {
+                size: FontSize::Medium,
+                spacing: LineSpacing::Normal,
+                ..TypeSettings::DEFAULT
+            },
+            TypeSettings {
+                size: FontSize::Medium,
+                spacing: LineSpacing::Relaxed,
+                ..TypeSettings::DEFAULT
+            },
+            TypeSettings {
+                size: FontSize::Large,
+                spacing: LineSpacing::Compact,
+                ..TypeSettings::DEFAULT
+            },
+            TypeSettings {
+                size: FontSize::Large,
+                spacing: LineSpacing::Normal,
+                ..TypeSettings::DEFAULT
+            },
+            TypeSettings {
+                size: FontSize::Large,
+                spacing: LineSpacing::Relaxed,
+                ..TypeSettings::DEFAULT
+            },
+        ];
         for role in [TextRole::Body, TextRole::Heading1] {
-            for window in ALL_SETTINGS.windows(2) {
+            for window in settings.windows(2) {
                 assert!(
                     line_advance(window[0], role) < line_advance(window[1], role)
                         || window[0].size != window[1].size,

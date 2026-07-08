@@ -7,7 +7,7 @@ use crate::reader_store::{
     MAX_READER_BLOCK_TEXT,
 };
 use crate::sd_session::{self, SdSessionError};
-use display::font::FontStyle;
+use display::font::{fixed_ceil, fixed_round, FontFamily, FontStyle, TypeSettings, STYLE_MARKER};
 use embassy_time::Instant;
 use embedded_sdmmc::{Directory, File, Mode, TimeSource};
 use esp_hal::gpio::Output;
@@ -450,6 +450,47 @@ pub(crate) fn load_app_state(epd: &mut Epd, sd_cs: &mut Output<'static>) -> Opti
         .flatten()
 }
 
+#[inline(never)]
+pub(crate) fn load_custom_font_manifest(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    library: &mut ReaderStore,
+) {
+    if display::font::builtin_custom_available() {
+        library.set_custom_font(
+            Some(display::font::builtin_custom_name()),
+            display::font::builtin_custom_identity(),
+            &[],
+        );
+        esp_println::println!(
+            "font: builtin custom '{}' identity={:016x}",
+            display::font::builtin_custom_name(),
+            display::font::builtin_custom_identity()
+        );
+        return;
+    }
+    let manifest = sd_session::with_root(epd, sd_cs, |root| {
+        reader_cache_files::read_custom_font_manifest(root)
+    })
+    .ok()
+    .flatten();
+    if let Some(manifest) = manifest {
+        esp_println::println!(
+            "font: custom '{}' identity={:016x}",
+            manifest.name.as_str(),
+            manifest.identity
+        );
+        library.set_custom_font(
+            Some(manifest.name.as_str()),
+            manifest.identity,
+            &manifest.faces[..manifest.face_count],
+        );
+    } else {
+        esp_println::println!("font: no custom font pack");
+        library.set_custom_font(None, 0, &[]);
+    }
+}
+
 /// Track the chapter for the page just rendered while reading, past the
 /// reducer's 128-chapter `sd_chapter_for_page` cap. Cheap in-RAM resolve every
 /// render; only touches SD (a 48-byte TOC title read) when the chapter actually
@@ -530,7 +571,12 @@ pub(crate) fn restore_book_page_count(
     let _ = display_name.push_str(&entry.display_name);
     let cache_key = proto::cache::cache_key_for(display_name.as_str(), source_identity.1);
     sd_session::with_root(epd, sd_cs, |root| {
-        reader_cache_files::read_v2_book_total_pages(root, cache_key.as_str(), source_identity)
+        reader_cache_files::read_v2_book_total_pages(
+            root,
+            cache_key.as_str(),
+            source_identity,
+            library,
+        )
     })
     .unwrap_or(0)
 }
@@ -622,7 +668,12 @@ fn refresh_chapter_tracking<
     T: TimeSource,
 {
     let config = reader_layout::reader_layout_config(library.type_settings());
-    let token = (source_identity.0, source_identity.1, config);
+    let token = (
+        source_identity.0,
+        source_identity.1,
+        config,
+        library.custom_font_identity(),
+    );
     if library.chapter_page_count == 0 || library.chapter_page_token != token {
         if reader_cache_files::load_v2_toc_page_map(root, cache_key, source_identity, library) {
             library.chapter_page_token = token;
@@ -972,7 +1023,7 @@ where
             book_partial: &mut book_partial,
             spine_index: spine_index.min(u16::MAX as usize) as u16,
             line: String::new(),
-            line_ink: StyledInkCursor::new(type_settings, FontStyle::Regular),
+            line_ink: LineInkCursor::new(type_settings, FontStyle::Regular),
             line_role: TextRole::Body,
             line_align: TextAlign::Justify,
             line_style: FontStyle::Regular,
@@ -1383,7 +1434,7 @@ struct LibraryBlockSink<
     /// Running ink width of `line`. `line` always starts with a style
     /// marker (or is empty), so the cursor's default font never shows
     /// through and the running width matches a from-scratch measure.
-    line_ink: StyledInkCursor,
+    line_ink: LineInkCursor,
     line_role: TextRole,
     line_align: TextAlign,
     line_style: FontStyle,
@@ -1395,12 +1446,112 @@ struct LibraryBlockSink<
     generated_toc_for_spine: bool,
 }
 
+#[derive(Clone, Copy)]
+enum LineInkCursor {
+    BuiltIn(StyledInkCursor),
+    Custom(CustomLineInkCursor),
+}
+
+impl LineInkCursor {
+    fn new(settings: TypeSettings, default_style: FontStyle) -> Self {
+        if settings.family == FontFamily::Custom && !display::font::builtin_custom_available() {
+            Self::Custom(CustomLineInkCursor::new(settings, default_style))
+        } else {
+            Self::BuiltIn(StyledInkCursor::new(settings, default_style))
+        }
+    }
+
+    fn width(&self) -> i16 {
+        match self {
+            Self::BuiltIn(cursor) => cursor.width(),
+            Self::Custom(cursor) => cursor.width(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CustomLineInkCursor {
+    advance_fp: i32,
+    right: i16,
+    settings: TypeSettings,
+    style: FontStyle,
+}
+
+impl CustomLineInkCursor {
+    const fn new(settings: TypeSettings, default_style: FontStyle) -> Self {
+        Self {
+            advance_fp: 0,
+            right: 0,
+            settings,
+            style: default_style,
+        }
+    }
+
+    fn reset_pair(&mut self) {}
+
+    fn push_metric(&mut self, metric: display::font::GlyphMetric) {
+        let advance = fixed_round(self.advance_fp);
+        let glyph_right = advance + metric.x_offset as i16 + metric.width as i16;
+        self.right = self.right.max(glyph_right);
+        self.advance_fp += metric.advance_fp as i32;
+    }
+
+    fn push_fallback(&mut self) {
+        self.advance_fp += 8 << 4;
+        self.right = self.right.max(fixed_ceil(self.advance_fp));
+    }
+
+    fn width(&self) -> i16 {
+        self.right.max(fixed_ceil(self.advance_fp))
+    }
+}
+
 impl<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>
     LibraryBlockSink<'_, '_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    fn reset_line_ink(&mut self) {
+        self.line_ink = LineInkCursor::new(self.library.type_settings(), FontStyle::Regular);
+    }
+
+    fn push_line_ink_str(&mut self, text: &str) {
+        match &mut self.line_ink {
+            LineInkCursor::BuiltIn(cursor) => cursor.push_str(text),
+            LineInkCursor::Custom(cursor) => {
+                let mut chars = text.chars();
+                while let Some(ch) = chars.next() {
+                    if ch == STYLE_MARKER {
+                        if let Some(code) = chars.next() {
+                            cursor.reset_pair();
+                            cursor.style =
+                                display::font::style_from_marker_code(code).unwrap_or(cursor.style);
+                        }
+                        continue;
+                    }
+                    let metric = crate::custom_font::measure_char(
+                        self.root,
+                        self.library,
+                        cursor.settings.size,
+                        cursor.settings.weight,
+                        cursor.style,
+                        ch,
+                    );
+                    if let Some(metric) = metric {
+                        cursor.push_metric(metric);
+                    } else {
+                        cursor.push_fallback();
+                    }
+                }
+            }
+        }
+    }
+
+    fn line_ink_width(&self) -> i16 {
+        self.line_ink.width()
+    }
+
     fn finish_spine(&mut self, partial: bool) {
         flush_styled_preview_line(self, true);
         self.flush_section(partial || self.stopped, false);
@@ -1638,7 +1789,9 @@ fn push_styled_preview_fragment<
             sink.line.truncate(kept_len);
             flush_styled_preview_line(sink, false);
             let _ = append_styled_word(&mut sink.line, word, style, sink.line_style, false);
-            sink.line_ink.push_str(sink.line.as_str());
+            let mut measure = String::<MAX_READER_BLOCK_TEXT>::new();
+            let _ = measure.push_str(sink.line.as_str());
+            sink.push_line_ink_str(measure.as_str());
             sink.line_role = role;
             sink.line_align = align;
             sink.line_style = style;
@@ -1646,7 +1799,9 @@ fn push_styled_preview_fragment<
             first_word = false;
             continue;
         }
-        sink.line_ink.push_str(&sink.line[kept_len..]);
+        let mut measure = String::<MAX_READER_BLOCK_TEXT>::new();
+        let _ = measure.push_str(&sink.line[kept_len..]);
+        sink.push_line_ink_str(measure.as_str());
 
         // The line in progress opens a paragraph while no line of it has
         // flushed yet: the previous block still closes a paragraph. Once the
@@ -1661,13 +1816,15 @@ fn push_styled_preview_fragment<
                 .unwrap_or(true);
         let x_eff = if opens_paragraph { x + indent } else { x };
         if !line_was_empty
-            && sink.line_ink.width() + x_eff + reader_layout::READER_WRAP_SAFETY > max_x
+            && sink.line_ink_width() + x_eff + reader_layout::READER_WRAP_SAFETY > max_x
         {
             sink.line.truncate(kept_len);
             sink.line_ink = kept_ink;
             flush_styled_preview_line(sink, false);
             let _ = append_styled_word(&mut sink.line, word, style, sink.line_style, false);
-            sink.line_ink.push_str(sink.line.as_str());
+            let mut measure = String::<MAX_READER_BLOCK_TEXT>::new();
+            let _ = measure.push_str(sink.line.as_str());
+            sink.push_line_ink_str(measure.as_str());
             sink.line_role = role;
             sink.line_align = align;
             sink.line_style = style;
@@ -1786,7 +1943,7 @@ fn flush_styled_preview_line<
         );
     }
     sink.line.clear();
-    sink.line_ink = StyledInkCursor::new(sink.library.type_settings(), FontStyle::Regular);
+    sink.reset_line_ink();
     sink.line_style = FontStyle::Regular;
     sink.pending_space = false;
 }

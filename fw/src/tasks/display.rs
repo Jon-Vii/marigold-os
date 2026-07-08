@@ -149,7 +149,9 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                     }
                 }
                 let layout_start = Instant::now();
-                crate::views::render(fb, request, sd_library);
+                if !render_custom_reader(&mut epd, &mut sd_cs, fb, request, sd_library) {
+                    crate::views::render(fb, request, sd_library);
+                }
                 let layout_ms = layout_start.elapsed().as_millis();
 
                 if !refresh_planner.screen_on() && refresh_planner.last_request().is_none() {
@@ -357,6 +359,27 @@ pub(crate) fn send_library_event(event: &LibraryEvent) {
     }
 }
 
+fn render_custom_reader(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    fb: &mut Framebuffer,
+    request: RenderRequest,
+    sd_library: &ReaderStore,
+) -> bool {
+    if request.view != AppView::Reading
+        || !ReaderSource::from_book_id(request.book_id).is_sd()
+        || request.font_family != display::font::FontFamily::Custom
+        || display::font::builtin_custom_available()
+        || !sd_library.custom_font_available()
+    {
+        return false;
+    }
+    crate::sd_session::with_root(epd, sd_cs, |root| {
+        crate::views::render_custom_reader_from_root(fb, request, sd_library, root)
+    })
+    .unwrap_or(false)
+}
+
 /// The reader-view render to paint as a loading plate before an open that
 /// re-paginates the book, or `None` when no plate is needed here. Only a
 /// layout change qualifies: the store still reports the old type settings at
@@ -470,6 +493,10 @@ fn handle_storage_command(
             } else {
                 esp_println::println!("wifi: no saved network");
             }
+            reader_cache::load_custom_font_manifest(epd, sd_cs, sd_library);
+            send_library_event(&LibraryEvent::CustomFont {
+                available: sd_library.custom_font_available(),
+            });
             if crate::library_sd::load_catalog_cache(epd, sd_cs, sd_library) {
                 // Restored goes out first so the very next Home repaint
                 // already shows the saved book; the Scanned default then
@@ -482,6 +509,10 @@ fn handle_storage_command(
             }
         }
         StorageCommand::RefreshCatalog => {
+            reader_cache::load_custom_font_manifest(epd, sd_cs, sd_library);
+            send_library_event(&LibraryEvent::CustomFont {
+                available: sd_library.custom_font_available(),
+            });
             crate::library_sd::scan_books(epd, sd_cs, sd_library);
             restore_saved_state(epd, sd_cs, sd_library, state_restored);
             send_library_event(&LibraryEvent::Scanned {

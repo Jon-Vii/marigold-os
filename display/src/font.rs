@@ -150,6 +150,7 @@ pub enum FontFamily {
     #[default]
     Literata,
     Merriweather,
+    Custom,
 }
 
 impl FontFamily {
@@ -157,6 +158,7 @@ impl FontFamily {
         match value {
             0 => Some(Self::Literata),
             1 => Some(Self::Merriweather),
+            2 => Some(Self::Custom),
             _ => None,
         }
     }
@@ -266,7 +268,71 @@ pub fn family_weighted(
                 _ => merriweather_sized(size, style),
             },
         },
+        FontFamily::Custom => custom_weighted(size, weight, style),
     }
+}
+
+pub fn builtin_custom_available() -> bool {
+    cfg!(feature = "builtin-custom-font")
+}
+
+#[cfg(feature = "builtin-custom-font")]
+pub fn builtin_custom_name() -> &'static str {
+    crate::custom_generated::CUSTOM_FONT_NAME
+}
+
+#[cfg(not(feature = "builtin-custom-font"))]
+pub fn builtin_custom_name() -> &'static str {
+    ""
+}
+
+#[cfg(feature = "builtin-custom-font")]
+pub fn builtin_custom_identity() -> u64 {
+    crate::custom_generated::CUSTOM_FONT_IDENTITY
+}
+
+#[cfg(not(feature = "builtin-custom-font"))]
+pub fn builtin_custom_identity() -> u64 {
+    0
+}
+
+#[cfg(feature = "builtin-custom-font")]
+pub fn custom_weighted(
+    size: FontSize,
+    weight: FontWeight,
+    style: FontStyle,
+) -> &'static BitmapFont {
+    use crate::custom_generated as custom;
+    let style = match (weight, style) {
+        (FontWeight::Normal, style) => style,
+        (FontWeight::Heavy, FontStyle::Regular | FontStyle::Bold) => FontStyle::Bold,
+        (FontWeight::Heavy, FontStyle::Italic | FontStyle::BoldItalic) => FontStyle::BoldItalic,
+    };
+    match (size, style) {
+        (FontSize::Small, FontStyle::Regular) => &custom::CUSTOM_19_REGULAR,
+        (FontSize::Small, FontStyle::Italic) => &custom::CUSTOM_19_ITALIC,
+        (FontSize::Small, FontStyle::Bold) => &custom::CUSTOM_19_BOLD,
+        (FontSize::Small, FontStyle::BoldItalic) => &custom::CUSTOM_19_BOLD_ITALIC,
+        (FontSize::Medium, FontStyle::Regular) => &custom::CUSTOM_22_REGULAR,
+        (FontSize::Medium, FontStyle::Italic) => &custom::CUSTOM_22_ITALIC,
+        (FontSize::Medium, FontStyle::Bold) => &custom::CUSTOM_22_BOLD,
+        (FontSize::Medium, FontStyle::BoldItalic) => &custom::CUSTOM_22_BOLD_ITALIC,
+        (FontSize::Large, FontStyle::Regular) => &custom::CUSTOM_26_REGULAR,
+        (FontSize::Large, FontStyle::Italic) => &custom::CUSTOM_26_ITALIC,
+        (FontSize::Large, FontStyle::Bold) => &custom::CUSTOM_26_BOLD,
+        (FontSize::Large, FontStyle::BoldItalic) => &custom::CUSTOM_26_BOLD_ITALIC,
+    }
+}
+
+#[cfg(not(feature = "builtin-custom-font"))]
+pub fn custom_weighted(
+    size: FontSize,
+    weight: FontWeight,
+    style: FontStyle,
+) -> &'static BitmapFont {
+    // Runtime SD-backed custom fonts are handled by firmware-specific
+    // providers. Host-only and non-reader paths keep a total selector.
+    literata_weighted(size, weight, style)
 }
 
 /// The SemiBold body face at a reading size, upright or italic.
