@@ -63,6 +63,17 @@ Current code status:
     true finger-to-eye latency.
   - Book open with a v2 cache hit: cache ready in 50–85 ms; perceived ~4 s is
     the full refresh that paints the first page.
+- Measured cold cache build (July 9 2026, on-device, 117-page/35-chapter EPUB,
+  same book and restored position both runs; from `bench: storage_build` via
+  `tools/bench/bench.py storage-cache`):
+  - Before the build-path work: **7.9 s** total (4.6 s writing section files;
+    3,903 write + 1,267 read block transactions).
+  - After write staging, held SECTIONS dir, dirty-gated pagination rebuilds,
+    and the 8 KB read clamp: **3.9 s** total (0.86 s writes; 537 write + 723
+    read block transactions) — ~34 ms per page, ~2× faster. The remainder is
+    ~70% CPU (inflate + parse + measure); the next material win would be
+    multi-block CMD18 reads (needs changes inside the pinned embedded-sdmmc)
+    or a progressive open that publishes the first section early.
 - Use the on-screen input calibration panel to record raw GPIO1/GPIO2 values for every button.
 
 ## Phase 3: reader core
