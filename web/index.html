@@ -404,6 +404,11 @@
   esp-web-install-button{ display:inline-flex; vertical-align:middle; }
   .flashbtn{ cursor:pointer; }
   .ewt-note{ font-size:13px; color:var(--label); }
+
+  /* The inline FWUPDATE.BIN link fell back to the browser's default blue,
+     which clashed with the warm palette; match the other prose links. */
+  .sdcard .txt a{ color:var(--mari); text-decoration:none; }
+  .sdcard .txt a:hover{ text-decoration:underline; }
 </style>
 </head>
 <body>
