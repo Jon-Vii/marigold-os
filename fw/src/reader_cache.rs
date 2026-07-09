@@ -172,6 +172,7 @@ pub(crate) fn dismantle_scratch(
 /// Kept out of line: the storage dispatcher's frame must stay small, and the
 /// EPUB open path below already runs close to the 30 KB stack region.
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_or_load_book_cache(
     epd: &mut Epd,
     sd_cs: &mut Output<'static>,
@@ -180,6 +181,7 @@ pub(crate) fn build_or_load_book_cache(
     requested_chapter: u8,
     target_pages: usize,
     scratch: &mut ReaderCacheScratch<'_>,
+    font_metrics: &mut crate::custom_font::MetricCache,
 ) {
     esp_println::println!(
         "epub: cache open index {} chapter {} target {}",
@@ -203,6 +205,7 @@ pub(crate) fn build_or_load_book_cache(
             requested_chapter,
             target_pages,
             scratch,
+            font_metrics,
         )
     })
     .unwrap_or_else(|err| {
@@ -228,6 +231,7 @@ pub(crate) fn build_or_load_book_cache_from_root<
     requested_chapter: u8,
     target_pages: usize,
     scratch: &mut ReaderCacheScratch<'_>,
+    font_metrics: &mut crate::custom_font::MetricCache,
 ) -> BookLoadStatus
 where
     D: embedded_sdmmc::BlockDevice,
@@ -280,6 +284,7 @@ where
                     target_pages,
                     library,
                     scratch,
+                    font_metrics,
                 )),
                 Err(err) => {
                     esp_println::println!("epub: open file failed: {:?}", err);
@@ -304,6 +309,7 @@ where
                 target_pages,
                 library,
                 scratch,
+                font_metrics,
             )),
             Err(err) => {
                 esp_println::println!("epub: open file failed: {:?}", err);
@@ -785,6 +791,7 @@ impl From<proto::epub::XhtmlError> for ReaderCacheError {
 }
 
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 fn build_or_load_epub_cache_from_file<
     D,
     T,
@@ -799,6 +806,7 @@ fn build_or_load_epub_cache_from_file<
     target_pages: usize,
     library: &mut ReaderStore,
     scratch: &mut ReaderCacheScratch<'_>,
+    font_metrics: &mut crate::custom_font::MetricCache,
 ) -> Result<(), ReaderCacheError>
 where
     D: embedded_sdmmc::BlockDevice,
@@ -835,6 +843,7 @@ where
         requested_global_page,
         open_started,
         library,
+        font_metrics,
         ZipBuildScratch {
             header: scratch.header,
             name: scratch.name,
@@ -877,6 +886,7 @@ fn build_or_load_epub_cache_from_zip<
     requested_global_page: u32,
     open_started: Instant,
     library: &mut ReaderStore,
+    font_metrics: &mut crate::custom_font::MetricCache,
     scratch: ZipBuildScratch<'_>,
 ) -> Result<(), ReaderCacheError>
 where
@@ -1026,6 +1036,7 @@ where
                 sections_dir,
                 cache_key,
                 source_identity,
+                font_metrics: &mut *font_metrics,
                 sections: &mut *sections,
                 section_count: &mut section_count,
                 total_pages: &mut total_pages,
@@ -1454,6 +1465,7 @@ struct LibraryBlockSink<
     sections_dir: Option<&'r Directory<'r, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>,
     cache_key: &'r str,
     source_identity: (u32, u32),
+    font_metrics: &'a mut crate::custom_font::MetricCache,
     sections: &'a mut [BookV2SectionRecord; MAX_BOOK_SECTIONS],
     section_count: &'a mut usize,
     total_pages: &'a mut u32,
@@ -1571,6 +1583,7 @@ where
                     let metric = crate::custom_font::measure_char(
                         self.root,
                         self.library,
+                        &mut *self.font_metrics,
                         cursor.settings.size,
                         cursor.settings.weight,
                         cursor.style,

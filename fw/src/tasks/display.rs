@@ -75,6 +75,11 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
     let mut prev_prestaged = false;
     static SD_LIBRARY: ConstStaticCell<ReaderStore> = ConstStaticCell::new(ReaderStore::new());
     let sd_library = SD_LIBRARY.take();
+    // ASCII glyph metrics for the custom font pack; shared by the build's
+    // line measurement and the reading-page draw so both stay off the card.
+    static FONT_METRICS: ConstStaticCell<crate::custom_font::MetricCache> =
+        ConstStaticCell::new(crate::custom_font::MetricCache::new());
+    let font_metrics = FONT_METRICS.take();
 
     esp_println::println!("display: init start");
     display_flush::init_panel(&mut epd).await;
@@ -152,7 +157,14 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                     }
                 }
                 let layout_start = Instant::now();
-                if !render_custom_reader(&mut epd, &mut sd_cs, fb, request, sd_library) {
+                if !render_custom_reader(
+                    &mut epd,
+                    &mut sd_cs,
+                    fb,
+                    request,
+                    sd_library,
+                    font_metrics,
+                ) {
                     crate::views::render(fb, request, sd_library);
                 }
                 let layout_ms = layout_start.elapsed().as_millis();
@@ -353,6 +365,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                     &mut epd,
                     &mut sd_cs,
                     sd_library,
+                    font_metrics,
                     &mut epub_scratch,
                     &mut sync_session,
                     &mut pending_progress,
@@ -377,6 +390,7 @@ fn render_custom_reader(
     fb: &mut Framebuffer,
     request: RenderRequest,
     sd_library: &ReaderStore,
+    font_metrics: &mut crate::custom_font::MetricCache,
 ) -> bool {
     if request.view != AppView::Reading
         || !ReaderSource::from_book_id(request.book_id).is_sd()
@@ -387,7 +401,7 @@ fn render_custom_reader(
         return false;
     }
     crate::sd_session::with_root(epd, sd_cs, |root| {
-        crate::views::render_custom_reader_from_root(fb, request, sd_library, root)
+        crate::views::render_custom_reader_from_root(fb, request, sd_library, font_metrics, root)
     })
     .unwrap_or(false)
 }
@@ -452,6 +466,7 @@ fn handle_storage_command(
     epd: &mut Epd,
     sd_cs: &mut Output<'static>,
     sd_library: &mut ReaderStore,
+    font_metrics: &mut crate::custom_font::MetricCache,
     epub_scratch: &mut Option<&'static mut ReaderCacheScratch<'static>>,
     sync_session: &mut SyncSession,
     pending_progress: &mut Option<AppStateRecord>,
@@ -649,6 +664,7 @@ fn handle_storage_command(
                 chapter,
                 target_pages as usize,
                 scratch,
+                font_metrics,
             );
             send_loaded_library_event(&LibraryEvent::Loaded {
                 book_id,
@@ -745,6 +761,7 @@ fn handle_storage_command(
                 chapter,
                 target_page as usize,
                 scratch,
+                font_metrics,
             );
             send_loaded_library_event(&LibraryEvent::Loaded {
                 book_id,

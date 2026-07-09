@@ -42,6 +42,7 @@ pub(crate) fn render_custom_reader_from_root(
     fb: &mut Framebuffer,
     request: RenderRequest,
     sd_library: &ReaderStore,
+    font_metrics: &mut crate::custom_font::MetricCache,
     root: &crate::sd_session::SdRoot<'_>,
 ) -> bool {
     if request.view != AppView::Reading
@@ -54,7 +55,7 @@ pub(crate) fn render_custom_reader_from_root(
 
     fb.set_frame(app_render::fb_frame(request.orientation));
     fb.clear(true);
-    draw_sd_reader_page_with_custom_font(fb, request, sd_library, root);
+    draw_sd_reader_page_with_custom_font(fb, request, sd_library, font_metrics, root);
     true
 }
 
@@ -264,6 +265,7 @@ fn draw_sd_reader_page_with_custom_font(
     fb: &mut Framebuffer,
     request: RenderRequest,
     sd_library: &ReaderStore,
+    font_metrics: &mut crate::custom_font::MetricCache,
     root: &crate::sd_session::SdRoot<'_>,
 ) {
     let layout_current = sd_library.type_settings()
@@ -290,7 +292,13 @@ fn draw_sd_reader_page_with_custom_font(
         (BookLoadStatus::Ready, _) => {
             let plan = reader_layout::ReaderPagePlan::new(sd_library, request.page);
             let page_count = plan.page_count().max(1);
-            if !crate::custom_font::draw_reading_page_body(root, fb, sd_library, plan.page()) {
+            if !crate::custom_font::draw_reading_page_body(
+                root,
+                fb,
+                sd_library,
+                font_metrics,
+                plan.page(),
+            ) {
                 ui::reading::draw_reading_page_body(fb, sd_library, plan.page());
             }
             draw_reader_footer(fb, request, sd_library, page_count);
