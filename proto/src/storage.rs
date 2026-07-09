@@ -101,13 +101,11 @@ pub fn catalog_display_path<const N: usize>(prefix: &str, name: &str, out: &mut 
     // Keep the EPUB suffix when a long FAT name needs trimming. The Library's
     // fallback label uses it to remove the extension, while the beginning of
     // the filename remains the most useful part for the reader.
-    let suffix = if name.as_bytes().len() >= 5
+    let suffix = if name.len() >= 5
         && name.as_bytes()[name.len() - 5..].eq_ignore_ascii_case(b".epub")
     {
         &name[name.len() - 5..]
-    } else if name.as_bytes().len() >= 4
-        && name.as_bytes()[name.len() - 4..].eq_ignore_ascii_case(b".epu")
-    {
+    } else if name.len() >= 4 && name.as_bytes()[name.len() - 4..].eq_ignore_ascii_case(b".epu") {
         &name[name.len() - 4..]
     } else {
         ""
