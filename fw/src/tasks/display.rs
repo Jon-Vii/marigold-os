@@ -127,7 +127,6 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                             &mut sd_cs,
                             sd_library,
                             request.selection,
-                            request.orientation.is_portrait(),
                         );
                     } else if ReaderSource::from_book_id(request.book_id).is_sd() {
                         if let Some(index) = ReaderStore::selected_book_index(request.book_id) {
@@ -145,7 +144,6 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                                     sd_library,
                                     index,
                                     request.selection as usize,
-                                    request.orientation.is_portrait(),
                                 );
                             }
                         }
@@ -437,14 +435,6 @@ fn open_loading_plate_request(
     request.line_spacing = type_settings.spacing;
     request.font_weight = type_settings.weight;
     request.font_family = type_settings.family;
-    // The command carries only a portrait bool, so preserve the request's
-    // existing variant when it already agrees and reconcile only a mismatch
-    // (a stale landscape template on a portrait open, or vice versa).
-    request.orientation = match (type_settings.portrait, request.orientation.is_portrait()) {
-        (true, false) => DisplayOrientation::PortraitButtonsRight,
-        (false, true) => DisplayOrientation::LandscapeButtonsBottom,
-        _ => request.orientation,
-    };
     Some(request)
 }
 
@@ -735,7 +725,6 @@ fn handle_storage_command(
                 sd_library,
                 index as usize,
                 chapter as usize,
-                true, // Over-estimate visible rows to ensure chapter is covered
             );
             let target_page = sd_library.overview_page_at(chapter as usize);
             let scratch = ensure_epub_scratch(epub_scratch);
@@ -1036,8 +1025,6 @@ fn sleep_request_from_saved_state(
     crate::library_sd::load_active_entry(epd, sd_cs, library, usize::from(index));
     reader_cache::load_chapter_title(epd, sd_cs, usize::from(index), record.chapter, library);
     let page_count = reader_cache::restore_book_page_count(epd, sd_cs, usize::from(index), library);
-    let orientation = display_orientation_from_u8(record.reading_orientation)
-        .unwrap_or(DisplayOrientation::LandscapeButtonsBottom);
     Some(RenderRequest {
         kind: RenderKind::Page,
         view: AppView::Home,
@@ -1046,8 +1033,8 @@ fn sleep_request_from_saved_state(
         chapter: record.chapter.min(u8::MAX as u16) as u8,
         selection: 0,
         book_id: ReaderSource::sd(index).book_id(),
-        orientation,
-        reading_sheet: false,
+        orientation: display_orientation_from_u8(record.reading_orientation)
+            .unwrap_or(DisplayOrientation::LandscapeButtonsBottom),
         refresh_policy: refresh_policy_from_u8(record.refresh_policy)
             .unwrap_or(app_core::RefreshPolicy::FullOnWake),
         font_size: display::font::FontSize::from_u8(record.font_size)
@@ -1068,7 +1055,7 @@ fn sleep_request_from_saved_state(
         sync_status: SyncStatus::NotConfigured,
         wifi_ssid: [0; 32],
         wifi_ssid_len: 0,
-        dirty: display::Rect::full_for_orientation(orientation.is_portrait()),
+        dirty: display::Rect::FULL,
     })
 }
 

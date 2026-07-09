@@ -41,9 +41,7 @@ impl AppStateRecord {
             book_id,
             chapter: 0,
             screen: 0,
-            // Both bytes carry the one user-facing orientation; landscape
-            // (0) is the reducer's boot default.
-            shell_orientation: 0,
+            shell_orientation: 3,
             reading_orientation: 0,
             refresh_policy: 1,
             font_size: Self::DEFAULT_FONT_SIZE,
