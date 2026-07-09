@@ -115,13 +115,16 @@
       0 26px 60px -16px rgba(40,36,28,.55);
     margin-bottom: 14px;
     transform-origin: center;
-    transition: transform 420ms cubic-bezier(.2,.8,.2,1);
+    transition:
+      transform 420ms cubic-bezier(.2,.8,.2,1),
+      margin 420ms cubic-bezier(.2,.8,.2,1);
   }
   .device.buttons-up { transform: rotate(180deg); }
-  /* The portrait hold: a quarter turn counter-clockwise, scaled so the
-     upright device fits roughly the landscape footprint. Same transition
-     as the buttons-up flip. */
-  .device.portrait { transform: rotate(-90deg) scale(.56); }
+  /* The portrait hold: a quarter turn counter-clockwise at full size —
+     the panel keeps its landscape resolution. Transforms leave layout
+     alone, so syncDeviceOrientation adds compensating margins that push
+     the sections below out of the taller visual box. */
+  .device.portrait { transform: rotate(-90deg); }
   @media (prefers-reduced-motion: reduce) {
     .device { transition: none; }
   }
@@ -467,7 +470,7 @@
     <div class="stage">
       <p class="stitle"><span class="no">2</span>Flash over USB</p>
       <div class="asset">
-        <div><span class="k">Version</span><b>v0.2.1</b></div>
+        <div><span class="k">Version</span><b>v0.3.0</b></div>
         <div><span class="k">Image</span><b id="img">firmware-x4.bin</b></div>
         <div><span class="k">Size</span><b>~2.0 MB</b></div>
       </div>
@@ -493,7 +496,7 @@
     <p class="txt">Already running Marigold on an X4? Use <a href="https://github.com/Jon-Vii/marigold-os/releases/latest/download/FWUPDATE.BIN">FWUPDATE.BIN</a> instead and reboot normally.</p>
   </div>
 
-  <p class="rel"><a href="https://github.com/Jon-Vii/marigold-os/releases/latest">v0.2.1 release notes &#8599;</a></p>
+  <p class="rel"><a href="https://github.com/Jon-Vii/marigold-os/releases/latest">v0.3.0 release notes &#8599;</a></p>
 </section>
 
 <div class="colophon">
@@ -565,7 +568,24 @@
       "portrait",
       orientation === ORIENTATION_PORTRAIT_LEFT || orientation === ORIENTATION_PORTRAIT_RIGHT,
     );
+    updatePortraitSpacing();
   }
+
+  // The quarter turn is a pure transform, so the device's layout box stays
+  // landscape-shaped; grow the vertical margins by the visual overhang
+  // (rotation about the center hangs (width - height) / 2 past each edge)
+  // so the page content below moves down instead of being covered.
+  function updatePortraitSpacing() {
+    if (device.classList.contains("portrait")) {
+      const overhang = Math.max(0, (device.offsetWidth - device.offsetHeight) / 2);
+      device.style.marginTop = `${Math.round(overhang)}px`;
+      device.style.marginBottom = `${Math.round(overhang) + 14}px`;
+    } else {
+      device.style.marginTop = "";
+      device.style.marginBottom = "";
+    }
+  }
+  addEventListener("resize", updatePortraitSpacing);
 
   // Restore the shelf position saved by a previous visit.
   try {
