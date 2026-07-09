@@ -884,6 +884,8 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    let io_start = crate::sd_session::sd_stats::snapshot();
+    let mut section_write_micros: u64 = 0;
     esp_println::println!("epub: stage ParseContainerAndOpf");
     let container_entry = zip.find_entry("META-INF/container.xml", scratch.header, scratch.name)?;
     let container_len = zip.read_entry_streamed(
@@ -970,6 +972,7 @@ where
     let css_rules = CssRules::new();
 
     esp_println::println!("epub: stage BuildV2BookCache");
+    let spine_started = Instant::now();
     let mut xhtml_path = String::<MAX_ENTRY_NAME_BYTES>::new();
     scratch.book_sections.fill(EMPTY_BOOK_SECTION_RECORD);
     let sections = &mut *scratch.book_sections;
@@ -1023,6 +1026,7 @@ where
             section_count: &mut section_count,
             total_pages: &mut total_pages,
             book_partial: &mut book_partial,
+            write_micros: &mut section_write_micros,
             spine_index: spine_index.min(u16::MAX as usize) as u16,
             line: String::new(),
             line_ink: LineInkCursor::new(type_settings, FontStyle::Regular),
@@ -1132,6 +1136,20 @@ where
             section_count,
             book_partial,
             cover,
+            cache_key
+        );
+        let io = crate::sd_session::sd_stats::snapshot().since(io_start);
+        esp_println::println!(
+            "bench: storage_build elapsed_ms={} spine_ms={} write_ms={} sections={} pages={} rd_calls={} rd_blocks={} wr_calls={} wr_blocks={} key={}",
+            open_started.elapsed().as_millis(),
+            spine_started.elapsed().as_millis(),
+            section_write_micros / 1000,
+            section_count,
+            total_pages,
+            io.read_calls,
+            io.read_blocks,
+            io.write_calls,
+            io.write_blocks,
             cache_key
         );
         Ok(())
@@ -1426,6 +1444,9 @@ struct LibraryBlockSink<
     section_count: &'a mut usize,
     total_pages: &'a mut u32,
     book_partial: &'a mut bool,
+    /// Accumulated wall time spent writing section files, for the
+    /// `bench: storage_build` line.
+    write_micros: &'a mut u64,
     spine_index: u16,
     line: String<MAX_READER_BLOCK_TEXT>,
     /// Running ink width of `line`. `line` always starts with a style
@@ -1592,6 +1613,7 @@ where
         self.library.set_cached_spine(self.spine_index);
         self.library.set_section_partial(partial);
         let section_id = (*self.section_count).min(u16::MAX as usize) as u16;
+        let write_started = Instant::now();
         let wrote = reader_cache_files::write_v2_section_cache(
             self.root,
             self.cache_key,
@@ -1599,6 +1621,7 @@ where
             section_id,
             self.library,
         );
+        *self.write_micros += write_started.elapsed().as_micros();
         if !wrote {
             *self.book_partial = true;
         }

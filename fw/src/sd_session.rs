@@ -2,6 +2,7 @@ use crate::display_flush::Epd;
 use crate::upload::{UploadBegin, UploadChunk};
 use crate::{UPLOAD_BEGINS, UPLOAD_CHUNKS, UPLOAD_RESULTS, UPLOAD_RETURNS};
 use core::sync::atomic::{AtomicU8, Ordering};
+use embedded_sdmmc::{Block, BlockCount, BlockDevice, BlockIdx};
 use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::OutputPin;
 use embedded_hal::spi::{Operation, SpiBus as BlockingSpiBus, SpiDevice};
@@ -23,6 +24,77 @@ const SD_DATA_FREQ_MHZ: u32 = 20;
 /// restoring the X4's 40 MHz leaves the panel deaf to every subsequent
 /// command (init included, since the boot catalog read precedes it).
 const DISPLAY_FREQ_HZ: u32 = display::epd::SPI_HZ;
+
+/// Block-level SD transaction counters for `bench:` telemetry. Single-writer
+/// (all SD traffic runs on the storage/display task), so plain load+store is
+/// enough on this RV32IMC core — no RMW atomics needed. Read via `snapshot`
+/// deltas around a workload; never reset, so concurrent snapshots stay
+/// comparable.
+pub(crate) mod sd_stats {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    pub(crate) static READ_CALLS: AtomicU32 = AtomicU32::new(0);
+    pub(crate) static READ_BLOCKS: AtomicU32 = AtomicU32::new(0);
+    pub(crate) static WRITE_CALLS: AtomicU32 = AtomicU32::new(0);
+    pub(crate) static WRITE_BLOCKS: AtomicU32 = AtomicU32::new(0);
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) struct Snapshot {
+        pub(crate) read_calls: u32,
+        pub(crate) read_blocks: u32,
+        pub(crate) write_calls: u32,
+        pub(crate) write_blocks: u32,
+    }
+
+    pub(crate) fn snapshot() -> Snapshot {
+        Snapshot {
+            read_calls: READ_CALLS.load(Ordering::Relaxed),
+            read_blocks: READ_BLOCKS.load(Ordering::Relaxed),
+            write_calls: WRITE_CALLS.load(Ordering::Relaxed),
+            write_blocks: WRITE_BLOCKS.load(Ordering::Relaxed),
+        }
+    }
+
+    impl Snapshot {
+        pub(crate) fn since(self, start: Snapshot) -> Snapshot {
+            Snapshot {
+                read_calls: self.read_calls.wrapping_sub(start.read_calls),
+                read_blocks: self.read_blocks.wrapping_sub(start.read_blocks),
+                write_calls: self.write_calls.wrapping_sub(start.write_calls),
+                write_blocks: self.write_blocks.wrapping_sub(start.write_blocks),
+            }
+        }
+    }
+
+    pub(crate) fn bump(counter: &AtomicU32, amount: u32) {
+        let value = counter.load(Ordering::Relaxed).wrapping_add(amount);
+        counter.store(value, Ordering::Relaxed);
+    }
+}
+
+/// Counts physical block transactions on their way to the SD card, so bench
+/// telemetry can report exact CMD17/CMD24-level traffic per workload.
+pub(crate) struct CountingDevice<B>(B);
+
+impl<B: BlockDevice> BlockDevice for CountingDevice<B> {
+    type Error = B::Error;
+
+    fn read(&self, blocks: &mut [Block], start_block_idx: BlockIdx) -> Result<(), Self::Error> {
+        sd_stats::bump(&sd_stats::READ_CALLS, 1);
+        sd_stats::bump(&sd_stats::READ_BLOCKS, blocks.len() as u32);
+        self.0.read(blocks, start_block_idx)
+    }
+
+    fn write(&self, blocks: &[Block], start_block_idx: BlockIdx) -> Result<(), Self::Error> {
+        sd_stats::bump(&sd_stats::WRITE_CALLS, 1);
+        sd_stats::bump(&sd_stats::WRITE_BLOCKS, blocks.len() as u32);
+        self.0.write(blocks, start_block_idx)
+    }
+
+    fn num_blocks(&self) -> Result<BlockCount, Self::Error> {
+        self.0.num_blocks()
+    }
+}
 
 pub(crate) struct StaticTime;
 
@@ -166,7 +238,7 @@ where
 
 type SdSpi<'a> = SdSpiDevice<'a, SpiDmaBus<'static, Async>, Output<'static>>;
 
-type SdCardDevice<'a> = SdCard<SdSpi<'a>, SdDelay>;
+type SdCardDevice<'a> = CountingDevice<SdCard<SdSpi<'a>, SdDelay>>;
 pub(crate) type SdRoot<'a> = Directory<'a, SdCardDevice<'a>, StaticTime, 8, 8, 1>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -309,7 +381,7 @@ where
             .apply_config(&SpiConfig::default().with_frequency(Rate::from_mhz(SD_DATA_FREQ_MHZ)));
     });
     let volume_mgr: VolumeManager<_, _, 8, 8, 1> =
-        VolumeManager::new_with_limits(card, StaticTime, 5000);
+        VolumeManager::new_with_limits(CountingDevice(card), StaticTime, 5000);
     // Bind the outcome so the open_volume scrutinee temporary (which borrows
     // volume_mgr) is dropped at the `;` while volume_mgr is still alive,
     // rather than racing volume_mgr's own drop at the function tail.
@@ -370,7 +442,7 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) -
             .apply_config(&SpiConfig::default().with_frequency(Rate::from_mhz(SD_DATA_FREQ_MHZ)));
     });
     let volume_mgr: VolumeManager<_, _, 8, 8, 1> =
-        VolumeManager::new_with_limits(card, StaticTime, 5000);
+        VolumeManager::new_with_limits(CountingDevice(card), StaticTime, 5000);
     let Ok(volume) = volume_mgr.open_volume(VolumeIdx(0)) else {
         esp_println::println!("upload: volume open failed");
         refuse_uploads_forever().await;
