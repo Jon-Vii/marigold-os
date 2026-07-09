@@ -32,7 +32,11 @@ pub(crate) const READER_COMPRESSED_SCRATCH: usize = 8192;
 pub(crate) const READER_CONTAINER_SCRATCH: usize = 4096;
 pub(crate) const READER_OPF_SCRATCH: usize = 16_384;
 pub(crate) const READER_XHTML_SCRATCH: usize = 24_576;
-const EPUB_READ_AT_CHUNK_BYTES: usize = 2048;
+/// Per-call clamp on `read_at`. The FAT layer transfers single 512-byte
+/// blocks either way, so this only bounds how much one embedded-sdmmc call
+/// copies; matching the compressed scratch keeps an 8 KB inflate fetch to
+/// one seek + one read call instead of four.
+const EPUB_READ_AT_CHUNK_BYTES: usize = 8192;
 const EPUB_OPEN_READ_OP_LIMIT: u32 = 65_536;
 const EPUB_OPEN_READ_BYTE_LIMIT: u32 = 64 * 1024 * 1024;
 
