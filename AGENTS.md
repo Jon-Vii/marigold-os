@@ -18,3 +18,10 @@ This is a single-context repo: read the domain and architecture docs in `docs/`,
 
 Development bench runs use `tools/bench/bench.py` and structured `bench:` serial
 telemetry. See `docs/agents/bench.md`.
+
+### Visual & Layout Changes Verification
+
+Visual, layout, rendering, and typography changes are verified locally against the
+emulator's golden frames, on both the X4 and the X3. Host-side cargo commands need
+an explicit `--target`, and the reading-page goldens run in no CI job. See
+`docs/agents/visual-verification.md`.
