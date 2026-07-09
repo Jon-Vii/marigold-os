@@ -35,6 +35,7 @@ jobs:
           cp target/release-images/firmware.bin target/public-release/firmware-x4.bin
           cp target/release-images/firmware-x3.bin target/public-release/firmware-x3.bin
           cp target/release-images/update.bin target/public-release/update.bin
+          cp target/release-images/update.bin target/public-release/FWUPDATE.BIN
           cp target/release-images/FWUPDX3.BIN target/public-release/FWUPDX3.BIN
 
       - name: Create GitHub Release
@@ -45,6 +46,7 @@ jobs:
             target/public-release/firmware-x4.bin \
             target/public-release/firmware-x3.bin \
             target/public-release/update.bin \
+            target/public-release/FWUPDATE.BIN \
             target/public-release/FWUPDX3.BIN \
             --title "${GITHUB_REF_NAME}" \
             --notes "MarigoldOS ${GITHUB_REF_NAME} firmware images for Xteink X4 and X3."
