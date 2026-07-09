@@ -532,7 +532,13 @@
 
   function present() {
     const dpr = window.devicePixelRatio || 1;
-    const cssWidth = canvas.getBoundingClientRect().width || WIDTH;
+    // Layout width, not getBoundingClientRect(): the portrait hold rotates
+    // and scales the device chrome with a CSS transform, and the rect of a
+    // transformed canvas is its visual box — sizing the backing store from
+    // that undersamples the panel (fuzzy) at the wrong aspect. clientWidth
+    // ignores transforms; the browser then resamples the full-resolution
+    // canvas through the transform at device-pixel quality.
+    const cssWidth = canvas.clientWidth || WIDTH;
     const width = Math.max(1, Math.round(cssWidth * dpr));
     const height = Math.max(1, Math.round((width * HEIGHT) / WIDTH));
     if (canvas.width !== width || canvas.height !== height) {
