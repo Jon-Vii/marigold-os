@@ -862,22 +862,29 @@ where
             partial,
         };
         let mut bytes = [0u8; BOOK_V2_HEADER_BYTES];
-        if encode_book_v2_header(header, &mut bytes).is_err() || file.write(&bytes).is_err() {
+        if encode_book_v2_header(header, &mut bytes).is_err() {
+            return false;
+        }
+        let mut stage = WriteStage::new(file);
+        if stage.push(&bytes).is_err() {
             return false;
         }
         let mut record_bytes = [0u8; BOOK_V2_SECTION_RECORD_BYTES];
         for section in sections {
             if encode_book_v2_section(*section, &mut record_bytes).is_err()
-                || file.write(&record_bytes).is_err()
+                || stage.push(&record_bytes).is_err()
             {
                 return false;
             }
         }
         let mut toc_bytes = [0u8; TOC_RECORD_BYTES];
         for record in library.toc.iter().take(toc_count).copied() {
-            if encode_toc(record, &mut toc_bytes).is_err() || file.write(&toc_bytes).is_err() {
+            if encode_toc(record, &mut toc_bytes).is_err() || stage.push(&toc_bytes).is_err() {
                 return false;
             }
+        }
+        if stage.flush().is_err() {
+            return false;
         }
         if header.toc_text_bytes > 0
             && file
@@ -1508,9 +1515,10 @@ where
     T: TimeSource,
 {
     let mut record = [0u8; 16];
+    let mut stage = WriteStage::new(file);
     for page in library.pages.iter().take(library.page_count) {
         if encode_page(*page, &mut record[..PAGE_RECORD_BYTES]).is_err()
-            || file.write(&record[..PAGE_RECORD_BYTES]).is_err()
+            || stage.push(&record[..PAGE_RECORD_BYTES]).is_err()
         {
             esp_println::println!("cache: write page record failed");
             return false;
@@ -1518,7 +1526,7 @@ where
     }
     for block in library.blocks.iter().take(library.block_count) {
         if encode_block(*block, &mut record[..BLOCK_RECORD_BYTES]).is_err()
-            || file.write(&record[..BLOCK_RECORD_BYTES]).is_err()
+            || stage.push(&record[..BLOCK_RECORD_BYTES]).is_err()
         {
             esp_println::println!("cache: write block record failed");
             return false;
@@ -1530,10 +1538,14 @@ where
         let end = library.block_paragraph_end[index];
         let start = library.block_paragraph_start[index];
         let flag = (end as u8) | ((start as u8) << 1);
-        if file.write(&[flag]).is_err() {
+        if stage.push(&[flag]).is_err() {
             esp_println::println!("cache: write paragraph flag failed");
             return false;
         }
+    }
+    if stage.flush().is_err() {
+        esp_println::println!("cache: write staged records failed");
+        return false;
     }
     if file.write(&library.text[..library.text_len]).is_err() {
         esp_println::println!("cache: write text failed");
@@ -1545,6 +1557,63 @@ where
 /// Staging size for batched record reads. Kept small: this sits on the
 /// stack inside the EPUB open path, in the same tight budget region.
 const RECORD_STAGE_BYTES: usize = 256;
+
+/// Batch small writes through one staging buffer — the write-side twin of
+/// `read_records_batched`. The FAT layer pays the same per-call overhead on
+/// writes (block lookup plus a read-modify-write of the current sector), so
+/// 1-16 byte record writes dominate section write time without it.
+struct WriteStage<
+    'f,
+    'v,
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+> where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    file: &'f File<'v, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    buf: [u8; RECORD_STAGE_BYTES],
+    len: usize,
+}
+
+impl<'f, 'v, D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>
+    WriteStage<'f, 'v, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    fn new(file: &'f File<'v, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>) -> Self {
+        Self {
+            file,
+            buf: [0u8; RECORD_STAGE_BYTES],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> Result<(), ()> {
+        if bytes.len() > self.buf.len() - self.len {
+            self.flush()?;
+        }
+        if bytes.len() >= self.buf.len() {
+            return self.file.write(bytes).map_err(|_| ());
+        }
+        self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        self.len += bytes.len();
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), ()> {
+        if self.len == 0 {
+            return Ok(());
+        }
+        let result = self.file.write(&self.buf[..self.len]).map_err(|_| ());
+        self.len = 0;
+        result
+    }
+}
 
 /// Read `count` fixed-size records through one staging buffer instead of
 /// one embedded-sdmmc read call per record; the FAT layer pays per-call
