@@ -7,6 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: write
   contents: write
 
 jobs:
@@ -50,3 +51,8 @@ jobs:
             target/public-release/FWUPDX3.BIN \
             --title "${GITHUB_REF_NAME}" \
             --notes "MarigoldOS ${GITHUB_REF_NAME} firmware images for Xteink X4 and X3."
+
+      - name: Publish release firmware to Pages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run pages.yml --ref main -f release_tag="${GITHUB_REF_NAME}"

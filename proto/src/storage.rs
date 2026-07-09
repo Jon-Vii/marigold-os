@@ -1,4 +1,5 @@
 use crate::book::{BookId, BookMeta, BookSource, CoverStatus};
+use heapless::String;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanRoot {
@@ -90,6 +91,42 @@ pub fn is_epub_path(path: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Store the catalog's display path in its fixed-size field. The FAT short
+/// name remains the open handle; this only provides the user-facing label and
+/// a stable cache identity.
+pub fn catalog_display_path<const N: usize>(prefix: &str, name: &str, out: &mut String<N>) {
+    out.clear();
+    push_utf8_prefix(prefix, N, out);
+
+    // Keep the EPUB suffix when a long FAT name needs trimming. The Library's
+    // fallback label uses it to remove the extension, while the beginning of
+    // the filename remains the most useful part for the reader.
+    let suffix = if name.as_bytes().len() >= 5
+        && name.as_bytes()[name.len() - 5..].eq_ignore_ascii_case(b".epub")
+    {
+        &name[name.len() - 5..]
+    } else if name.as_bytes().len() >= 4
+        && name.as_bytes()[name.len() - 4..].eq_ignore_ascii_case(b".epu")
+    {
+        &name[name.len() - 4..]
+    } else {
+        ""
+    };
+    let stem = &name[..name.len() - suffix.len()];
+    let stem_capacity = N.saturating_sub(out.len() + suffix.len());
+    push_utf8_prefix(stem, out.len() + stem_capacity, out);
+    let _ = out.push_str(suffix);
+}
+
+fn push_utf8_prefix<const N: usize>(text: &str, end: usize, out: &mut String<N>) {
+    for ch in text.chars() {
+        if out.len() + ch.len_utf8() > end {
+            break;
+        }
+        let _ = out.push(ch);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,5 +151,20 @@ mod tests {
         assert_eq!(book.title, "algernon");
         assert_eq!(book.source, BookSource::MicroSd);
         assert_eq!(book.byte_size, 42);
+    }
+
+    #[test]
+    fn long_epub_names_do_not_collapse_to_the_root_path() {
+        for name in [
+            "L'Istituto per la Regolazione degli Orologi - Ahmet Hamdi Tanpinar_748.epub",
+            "The Weird_ A Compendium of Stra - Jeff Vandermeer; Ann Vandermeer.epub",
+        ] {
+            let mut path = String::<64>::new();
+            catalog_display_path("/", name, &mut path);
+
+            assert_ne!(path.as_str(), "/");
+            assert!(path.ends_with(".epub"));
+            assert!(path.len() <= 64);
+        }
     }
 }

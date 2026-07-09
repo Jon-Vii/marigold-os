@@ -742,7 +742,10 @@
 
 <script>
 (function(){
-  const R="https://github.com/Jon-Vii/marigold-os/releases/latest/download/";
+  // Keep the installer and downloads on this Pages origin. GitHub Release
+  // assets redirect to a storage host without CORS headers, which makes the
+  // ESP Web Tools fetch fail even though opening the release URL works.
+  const R="";
   const FW={x4:R+"firmware-x4.bin", x3:R+"firmware-x3.bin"};
   const SD={x4:R+"update.bin", x3:R+"FWUPDX3.BIN"};
   const IMG={x4:"firmware-x4.bin", x3:"firmware-x3.bin"};

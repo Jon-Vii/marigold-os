@@ -14,6 +14,11 @@ on:
       - "fixtures/golden/**"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag whose firmware should be published"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -29,6 +34,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.sha }}
       - name: Install Rust (stable, wasm target)
         run: |
           rustup toolchain install stable --profile minimal
@@ -41,10 +48,22 @@ jobs:
       - name: Check X3 emulator golden frames
         run: cargo run --manifest-path tools/emulator/Cargo.toml --target x86_64-unknown-linux-gnu --no-default-features --features device-x3 -- --scenario fixtures/scenarios --check fixtures/golden
       - name: Assemble site
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || 'latest' }}
         run: |
           mkdir -p _site
           cp -R web/. _site/
           cp tools/web-emulator/target/wasm32-unknown-unknown/release/x4_web_emulator.wasm _site/
+          if [ "$RELEASE_TAG" = latest ]; then
+            gh release download --repo "$GITHUB_REPOSITORY" \
+              --pattern firmware-x4.bin --pattern firmware-x3.bin \
+              --pattern update.bin --pattern FWUPDX3.BIN --dir _site
+          else
+            gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --pattern firmware-x4.bin --pattern firmware-x3.bin \
+              --pattern update.bin --pattern FWUPDX3.BIN --dir _site
+          fi
+          tools/verify_web_flasher.sh _site
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _site

@@ -11,11 +11,13 @@ use heapless::String;
 const CATALOG_ROOT_DIR: &str = "XTEINK";
 const CATALOG_FILE: &str = "CATALOG.BIN";
 const CATALOG_MAGIC: &[u8; 4] = b"X4CT";
-/// v3 widens the on-disk book count from a single byte to a `u16` at
+/// v3 widened the on-disk book count from a single byte to a `u16` at
 /// `header[5..7]`, so the catalog (and the streamed Library list) is bounded by
-/// the card, not 255. An older v2 file fails the version check and is rebuilt
-/// by a fresh scan -- no migration code needed.
-const CATALOG_VERSION: u8 = 3;
+/// the card, not 255. v4 rebuilds stale records written before long filenames
+/// were safely bounded: those records could contain only `/`. An older catalog
+/// fails the version check and is rebuilt by a fresh scan -- no migration code
+/// needed.
+const CATALOG_VERSION: u8 = 4;
 const CATALOG_HEADER_BYTES: usize = 8;
 const CATALOG_RECORD_BYTES: usize = 92;
 /// Books staged in RAM per pass of the multi-pass scan write. embedded-sdmmc
@@ -751,8 +753,7 @@ fn visit_prefixed(
     visit: &mut impl FnMut(&str, &str, bool, u32),
 ) {
     let mut path = String::<64>::new();
-    let _ = path.push_str(prefix);
-    let _ = path.push_str(name);
+    proto::storage::catalog_display_path(prefix, name, &mut path);
     visit(&path, open_name, in_books_dir, byte_size);
 }
 

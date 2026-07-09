@@ -516,8 +516,10 @@ python3 -m http.server -d web   # local check
 `.github/workflows/pages.yml` runs the same build, checks the golden frames,
 exports browser-presented scenario screenshots into `images/screens/`, and
 publishes `web/` to GitHub Pages on every push to main that touches `web/`, the
-wasm crate, shared crates, or scenario fixtures. The built `.wasm` is
-gitignored; only sources are committed.
+wasm crate, shared crates, or scenario fixtures. A tagged release dispatches
+the Pages workflow with its tag, which copies that release's flash images into
+the Pages artifact so the ESP web flasher can fetch same-origin firmware. The
+built `.wasm` and release images are gitignored; only sources are committed.
 
 ## Reader app model
 

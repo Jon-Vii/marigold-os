@@ -7,7 +7,7 @@
       "chipFamily": "ESP32-C3",
       "parts": [
         {
-          "path": "https://github.com/Jon-Vii/marigold-os/releases/latest/download/firmware-x4.bin",
+          "path": "firmware-x4.bin",
           "offset": 65536
         }
       ]
