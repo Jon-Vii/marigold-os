@@ -400,9 +400,11 @@ pub(crate) fn ensure_toc_window(
     library: &mut ReaderStore,
     index: usize,
     selection: usize,
+    portrait: bool,
 ) -> bool {
-    let first_visible = ui::render::toc_scroll_start(selection, library.overview_chapter_count());
-    if library.toc_window_covers(first_visible, ui::render::TOC_VISIBLE_ROWS) {
+    let first_visible =
+        ui::render::toc_scroll_start(selection, library.overview_chapter_count(), portrait);
+    if library.toc_window_covers(first_visible, ui::render::toc_visible_rows(portrait)) {
         return true;
     }
     load_chapters_into_store(epd, sd_cs, library, index, selection)

@@ -44,10 +44,17 @@ const HEADING_CX: i16 = 480;
 const FOOTER_RIGHT: i16 = WIDTH as i16 - 24;
 const ROW_STEP: i16 = 56;
 const FIRST_ROW_Y: i16 = 118;
-/// Rows the Library list shows at once. Public so the firmware sizes the
-/// resident catalog window to cover the visible range it must stream in.
-pub const LIBRARY_VISIBLE_ROWS: usize = 6;
-const VISIBLE_ROWS: usize = LIBRARY_VISIBLE_ROWS;
+/// Rows the Library list shows at once. Public so the firmware slides the
+/// resident catalog window over the visible range it must stream in. The
+/// portrait page runs the long axis upright, so it seats more rows above
+/// its bottom key rail than landscape does above its footer line.
+pub const fn library_visible_rows(portrait: bool) -> usize {
+    if portrait {
+        10
+    } else {
+        6
+    }
+}
 /// Footer baseline: 24px up from the panel's bottom edge (the X4's
 /// historical 456). Panel-relative so the taller X3 keeps its apparatus in
 /// the corner rather than floating it mid-page.
@@ -357,11 +364,11 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     // range. A miss (stale window mid-refill) leaves that row blank rather than
     // drawing the wrong book.
     let selected_index = (shell.selection as usize).min(total.saturating_sub(1));
-    let start = library_scroll_start(selected_index, total);
+    let start = library_scroll_start(selected_index, total, layout.portrait);
     let window_start = shell.library_window_start as usize;
     let body = literata(FontStyle::Regular);
     let mut y = FIRST_ROW_Y;
-    for row in 0..VISIBLE_ROWS {
+    for row in 0..library_visible_rows(layout.portrait) {
         let abs = start + row;
         if abs >= total {
             break;
@@ -395,30 +402,39 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
 /// Absolute catalog index of the first visible Library row that keeps
 /// `selection` on screen. Shared by the renderer and the firmware's window
 /// loader so both agree on which slice of the catalog is resident.
-pub fn library_scroll_start(selection: usize, total: usize) -> usize {
-    let start = if selection >= VISIBLE_ROWS {
-        selection + 1 - VISIBLE_ROWS
+pub fn library_scroll_start(selection: usize, total: usize, portrait: bool) -> usize {
+    let rows = library_visible_rows(portrait);
+    let start = if selection >= rows {
+        selection + 1 - rows
     } else {
         0
     };
-    start.min(total.saturating_sub(VISIBLE_ROWS))
+    start.min(total.saturating_sub(rows))
 }
 
 // The contents page uses tight index rows — a real table of contents,
 // not a menu: title, dot leaders, the chapter's book page right-aligned.
 const TOC_ROW_STEP: i16 = 36;
-pub const TOC_VISIBLE_ROWS: usize = 9;
+
+pub const fn toc_visible_rows(portrait: bool) -> usize {
+    if portrait {
+        15
+    } else {
+        9
+    }
+}
 
 /// Absolute TOC index of the first visible Contents row that keeps
 /// `selection` on screen. Shared by the renderer and the firmware's TOC
 /// window loader so both agree on which slice must be resident.
-pub fn toc_scroll_start(selection: usize, total: usize) -> usize {
-    let start = if selection >= TOC_VISIBLE_ROWS {
-        selection + 1 - TOC_VISIBLE_ROWS
+pub fn toc_scroll_start(selection: usize, total: usize, portrait: bool) -> usize {
+    let rows = toc_visible_rows(portrait);
+    let start = if selection >= rows {
+        selection + 1 - rows
     } else {
         0
     };
-    start.min(total.saturating_sub(TOC_VISIBLE_ROWS))
+    start.min(total.saturating_sub(rows))
 }
 
 fn render_chapters(fb: &mut Framebuffer, shell: &UiShell<'_>) {
@@ -453,10 +469,10 @@ fn render_chapters(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     // before each render. A miss (stale window mid-refill) leaves that row
     // blank rather than drawing the wrong chapter.
     let selected = (shell.selection as usize).min(total - 1);
-    let start = toc_scroll_start(selected, total);
+    let start = toc_scroll_start(selected, total, layout.portrait);
     let window_start = shell.chapters_window_start as usize;
     let mut y = FIRST_ROW_Y;
-    for row in 0..TOC_VISIBLE_ROWS {
+    for row in 0..toc_visible_rows(layout.portrait) {
         let abs = start + row;
         if abs >= total {
             break;

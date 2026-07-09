@@ -10,7 +10,7 @@ use proto::text::{TextAlign, TextRole};
 /// Resident slice of the on-disk catalog kept for the Library list. The full
 /// catalog lives in CATALOG.BIN and is streamed a window at a time around the
 /// selection, so the book count is bounded by the card, not by RAM. Sized a
-/// little above `ui::render::LIBRARY_VISIBLE_ROWS` so ordinary scrolling stays
+/// little above `ui::render::library_visible_rows(true)` so ordinary scrolling stays
 /// inside one loaded window and only crossings re-read the card.
 pub(crate) const LIBRARY_WINDOW: usize = 16;
 pub(crate) const MAX_SD_TOC_ITEMS: usize = 128;

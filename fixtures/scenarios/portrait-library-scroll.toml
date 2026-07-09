@@ -1,0 +1,69 @@
+# The Library in portrait with a catalog far larger than one resident
+# window, scrolled past the taller page's ten visible rows. Pins the
+# portrait row count and the shared scroll math that sizes the firmware's
+# streamed window.
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Confirm"
+
+[[steps]]
+button = "Previous"
+
+[[steps]]
+button = "Back"
+
+[[steps]]
+library = "Scanned"
+count = 40
+
+[[steps]]
+button = "Back"
+
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+[[steps]]
+button = "Next"
+
+[expect]
+view = "Library"
+orientation = "portrait-left"
+library_count = 40
+selection = 12

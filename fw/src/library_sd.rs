@@ -458,6 +458,7 @@ pub(crate) fn ensure_library_window(
     sd_cs: &mut Output<'static>,
     library: &mut ReaderStore,
     selection: u16,
+    portrait: bool,
 ) {
     let total = library.catalog_count();
     if total == 0 {
@@ -465,8 +466,8 @@ pub(crate) fn ensure_library_window(
         return;
     }
     let selection = (selection as usize).min(total - 1);
-    let start = ui::render::library_scroll_start(selection, total);
-    let need = ui::render::LIBRARY_VISIBLE_ROWS.min(total - start);
+    let start = ui::render::library_scroll_start(selection, total, portrait);
+    let need = ui::render::library_visible_rows(portrait).min(total - start);
     if library.window_covers(start, need) {
         return;
     }

@@ -127,6 +127,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                             &mut sd_cs,
                             sd_library,
                             request.selection,
+                            app_core::is_portrait(request.orientation),
                         );
                     } else if ReaderSource::from_book_id(request.book_id).is_sd() {
                         if let Some(index) = ReaderStore::selected_book_index(request.book_id) {
@@ -144,6 +145,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                                     sd_library,
                                     index,
                                     request.selection as usize,
+                                    app_core::is_portrait(request.orientation),
                                 );
                             }
                         }
@@ -731,6 +733,7 @@ fn handle_storage_command(
                 sd_library,
                 index as usize,
                 chapter as usize,
+                portrait,
             );
             let target_page = sd_library.overview_page_at(chapter as usize);
             let scratch = ensure_epub_scratch(epub_scratch);
