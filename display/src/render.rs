@@ -1,5 +1,5 @@
 use crate::fb::Framebuffer;
-use crate::{Rect, HEIGHT, WIDTH};
+use crate::Rect;
 use embedded_graphics_core::{
     draw_target::DrawTarget,
     pixelcolor::BinaryColor,
@@ -9,7 +9,7 @@ use embedded_graphics_core::{
 
 impl OriginDimensions for Framebuffer {
     fn size(&self) -> Size {
-        Size::new(WIDTH as u32, HEIGHT as u32)
+        Size::new(self.width() as u32, self.height() as u32)
     }
 }
 
@@ -35,7 +35,7 @@ impl DrawTarget for Framebuffer {
 }
 
 pub fn fill_rect(fb: &mut Framebuffer, rect: Rect, white: bool) {
-    let Some(rect) = rect.clipped() else {
+    let Some(rect) = rect.clipped_to(fb.width() as u16, fb.height() as u16) else {
         return;
     };
 
@@ -49,7 +49,7 @@ pub fn fill_rect(fb: &mut Framebuffer, rect: Rect, white: bool) {
 }
 
 pub fn stroke_rect(fb: &mut Framebuffer, rect: Rect, white: bool) {
-    let Some(rect) = rect.clipped() else {
+    let Some(rect) = rect.clipped_to(fb.width() as u16, fb.height() as u16) else {
         return;
     };
     if rect.w == 0 || rect.h == 0 {
@@ -84,7 +84,16 @@ fn draw_glyph(fb: &mut Framebuffer, byte: u8, x: usize, y: usize, white: bool) {
     for (col, bits) in glyph.iter().enumerate() {
         for row in 0..7 {
             if bits & (1 << row) != 0 {
-                fb.set_pixel(x + col, y + row, white);
+                // The 5x7 bitmaps are stored bottom-row-first: landscape
+                // frames get mirrored onto the panel afterward, which
+                // rights them. Portrait frames stay viewer-upright, so the
+                // glyph box flips here instead.
+                let glyph_y = if fb.is_portrait() {
+                    y + 6 - row
+                } else {
+                    y + row
+                };
+                fb.set_pixel(x + col, glyph_y, white);
             }
         }
     }

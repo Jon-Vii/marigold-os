@@ -101,6 +101,13 @@ pub enum DisplayOrientation {
     PortraitButtonsRight,
 }
 
+impl DisplayOrientation {
+    /// Whether frames compose into the upright portrait page box.
+    pub const fn is_portrait(self) -> bool {
+        matches!(self, Self::PortraitButtonsLeft | Self::PortraitButtonsRight)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppView {
     Home,
@@ -190,13 +197,16 @@ impl RefreshPlanner {
         if last.kind == RenderKind::Boot
             || request.view != last.view
             || request.book_id != last.book_id
-            || request.orientation != last.orientation
             // A type-settings change redraws whole text columns; the clean
             // pass avoids fast-diff ghosting across the page.
             || request.font_size != last.font_size
             || request.line_spacing != last.line_spacing
             || request.font_weight != last.font_weight
             || request.font_family != last.font_family
+            // An orientation change replaces every pixel and the previous
+            // frame lives in the other frame geometry — a differential
+            // Fast against it would diff garbage. FastClean is absolute.
+            || request.orientation != last.orientation
             || Self::needs_clean_library_refresh(request, last)
         {
             return RefreshMode::FastClean;
@@ -245,6 +255,9 @@ pub struct RenderRequest {
     pub selection: u16,
     pub book_id: u32,
     pub orientation: DisplayOrientation,
+    /// Portrait reading's summoned key sheet is up; renderers draw it
+    /// over the page bottom.
+    pub reading_sheet: bool,
     pub refresh_policy: RefreshPolicy,
     pub font_size: FontSize,
     pub line_spacing: LineSpacing,
@@ -627,6 +640,9 @@ pub struct ReaderState {
     pub sd_chapter_count: u8,
     pub sd_chapter_pages: [u16; MAX_SD_CHAPTERS],
     pub read_request_pending: bool,
+    /// Portrait reading's summoned key sheet is up: the next named-key
+    /// press acts on its revealed label instead of summoning again.
+    pub reading_sheet: bool,
     pub sync_status: SyncStatus,
     /// The saved Wi-Fi network's name; len 0 means none is saved. Fed by
     /// `SyncEvent::NetworkSaved` at boot and `CredentialsSaved` from the
@@ -662,6 +678,7 @@ impl ReaderState {
             sd_chapter_count: 1,
             sd_chapter_pages: [0; MAX_SD_CHAPTERS],
             read_request_pending: false,
+            reading_sheet: false,
             sync_status: SyncStatus::NotConfigured,
             wifi_ssid: [0; 32],
             wifi_ssid_len: 0,
@@ -695,7 +712,7 @@ impl ReaderState {
         next.page_raw = page_raw;
         next.battery_mv = battery_mv;
         next.battery_percent = battery_percent;
-        next.dirty = Rect::FULL;
+        next.dirty = Rect::full_for_orientation(next.orientation.is_portrait());
 
         match (self.view, button) {
             (_, None) => {}
@@ -730,6 +747,9 @@ impl ReaderState {
                 next.read_request_pending = false;
             }
             (AppView::Reading, Some(Button::Next | Button::PageNext)) => {
+                // The browse pair always pages — summoning must never cost
+                // a page turn a second press. A turn dismisses the sheet.
+                next.reading_sheet = false;
                 if ReaderSource::from_book_id(self.book_id).is_sd() {
                     if self.page + 1 < self.sd_page_count {
                         next.page = self.page + 1;
@@ -748,6 +768,7 @@ impl ReaderState {
                 }
             }
             (AppView::Reading, Some(Button::Previous | Button::PagePrevious)) => {
+                next.reading_sheet = false;
                 if ReaderSource::from_book_id(self.book_id).is_sd() {
                     if self.page > 0 {
                         next.page = self.page - 1;
@@ -764,15 +785,30 @@ impl ReaderState {
                 }
             }
             (AppView::Reading, Some(Button::Confirm)) => {
-                next.view = AppView::Chapters;
-                // `chapter` already tracks the reading position (kept current
-                // by the firmware's Loaded event, un-capped); opening the list
-                // lands the cursor there rather than on the saturated guess.
-                next.selection = self.chapter as u16;
+                // Portrait reading is full-bleed: the first named-key press
+                // summons the key sheet above the buttons (the margin
+                // appears when called for); the second press acts on the
+                // label it revealed. Landscape keeps its direct mapping.
+                if self.orientation.is_portrait() && !self.reading_sheet {
+                    next.reading_sheet = true;
+                } else {
+                    next.reading_sheet = false;
+                    next.view = AppView::Chapters;
+                    // `chapter` already tracks the reading position (kept
+                    // current by the firmware's Loaded event, un-capped);
+                    // opening the list lands the cursor there rather than
+                    // on the saturated guess.
+                    next.selection = self.chapter as u16;
+                }
             }
             (AppView::Reading, Some(Button::Back)) => {
-                next.view = AppView::Home;
-                next.selection = 0;
+                if self.orientation.is_portrait() && !self.reading_sheet {
+                    next.reading_sheet = true;
+                } else {
+                    next.reading_sheet = false;
+                    next.view = AppView::Home;
+                    next.selection = 0;
+                }
             }
             (AppView::Chapters, Some(Button::Next | Button::PageNext)) => {
                 next.selection = wrap_next(self.selection, self.chapter_item_count(ctx) as u16);
@@ -858,6 +894,12 @@ impl ReaderState {
             }
         }
 
+        // The sheet is a reading-surface state; leaving the page (or the
+        // posture that summons it) always drops it.
+        if next.view != AppView::Reading || !next.orientation.is_portrait() {
+            next.reading_sheet = false;
+        }
+
         next
     }
 
@@ -878,7 +920,7 @@ impl ReaderState {
                     self.book_id = ReaderSource::sd(0).book_id();
                     self.chapter = 0;
                     self.page = 0;
-                    self.dirty = Rect::FULL;
+                    self.dirty = Rect::full_for_orientation(self.orientation.is_portrait());
                 }
                 if self.view == AppView::Library {
                     if count == 0 {
@@ -886,7 +928,7 @@ impl ReaderState {
                     } else if self.selection >= count {
                         self.selection = count - 1;
                     }
-                    self.dirty = Rect::FULL;
+                    self.dirty = Rect::full_for_orientation(self.orientation.is_portrait());
                     if self.read_request_pending {
                         self.read_request_pending = false;
                     }
@@ -908,7 +950,7 @@ impl ReaderState {
                     // book; adopt it so the cursor tracks past the cap that the
                     // page-turn recompute (sd_chapter_for_page) saturates at.
                     self.chapter = current_chapter.min(u8::MAX as u16) as u8;
-                    self.dirty = Rect::FULL;
+                    self.dirty = Rect::full_for_orientation(self.orientation.is_portrait());
                 }
             }
             LibraryEvent::ChapterPage {
@@ -920,7 +962,7 @@ impl ReaderState {
                     if let Some(slot) = self.sd_chapter_pages.get_mut(chapter as usize) {
                         *slot = page.min(u16::MAX as u32) as u16;
                     }
-                    self.dirty = Rect::FULL;
+                    self.dirty = Rect::full_for_orientation(self.orientation.is_portrait());
                 }
             }
             LibraryEvent::ChapterCursor {
@@ -940,7 +982,7 @@ impl ReaderState {
                 if !available && self.font_family == FontFamily::Custom {
                     self.font_family = FontFamily::Literata;
                 }
-                self.dirty = Rect::FULL;
+                self.dirty = Rect::full_for_orientation(self.orientation.is_portrait());
             }
             LibraryEvent::Restored {
                 book_id,
@@ -998,14 +1040,14 @@ impl ReaderState {
                             family
                         };
                 }
-                self.dirty = Rect::FULL;
+                self.dirty = Rect::full_for_orientation(self.orientation.is_portrait());
             }
         }
         if self.view == AppView::Library {
             self.selection = self
                 .selection
                 .min(self.library_item_count(ctx).saturating_sub(1));
-            self.dirty = Rect::FULL;
+            self.dirty = Rect::full_for_orientation(self.orientation.is_portrait());
         }
         self
     }
@@ -1033,7 +1075,7 @@ impl ReaderState {
             }
             SyncEvent::Failed(error) => SyncStatus::Error(error),
         };
-        self.dirty = Rect::FULL;
+        self.dirty = Rect::full_for_orientation(self.orientation.is_portrait());
         self
     }
 
@@ -1057,6 +1099,7 @@ impl ReaderState {
             selection: self.selection,
             book_id: self.book_id,
             orientation: self.orientation,
+            reading_sheet: self.reading_sheet,
             refresh_policy: self.refresh_policy,
             font_size: self.font_size,
             line_spacing: self.line_spacing,
@@ -1081,7 +1124,10 @@ impl ReaderState {
             book_id: self.book_id,
             chapter: self.chapter as u16,
             screen: self.page,
-            shell_orientation: DisplayOrientation::PortraitButtonsLeft as u8,
+            // One user-facing orientation drives every surface; both record
+            // bytes carry it (shell_orientation historically held a stock-
+            // firmware constant that nothing restored).
+            shell_orientation: self.orientation as u8,
             reading_orientation: self.orientation as u8,
             refresh_policy: self.refresh_policy as u8,
             font_size: self.font_size as u8,
@@ -1099,6 +1145,7 @@ impl ReaderState {
             spacing: self.line_spacing,
             weight: self.font_weight,
             family: self.font_family,
+            portrait: self.orientation.is_portrait(),
         }
     }
 
@@ -1255,11 +1302,20 @@ fn apply_setting(mut state: ReaderState) -> ReaderState {
             };
         }
         5 => {
+            // Three exposed postures, cycled in order: landscape buttons
+            // down, landscape buttons up (the 180 flip), and the portrait
+            // posture with the ladder along the bottom edge — the device
+            // turned a quarter counter-clockwise, rocker on the right.
+            // PortraitButtonsLeft stays unexposed.
             state.orientation = match state.orientation {
                 DisplayOrientation::LandscapeButtonsBottom => {
                     DisplayOrientation::LandscapeButtonsTop
                 }
-                _ => DisplayOrientation::LandscapeButtonsBottom,
+                DisplayOrientation::LandscapeButtonsTop => DisplayOrientation::PortraitButtonsRight,
+                DisplayOrientation::PortraitButtonsLeft
+                | DisplayOrientation::PortraitButtonsRight => {
+                    DisplayOrientation::LandscapeButtonsBottom
+                }
             };
         }
         _ => {}
@@ -1691,17 +1747,131 @@ mod tests {
     }
 
     #[test]
-    fn settings_change_key_toggles_landscape_orientation() {
+    fn settings_change_key_cycles_all_orientations() {
         let mut state = press(ReaderState::boot(), Button::Next);
         state.selection = 5;
 
+        // Bottom -> Top -> Portrait -> Bottom. Once in landscape-top the
+        // front keys are remapped, so the physical Previous reads as
+        // Confirm and advances the cycle the same as Confirm would.
         let state = press(state, Button::Confirm);
         assert_eq!(state.orientation, DisplayOrientation::LandscapeButtonsTop);
 
         let state = press(state, Button::Previous);
+        assert_eq!(state.orientation, DisplayOrientation::PortraitButtonsRight);
+        assert!(state.type_settings().portrait);
+
+        let state = press(state, Button::Confirm);
         assert_eq!(
             state.orientation,
             DisplayOrientation::LandscapeButtonsBottom
+        );
+        assert!(!state.type_settings().portrait);
+    }
+
+    #[test]
+    fn portrait_orientation_persists_and_restores() {
+        let mut state = ReaderState::boot();
+        state.orientation = DisplayOrientation::PortraitButtonsRight;
+        assert!(state.type_settings().portrait);
+
+        // Both persisted bytes carry the one orientation.
+        let persisted = state.persisted();
+        assert_eq!(
+            persisted.reading_orientation,
+            DisplayOrientation::PortraitButtonsRight as u8
+        );
+        assert_eq!(persisted.shell_orientation, persisted.reading_orientation);
+
+        let restored = ReaderState::boot().apply_library_event(
+            CTX,
+            LibraryEvent::Restored {
+                book_id: persisted.book_id,
+                chapter: persisted.chapter as u8,
+                page: persisted.screen,
+                page_count: 0,
+                reading_orientation: persisted.reading_orientation,
+                refresh_policy: persisted.refresh_policy,
+                font_size: persisted.font_size,
+                line_spacing: persisted.line_spacing,
+                font_weight: persisted.font_weight,
+                font_family: persisted.font_family,
+            },
+        );
+        assert_eq!(
+            restored.orientation,
+            DisplayOrientation::PortraitButtonsRight
+        );
+    }
+
+    #[test]
+    fn portrait_reading_summons_the_sheet_before_acting() {
+        let mut state = press(ReaderState::boot(), Button::Confirm);
+        assert_eq!(state.view, AppView::Reading);
+        state.orientation = DisplayOrientation::PortraitButtonsRight;
+
+        // First named-key press summons; the second acts on its label.
+        let state = press(state, Button::Confirm);
+        assert!(state.reading_sheet);
+        assert_eq!(state.view, AppView::Reading, "summoning is not an action");
+        let state = press(state, Button::Confirm);
+        assert!(!state.reading_sheet);
+        assert_eq!(state.view, AppView::Chapters);
+
+        // Back out of Chapters returns to a sheetless page; Back then
+        // summons, and a second Back leaves for Home.
+        let state = press(state, Button::Back);
+        assert_eq!(state.view, AppView::Reading);
+        assert!(!state.reading_sheet);
+        let state = press(state, Button::Back);
+        assert!(state.reading_sheet);
+        let state = press(state, Button::Back);
+        assert_eq!(state.view, AppView::Home);
+        assert!(!state.reading_sheet);
+    }
+
+    #[test]
+    fn portrait_page_turns_never_wait_on_the_sheet() {
+        let mut state = press(ReaderState::boot(), Button::Confirm);
+        state.orientation = DisplayOrientation::PortraitButtonsRight;
+
+        // The browse pair pages immediately — no summon toll.
+        let chapter_before = state.chapter;
+        let state = press(state, Button::Next);
+        assert!(!state.reading_sheet);
+        assert_ne!(state.chapter, chapter_before, "next paged immediately");
+
+        // And a page turn dismisses an up sheet.
+        let state = press(state, Button::Confirm);
+        assert!(state.reading_sheet);
+        let state = press(state, Button::Next);
+        assert!(!state.reading_sheet);
+        assert_eq!(state.view, AppView::Reading);
+    }
+
+    #[test]
+    fn landscape_reading_keeps_direct_key_mappings() {
+        let state = press(ReaderState::boot(), Button::Confirm);
+        assert_eq!(state.view, AppView::Reading);
+        let state = press(state, Button::Confirm);
+        assert_eq!(state.view, AppView::Chapters, "no sheet in landscape");
+        assert!(!state.reading_sheet);
+    }
+
+    #[test]
+    fn refresh_plan_cleans_after_portrait_flip() {
+        let mut planner = RefreshPlanner::new();
+        let landscape = ReaderState::boot();
+        let mode = planner.mode_for(landscape.render_request(RenderKind::Boot));
+        planner.record_render(landscape.render_request(RenderKind::Boot), mode);
+
+        let mut portrait = landscape;
+        portrait.orientation = DisplayOrientation::PortraitButtonsRight;
+        let request = portrait.render_request(RenderKind::Page);
+        assert_eq!(
+            planner.mode_for(request),
+            display::epd::RefreshMode::FastClean,
+            "a flip into portrait must never ride a differential Fast against a landscape frame"
         );
     }
 

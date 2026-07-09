@@ -1,7 +1,5 @@
 use display::fb::Framebuffer;
 #[cfg(feature = "gui")]
-use display::{HEIGHT, WIDTH};
-#[cfg(feature = "gui")]
 use egui::{Color32, ColorImage};
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -68,9 +66,10 @@ fn apply_orientation(fb: &mut Framebuffer, orientation: app_core::DisplayOrienta
 
 #[cfg(feature = "gui")]
 pub fn framebuffer_to_color_image(fb: &Framebuffer) -> ColorImage {
-    let mut pixels = Vec::with_capacity(WIDTH * HEIGHT);
-    for y in 0..HEIGHT {
-        for x in 0..WIDTH {
+    let (width, height) = (fb.width(), fb.height());
+    let mut pixels = Vec::with_capacity(width * height);
+    for y in 0..height {
+        for x in 0..width {
             pixels.push(if fb.pixel(x, y) {
                 Color32::from_rgb(238, 236, 226)
             } else {
@@ -79,7 +78,7 @@ pub fn framebuffer_to_color_image(fb: &Framebuffer) -> ColorImage {
         }
     }
     ColorImage {
-        size: [WIDTH, HEIGHT],
+        size: [width, height],
         pixels,
     }
 }
@@ -108,13 +107,16 @@ pub fn write_presented_png(
 }
 
 pub fn encode_png<W: Write>(writer: W, fb: &Framebuffer) -> Result<(), png::EncodingError> {
-    let mut encoder = png::Encoder::new(writer, display::WIDTH as u32, display::HEIGHT as u32);
+    // Logical frame dimensions: a portrait frame dumps as an upright
+    // HEIGHT x WIDTH image (portrait frames skip the panel-mount mirror).
+    let (width, height) = (fb.width(), fb.height());
+    let mut encoder = png::Encoder::new(writer, width as u32, height as u32);
     encoder.set_color(png::ColorType::Grayscale);
     encoder.set_depth(png::BitDepth::Eight);
     let mut writer = encoder.write_header()?;
-    let mut data = Vec::with_capacity(display::WIDTH * display::HEIGHT);
-    for y in 0..display::HEIGHT {
-        for x in 0..display::WIDTH {
+    let mut data = Vec::with_capacity(width * height);
+    for y in 0..height {
+        for x in 0..width {
             data.push(if fb.pixel(x, y) { 0xEE } else { 0x18 });
         }
     }
@@ -125,13 +127,14 @@ pub fn encode_presented_png<W: Write>(
     writer: W,
     fb: &Framebuffer,
 ) -> Result<(), png::EncodingError> {
-    let mut encoder = png::Encoder::new(writer, display::WIDTH as u32, display::HEIGHT as u32);
+    let (width, height) = (fb.width(), fb.height());
+    let mut encoder = png::Encoder::new(writer, width as u32, height as u32);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
     let mut writer = encoder.write_header()?;
-    let mut data = Vec::with_capacity(display::WIDTH * display::HEIGHT * 4);
-    for y in 0..display::HEIGHT {
-        for x in 0..display::WIDTH {
+    let mut data = Vec::with_capacity(width * height * 4);
+    for y in 0..height {
+        for x in 0..width {
             if fb.pixel(x, y) {
                 data.extend_from_slice(&[238, 236, 226, 255]);
             } else {

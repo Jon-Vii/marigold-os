@@ -245,8 +245,7 @@ order and bit order without leaking hardware orientation into app rendering.
 mirrored/upside down.
 
 Physical orientation is an app/layout concern, not an SSD1677 streaming concern.
-The current readable build places logical top on the physical button side. The
-reader state already carries a complete orientation enum:
+The reader state carries a complete orientation enum:
 
 ```rust
 enum DisplayOrientation {
@@ -257,8 +256,18 @@ enum DisplayOrientation {
 }
 ```
 
-Default reader mode is `LandscapeButtonsBottom`, but the low-level display
-transform above should stay fixed unless corruption returns.
+Default reader mode is `LandscapeButtonsBottom`; the Settings Orientation row
+toggles it against `PortraitButtonsRight` (the device turned a quarter
+counter-clockwise so the front-key ladder runs along the bottom edge). The
+per-panel mirror/reverse constants above stay fixed for both orientations:
+landscape frames are composed at `WIDTH x HEIGHT`, panel-mount mirrored, and
+streamed through `fill_transformed_band_impl` as before, while portrait frames
+are composed viewer-upright at `HEIGHT x WIDTH` in the same buffer
+(`Framebuffer::set_portrait`, identical byte size) and gathered by the sibling
+`fill_transposed_band_impl`, which folds the quarter-turn into the band fill
+and then applies the same mirror/reverse tail. Tests in `display::epd` pin the
+transposed stream byte-for-byte against the equivalent relabeled landscape
+frame on both controllers.
 
 Addressing follows the OpenX4 community SDK behavior:
 
@@ -527,15 +536,24 @@ The firmware now has the e-reader surfaces as explicit app state:
 - `Library`: selects a book or opens settings.
 - `Reading`: owns the active book/page position.
 - `Chapters`: selects a chapter within the current book.
-- `Settings`: cycles refresh policy, font size, line spacing, typeface, and
-  type weight. `DisplayOrientation` is persisted for future reading-layout
-  work, but it is not currently exposed as a user-facing setting.
+- `Settings`: cycles refresh policy, font size, line spacing, typeface, type
+  weight, and orientation. The Orientation row toggles landscape against the
+  portrait posture (front-key ladder along the bottom edge) and persists it.
 
-Every surface renders in landscape: the X4 is held that way for its side page
-buttons, so `Home`, `Library`, and `Settings` share the reading posture rather
-than rotating into portrait. Home is cover-led: the current book is the visual
-anchor, with a restrained menu down the side for Continue, Library, Sync, and
-Settings.
+Every surface renders in both orientations. Landscape keeps the historical
+layout: the key rail down the left bezel edge and the content column beside
+it. Portrait turns the rail into a horizontal key strip above the bottom
+buttons (labels staggered across two baselines so full words fit the key
+pitch) and lets content run the page width; the shared layout values live in
+`ui::render`'s per-orientation `Metrics`. Orientation rides in
+`TypeSettings::portrait`, so the pagination cache, the store staleness
+checks, and the reopen-on-change path all treat a flip exactly like a type
+change (portrait caches claim their own `reader_layout_config` version band).
+While reading in portrait the page stays full-bleed and a named-key press
+summons a key sheet above the buttons; the second press acts on the label it
+revealed, and page turns never wait on it. Home is cover-led: the current
+book is the visual anchor, with a restrained menu beside (or below) it for
+Continue, Library, Sync, and Settings.
 Reading mode keeps the page quiet: tiny book title, rendered-screen count within
 the chapter, symbolic battery, and a thin whole-book progress bar. Home shows a
 small battery percentage because it is a status surface. GPIO0 is sampled as the

@@ -1,4 +1,4 @@
-use crate::reader_layout::{self, READER_LEFT_X, READER_RIGHT_X};
+use crate::reader_layout::{self, reader_right_x, READER_LEFT_X};
 use crate::reader_store::{BookLoadStatus, LibraryScanStatus, ReaderStore, LIBRARY_WINDOW};
 use crate::{catalog, AppView, DisplayOrientation, ReaderSource, RenderRequest};
 use core::fmt::Write;
@@ -19,9 +19,14 @@ const MAX_UI_CHAPTERS: usize = 256;
 
 pub(crate) fn render(fb: &mut Framebuffer, request: RenderRequest, sd_library: &ReaderStore) {
     if request.view == AppView::Reading && ReaderSource::from_book_id(request.book_id).is_sd() {
+        fb.set_portrait(request.orientation.is_portrait());
         fb.clear(true);
         draw_sd_reader_page(fb, request, sd_library);
-        fb.flip_vertical();
+        if !fb.is_portrait() {
+            // Landscape frames mount for the panel; portrait stays
+            // viewer-upright and the flush transform owns the quarter-turn.
+            fb.flip_vertical();
+        }
     } else {
         let mut library_entries = [""; LIBRARY_WINDOW];
         let mut chapters = [UiTocItem {
@@ -53,9 +58,14 @@ pub(crate) fn render_custom_reader_from_root(
         return false;
     }
 
+    fb.set_portrait(request.orientation.is_portrait());
     fb.clear(true);
     draw_sd_reader_page_with_custom_font(fb, request, sd_library, root);
-    fb.flip_vertical();
+    if !fb.is_portrait() {
+        // Landscape frames mount for the panel; portrait stays
+        // viewer-upright and the flush transform owns the quarter-turn.
+        fb.flip_vertical();
+    }
     apply_orientation(fb, request.orientation);
     true
 }
@@ -232,14 +242,16 @@ fn ui_library_status(status: LibraryScanStatus) -> UiLibraryStatus {
 }
 
 fn draw_sd_reader_page(fb: &mut Framebuffer, request: RenderRequest, sd_library: &ReaderStore) {
-    // A store paginated under different type settings is as unusable as an
-    // unloaded one; show the loading plate until the relayout lands.
+    // A store paginated under different type settings (or the other
+    // orientation) is as unusable as an unloaded one; show the loading
+    // plate until the relayout lands.
     let layout_current = sd_library.type_settings()
         == display::font::TypeSettings {
             size: request.font_size,
             spacing: request.line_spacing,
             weight: request.font_weight,
             family: request.font_family,
+            portrait: request.orientation.is_portrait(),
         };
     // While the Chapters overview borrows the reading text buffer for the
     // on-disk TOC, page/block records still point at the old section but the
@@ -262,6 +274,9 @@ fn draw_sd_reader_page(fb: &mut Framebuffer, request: RenderRequest, sd_library:
             draw_reader_footer(fb, request, sd_library, page_count);
         }
     }
+    if request.reading_sheet {
+        ui::render::render_reading_sheet(fb);
+    }
 }
 
 fn draw_sd_reader_page_with_custom_font(
@@ -276,6 +291,7 @@ fn draw_sd_reader_page_with_custom_font(
             spacing: request.line_spacing,
             weight: request.font_weight,
             family: request.font_family,
+            portrait: request.orientation.is_portrait(),
         };
     let reading_buffer_ready = layout_current
         && sd_library.loaded_index == ReaderStore::selected_book_index(request.book_id)
@@ -295,6 +311,9 @@ fn draw_sd_reader_page_with_custom_font(
             }
             draw_reader_footer(fb, request, sd_library, page_count);
         }
+    }
+    if request.reading_sheet {
+        ui::render::render_reading_sheet(fb);
     }
 }
 
@@ -347,24 +366,19 @@ fn draw_sd_reader_loading(fb: &mut Framebuffer, request: RenderRequest, sd_libra
         sd_library.active_book_labels(request.book_id, fallback.title, fallback.author);
 
     // Vertically center title + author block within the reader page region
-    // (panel-relative, so the X3's taller page carries the plate down).
-    let title_y = display::HEIGHT as i16 / 2 - 8;
+    // (frame-relative, so the X3's taller page — and the portrait page —
+    // carry the plate to their own centers).
+    let right_x = reader_right_x(fb.is_portrait());
+    let title_y = fb.height() as i16 / 2 - 8;
     let author_y = title_y + 36;
-    draw_text_centered_truncated_local(
-        fb,
-        title_font,
-        title,
-        READER_LEFT_X,
-        READER_RIGHT_X,
-        title_y,
-    );
+    draw_text_centered_truncated_local(fb, title_font, title, READER_LEFT_X, right_x, title_y);
     if !author.is_empty() {
         draw_text_centered_truncated_local(
             fb,
             author_font,
             author,
             READER_LEFT_X,
-            READER_RIGHT_X,
+            right_x,
             author_y,
         );
     }
@@ -376,30 +390,21 @@ fn draw_sd_reader_error(fb: &mut Framebuffer, request: RenderRequest, sd_library
     let fallback = catalog::active_book(request.book_id);
     let (title, _) = sd_library.active_book_labels(request.book_id, fallback.title, "");
 
-    let title_y = 224i16;
+    let right_x = reader_right_x(fb.is_portrait());
+    let title_y = if fb.is_portrait() {
+        fb.height() as i16 / 2 - 16
+    } else {
+        224
+    };
     let message_y = title_y + 40;
-    draw_text_centered_truncated_local(
-        fb,
-        title_font,
-        title,
-        READER_LEFT_X,
-        READER_RIGHT_X,
-        title_y,
-    );
+    draw_text_centered_truncated_local(fb, title_font, title, READER_LEFT_X, right_x, title_y);
     let error = sd_library.reader_error();
     let message: &str = if error.is_empty() {
         "Could not open this book."
     } else {
         error
     };
-    draw_text_centered_truncated_local(
-        fb,
-        body_font,
-        message,
-        READER_LEFT_X,
-        READER_RIGHT_X,
-        message_y,
-    );
+    draw_text_centered_truncated_local(fb, body_font, message, READER_LEFT_X, right_x, message_y);
 }
 
 fn draw_text_centered_truncated_local(

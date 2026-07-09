@@ -400,9 +400,11 @@ pub(crate) fn ensure_toc_window(
     library: &mut ReaderStore,
     index: usize,
     selection: usize,
+    portrait: bool,
 ) -> bool {
-    let first_visible = ui::render::toc_scroll_start(selection, library.overview_chapter_count());
-    if library.toc_window_covers(first_visible, ui::render::TOC_VISIBLE_ROWS) {
+    let first_visible =
+        ui::render::toc_scroll_start(portrait, selection, library.overview_chapter_count());
+    if library.toc_window_covers(first_visible, ui::render::toc_visible_rows(portrait)) {
         return true;
     }
     load_chapters_into_store(epd, sd_cs, library, index, selection)
@@ -1558,7 +1560,7 @@ where
         reader_layout::rebuild_page_index(
             self.library,
             reader_layout::READER_PAGE_TOP,
-            reader_layout::READER_PAGE_BOTTOM,
+            reader_layout::reader_page_bottom(self.library.type_settings().portrait),
         );
         if self.library.block_count() == 0 || self.library.page_count == 0 {
             self.library.clear_lines();
@@ -1624,7 +1626,7 @@ where
                 reader_layout::rebuild_page_index(
                     self.library,
                     reader_layout::READER_PAGE_TOP,
-                    reader_layout::READER_PAGE_BOTTOM,
+                    reader_layout::reader_page_bottom(self.library.type_settings().portrait),
                 );
             }
             None => self.library.clear_lines(),
@@ -1636,7 +1638,7 @@ where
         reader_layout::rebuild_page_index(
             self.library,
             reader_layout::READER_PAGE_TOP,
-            reader_layout::READER_PAGE_BOTTOM,
+            reader_layout::reader_page_bottom(self.library.type_settings().portrait),
         );
         if self.library.page_count >= self.target_pages
             || self.library.block_count() >= self.library.block_capacity().saturating_sub(4)
@@ -1750,7 +1752,7 @@ fn push_styled_preview_fragment<
     normalize_decorative_separator(&mut normalized);
     let align = block_align_for(align, normalized.as_str(), role);
     let x = reader_layout::reader_x_for(role);
-    let max_x = reader_layout::READER_RIGHT_X;
+    let max_x = reader_layout::reader_right_x(sink.library.type_settings().portrait);
     // Book-style first-line indent: a Body paragraph's opening line wraps
     // against a narrower column. Only Left/Justify Body takes it, matching
     // `ui::reading::block_first_line_indent`, so the built line breaks agree

@@ -13,7 +13,7 @@ crate-type = ["cdylib", "rlib"]
 default = []
 # Render at Xteink X3 geometry (792x528). Additive across the workspace:
 # flipping the single display crate switches WIDTH/HEIGHT for ui too.
-device-x3 = ["display/device-x3"]
+device-x3 = ["display/device-x3", "ui/device-x3"]
 
 [dependencies]
 app-core = { path = "../../app-core" }

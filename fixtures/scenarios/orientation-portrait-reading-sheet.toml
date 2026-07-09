@@ -1,0 +1,30 @@
+# Portrait reading is full-bleed; the first named-key press summons the
+# key sheet above the buttons rather than acting, and the reducer holds it
+# up until a key acts on its label (or a page turn dismisses it).
+
+# Set portrait, then open the first SD book and let it load.
+[[steps]]
+orientation = "portrait-right"
+
+[[steps]]
+library = "Scanned"
+count = 1
+
+[[steps]]
+button = "Confirm"
+
+[[steps]]
+library = "Loaded"
+book_id = 2
+pages = 3
+chapters = 1
+
+# The named key summons the sheet rather than opening Chapters.
+[[steps]]
+button = "Confirm"
+
+[expect]
+view = "Reading"
+orientation = "portrait-right"
+reading_sheet = true
+book_id = 2

@@ -29,6 +29,9 @@ struct Step {
     ip: Option<[u8; 4]>,
     error: Option<String>,
     ssid: Option<String>,
+    /// Set the display orientation directly, bypassing the Settings cycle —
+    /// portrait goldens want the posture, not the menu choreography.
+    orientation: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -39,6 +42,7 @@ struct Expect {
     page: Option<u32>,
     selection: Option<u16>,
     orientation: Option<String>,
+    reading_sheet: Option<bool>,
     refresh_policy: Option<String>,
     font_size: Option<String>,
     line_spacing: Option<String>,
@@ -63,6 +67,9 @@ impl Scenario {
 
     pub fn run(&self, emu: &mut Emulator) -> Result<(), String> {
         for step in &self.steps {
+            if let Some(orientation) = &step.orientation {
+                emu.set_orientation(parse_orientation(orientation)?);
+            }
             if let Some(button) = &step.button {
                 emu.input(parse_button(button)?);
             }
@@ -104,6 +111,9 @@ impl Scenario {
                     state.orientation
                 ));
             }
+        }
+        if let Some(reading_sheet) = self.expect.reading_sheet {
+            expect_eq("reading_sheet", reading_sheet, state.reading_sheet)?;
         }
         if let Some(policy) = &self.expect.refresh_policy {
             let expected = parse_refresh_policy(policy)?;

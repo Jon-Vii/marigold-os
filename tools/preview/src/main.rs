@@ -1853,7 +1853,15 @@ fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u16) -> 
         view,
         UiView::Home | UiView::Library | UiView::Settings | UiView::Wireless
     ) {
-        write_portrait_left_png(&out.join(format!("{name}-upright.png")), &fb)?;
+        // Portrait-native companion frame: the same shell laid out for the
+        // upright page box, not the old finished-landscape-frame rotation.
+        let mut portrait_fb = Framebuffer::new();
+        let portrait_shell = UiShell {
+            orientation: UiOrientation::PortraitButtonsRight,
+            ..shell
+        };
+        render_shell(&mut portrait_fb, &portrait_shell);
+        write_upright_png(&out.join(format!("{name}-portrait.png")), &portrait_fb)?;
     } else {
         write_panel_png(&out.join(format!("{name}-panel.png")), &fb)?;
     }
@@ -1936,18 +1944,19 @@ fn write_panel_png(path: &Path, fb: &Framebuffer) -> std::io::Result<()> {
     Ok(())
 }
 
-fn write_portrait_left_png(path: &Path, fb: &Framebuffer) -> std::io::Result<()> {
+/// A portrait-composed frame is already viewer-upright (no panel-mount
+/// mirror); write it out row for row at its logical dimensions.
+fn write_upright_png(path: &Path, fb: &Framebuffer) -> std::io::Result<()> {
+    let (width, height) = (fb.width(), fb.height());
     let file = BufWriter::new(File::create(path)?);
-    let mut encoder = png::Encoder::new(file, HEIGHT as u32, WIDTH as u32);
+    let mut encoder = png::Encoder::new(file, width as u32, height as u32);
     encoder.set_color(png::ColorType::Grayscale);
     encoder.set_depth(png::BitDepth::Eight);
     let mut writer = encoder.write_header()?;
-    let mut pixels = vec![0u8; WIDTH * HEIGHT];
-    for y in 0..WIDTH {
-        for x in 0..HEIGHT {
-            let fb_x = WIDTH - 1 - y;
-            let fb_y = HEIGHT - 1 - x;
-            pixels[y * HEIGHT + x] = if fb.pixel(fb_x, fb_y) { 255 } else { 0 };
+    let mut pixels = vec![0u8; width * height];
+    for y in 0..height {
+        for x in 0..width {
+            pixels[y * width + x] = if fb.pixel(x, y) { 255 } else { 0 };
         }
     }
     writer.write_image_data(&pixels)?;

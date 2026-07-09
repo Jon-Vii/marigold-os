@@ -302,6 +302,14 @@ impl Emulator {
         self.render(app_core::RenderKind::Page);
     }
 
+    /// Set the display orientation directly and repaint — the scenario
+    /// escape hatch for portrait goldens that want the posture, not the
+    /// Settings-cycle choreography.
+    pub fn set_orientation(&mut self, orientation: app_core::DisplayOrientation) {
+        self.state.orientation = orientation;
+        self.render(app_core::RenderKind::Page);
+    }
+
     pub fn state(&self) -> app_core::ReaderState {
         self.state
     }
@@ -568,5 +576,44 @@ mod tests {
                 .assert(&emulator)
                 .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
         }
+    }
+
+    /// Every shell view renders in portrait through the real panel-model
+    /// flush (which validates the transposed band stream against the
+    /// controller protocol), and the dumps land in target/portrait-qa for
+    /// eyeballing. Layout regressions are caught by the portrait goldens;
+    /// this test pins the pipeline end to end.
+    #[test]
+    fn portrait_shell_views_flush_through_the_panel_model() {
+        let out_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/portrait-qa");
+        let mut emu = Emulator::boot(None);
+        emu.state.orientation = app_core::DisplayOrientation::PortraitButtonsRight;
+        emu.library_event(LibraryEvent::Scanned { count: 9 });
+
+        let views = [
+            (AppView::Home, "home"),
+            (AppView::Library, "library"),
+            (AppView::Chapters, "chapters"),
+            (AppView::Settings, "settings"),
+            (AppView::Wireless, "wireless"),
+        ];
+        for (view, name) in views {
+            emu.state.view = view;
+            emu.state.selection = 1;
+            emu.render(app_core::RenderKind::Page);
+            assert!(emu.framebuffer().is_portrait(), "{name} composed portrait");
+            write_png(&out_dir.join(format!("{name}.png")), emu.framebuffer())
+                .expect("dump portrait view");
+        }
+
+        emu.state.view = AppView::Wireless;
+        emu.sync_event(app_core::SyncEvent::PortalUp);
+        write_png(&out_dir.join("wireless-portal.png"), emu.framebuffer())
+            .expect("dump portrait portal");
+
+        emu.state.view = AppView::Home;
+        emu.input(Button::Power);
+        assert!(emu.sleeping());
+        write_png(&out_dir.join("sleep.png"), emu.framebuffer()).expect("dump portrait sleep");
     }
 }

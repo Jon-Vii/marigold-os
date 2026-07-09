@@ -1,4 +1,4 @@
-use super::{fill_transformed_band_impl, RefreshMode, SpiOp};
+use super::{fill_transformed_band_impl, fill_transposed_band_impl, RefreshMode, SpiOp};
 use crate::{fb::Framebuffer, Rect, BAND_BYTES, HEIGHT, WIDTH};
 
 pub const CMD_DRIVER_OUTPUT_CONTROL: u8 = 0x01;
@@ -157,5 +157,9 @@ pub const fn is_byte_aligned(rect: Rect) -> bool {
 }
 
 pub fn fill_transformed_band(fb: &Framebuffer, band_y: usize, out: &mut [u8; BAND_BYTES]) -> usize {
-    fill_transformed_band_impl::<MIRROR_X, MIRROR_Y, REVERSE_BITS>(fb, band_y, out)
+    if fb.is_portrait() {
+        fill_transposed_band_impl::<MIRROR_X, MIRROR_Y, REVERSE_BITS>(fb, band_y, out)
+    } else {
+        fill_transformed_band_impl::<MIRROR_X, MIRROR_Y, REVERSE_BITS>(fb, band_y, out)
+    }
 }

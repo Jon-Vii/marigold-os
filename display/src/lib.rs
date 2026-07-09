@@ -26,13 +26,19 @@ pub const WIDTH: usize = 792;
 pub const HEIGHT: usize = 528;
 
 pub const ROW_BYTES: usize = WIDTH / 8;
+/// Row pitch of a portrait frame: the same buffer re-read as `WIDTH` rows
+/// of `HEIGHT` pixels. `PORTRAIT_ROW_BYTES * WIDTH == FB_BYTES`, so a
+/// portrait frame costs no extra RAM.
+pub const PORTRAIT_ROW_BYTES: usize = HEIGHT / 8;
 pub const FB_BYTES: usize = ROW_BYTES * HEIGHT;
 pub const BAND_ROWS: usize = 80;
 pub const BAND_BYTES: usize = ROW_BYTES * BAND_ROWS;
 
-// WIDTH must stay byte-addressable; HEIGHT need not divide into bands —
-// fill_transformed_band already emits a short final band.
+// Both axes must stay byte-addressable (HEIGHT is the portrait row pitch);
+// HEIGHT need not divide into bands — fill_transformed_band already emits
+// a short final band.
 const _: () = assert!(WIDTH.is_multiple_of(8));
+const _: () = assert!(HEIGHT.is_multiple_of(8));
 
 #[cfg(not(feature = "device-x3"))]
 const _: () = assert!(FB_BYTES == 48_000 && BAND_BYTES == 8_000);
@@ -48,6 +54,13 @@ pub struct Rect {
 }
 
 impl Rect {
+    /// Raw physical dimensions of the display panel.
+    ///
+    /// # Warning
+    ///
+    /// Do not use this directly for application rendering, layout, or dirty tracking,
+    /// as it does not account for the current screen orientation. For orientation-aware
+    /// full-screen rects, use [`Rect::full_for_orientation`] instead.
     pub const FULL: Self = Self {
         x: 0,
         y: 0,
@@ -55,15 +68,39 @@ impl Rect {
         h: HEIGHT as u16,
     };
 
+    /// Returns the full rect bounds matching the active orientation.
+    ///
+    /// Callers should use this instead of [`Rect::FULL`] to ensure orientation-aware sizing
+    /// is correctly applied for rendering, layouts, and screen redraw bounds.
+    pub fn full_for_orientation(portrait: bool) -> Self {
+        if portrait {
+            Self {
+                x: 0,
+                y: 0,
+                w: HEIGHT as u16,
+                h: WIDTH as u16,
+            }
+        } else {
+            Self::FULL
+        }
+    }
+
     pub const fn new(x: u16, y: u16, w: u16, h: u16) -> Self {
         Self { x, y, w, h }
     }
 
-    pub fn clipped(self) -> Option<Self> {
-        let x0 = self.x.min(WIDTH as u16);
-        let y0 = self.y.min(HEIGHT as u16);
-        let x1 = self.x.saturating_add(self.w).min(WIDTH as u16);
-        let y1 = self.y.saturating_add(self.h).min(HEIGHT as u16);
+    pub fn clipped(self, portrait: bool) -> Option<Self> {
+        let bounds = Self::full_for_orientation(portrait);
+        self.clipped_to(bounds.w, bounds.h)
+    }
+
+    /// Clip against an explicit frame size — the logical dimensions of the
+    /// target framebuffer, which swap in portrait orientation.
+    pub fn clipped_to(self, width: u16, height: u16) -> Option<Self> {
+        let x0 = self.x.min(width);
+        let y0 = self.y.min(height);
+        let x1 = self.x.saturating_add(self.w).min(width);
+        let y1 = self.y.saturating_add(self.h).min(height);
 
         if x1 <= x0 || y1 <= y0 {
             return None;

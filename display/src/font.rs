@@ -173,6 +173,12 @@ pub struct TypeSettings {
     pub spacing: LineSpacing,
     pub weight: FontWeight,
     pub family: FontFamily,
+    /// Whether the page box is the portrait one. Orientation rides with
+    /// the type settings because both name the layout identity a
+    /// pagination cache was built under: an orientation flip changes wrap
+    /// points exactly the way a size change does, and every staleness
+    /// check that compares settings then re-paginates for free.
+    pub portrait: bool,
 }
 
 impl TypeSettings {
@@ -181,6 +187,7 @@ impl TypeSettings {
         spacing: LineSpacing::Normal,
         weight: FontWeight::Normal,
         family: FontFamily::Literata,
+        portrait: false,
     };
 }
 

@@ -1,0 +1,11 @@
+# The Home title page in the portrait posture (front-key ladder along the
+# bottom edge). Orientation is set directly — the Settings 3-way cycle and
+# its landscape-top key remapping are exercised by the app-core reducer
+# tests; here we just want the portrait frame.
+
+[[steps]]
+orientation = "portrait-right"
+
+[expect]
+view = "Home"
+orientation = "portrait-right"

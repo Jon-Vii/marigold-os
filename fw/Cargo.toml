@@ -11,7 +11,7 @@ default-run = "fw"
 ota-selftest = []
 # Build for the Xteink X3 (792x528 UC8253 panel, BQ27220 battery gauge).
 # Off = Xteink X4, the default. See docs/plans/2026-07-06-x3-support-plan.md.
-device-x3 = ["display/device-x3"]
+device-x3 = ["display/device-x3", "ui/device-x3"]
 # Compile a generated custom typeface into firmware. Requires
 # display/src/custom_generated.rs, produced by tools/font_pack_to_rust.py.
 builtin-custom-font = ["display/builtin-custom-font"]

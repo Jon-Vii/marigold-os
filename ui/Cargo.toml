@@ -3,6 +3,9 @@ name = "ui"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+device-x3 = ["display/device-x3"]
+
 [dependencies]
 app-core = { path = "../app-core" }
 display = { path = "../display" }

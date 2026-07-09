@@ -295,9 +295,14 @@ impl WebEmulator {
         let sd_reading = request.view == AppView::Reading
             && ReaderSource::from_book_id(request.book_id).is_sd();
         if sd_reading {
+            self.fb.set_portrait(request.orientation.is_portrait());
             self.fb.clear(true);
             self.draw_reader_page(request);
-            self.fb.flip_vertical();
+            if !self.fb.is_portrait() {
+                // Landscape frames mount for the panel; portrait stays
+                // viewer-upright, the flush transform owns the quarter-turn.
+                self.fb.flip_vertical();
+            }
         } else {
             self.draw_shell(request, false);
         }
@@ -397,9 +402,9 @@ impl WebEmulator {
             || (self.store_book == Some(book_index) && self.load_status == LoadStatus::Ready);
         if !ready {
             let source = &SHELF[book_index as usize % SHELF.len()];
-            // Straddle the panel's vertical center (X4: 232/268) so the plate
-            // stays centered on the taller X3 instead of riding high.
-            let mid = HEIGHT as i16 / 2;
+            // Straddle the frame's vertical center so the plate stays
+            // centered on the taller X3 — and on the portrait page.
+            let mid = self.fb.height() as i16 / 2;
             draw_centered(&mut self.fb, literata(FontStyle::Bold), source.title, mid - 8);
             draw_centered(&mut self.fb, literata(FontStyle::Italic), source.author, mid + 28);
             return;
@@ -410,20 +415,32 @@ impl WebEmulator {
 
         let (current, total) = store.chapter_page_position(request.page);
         let label = format!("{}/{}", current, total);
+        // Shared with fw::views via ui::reading, which owns the footer's
+        // exact frame-relative position in every orientation (`left` tucks
+        // it into the mirrored corner for buttons-up).
         ui::reading::draw_reading_page_counter_aligned(
             &mut self.fb,
             &label,
             request.orientation == DisplayOrientation::LandscapeButtonsTop,
         );
+        if request.reading_sheet {
+            ui::render::render_reading_sheet(&mut self.fb);
+        }
     }
 
-    /// Convert the panel-mounted framebuffer (rows mirrored for the X4's
-    /// upside-down panel) to viewer-oriented RGBA.
+    /// Convert the framebuffer to viewer-oriented RGBA. Landscape frames
+    /// are panel-mounted (rows mirrored for the X4's upside-down panel) so
+    /// they un-flip here; portrait frames are composed viewer-upright and
+    /// paint straight through at their swapped dimensions. The RGBA buffer
+    /// holds the same pixel count either way.
     fn blit(&mut self) {
-        for y in 0..HEIGHT {
-            for x in 0..WIDTH {
-                let color = if self.fb.pixel(x, HEIGHT - 1 - y) { PAPER } else { INK };
-                let offset = (y * WIDTH + x) * 4;
+        let (width, height) = (self.fb.width(), self.fb.height());
+        let portrait = self.fb.is_portrait();
+        for y in 0..height {
+            let src_y = if portrait { y } else { height - 1 - y };
+            for x in 0..width {
+                let color = if self.fb.pixel(x, src_y) { PAPER } else { INK };
+                let offset = (y * width + x) * 4;
                 self.rgba[offset] = color[0];
                 self.rgba[offset + 1] = color[1];
                 self.rgba[offset + 2] = color[2];
@@ -439,7 +456,8 @@ fn home_network() -> WifiSsid {
 
 fn draw_centered(fb: &mut Framebuffer, font: &'static display::font::BitmapFont, text: &str, y: i16) {
     let width = measure_text(font, text) as i16;
-    draw_text(fb, font, text, (WIDTH as i16 - width) / 2, y, false);
+    let frame_width = fb.width() as i16;
+    draw_text(fb, font, text, (frame_width - width) / 2, y, false);
 }
 
 /// The desktop emulator's transition-to-storage-command mapping, verbatim.
@@ -526,6 +544,23 @@ pub extern "C" fn x4_tick(now_ms: f64) {
 #[no_mangle]
 pub extern "C" fn x4_frame_ptr() -> *const u8 {
     emulator().rgba.as_ptr()
+}
+
+/// Logical width of the current frame: `WIDTH` in landscape, `HEIGHT` when
+/// the frame was composed portrait. The page sizes its canvas from these.
+#[no_mangle]
+pub extern "C" fn x4_frame_width() -> u32 {
+    emulator().fb.width() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn x4_frame_height() -> u32 {
+    emulator().fb.height() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn x4_orientation() -> u32 {
+    emulator().state.orientation as u32
 }
 
 #[no_mangle]

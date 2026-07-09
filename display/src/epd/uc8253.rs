@@ -18,7 +18,7 @@
 //! from the reference, but mirrored or offset output is the expected first
 //! symptom to chase here.
 
-use super::{fill_transformed_band_impl, RefreshMode, SpiOp};
+use super::{fill_transformed_band_impl, fill_transposed_band_impl, RefreshMode, SpiOp};
 use crate::{fb::Framebuffer, BAND_BYTES};
 
 // --- UC8253 command set (subset used by the BW path) ---
@@ -74,7 +74,11 @@ pub const MIRROR_Y: bool = true;
 pub const REVERSE_BITS: bool = true;
 
 pub fn fill_transformed_band(fb: &Framebuffer, band_y: usize, out: &mut [u8; BAND_BYTES]) -> usize {
-    fill_transformed_band_impl::<MIRROR_X, MIRROR_Y, REVERSE_BITS>(fb, band_y, out)
+    if fb.is_portrait() {
+        fill_transposed_band_impl::<MIRROR_X, MIRROR_Y, REVERSE_BITS>(fb, band_y, out)
+    } else {
+        fill_transformed_band_impl::<MIRROR_X, MIRROR_Y, REVERSE_BITS>(fb, band_y, out)
+    }
 }
 
 /// One waveform bank: VCOM plus the four transition LUTs, each `LUT_LEN`

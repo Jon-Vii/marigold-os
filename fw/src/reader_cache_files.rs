@@ -1031,7 +1031,7 @@ where
             reader_layout::rebuild_page_index(
                 library,
                 reader_layout::READER_PAGE_TOP,
-                reader_layout::READER_PAGE_BOTTOM,
+                reader_layout::reader_page_bottom(library.type_settings().portrait),
             );
         }
         let pages = library.page_count;

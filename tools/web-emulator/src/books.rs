@@ -6,11 +6,7 @@
 use display::font::{FontStyle, TypeSettings};
 use proto::cache::{BlockRecord, PageRecord};
 use proto::text::{TextAlign, TextRole};
-use ui::reading::{
-    block_first_line_indent, block_height, block_ink_height, body_font, wrapped_line_count,
-    ReadingBlocks, READER_LEFT_X, READER_PAGE_BOTTOM, READER_PAGE_TOP, READER_RIGHT_X,
-    reader_x_for,
-};
+use ui::reading::{block_height, block_ink_height, ReadingBlocks, READER_PAGE_TOP};
 
 pub struct BookSource {
     pub title: &'static str,
@@ -160,18 +156,9 @@ impl BookStore {
     /// Compute the wrap-dependent line counts the parser could not know yet.
     fn finish_line_counts(&mut self) {
         for index in 0..self.blocks.len() {
-            let record = self.blocks[index].record;
-            let indent = block_first_line_indent(self, index);
-            let font = body_font(self.settings, self.blocks[index].style);
-            let max_width = READER_RIGHT_X
-                - if record.align == TextAlign::Center {
-                    READER_LEFT_X
-                } else {
-                    reader_x_for(record.role)
-                };
-            let lines =
-                wrapped_line_count(font, &self.blocks[index].text, max_width, indent).max(1);
-            self.blocks[index].record.line_count = lines.min(u8::MAX as u16) as u8;
+            let text = self.blocks[index].text.clone();
+            self.blocks[index].record.line_count =
+                ui::reading::compute_block_line_count(self, index, &text);
         }
     }
 
@@ -183,6 +170,7 @@ impl BookStore {
         if self.blocks.is_empty() {
             return;
         }
+        let page_bottom = ui::reading::reader_page_bottom(self.settings.portrait);
         let mut first_block = 0usize;
         let mut block_count = 0usize;
         let mut y = READER_PAGE_TOP;
@@ -190,7 +178,7 @@ impl BookStore {
 
         for index in 0..self.blocks.len() {
             let height = block_height(self, index);
-            let new_page = (y + block_ink_height(self, index) > READER_PAGE_BOTTOM
+            let new_page = (y + block_ink_height(self, index) > page_bottom
                 || self.blocks[index].page_break_before)
                 && y > READER_PAGE_TOP;
             if new_page {

@@ -8,8 +8,8 @@
 //! only — the device does not tell time.
 
 use crate::{
-    qr_generated, UiLibraryStatus, UiOrientation, UiRefreshPolicy, UiShell, UiSyncStatus,
-    UiTocItem, UiView,
+    qr_generated, reading::PORTRAIT_READING_SHEET_HEIGHT, UiLibraryStatus, UiOrientation,
+    UiRefreshPolicy, UiShell, UiSyncStatus, UiTocItem, UiView,
 };
 use display::fb::Framebuffer;
 use display::font::{
@@ -19,15 +19,15 @@ use display::render::fill_rect;
 use display::{Rect, HEIGHT, WIDTH};
 
 /// Vertical centers of the four left-bezel buttons on screen,
-/// top to bottom: Back, Confirm, Previous, Next. Positioned as a fraction
-/// of panel height (the X4's 480 gives the historical 120/200/280/360), so
-/// the same button arrangement stays aligned on the X3's differently sized
-/// panel rather than bunching toward the top.
-const KEY_YS: [i16; 4] = [key_y(120), key_y(200), key_y(280), key_y(360)];
+/// top to bottom: Back, Confirm, Previous, Next.
+#[cfg(not(feature = "device-x3"))]
+const KEY_YS: [i16; 4] = [90, 190, 290, 390];
 
-const fn key_y(x4_y: i16) -> i16 {
-    (x4_y as i32 * HEIGHT as i32 / 480) as i16
-}
+/// On the X3 device, the physical buttons are two distinct rockers. This layout
+/// matches the outer bounds of the rockers but distributes the icons evenly.
+#[cfg(feature = "device-x3")]
+const KEY_YS: [i16; 4] = [99, 209, 319, 429];
+
 const KEY_DASH_X: i16 = 10;
 const KEY_LABEL_X: i16 = 40;
 const CONTENT_X: i16 = 210;
@@ -46,8 +46,13 @@ const ROW_STEP: i16 = 56;
 const FIRST_ROW_Y: i16 = 118;
 /// Rows the Library list shows at once. Public so the firmware sizes the
 /// resident catalog window to cover the visible range it must stream in.
-pub const LIBRARY_VISIBLE_ROWS: usize = 6;
-const VISIBLE_ROWS: usize = LIBRARY_VISIBLE_ROWS;
+pub fn library_visible_rows(portrait: bool) -> usize {
+    if portrait {
+        10
+    } else {
+        6
+    }
+}
 /// Footer baseline: 24px up from the panel's bottom edge (the X4's
 /// historical 456). Panel-relative so the taller X3 keeps its apparatus in
 /// the corner rather than floating it mid-page.
@@ -57,13 +62,44 @@ const FOOTER_Y: i16 = HEIGHT as i16 - 24;
 /// conventionally are.
 const TITLE_LEADING: i16 = 54;
 
+/// Logical portrait frame dimensions: the panel turned a quarter
+/// counter-clockwise, so the panel height becomes the page width.
+const PORTRAIT_W: i16 = HEIGHT as i16;
+const PORTRAIT_H: i16 = WIDTH as i16;
+
+/// In portrait the four front keys run along the bottom edge; their x
+/// centers reuse KEY_YS (portrait width == landscape height), so the
+/// quarter-turn maps the ladder's top-to-bottom order onto the bottom
+/// edge left-to-right with no re-derivation.
+const KEY_XS: [i16; 4] = KEY_YS;
+/// Portrait key strip: icons sit on a single baseline centered above the
+/// physical buttons.
+const KEY_STRIP_ICON_Y: i16 = PORTRAIT_H - 24;
+
+/// The orientation-varying layout values. Landscape entries are the
+/// historical constants (buttons-top mirrors the x axis); portrait
+/// re-derives them for a full-width column on the taller page with the
+/// key strip at the bottom edge.
 #[derive(Clone, Copy)]
 struct ShellLayout {
     mirrored: bool,
+    portrait: bool,
     content_x: i16,
     content_right: i16,
     colophon_right: i16,
     heading_cx: i16,
+    footer_right: i16,
+    footer_y: i16,
+    battery_y: i16,
+    note_y: i16,
+    hint_y: i16,
+    qr_top: i16,
+    qr_caption_y: i16,
+    qr_hint_y: i16,
+    home_title_y: i16,
+    home_author_y: i16,
+    home_rule_y: i16,
+    home_colophon_y: i16,
 }
 
 impl ShellLayout {
@@ -75,16 +111,57 @@ impl ShellLayout {
                 content_right: WIDTH as i16 - CONTENT_X,
                 colophon_right: WIDTH as i16 - (COLOPHON_RIGHT - CONTENT_RIGHT),
                 heading_cx: WIDTH as i16 - HEADING_CX,
+                ..Self::LANDSCAPE
             },
-            _ => Self {
+            UiOrientation::PortraitButtonsLeft | UiOrientation::PortraitButtonsRight => Self {
                 mirrored: false,
-                content_x: CONTENT_X,
-                content_right: CONTENT_RIGHT,
-                colophon_right: COLOPHON_RIGHT,
-                heading_cx: HEADING_CX,
+                portrait: true,
+                content_x: 56,
+                content_right: PORTRAIT_W - 32,
+                colophon_right: PORTRAIT_W - 24,
+                heading_cx: PORTRAIT_W / 2,
+                footer_right: PORTRAIT_W - 24,
+                footer_y: PORTRAIT_H - 72,
+                // Phone-style status corner: the readout sits in the very
+                // top-right, above the centered heading (baseline 42) so it
+                // reads as its own marker rather than hanging off the rule.
+                battery_y: 30,
+                note_y: 320,
+                hint_y: 370,
+                qr_top: 210,
+                qr_caption_y: 398,
+                qr_hint_y: 432,
+                home_title_y: 300,
+                home_author_y: 342,
+                home_rule_y: 400,
+                home_colophon_y: 432,
             },
+            _ => Self::LANDSCAPE,
         }
     }
+
+    /// The landscape buttons-bottom baseline; buttons-top reuses every y
+    /// value and only mirrors the x fields above.
+    const LANDSCAPE: Self = Self {
+        mirrored: false,
+        portrait: false,
+        content_x: CONTENT_X,
+        content_right: CONTENT_RIGHT,
+        colophon_right: COLOPHON_RIGHT,
+        heading_cx: HEADING_CX,
+        footer_right: FOOTER_RIGHT,
+        footer_y: FOOTER_Y,
+        battery_y: FOOTER_Y,
+        note_y: 230,
+        hint_y: 280,
+        qr_top: 160,
+        qr_caption_y: 348,
+        qr_hint_y: 382,
+        home_title_y: 180,
+        home_author_y: 222,
+        home_rule_y: 280,
+        home_colophon_y: 312,
+    };
 
     const fn content_width(self) -> i16 {
         self.content_right - self.content_x
@@ -100,6 +177,10 @@ impl ShellLayout {
 }
 
 pub fn render_shell(fb: &mut Framebuffer, shell: &UiShell<'_>) {
+    fb.set_portrait(matches!(
+        shell.orientation,
+        UiOrientation::PortraitButtonsLeft | UiOrientation::PortraitButtonsRight
+    ));
     fb.clear(true);
     match shell.view {
         UiView::Home => render_home(fb, shell),
@@ -133,17 +214,31 @@ fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         layout.content_width() as u16,
     );
     if second.is_empty() {
-        draw_text(fb, title_font, first, layout.content_x, 180, false);
+        draw_text(
+            fb,
+            title_font,
+            first,
+            layout.content_x,
+            layout.home_title_y,
+            false,
+        );
     } else {
         draw_text(
             fb,
             title_font,
             first,
             layout.content_x,
-            180 - TITLE_LEADING,
+            layout.home_title_y - TITLE_LEADING,
             false,
         );
-        draw_text(fb, title_font, second, layout.content_x, 180, false);
+        draw_text(
+            fb,
+            title_font,
+            second,
+            layout.content_x,
+            layout.home_title_y,
+            false,
+        );
     }
     if !shell.active_book.author.is_empty() {
         ls_caps(
@@ -151,7 +246,7 @@ fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>) {
             literata_small(FontStyle::Regular),
             shell.active_book.author,
             layout.content_x,
-            222,
+            layout.home_author_y,
             3,
         );
     }
@@ -161,7 +256,7 @@ fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     } else {
         shell.active_book.progress_permille
     };
-    progress_rule(fb, layout.content_x, 280, 240, permille);
+    progress_rule(fb, layout.content_x, layout.home_rule_y, 240, permille);
 
     // Colophon: the chapter name alone, in the book's italic voice —
     // the progress rule already answers "how far". Roman numeral
@@ -172,12 +267,12 @@ fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         shell.chapter,
         shell.chapter_title,
         layout.content_x,
-        312,
+        layout.home_colophon_y,
         layout.colophon_right - layout.content_x,
     );
 
     draw_battery_percent(fb, layout, shell.battery_percent);
-    mirror_framebuffer_long_axis(fb);
+    finish_frame(fb);
 }
 
 pub(crate) fn draw_chapter_colophon(
@@ -318,11 +413,13 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     // range. A miss (stale window mid-refill) leaves that row blank rather than
     // drawing the wrong book.
     let selected_index = (shell.selection as usize).min(total.saturating_sub(1));
-    let start = library_scroll_start(selected_index, total);
+    let portrait = layout.portrait;
+    let visible_rows = library_visible_rows(portrait);
+    let start = library_scroll_start(portrait, selected_index, total);
     let window_start = shell.library_window_start as usize;
     let body = literata(FontStyle::Regular);
     let mut y = FIRST_ROW_Y;
-    for row in 0..VISIBLE_ROWS {
+    for row in 0..visible_rows {
         let abs = start + row;
         if abs >= total {
             break;
@@ -356,30 +453,38 @@ fn render_library(fb: &mut Framebuffer, shell: &UiShell<'_>) {
 /// Absolute catalog index of the first visible Library row that keeps
 /// `selection` on screen. Shared by the renderer and the firmware's window
 /// loader so both agree on which slice of the catalog is resident.
-pub fn library_scroll_start(selection: usize, total: usize) -> usize {
-    let start = if selection >= VISIBLE_ROWS {
-        selection + 1 - VISIBLE_ROWS
+pub fn library_scroll_start(portrait: bool, selection: usize, total: usize) -> usize {
+    let visible_rows = library_visible_rows(portrait);
+    let start = if selection >= visible_rows {
+        selection + 1 - visible_rows
     } else {
         0
     };
-    start.min(total.saturating_sub(VISIBLE_ROWS))
+    start.min(total.saturating_sub(visible_rows))
 }
 
 // The contents page uses tight index rows — a real table of contents,
 // not a menu: title, dot leaders, the chapter's book page right-aligned.
 const TOC_ROW_STEP: i16 = 36;
-pub const TOC_VISIBLE_ROWS: usize = 9;
+pub fn toc_visible_rows(portrait: bool) -> usize {
+    if portrait {
+        16
+    } else {
+        9
+    }
+}
 
 /// Absolute TOC index of the first visible Contents row that keeps
 /// `selection` on screen. Shared by the renderer and the firmware's TOC
 /// window loader so both agree on which slice must be resident.
-pub fn toc_scroll_start(selection: usize, total: usize) -> usize {
-    let start = if selection >= TOC_VISIBLE_ROWS {
-        selection + 1 - TOC_VISIBLE_ROWS
+pub fn toc_scroll_start(portrait: bool, selection: usize, total: usize) -> usize {
+    let visible_rows = toc_visible_rows(portrait);
+    let start = if selection >= visible_rows {
+        selection + 1 - visible_rows
     } else {
         0
     };
-    start.min(total.saturating_sub(TOC_VISIBLE_ROWS))
+    start.min(total.saturating_sub(visible_rows))
 }
 
 fn render_chapters(fb: &mut Framebuffer, shell: &UiShell<'_>) {
@@ -414,10 +519,12 @@ fn render_chapters(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     // before each render. A miss (stale window mid-refill) leaves that row
     // blank rather than drawing the wrong chapter.
     let selected = (shell.selection as usize).min(total - 1);
-    let start = toc_scroll_start(selected, total);
+    let portrait = layout.portrait;
+    let visible_rows = toc_visible_rows(portrait);
+    let start = toc_scroll_start(portrait, selected, total);
     let window_start = shell.chapters_window_start as usize;
     let mut y = FIRST_ROW_Y;
-    for row in 0..TOC_VISIBLE_ROWS {
+    for row in 0..visible_rows {
         let abs = start + row;
         if abs >= total {
             break;
@@ -525,7 +632,7 @@ fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     dash_unused(fb, layout, 3);
     heading(fb, layout, "Wireless");
 
-    let hint_y = 280;
+    let hint_y = layout.hint_y;
     match shell.sync_status {
         UiSyncStatus::NotConfigured => {
             centered_note(fb, layout, "no wi-fi network saved yet");
@@ -586,7 +693,7 @@ fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
                 qr_generated::QR_JOIN_SIZE,
                 qr_generated::QR_JOIN_STRIDE,
                 layout.heading_cx,
-                160,
+                layout.qr_top,
                 5,
             );
             draw_text_centered(
@@ -594,14 +701,14 @@ fn render_wireless(fb: &mut Framebuffer, shell: &UiShell<'_>) {
                 literata_small(FontStyle::Regular),
                 "scan to join \u{201c}XTEINK-X4\u{201d}",
                 layout.heading_cx,
-                348,
+                layout.qr_caption_y,
             );
             draw_text_centered(
                 fb,
                 literata_small(FontStyle::Italic),
                 "then enter your wi-fi in the page that opens \u{00b7} http://192.168.4.1",
                 layout.heading_cx,
-                382,
+                layout.qr_hint_y,
             );
         }
         UiSyncStatus::Serving(ip) => {
@@ -696,8 +803,28 @@ fn text_in(buf: &[u8], len: usize) -> &str {
 // ------------------------------------------------------------------
 
 /// An em-dash faces the physical button; the label is letterspaced
-/// small caps, bold for the screen's one primary action.
+/// small caps, bold for the screen's one primary action. Landscape sets
+/// mark and label in the bezel-edge margin rail (mirrored for buttons-up);
+/// portrait stacks the label above its mark in the bottom key strip.
 fn dash_key(fb: &mut Framebuffer, layout: ShellLayout, slot: usize, label: &str, primary: bool) {
+    let style = if primary {
+        FontStyle::Bold
+    } else {
+        FontStyle::Regular
+    };
+    if layout.portrait {
+        // Portrait keys are named by a 1bpp icon centered over the button,
+        // not by a letterspaced label; `primary` carries no weight here.
+        let glyph = crate::icons::icon_for_label(label);
+        let left = KEY_XS[slot] - crate::icons::ICON_SIZE / 2;
+        crate::icons::draw_icon(
+            fb,
+            glyph,
+            left,
+            KEY_STRIP_ICON_Y - crate::icons::ICON_SIZE / 2,
+        );
+        return;
+    }
     let y = KEY_YS[slot];
     let dash_font = literata(FontStyle::Regular);
     let dash = "\u{2014}";
@@ -707,11 +834,6 @@ fn dash_key(fb: &mut Framebuffer, layout: ShellLayout, slot: usize, label: &str,
         KEY_DASH_X
     };
     draw_text(fb, dash_font, dash, dash_x, y + 8, false);
-    let style = if primary {
-        FontStyle::Bold
-    } else {
-        FontStyle::Regular
-    };
     let label_font = literata_small(style);
     if layout.mirrored {
         let width = ls_width(label_font, label, 2);
@@ -723,6 +845,9 @@ fn dash_key(fb: &mut Framebuffer, layout: ShellLayout, slot: usize, label: &str,
 
 /// An unused key keeps its bare dash: the mark stays, the word goes.
 fn dash_unused(fb: &mut Framebuffer, layout: ShellLayout, slot: usize) {
+    if layout.portrait {
+        return;
+    }
     let dash_font = literata(FontStyle::Regular);
     let dash = "\u{2014}";
     let dash_x = if layout.mirrored {
@@ -731,6 +856,34 @@ fn dash_unused(fb: &mut Framebuffer, layout: ShellLayout, slot: usize) {
         KEY_DASH_X
     };
     draw_text(fb, dash_font, dash, dash_x, KEY_YS[slot] + 8, false);
+}
+
+/// The summoned reading key sheet: portrait reading stays chrome-free, and a
+/// named-key press slides this white band up from the reserved bottom zone
+/// above the physical buttons. A hairline closes its top edge; the four
+/// staggered strip keys name what the buttons do while it is up. Paging
+/// dismisses it (the reducer owns that).
+pub fn render_reading_sheet(fb: &mut Framebuffer) {
+    if !fb.is_portrait() {
+        return;
+    }
+    let top = PORTRAIT_H - PORTRAIT_READING_SHEET_HEIGHT;
+    fill_rect(
+        fb,
+        Rect::new(
+            0,
+            top as u16,
+            PORTRAIT_W as u16,
+            PORTRAIT_READING_SHEET_HEIGHT as u16,
+        ),
+        true,
+    );
+    hline(fb, 0, top, PORTRAIT_W);
+    let layout = ShellLayout::for_orientation(UiOrientation::PortraitButtonsRight);
+    dash_key(fb, layout, 0, "home", false);
+    dash_key(fb, layout, 1, "contents", true);
+    dash_key(fb, layout, 2, "previous", false);
+    dash_key(fb, layout, 3, "next", false);
 }
 
 fn heading(fb: &mut Framebuffer, layout: ShellLayout, text: &str) {
@@ -871,7 +1024,7 @@ fn centered_note(fb: &mut Framebuffer, layout: ShellLayout, text: &str) {
         literata(FontStyle::Italic),
         text,
         layout.heading_cx,
-        230,
+        layout.note_y,
     );
 }
 
@@ -890,7 +1043,7 @@ fn position_footer(fb: &mut Framebuffer, layout: ShellLayout, current: usize, to
         literata_small(FontStyle::Regular),
         label,
         layout.heading_cx,
-        FOOTER_Y,
+        layout.footer_y,
     );
 }
 
@@ -902,23 +1055,40 @@ fn draw_battery_percent(fb: &mut Framebuffer, layout: ShellLayout, percent: u8) 
     let label = core::str::from_utf8(&buf[..cursor]).unwrap_or("");
     let small = literata_small(FontStyle::Regular);
     if layout.mirrored {
+        // Buttons-top tucks the readout into the mirrored corner.
         draw_text(
             fb,
             small,
             label,
             WIDTH as i16 - FOOTER_RIGHT,
-            FOOTER_Y,
+            layout.battery_y,
             false,
         );
     } else {
         let width = measure_text(small, label) as i16;
-        draw_text(fb, small, label, FOOTER_RIGHT - width, FOOTER_Y, false);
+        draw_text(
+            fb,
+            small,
+            label,
+            layout.footer_right - width,
+            layout.battery_y,
+            false,
+        );
     }
 }
 
 fn finish_working_screen(fb: &mut Framebuffer, shell: &UiShell<'_>, layout: ShellLayout) {
     draw_battery_percent(fb, layout, shell.battery_percent);
-    mirror_framebuffer_long_axis(fb);
+    finish_frame(fb);
+}
+
+/// Landscape frames mount for the panel with the long-axis mirror;
+/// portrait frames stay viewer-upright and the flush transform owns their
+/// quarter-turn onto the panel.
+pub(crate) fn finish_frame(fb: &mut Framebuffer) {
+    if !fb.is_portrait() {
+        mirror_framebuffer_long_axis(fb);
+    }
 }
 
 fn hline(fb: &mut Framebuffer, x: i16, y: i16, w: i16) {
@@ -1044,7 +1214,7 @@ fn orientation_label(orientation: UiOrientation) -> &'static str {
     match orientation {
         UiOrientation::LandscapeButtonsBottom => "buttons down",
         UiOrientation::LandscapeButtonsTop => "buttons up",
-        UiOrientation::PortraitButtonsLeft | UiOrientation::PortraitButtonsRight => "buttons down",
+        UiOrientation::PortraitButtonsLeft | UiOrientation::PortraitButtonsRight => "portrait",
     }
 }
 

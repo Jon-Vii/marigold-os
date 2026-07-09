@@ -192,24 +192,7 @@
   .slot.s1 { top: 27.5%; }
   .slot.s2 { top: 72.5%; }
   
-  /* X3 front rocker layout */
-  .device.x3 .sidekeys {
-    position: relative;
-    width: 16px; /* 2mm width */
-    height: 332px; /* 156px + 20px + 156px */
-    align-self: center;
-    display: flex;
-    flex-direction: column;
-    gap: 20px; /* 2.5mm apart */
-  }
-  .device.x3 .slot {
-    position: relative;
-    width: 100%;
-    height: 156px; /* 19.2mm height */
-    top: 0;
-    transform: none;
-  }
-  
+
   /* X3 side buttons */
   .device.x3 .side-left {
     top: -9px;
@@ -303,6 +286,14 @@
     background: var(--led);
     box-shadow: 0 0 6px 1px color-mix(in srgb, var(--led) 70%, transparent);
   }
+  /* Portrait posture: the firmware reports an upright frame, so the whole
+     slab turns a quarter counter-clockwise - the front-key ladder lands on
+     the bottom edge and the page rocker on the right, as in the hand. The
+     panel canvas keeps its native landscape store; the script paints
+     portrait frames rotated a quarter clockwise into it, and the two
+     turns cancel. JS sets the vertical margins that reserve the rotated
+     silhouette's room. */
+  .device.portrait { transform: rotate(-90deg); }
 
   /* ------------------------------------------------ page matter */
   .hints {
@@ -598,6 +589,8 @@
   const BTN = { power: 0, back: 1, ok: 2, prev: 3, next: 4, pagePrev: 5, pageNext: 6 };
   const SAVE_KEY = board + "-progress-v1";
   const ORIENTATION_BUTTONS_TOP = 1;
+  const ORIENTATION_PORTRAIT_LEFT = 2;
+  const ORIENTATION_PORTRAIT_RIGHT = 3;
 
   const device = document.querySelector(".device");
   const canvas = document.getElementById("panel");
@@ -674,16 +667,64 @@
   const ghostCtx = ghost.getContext("2d");
   let ghosting = false;
 
+  // Portrait frames arrive viewer-upright at HEIGHT x WIDTH; they paint
+  // into the panel-native page canvas rotated a quarter clockwise (the
+  // same turn the firmware's flush transform makes), and the CSS device
+  // rotation turns them back upright. Landscape frames paint straight.
+  const scratch = document.createElement("canvas");
+  const scratchCtx = scratch.getContext("2d");
+  const framePortrait = () => wasm.x4_frame_width() < wasm.x4_frame_height();
+  const statePortrait = () => {
+    const o = wasm.x4_orientation();
+    return o === ORIENTATION_PORTRAIT_LEFT || o === ORIENTATION_PORTRAIT_RIGHT;
+  };
+
+  function paintFrame(pixels) {
+    const w = wasm.x4_frame_width(), h = wasm.x4_frame_height();
+    if (!framePortrait()) {
+      ctx.putImageData(new ImageData(new Uint8ClampedArray(pixels), w, h), 0, 0);
+      return;
+    }
+    if (scratch.width !== w || scratch.height !== h) {
+      scratch.width = w; scratch.height = h;
+    }
+    scratchCtx.putImageData(new ImageData(new Uint8ClampedArray(pixels), w, h), 0, 0);
+    ctx.save();
+    ctx.imageSmoothingEnabled = false;
+    ctx.translate(WIDTH, 0);
+    ctx.rotate(Math.PI / 2);
+    ctx.drawImage(scratch, 0, 0);
+    ctx.restore();
+  }
+
+  // Turn the slab to match the frame and reserve room for the rotated
+  // silhouette (a transform keeps the original layout box).
+  let chromePortrait = false;
+  function applyOrientationChrome() {
+    const portrait = statePortrait();
+    device.classList.toggle("portrait", portrait);
+    if (portrait) {
+      const pad = Math.max(0, (device.offsetWidth - device.offsetHeight) / 2);
+      device.style.marginTop = Math.round(pad + 8) + "px";
+      device.style.marginBottom = Math.round(pad + 22) + "px";
+    } else {
+      device.style.marginTop = "";
+      device.style.marginBottom = "";
+    }
+    chromePortrait = portrait;
+  }
+  addEventListener("resize", () => { if (chromePortrait) applyOrientationChrome(); });
+
   function putInverted(pixels) {
     const inv = new Uint8ClampedArray(pixels);
     for (let i = 0; i < inv.length; i += 4) {
       inv[i] = 255 - inv[i]; inv[i + 1] = 255 - inv[i + 1]; inv[i + 2] = 255 - inv[i + 2];
     }
-    ctx.putImageData(new ImageData(inv, WIDTH, HEIGHT), 0, 0);
+    paintFrame(inv);
     present();
   }
   function putFinal(pixels) {
-    ctx.putImageData(new ImageData(new Uint8ClampedArray(pixels), WIDTH, HEIGHT), 0, 0);
+    paintFrame(pixels);
     if (ghosting) {
       ctx.globalAlpha = 0.035;
       ctx.drawImage(ghost, 0, 0);
@@ -700,6 +741,9 @@
   async function refresh(mode) {
     const pixels = frame();
     busy = true;
+    if (statePortrait() !== chromePortrait) {
+      applyOrientationChrome();
+    }
     led.classList.add("on");
     if (reduceMotion) {
       ghosting = false;

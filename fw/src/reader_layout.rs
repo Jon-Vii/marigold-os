@@ -9,8 +9,8 @@ pub(crate) use display::font::{style_marker_code, STYLE_MARKER};
 use proto::cache::PageRecord;
 use ui::reading::{block_height, page_record_at, paginate_block_pages, ReadingBlocks};
 pub(crate) use ui::reading::{
-    first_styled_line_style, paragraph_indent, reader_layout_config, reader_x_for, READER_LEFT_X,
-    READER_PAGE_BOTTOM, READER_PAGE_TOP, READER_RIGHT_X, READER_WRAP_SAFETY,
+    first_styled_line_style, paragraph_indent, reader_layout_config, reader_page_bottom,
+    reader_right_x, reader_x_for, READER_LEFT_X, READER_PAGE_TOP, READER_WRAP_SAFETY,
 };
 
 pub(crate) struct ReaderPagePlan {
@@ -20,14 +20,12 @@ pub(crate) struct ReaderPagePlan {
 
 impl ReaderPagePlan {
     pub(crate) fn new(sd_library: &ReaderStore, requested_page: u32) -> Self {
-        let page_count = reader_page_count(sd_library, READER_PAGE_TOP, READER_PAGE_BOTTOM);
+        // The page box the store was paginated under — its settings carry
+        // the orientation the way they carry the type size.
+        let page_bottom = reader_page_bottom(sd_library.type_settings().portrait);
+        let page_count = reader_page_count(sd_library, READER_PAGE_TOP, page_bottom);
         let requested_page = sd_library.local_page_for_global(requested_page.min(page_count - 1));
-        let page = reader_page_at(
-            sd_library,
-            requested_page,
-            READER_PAGE_TOP,
-            READER_PAGE_BOTTOM,
-        );
+        let page = reader_page_at(sd_library, requested_page, READER_PAGE_TOP, page_bottom);
         Self { page_count, page }
     }
 
