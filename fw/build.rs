@@ -66,5 +66,15 @@ ASSERT(_stack_start - _stack_end >= {min_stack},
 
     fs::write(out_dir.join("ram-layout.x"), script).unwrap();
     println!("cargo:rustc-link-search={}", out_dir.display());
+
+    // Both linker scripts are emitted unconditionally from this build script
+    // (not from .cargo/config.toml rustflags) so the order is deterministic:
+    // linkall.x must precede ram-layout.x because ram-layout.x references
+    // dram2_seg which linkall.x defines. Emitting both here prevents any
+    // ancestor config from injecting -Tlinkall.x at an uncontrolled position
+    // and eliminates the conditional that previously deferred to the
+    // environment. A build script runs once per package, so no doubling can
+    // occur as long as .cargo/config.toml carries no -Tlinkall.x.
+    println!("cargo:rustc-link-arg-bins=-Tlinkall.x");
     println!("cargo:rustc-link-arg-bins=-Tram-layout.x");
 }

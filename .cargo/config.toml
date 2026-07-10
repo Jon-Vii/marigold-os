@@ -4,8 +4,11 @@
 # descriptor validator; our descriptor is still emitted at image offset 0x20.
 [target.riscv32imc-unknown-none-elf]
 runner = "espflash flash --monitor --ignore-app-descriptor --flash-size 16mb --partition-table partitions.csv"
+# -Tlinkall.x lives in fw/build.rs (rustc-link-arg-bins), not here: cargo merges
+# this file with any ancestor checkout's copy (a worktree nested inside the repo,
+# e.g. under .claude/worktrees/), and a doubled linker script fails the link with
+# "region 'ICACHE' already defined". A doubled --cfg is harmless, so it can stay.
 rustflags = [
-  "-C", "link-arg=-Tlinkall.x",
   # Required to work with portable-atomic for CAS operations on single-core riscv32
   "--cfg", "portable_atomic_unsafe_assume_single_core",
 ]
