@@ -78,8 +78,13 @@ where
 
     pub async fn wait_ready(&mut self) {
         // Give BUSY time to assert after a command before the level wait;
-        // a too-early check would sail straight through a refresh.
-        Timer::after_millis(1).await;
+        // a too-early check would sail straight through a refresh. A bounded
+        // edge wait returns as soon as BUSY asserts instead of always burning
+        // the old fixed 1 ms sleep, and its 2 ms ceiling covers a slower
+        // assert the fixed delay would have missed. On timeout BUSY never
+        // rose, so the low wait below falls through immediately.
+        let _ =
+            embassy_time::with_timeout(Duration::from_millis(2), self.busy.wait_for_high()).await;
         // BUSY is active high. The interrupt-driven level wait returns
         // immediately if the pin is already low, replacing the 20 ms poll
         // loop's wake-ups and exit jitter; the ceiling matches the poll
