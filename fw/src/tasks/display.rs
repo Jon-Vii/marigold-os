@@ -1066,6 +1066,7 @@ fn sleep_request_from_saved_state(
             .unwrap_or(DisplayOrientation::LandscapeButtonsBottom),
         front_buttons: app_core::front_buttons_from_u8(record.front_buttons)
             .unwrap_or(app_core::FrontButtons::PagesRight),
+        reading_sheet: false,
         refresh_policy: refresh_policy_from_u8(record.refresh_policy)
             .unwrap_or(app_core::RefreshPolicy::FullOnWake),
         font_size: display::font::FontSize::from_u8(record.font_size)

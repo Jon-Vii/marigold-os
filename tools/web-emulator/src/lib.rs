@@ -308,6 +308,7 @@ impl WebEmulator {
                 .set_frame(ui::app_render::fb_frame(request.orientation));
             self.fb.clear(true);
             self.draw_reader_page(request);
+            ui::app_render::render_reading_sheet_overlay(&mut self.fb, request);
         } else {
             self.draw_shell(request, false);
         }

@@ -22,6 +22,7 @@ pub(crate) fn render(fb: &mut Framebuffer, request: RenderRequest, sd_library: &
     if request.view == AppView::Reading && ReaderSource::from_book_id(request.book_id).is_sd() {
         fb.clear(true);
         draw_sd_reader_page(fb, request, sd_library);
+        app_render::render_reading_sheet_overlay(fb, request);
     } else {
         let mut library_entries = [""; LIBRARY_WINDOW];
         let mut chapters = [UiTocItem {
@@ -56,6 +57,7 @@ pub(crate) fn render_custom_reader_from_root(
     fb.set_frame(app_render::fb_frame(request.orientation));
     fb.clear(true);
     draw_sd_reader_page_with_custom_font(fb, request, sd_library, font_metrics, root);
+    app_render::render_reading_sheet_overlay(fb, request);
     true
 }
 

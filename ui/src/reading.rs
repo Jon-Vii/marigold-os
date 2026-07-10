@@ -375,6 +375,12 @@ pub const READER_FOOTER_BASELINE_Y: i16 = display::HEIGHT as i16 - 3;
 /// keeps every possible descender a clear row away from the counter. On the
 /// X4 this is the historical 457.
 pub const READER_PAGE_BOTTOM: i16 = display::HEIGHT as i16 - 23;
+/// Rows the portrait reading sheet covers when summoned. The portrait
+/// reader reserves no space for it: the page and its footer use the full
+/// frame height, and the sheet draws on top of the footer and bottom text
+/// lines while it is up. Shallow because the portrait key strip names keys
+/// with single 24px icons centered 24 rows up.
+pub const PORTRAIT_READING_SHEET_HEIGHT: i16 = 48;
 pub const READER_LEFT_X: i16 = 8;
 /// Right text margin: 8 rows in from the panel's right edge (the X4's
 /// historical 792). Panel-relative so the X3's narrower panel keeps the
@@ -967,6 +973,20 @@ mod tests {
         fn paragraph_end(&self, index: usize) -> bool {
             self.ends.get(index).copied().unwrap_or(true)
         }
+    }
+
+    #[test]
+    fn portrait_sheet_overlays_the_footer_instead_of_reserving_space() {
+        let frame_height = FbFrame::Portrait.height() as i16;
+        let sheet_top = frame_height - PORTRAIT_READING_SHEET_HEIGHT;
+        // The page counter baseline (frame_height - 3, drawn by
+        // `draw_reading_page_counter_aligned`) falls inside the summoned
+        // band: the sheet covers the footer while up rather than the page
+        // keeping its furniture above a permanently reserved zone.
+        assert!(frame_height - 3 > sheet_top);
+        // The page box runs under the band too — body text keeps the
+        // full-height page when the sheet is down.
+        assert!(PageBox::PORTRAIT.bottom > sheet_top);
     }
 
     #[test]

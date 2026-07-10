@@ -46,6 +46,7 @@ struct Expect {
     font_weight: Option<String>,
     font_family: Option<String>,
     sleeping: Option<bool>,
+    reading_sheet: Option<bool>,
     library_count: Option<u16>,
     last_button: Option<String>,
     last_refresh: Option<String>,
@@ -105,6 +106,9 @@ impl Scenario {
                     state.orientation
                 ));
             }
+        }
+        if let Some(reading_sheet) = self.expect.reading_sheet {
+            expect_eq("reading_sheet", reading_sheet, state.reading_sheet)?;
         }
         if let Some(front_buttons) = &self.expect.front_buttons {
             let expected = parse_front_buttons(front_buttons)?;

@@ -42,10 +42,26 @@ pub fn fb_frame(orientation: DisplayOrientation) -> FbFrame {
     }
 }
 
+/// Draw the summoned portrait key sheet over a finished reading page.
+/// Shared by every reading compositor (built-in books here, the firmware's
+/// SD reader paths, the web emulator), so the band and its labels cannot
+/// drift between them. A no-op unless the request holds the sheet up.
+pub fn render_reading_sheet_overlay(fb: &mut Framebuffer, request: RenderRequest) {
+    if !request.reading_sheet {
+        return;
+    }
+    crate::render::render_reading_sheet(
+        fb,
+        ui_orientation(request.orientation),
+        request.front_buttons == FrontButtons::PagesLeft,
+    );
+}
+
 pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRenderModel<'_>) {
     fb.set_frame(fb_frame(request.orientation));
     if request.view == AppView::Reading {
         render_builtin_reading(fb, request, model);
+        render_reading_sheet_overlay(fb, request);
         return;
     }
 

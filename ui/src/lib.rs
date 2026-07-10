@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 pub mod app_render;
+pub mod icons;
 pub mod layout;
 pub mod qr_generated;
 pub mod reading;
