@@ -387,7 +387,7 @@ where
         for y in 0..metric.height as usize {
             let offset = face
                 .bitmap_offset
-                .checked_add(metric.offset as u32)?
+                .checked_add(metric.offset)?
                 .checked_add((y * row_bytes) as u32)?;
             self.file.seek_from_start(offset).ok()?;
             read_full(self.file, &mut row[..row_bytes])?;
@@ -479,8 +479,8 @@ where
 
 fn decode_metric(bytes: &[u8; FONT_PACK_METRIC_BYTES]) -> GlyphMetric {
     GlyphMetric {
-        offset: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize,
-        len: u16::from_le_bytes([bytes[4], bytes[5]]) as usize,
+        offset: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        len: u16::from_le_bytes([bytes[4], bytes[5]]),
         width: bytes[6],
         height: bytes[7],
         x_offset: bytes[8] as i8,

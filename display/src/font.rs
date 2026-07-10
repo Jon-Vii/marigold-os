@@ -34,10 +34,14 @@ pub fn style_from_marker_code(code: char) -> Option<FontStyle> {
     }
 }
 
+/// Per-glyph bitmap location and layout. Field widths match the SD
+/// font-pack metric record (`proto::font_pack::FONT_PACK_METRIC_BYTES`):
+/// 12 bytes instead of the padded 16 that `usize` offsets cost, which
+/// saves ~195 KB of flash across the ~50k built-in glyph entries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GlyphMetric {
-    pub offset: usize,
-    pub len: usize,
+    pub offset: u32,
+    pub len: u16,
     pub width: u8,
     pub height: u8,
     pub x_offset: i8,
@@ -67,10 +71,8 @@ impl BitmapFont {
     pub fn glyph(&self, codepoint: u16) -> Option<(&GlyphMetric, &'static [u8])> {
         let index = self.codepoints.binary_search(&codepoint).ok()?;
         let metric = self.metrics.get(index)?;
-        Some((
-            metric,
-            &self.bitmap[metric.offset..metric.offset + metric.len],
-        ))
+        let offset = metric.offset as usize;
+        Some((metric, &self.bitmap[offset..offset + metric.len as usize]))
     }
 
     pub fn kerning_adjust_fp(&self, left: u16, right: u16) -> i16 {
