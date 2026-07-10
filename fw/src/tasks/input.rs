@@ -28,10 +28,17 @@ const REPEAT_COOLDOWN_TICKS: u8 = 32;
 const NAV_BACK_MIN_MV: u16 = 2400;
 const NAV_BACK_MAX_MV: u16 = 2700;
 const RAW_LOG_TICKS: u8 = 67;
-// A dead gauge fails on every 15 ms poll; log the first error (with its
-// kind) and then one line per ~10 s instead of ~66 lines/s.
+// Battery moves over minutes, not ticks: sample the gauge/ADC once per
+// ~3 s instead of at the top of every 15 ms tick. On the X3 each sample
+// is two clock-stretched BQ27220 write_reads (up to ~5 ms each behind the
+// raised bus timeout), awaited ahead of the button ADC reads — per-tick
+// sampling cost input jitter and standing I2C traffic for a value the UI
+// hysteresis-holds anyway. Buttons still sample every tick.
+const BATTERY_SAMPLE_TICKS: u32 = 200;
+// A dead gauge fails once per battery sample; log the first error (with
+// its kind) and then one line per ~minute instead of one per sample.
 #[cfg(feature = "device-x3")]
-const GAUGE_ERR_LOG_TICKS: u32 = 667;
+const GAUGE_ERR_LOG_SAMPLES: u32 = 20;
 
 #[derive(Clone, Copy)]
 struct Band {
@@ -144,12 +151,20 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
     let mut reported_percent: Option<u8> = None;
     let mut battery_seeded = false;
     let mut gauge_failures: u32 = 0;
+    // (mv, percent, aux) from the most recent battery sample; ticks between
+    // samples reuse it. Tick 0 reads immediately so the boot seed below
+    // still pushes a real reading before the first paint.
+    let mut battery: (u16, u8, u16) = (0, 100, 0);
+    let mut battery_ticks: u32 = 0;
 
     loop {
         Timer::after_millis(POLL_MS).await;
 
-        let (battery_mv, raw_percent, aux) =
-            read_power(&mut adc, &mut pins, &mut gauge_failures).await;
+        if battery_ticks == 0 {
+            battery = read_power(&mut adc, &mut pins, &mut gauge_failures).await;
+        }
+        battery_ticks = (battery_ticks + 1) % BATTERY_SAMPLE_TICKS;
+        let (battery_mv, raw_percent, aux) = battery;
         let sample = RawSample {
             aux,
             nav: read_adc(&mut adc, &mut pins.nav_pin).await,
@@ -243,7 +258,7 @@ async fn read_power(
         }
         Err(err) => {
             *gauge_failures = gauge_failures.saturating_add(1);
-            if *gauge_failures == 1 || (*gauge_failures).is_multiple_of(GAUGE_ERR_LOG_TICKS) {
+            if *gauge_failures == 1 || (*gauge_failures).is_multiple_of(GAUGE_ERR_LOG_SAMPLES) {
                 esp_println::println!(
                     "input: bq27220 read failed ({:?}, {} consecutive)",
                     err,

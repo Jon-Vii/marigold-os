@@ -49,7 +49,7 @@ static EPUB_SCRATCH: static_cell::StaticCell<ReaderCacheScratch<'static>> =
     static_cell::StaticCell::new();
 
 #[embassy_executor::task]
-pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
+pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool) {
     esp_println::println!("display: started");
 
     static FB: static_cell::StaticCell<Framebuffer> = static_cell::StaticCell::new();
@@ -63,7 +63,15 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
     // Storage-command admission for the sync session lifecycle; the loan
     // transition and refusal rules live in app-core with the contracts.
     let mut sync_session = SyncSession::default();
-    let mut refresh_planner = RefreshPlanner::new();
+    // On a deep-sleep (Power button) wake the panel still shows the sleep
+    // screen: deep_sleep_wake is true only when the RTC wake cause is the
+    // armed GPIO *and* the pre-sleep handshake recorded that the sleep frame
+    // settled on the panel (see sleep_marker). The seeded planner then picks
+    // the ~1.5 s one-flicker FastClean for the wake render instead of the
+    // ~3.5 s multi-flash Full. Any other boot — battery pull, crash, software
+    // reset, or a sleep whose final flush failed — leaves the seed false and
+    // keeps the full waveform for unknown panel contents.
+    let mut refresh_planner = RefreshPlanner::new().with_panel_shows_sleep_screen(deep_sleep_wake);
     let mut pending_progress: Option<AppStateRecord> = None;
     let mut last_progress_write: Option<Instant> = None;
     // STATE.BIN is consulted once per boot, after the first catalog with
@@ -85,14 +93,21 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
         ConstStaticCell::new(crate::custom_font::MetricCache::new());
     let font_metrics = FONT_METRICS.take();
 
-    esp_println::println!("display: init start");
-    display_flush::init_panel(&mut epd).await;
-    esp_println::println!("display: init complete");
+    // No panel init here: the first-render guard in the loop below (fresh
+    // planner — screen off, no last request) owns the boot init, exactly as
+    // it already owned re-init after a display sleep. Initializing at task
+    // start too made every boot's first render pay reset + init twice (on
+    // the X3 that second pass re-whitens both ~52 KB DTM planes).
 
     // One-shot firmware self-update: if the card holds a pending image, flash it
     // into the inactive OTA slot and reboot into it before the reader starts.
     // Runs here because SD access lives behind this task's shared SPI bus, and
-    // the radio is still idle so the flash writes are safe.
+    // the radio is still idle so the flash writes are safe. Runs on every boot,
+    // deep-sleep wakes included: the card is user-removable, so an update can
+    // be staged offline while the device sleeps and arrive through a Power-
+    // button wake — wifi-staged updates are not the only source. The no-
+    // trigger probe costs one failed open on the mounted root, and the cold
+    // card init it pays is one the first render's SD reads would pay anyway.
     match crate::sd_session::with_root(
         &mut epd,
         &mut sd_cs,
@@ -173,6 +188,11 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                 }
                 let layout_ms = layout_start.elapsed().as_millis();
 
+                // Sole panel-init site: true for a boot's first render (fresh
+                // planner) and again after any display sleep — record_sleep
+                // clears last_request, which also covers the aborted-sleep
+                // path where a late button press interrupts the handshake
+                // after the panel already powered down.
                 if !refresh_planner.screen_on() && refresh_planner.last_request().is_none() {
                     esp_println::println!("display: wake init start");
                     display_flush::init_panel(&mut epd).await;
@@ -300,27 +320,33 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                     false
                 };
                 prev_prestaged = false;
-                if display_flush::sleep_panel(&mut epd).await.is_ok() {
-                    if sleep_frame_settled {
-                        refresh_planner.record_sleep();
-                    }
-                    send_required_display_event(&DisplayEvent::Asleep);
-                    let _ = POWER_EVENTS.try_send(PowerEvent::DisplayAsleep);
-                    esp_println::println!(
-                        "bench: sleep phase=complete ok=true elapsed_ms={} t_ms={}",
-                        sleep_start.elapsed().as_millis(),
-                        Instant::now().as_millis(),
-                    );
-                } else {
+                let panel_slept = display_flush::sleep_panel(&mut epd).await.is_ok();
+                if !panel_slept {
                     esp_println::println!("display: sleep command failed");
-                    send_required_display_event(&DisplayEvent::Asleep);
-                    let _ = POWER_EVENTS.try_send(PowerEvent::DisplayAsleep);
-                    esp_println::println!(
-                        "bench: sleep phase=complete ok=false elapsed_ms={} t_ms={}",
-                        sleep_start.elapsed().as_millis(),
-                        Instant::now().as_millis(),
-                    );
                 }
+                // Whenever the panel actually slept the planner must know the
+                // screen is off — an aborted handshake (a late button press
+                // beating DisplayAsleep) otherwise renders to a powered-down
+                // panel without re-init. The settled flag rides along so a
+                // failed flush wakes with the deep full waveform, not a fast
+                // clean over stale pixels.
+                if panel_slept {
+                    refresh_planner.record_sleep(sleep_frame_settled);
+                }
+                // Persist whether the panel really holds the sleep frame
+                // before DisplayAsleep releases the power task to cut power:
+                // the next boot's GPIO wake seeds its fast-wake planner from
+                // this marker, and a flush or panel-sleep failure must leave
+                // it false so that boot falls back to the full waveform.
+                crate::sleep_marker::record_sleep_image(panel_slept && sleep_frame_settled);
+                send_required_display_event(&DisplayEvent::Asleep);
+                let _ = POWER_EVENTS.try_send(PowerEvent::DisplayAsleep);
+                esp_println::println!(
+                    "bench: sleep phase=complete ok={} elapsed_ms={} t_ms={}",
+                    panel_slept,
+                    sleep_start.elapsed().as_millis(),
+                    Instant::now().as_millis(),
+                );
             }
             Either::Second(StorageCommand::ReceiveUpload) => {
                 if sync_session.admits(&StorageCommand::ReceiveUpload) {

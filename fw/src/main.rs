@@ -102,6 +102,7 @@ mod reader_cache_files;
 mod reader_layout;
 mod reader_store;
 mod sd_session;
+mod sleep_marker;
 mod sync_mem;
 pub mod tasks;
 pub mod upload;
@@ -163,6 +164,25 @@ fn main() -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(esp_hal::clock::CpuClock::_160MHz);
     let peripherals = esp_hal::init(config);
     esp_println::println!("calendula-os: boot");
+
+    // Deep sleep is terminal, so waking is this cold boot; the RTC wake
+    // cause and RTC RAM are its only trace. Fast wake needs both: the
+    // Power-button (GPIO) wake cause proves how the chip woke, and the
+    // sleep_marker records that the pre-sleep handshake actually settled
+    // the sleep frame on the panel — a failed flush still powers down, so
+    // the wake cause alone can't vouch for the pixels. Only when both hold
+    // does the display task seed its refresh planner for the fast wake
+    // waveform. Battery pulls, crashes, and software resets read false.
+    // The marker is consumed unconditionally so it never outlives one boot.
+    let woke_by_button = hal_ext::rtc::woke_from_deep_sleep_gpio();
+    let sleep_image_settled = sleep_marker::take_sleep_image_settled();
+    let deep_sleep_wake = woke_by_button && sleep_image_settled;
+    esp_println::println!(
+        "main: deep_sleep_wake={} (gpio={}, sleep_image={})",
+        deep_sleep_wake,
+        woke_by_button,
+        sleep_image_settled
+    );
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let sw_ints = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
@@ -298,7 +318,7 @@ fn main() -> ! {
             );
         }
         esp_println::println!("main: spawn display");
-        spawner.spawn(tasks::display::run(epd_bus, sd_cs).unwrap());
+        spawner.spawn(tasks::display::run(epd_bus, sd_cs, deep_sleep_wake).unwrap());
         esp_println::println!("main: spawn power");
         spawner.spawn(tasks::power::run(peripherals.LPWR).unwrap());
         esp_println::println!("main: spawn app");

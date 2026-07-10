@@ -319,7 +319,7 @@ impl WebEmulator {
         let request = self.state.render_request(RenderKind::Page);
         self.draw_shell(request, true);
         self.blit();
-        self.planner.record_sleep();
+        self.planner.record_sleep(true);
         self.last_refresh = RefreshMode::Full as u32 + 1;
         self.frame_seq = self.frame_seq.wrapping_add(1);
     }

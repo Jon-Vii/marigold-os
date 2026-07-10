@@ -6,6 +6,22 @@ use core::time::Duration;
 use esp_hal::gpio::RtcPinWithResistors;
 use esp_hal::rtc_cntl::sleep::{RtcioWakeupSource, TimerWakeupSource, WakeupLevel};
 use esp_hal::rtc_cntl::Rtc;
+use esp_hal::system::SleepSource;
+
+/// Whether this boot is a deep-sleep wake triggered by the armed RTC GPIO —
+/// on this firmware, the Power button `enter_deep_sleep_button` arms.
+///
+/// Deep sleep is terminal (the chip resets into `main`), so the wake cause
+/// is only readable here, at boot. The check is strict on purpose:
+/// `wakeup_cause()` reports `Gpio` only when the reset reason is the
+/// deep-sleep reset *and* the GPIO trigger fired, so battery pulls, crashes,
+/// watchdog resets, and software resets (OTA staging) all report other
+/// causes and read as `false`. Callers use this to trust panel contents the
+/// sleep path drew before powering down.
+pub fn woke_from_deep_sleep_gpio() -> bool {
+    // SleepSource carries no PartialEq upstream; match instead of `==`.
+    matches!(esp_hal::rtc_cntl::wakeup_cause(), SleepSource::Gpio)
+}
 
 /// Enters deep sleep with `wake_pin` (the active-low Power button) as the wake
 /// source. The chip draws ~10–15 µA until the button is pressed, then resets

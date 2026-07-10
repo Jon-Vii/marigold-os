@@ -171,6 +171,22 @@ impl RefreshPlanner {
         self
     }
 
+    /// Seeds a fresh planner with the knowledge that the panel already shows
+    /// the sleep screen. Deep sleep is terminal — waking reboots the chip and
+    /// builds a new planner — but the only deep-sleep entry path draws the
+    /// sleep screen and waits for the panel to settle before cutting power,
+    /// so on a deep-sleep wake the panel contents are known by construction
+    /// and the first render can take the one-flicker clean instead of the
+    /// multi-flash full waveform. Callers must gate the seed strictly on the
+    /// deep-sleep wake cause *and* on a persisted record that the sleep
+    /// frame actually settled: the sleep path still powers down when its
+    /// final flush fails, and any other cold boot (battery pull, crash,
+    /// software reset) leaves unknown pixels that only `Full` clears.
+    pub const fn with_panel_shows_sleep_screen(mut self, shows_sleep_screen: bool) -> Self {
+        self.panel_shows_sleep_screen = shows_sleep_screen;
+        self
+    }
+
     pub const fn screen_on(&self) -> bool {
         self.screen_on
     }
@@ -231,11 +247,18 @@ impl RefreshPlanner {
         }
     }
 
-    pub fn record_sleep(&mut self) {
+    /// Records the panel powering down at the end of the sleep handshake.
+    /// Clearing `last_request` is what makes the next render re-init the
+    /// panel, so this must run whenever the panel actually slept — even if
+    /// the sleep-frame flush failed. `panel_shows_sleep_screen` carries that
+    /// flush outcome: `true` lets the wake render take the one-flicker
+    /// clean, `false` (stale pixels under a failed flush) keeps the deep
+    /// full waveform that unknown panel contents require.
+    pub fn record_sleep(&mut self, panel_shows_sleep_screen: bool) {
         self.screen_on = false;
         self.fast_refreshes = 0;
         self.last_request = None;
-        self.panel_shows_sleep_screen = true;
+        self.panel_shows_sleep_screen = panel_shows_sleep_screen;
     }
 
     fn needs_clean_library_refresh(request: RenderRequest, last: RenderRequest) -> bool {
@@ -585,7 +608,10 @@ pub enum SyncCommand {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PowerEvent {
-    Activity,
+    /// User input landed; carries the view the input left the app in so the
+    /// power task can tier its idle timeout (long leash while Reading,
+    /// short on the shell views).
+    Activity(AppView),
     DisplaySettled,
     DisplayAsleep,
     SleepNow,
@@ -2140,7 +2166,7 @@ mod tests {
 
         // After a display sleep the panel shows the sleep screen the
         // firmware drew, so wake also needs only the one-flicker clean.
-        planner.record_sleep();
+        planner.record_sleep(true);
         assert_eq!(planner.mode_for(request), RefreshMode::FastClean);
     }
 
@@ -2154,13 +2180,62 @@ mod tests {
         planner.record_render(request, RefreshMode::Full);
 
         // Wake after sleep: known sleep-screen contents, one-flicker clean.
-        planner.record_sleep();
+        planner.record_sleep(true);
         assert_eq!(planner.mode_for(request), RefreshMode::FastClean);
         planner.record_render(request, RefreshMode::FastClean);
-        planner.record_sleep();
+        planner.record_sleep(true);
+
+        // A sleep whose final flush failed still powers the panel down, so
+        // the screen is off and the next render re-inits — but the pixels
+        // underneath are stale, and the wake render must pay the deep full
+        // waveform instead of fast-cleaning over them.
+        let mut failed_flush = RefreshPlanner::new();
+        failed_flush.record_render(request, RefreshMode::Full);
+        failed_flush.record_sleep(false);
+        assert!(!failed_flush.screen_on());
+        assert_eq!(failed_flush.last_request(), None);
+        assert_eq!(failed_flush.mode_for(request), RefreshMode::Full);
 
         // Disabling fast refresh falls back to the deep full everywhere.
         let conservative = RefreshPlanner::new().with_fast_refresh_enabled(false);
+        assert_eq!(conservative.mode_for(request), RefreshMode::Full);
+    }
+
+    #[test]
+    fn refresh_plan_seeded_deep_sleep_wake_uses_fast_clean() {
+        let request = ReaderState::boot().render_request(RenderKind::Boot);
+
+        // A deep-sleep wake is a cold boot with a fresh planner, but the
+        // panel still shows the sleep screen the firmware drew before
+        // powering down; the seed lets the wake render take the one-flicker
+        // clean instead of the multi-flash full waveform.
+        let mut planner = RefreshPlanner::new().with_panel_shows_sleep_screen(true);
+        assert_eq!(planner.mode_for(request), RefreshMode::FastClean);
+
+        // The seed is consumed by the first render: from here the planner
+        // behaves exactly like an in-session one — the post-boot cleanup
+        // pass, then fast differentials for same-context turns.
+        planner.record_render(request, RefreshMode::FastClean);
+        let mut page = request;
+        page.kind = RenderKind::Page;
+        assert_eq!(planner.mode_for(page), RefreshMode::FastClean);
+        planner.record_render(page, RefreshMode::FastClean);
+        page.selection = 1;
+        assert_eq!(planner.mode_for(page), RefreshMode::Fast);
+
+        // An unseeded cold boot (battery pull, crash, software reset) still
+        // pays the deep full waveform — panel contents are unknown.
+        assert_eq!(
+            RefreshPlanner::new()
+                .with_panel_shows_sleep_screen(false)
+                .mode_for(request),
+            RefreshMode::Full
+        );
+
+        // With fast refresh disabled the seed is ignored.
+        let conservative = RefreshPlanner::new()
+            .with_panel_shows_sleep_screen(true)
+            .with_fast_refresh_enabled(false);
         assert_eq!(conservative.mode_for(request), RefreshMode::Full);
     }
 

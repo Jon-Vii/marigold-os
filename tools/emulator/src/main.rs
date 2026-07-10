@@ -388,7 +388,7 @@ impl Emulator {
         self.prev_fb.copy_from(&self.fb);
         self.prev_prestaged = false;
         self.panel.deep_sleep().expect("panel deep sleep");
-        self.refresh_planner.record_sleep();
+        self.refresh_planner.record_sleep(true);
     }
 }
 

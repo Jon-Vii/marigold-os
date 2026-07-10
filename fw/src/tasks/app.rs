@@ -101,10 +101,13 @@ pub async fn run() {
                     continue;
                 }
 
-                let _ = POWER_EVENTS.try_send(PowerEvent::Activity);
                 let previous = state;
                 let previous_persisted = state.persisted();
                 state = state.apply_input(ctx, event);
+                // Activity carries the post-input view so entering a view
+                // immediately gets that view's idle leash (e.g. opening a
+                // book starts the long Reading timeout right away).
+                let _ = POWER_EVENTS.try_send(PowerEvent::Activity(state.view));
                 let next_persisted = state.persisted();
                 if previous.type_settings() != state.type_settings()
                     || app_core::is_portrait(previous.orientation)

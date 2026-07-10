@@ -600,7 +600,7 @@ flash/NVM fallback remains separate from the record format.
 | | |
 |---|---|
 | Page turn | 473 ms end-to-end; 421 ms of that is the panel's rated fast waveform |
-| Wake from sleep | one flicker, ~1.5 s |
+| Wake from sleep | one flicker, ~1.5 s (deep-sleep Power-button wake only: the boot reads the RTC wake cause plus an RTC-RAM marker the sleep handshake writes after the sleep frame settles, and seeds the refresh planner with the sleep screen it knows the panel holds; a battery pull, crash, or a sleep whose final flush failed boots with unknown panel contents and pays the full 3.5 s) |
 | Cold-boot full refresh | 3.5 s |
 | Reopen a cached book | tens of milliseconds |
 | RAM | 400 KB SRAM, no PSRAM |
