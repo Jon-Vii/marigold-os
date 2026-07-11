@@ -22,6 +22,7 @@ display = { path = "../display" }
 ui = { path = "../ui" }
 proto = { path = "../proto" }
 hal-ext = { path = "../hal-ext" }
+upload-store = { path = "../upload-store" }
 
 embassy-executor  = "0.10.0"
 embassy-time      = "0.5.1"

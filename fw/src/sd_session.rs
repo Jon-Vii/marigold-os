@@ -7,7 +7,7 @@ use embedded_hal::digital::OutputPin;
 use embedded_hal::spi::{Operation, SpiBus as BlockingSpiBus, SpiDevice};
 use embedded_sdmmc::sdcard::CardType;
 use embedded_sdmmc::{Block, BlockCount, BlockDevice, BlockIdx};
-use embedded_sdmmc::{Directory, Mode, SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
+use embedded_sdmmc::{Directory, SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
 use esp_hal::gpio::Output;
 use esp_hal::spi::master::{Config as SpiConfig, SpiDmaBus};
 use esp_hal::time::Rate;
@@ -479,7 +479,7 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) -
                 root.delete_file_in_dir(begin.name.as_str()).is_ok()
             };
             if removed && begin.in_books {
-                crate::reader_cache_files::delete_upload_sidecars(&root, begin.name.as_str());
+                upload_store::delete_upload_sidecars(&root, begin.name.as_str());
             }
             removed
         } else {
@@ -493,27 +493,6 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) -
         );
         UPLOAD_RESULTS.send(ok).await;
     }
-}
-
-/// Collision-probe window: how many consecutive hash-tail slots an upload
-/// examines. Uploads always land inside this window (at its first empty
-/// slot), so scanning the whole window finds every surviving same-identity
-/// copy — the invariant that makes replacement sound. It holds for any size,
-/// but only if the window never shrinks once a release has placed books with
-/// it; widening is always safe. 16 tolerates a 15-book tail-collision
-/// cluster, far beyond what 4 base-36 hash digits make plausible, while
-/// keeping the per-upload probe cost and the obsolete-tail buffer small.
-const UPLOAD_PROBE_WINDOW: usize = 16;
-
-fn suffixed_name(prefix4: &str, tail: u32) -> UploadName {
-    let digits = crate::upload::base36_tail(tail);
-    let mut name = UploadName::new();
-    let _ = name.push_str(prefix4);
-    for digit in digits {
-        let _ = name.push(digit as char);
-    }
-    let _ = name.push_str(".EPU");
-    name
 }
 
 async fn write_one_book<
@@ -531,116 +510,37 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let mut candidate_name = begin.name.clone();
-    let mut tail = 0u32;
-    for c in candidate_name.as_str()[4..8].chars() {
-        tail = tail * 36
-            + match c {
-                '0'..='9' => (c as u8 - b'0') as u32,
-                'A'..='Z' => (c as u8 - b'A' + 10) as u32,
-                _ => 0,
-            };
-    }
-
-    let mut obsolete_tails = heapless::Vec::<u32, UPLOAD_PROBE_WINDOW>::new();
-    let mut first_empty_name = None;
-
-    // Scan the whole window with no early exit: a deletion can open an empty
-    // slot in front of a surviving copy, so the first empty slot proves
-    // nothing about later ones. Cost per upload is UPLOAD_PROBE_WINDOW
-    // existence probes plus one identity read per occupied slot — noise next
-    // to streaming the book body.
-    for _ in 0..UPLOAD_PROBE_WINDOW {
-        match books.open_file_in_dir(candidate_name.as_str(), Mode::ReadOnly) {
-            Ok(existing_file) => {
-                drop(existing_file);
-
-                // Read the existing stashed identity to compare exact logical filename
-                match crate::reader_cache_files::read_upload_identity(root, candidate_name.as_str())
-                {
-                    Ok(Some(existing_identity)) => {
-                        if existing_identity == begin.identity_hash {
-                            // Same logical filename; the old copy is replaced
-                            // only after the new data lands whole in an empty
-                            // slot, so a failed transfer never costs it.
-                            let _ = obsolete_tails.push(tail);
-                        }
-                    }
-                    Ok(None) => {
-                        // No identity (absent or malformed sidecar): treat as a
-                        // different file. A malformed sidecar never heals, so
-                        // matching it can't be trusted and aborting would block
-                        // this probe window forever; the worst case here is a
-                        // visible duplicate the user can delete.
-                    }
-                    Err(_) => {
-                        // I/O error reading the identity sidecar. Abort.
-                        drain_until_end().await;
-                        return None;
-                    }
-                }
-            }
-            Err(embedded_sdmmc::Error::NotFound) => {
-                // No existing file. Remember the first empty slot we find.
-                if first_empty_name.is_none() {
-                    first_empty_name = Some(candidate_name.clone());
-                }
-            }
-            Err(_) => {
-                // I/O error checking if the file exists. Abort.
-                drain_until_end().await;
-                return None;
-            }
-        }
-
-        // Genuinely different filename (or manually-copied file).
-        // Increment the suffix and try the next candidate.
-        tail = (tail + 1) % 36u32.pow(4);
-        candidate_name = suffixed_name(&begin.name.as_str()[0..4], tail);
-    }
-
-    // The data always streams into an empty slot, never over the existing
-    // book: embedded-sdmmc has no rename, so replacing in place would
-    // truncate the old copy before the new one is known good. The old book
-    // (if any) is deleted only after the write completes.
-    let target_name = first_empty_name;
-    let mut file_to_write = None;
-
-    if let Some(name) = target_name.as_ref() {
-        // Write sidecars before creating the book data
-        let sidecars_ok = crate::reader_cache_files::write_upload_label(
-            root,
-            name.as_str(),
-            begin.label.as_str(),
-        ) && crate::reader_cache_files::write_upload_identity(
-            root,
-            name.as_str(),
-            begin.identity_hash,
-        );
-
-        if sidecars_ok {
-            if let Ok(file) = books.open_file_in_dir(name.as_str(), Mode::ReadWriteCreateOrTruncate)
-            {
-                file_to_write = Some(file);
-            }
-        }
-        if file_to_write.is_none() {
-            // Don't leave sidecars for a slot that never got its book.
-            crate::reader_cache_files::delete_upload_sidecars(root, name.as_str());
-        }
-    }
-
-    let Some(file) = file_to_write else {
+    // The probe/sidecar/replace state machine lives in upload-store (where
+    // the host fault-injection tests exercise it); this shell owns only the
+    // chunk streaming between begin and commit/abort.
+    let begun = upload_store::PendingUpload::begin(
+        root,
+        books,
+        &begin.name,
+        begin.identity_hash,
+        begin.label.as_str(),
+    );
+    let Ok(pending) = begun else {
         drain_until_end().await;
         return None;
     };
+    let malformed = pending.skipped_malformed_sidecars();
+    if malformed > 0 {
+        esp_println::println!(
+            "upload: {} malformed identity sidecar(s) treated as absent",
+            malformed
+        );
+    }
     let mut failed = false;
     let mut aborted = false;
     loop {
         let chunk = UPLOAD_CHUNKS.receive().await;
         if !failed && !chunk.abort {
             if let Some(buffer) = &chunk.buffer {
-                if file.write(&buffer[..chunk.len.min(buffer.len())]).is_err() {
+                if pending
+                    .write(&buffer[..chunk.len.min(buffer.len())])
+                    .is_err()
+                {
                     failed = true;
                 }
             }
@@ -652,29 +552,13 @@ where
             break;
         }
     }
-    if file.close().is_err() {
-        failed = true;
-    }
     if failed || aborted {
-        if let Some(name) = target_name.as_ref() {
-            if books.delete_file_in_dir(name.as_str()).is_ok() {
-                crate::reader_cache_files::delete_upload_sidecars(root, name.as_str());
-            }
-        }
+        pending.abort(root, books);
         return None;
     }
-    // The new copy is whole; retire the replaced books. Sidecars go only if
-    // the file itself went, so a failed delete stays identity-matched and
-    // gets retried by the next re-upload.
-    for obsolete_tail in obsolete_tails {
-        let old = suffixed_name(&begin.name.as_str()[0..4], obsolete_tail);
-
-        if books.delete_file_in_dir(old.as_str()).is_ok() {
-            crate::reader_cache_files::delete_upload_sidecars(root, old.as_str());
-        }
-    }
-
-    target_name
+    // commit closes the file and retires the replaced copies only if the
+    // close succeeded; a failed close discards the target and returns None.
+    pending.commit(root, books)
 }
 
 /// Consumes one file's worth of chunks without a file to write into.

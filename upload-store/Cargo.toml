@@ -1,0 +1,14 @@
+[package]
+name = "upload-store"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Same pin as fw's; see fw/Cargo.toml for why this exact rev.
+embedded-sdmmc = { git = "https://github.com/rust-embedded-community/embedded-sdmmc-rs.git", rev = "d26892f7405469eba95741763ab39bda2239d5ec", default-features = false }
+heapless = "0.9.0"
+proto = { path = "../proto" }
+
+[dev-dependencies]
+# Formats the in-memory FAT image the fault-injection tests run against.
+fatfs = "0.3.6"

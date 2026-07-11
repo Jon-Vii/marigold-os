@@ -13,7 +13,6 @@
 // riscv32imc has no CAS; portable-atomic provides it on single-core.
 use portable_atomic::AtomicBool;
 
-pub(crate) use proto::upload::base36_tail;
 pub use proto::upload::{
     hash_identity, readable_filename, sanitized_name, UploadLabel, UploadName,
 };

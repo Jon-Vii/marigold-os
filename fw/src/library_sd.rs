@@ -436,11 +436,7 @@ where
         title,
     ) {
         Some(title.as_str())
-    } else if crate::reader_cache_files::read_upload_label(
-        root,
-        decoded.open_name.as_str(),
-        &mut raw_name,
-    ) {
+    } else if upload_store::read_upload_label(root, decoded.open_name.as_str(), &mut raw_name) {
         crate::reader_store::derive_catalog_label(
             raw_name.as_str(),
             decoded.open_name.as_str(),

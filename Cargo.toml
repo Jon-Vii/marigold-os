@@ -6,6 +6,7 @@ members = [
     "proto",
     "hal-ext",
     "fw",
+    "upload-store",
 ]
 resolver = "2"
 
