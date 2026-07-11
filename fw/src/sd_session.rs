@@ -505,6 +505,17 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) -
 /// keeping the per-upload probe cost and the obsolete-tail buffer small.
 const UPLOAD_PROBE_WINDOW: usize = 16;
 
+fn suffixed_name(prefix4: &str, tail: u32) -> UploadName {
+    let digits = crate::upload::base36_tail(tail);
+    let mut name = UploadName::new();
+    let _ = name.push_str(prefix4);
+    for digit in digits {
+        let _ = name.push(digit as char);
+    }
+    let _ = name.push_str(".EPU");
+    name
+}
+
 async fn write_one_book<
     D,
     T,
@@ -585,14 +596,7 @@ where
         // Genuinely different filename (or manually-copied file).
         // Increment the suffix and try the next candidate.
         tail = (tail + 1) % 36u32.pow(4);
-        let digits = crate::upload::base36_tail(tail);
-        let mut new_name = UploadName::new();
-        let _ = new_name.push_str(&begin.name.as_str()[0..4]);
-        for digit in digits {
-            let _ = new_name.push(digit as char);
-        }
-        let _ = new_name.push_str(".EPU");
-        candidate_name = new_name;
+        candidate_name = suffixed_name(&begin.name.as_str()[0..4], tail);
     }
 
     // The data always streams into an empty slot, never over the existing
@@ -663,13 +667,7 @@ where
     // the file itself went, so a failed delete stays identity-matched and
     // gets retried by the next re-upload.
     for obsolete_tail in obsolete_tails {
-        let digits = crate::upload::base36_tail(obsolete_tail);
-        let mut old = UploadName::new();
-        let _ = old.push_str(&begin.name.as_str()[0..4]);
-        for digit in digits {
-            let _ = old.push(digit as char);
-        }
-        let _ = old.push_str(".EPU");
+        let old = suffixed_name(&begin.name.as_str()[0..4], obsolete_tail);
 
         if books.delete_file_in_dir(old.as_str()).is_ok() {
             crate::reader_cache_files::delete_upload_sidecars(root, old.as_str());
