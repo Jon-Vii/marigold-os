@@ -130,12 +130,16 @@ wifi_task
 The wireless session is one-way and modal because the radio blob needs ~100 KB of
 heap this firmware does not have while reading. `fw::sync_mem` owns the
 plumbing: the display task dismantles the EPUB scratch into raw regions
-(`reader_cache::dismantle_scratch`), and the wifi task donates them plus a
-16 KB claim on the otherwise unused dram2 boot-loader shadow segment to
-esp-alloc. The previous-frame framebuffer also lives in dram2 now so
-esp-wifi's static demand fits in main DRAM with the ~41 KB stack region
-intact. The smaller scratch buffers are reused directly as TCP socket and
-HTTP buffers. Once loaned, the reader pipeline cannot come back: leaving
+(`reader_cache::dismantle_scratch`), and the wifi task donates them to
+esp-alloc. dram2 (the boot-loader shadow segment) no longer contributes a
+radio-heap share: it holds only the previous-frame framebuffer, packed
+against its top, and every byte underneath belongs to the main stack —
+`fw/build.rs` raises `_stack_start` over the freed bytes and asserts the
+reader's 27 KB deep-call floor. The radio makes do with the scratch
+regions alone, sized for the upload workload by the `ControllerConfig` in
+`tasks/wifi.rs`; heap slack is logged at join and after each upload so
+that budget stays observable. The smaller scratch buffers are reused
+directly as TCP socket and HTTP buffers. Once loaned, the reader pipeline cannot come back: leaving
 the Wireless screen after the radio ran maps to `SyncCommand::Exit`, which is
 a software reset; boot restore then reloads the saved position.
 
@@ -217,7 +221,7 @@ the single SPI owner, so display refresh and SD transactions cannot overlap, but
 the user-facing view is always drawn from the latest already-owned snapshot.
 SD/FAT access goes through an SD session: the board I/O task deselects the
 display, clocks the bus down for the card (400 kHz identification with wake
-clocks, then 20 MHz data), opens the FAT root, performs one storage action, and
+clocks, then 25 MHz data), opens the FAT root, performs one storage action, and
 restores 40 MHz display SPI before returning to EPD work. The card stays powered
 between sessions while the device is awake, so only the first session runs the
 full CMD0/ACMD41 init; later ones reuse the remembered card type and skip the

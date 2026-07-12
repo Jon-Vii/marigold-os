@@ -18,7 +18,7 @@ use esp_hal::Async;
 /// clock, which on the X4 (SSD1677, 40 MHz) is out of SD spec entirely and
 /// what the read-retry machinery in the EPUB path was quietly absorbing.
 const SD_IDENT_FREQ_KHZ: u32 = 400;
-const SD_DATA_FREQ_MHZ: u32 = 20;
+const SD_DATA_FREQ_MHZ: u32 = 25;
 /// Restore frequency after SD access: the active panel's SPI clock. This
 /// MUST be per-panel — the UC8253 (X3) can't decode above ~20 MHz, so
 /// restoring the X4's 40 MHz leaves the panel deaf to every subsequent
@@ -128,11 +128,53 @@ pub(crate) struct SdSpiDevice<'a, SPI, CS> {
 
 /// Also sizes the shared bus's RX DMA buffer in main.rs: SD traffic is the
 /// only read path on SPI2 (the EPD is write-only), and every SD operation
-/// bounces through one of these chunks.
-pub(crate) const SD_SPI_CHUNK_BYTES: usize = 64;
+/// bounces through one of these chunks. Sized to one SD block so a 512-B
+/// data read/write is a single DMA transaction instead of eight; the
+/// extra ~448 B of DRAM comes out of the stack headroom build.rs asserts.
+pub(crate) const SD_SPI_CHUNK_BYTES: usize = 512;
 
 #[repr(align(4))]
 struct AlignedSdChunk([u8; SD_SPI_CHUNK_BYTES]);
+
+/// The one bounce chunk all SD SPI operations share. Static rather than a
+/// local so the 512-B block never lands on the reader's deep-call stack
+/// (the 27 KB link-time budget in build.rs is nearly spent); as .bss it is
+/// instead counted against the stack-headroom ASSERT. Sound for the same
+/// reason `sd_stats` uses plain load/store: every SD transaction runs on
+/// the storage/display task, and the borrows below never overlap.
+struct SdBounce {
+    chunk: core::cell::UnsafeCell<AlignedSdChunk>,
+    /// A shared static cannot rule out overlapping borrows at compile
+    /// time, so this flag turns any overlap (including reentrancy from
+    /// the callback) into a panic instead of aliased `&mut`s.
+    busy: portable_atomic::AtomicBool,
+}
+// Safety: only the single SD-owning task touches the chunk (see above),
+// and `with_sd_bounce` panics on overlapping access.
+#[allow(unsafe_code)]
+unsafe impl Sync for SdBounce {}
+static SD_BOUNCE: SdBounce = SdBounce {
+    chunk: core::cell::UnsafeCell::new(AlignedSdChunk([0xFF; SD_SPI_CHUNK_BYTES])),
+    busy: portable_atomic::AtomicBool::new(false),
+};
+
+/// Runs `f` with exclusive access to the shared bounce chunk, refilled
+/// with the 0xFF idle pattern SD cards expect on MOSI during reads. The
+/// closure signature keeps the borrow from escaping.
+#[allow(unsafe_code)]
+fn with_sd_bounce<R>(f: impl FnOnce(&mut AlignedSdChunk) -> R) -> R {
+    use portable_atomic::Ordering;
+    if SD_BOUNCE.busy.swap(true, Ordering::Acquire) {
+        panic!("sd bounce chunk borrowed twice");
+    }
+    // Safety: the busy flag above makes this the only live borrow, and
+    // it cannot outlive `f`.
+    let chunk = unsafe { &mut *SD_BOUNCE.chunk.get() };
+    chunk.0.fill(0xFF);
+    let result = f(chunk);
+    SD_BOUNCE.busy.store(false, Ordering::Release);
+    result
+}
 
 fn sd_spi_pace(iterations: u32) {
     for _ in 0..iterations {
@@ -185,18 +227,21 @@ where
 {
     fn read_with_sd_clocks(&mut self, buffer: &mut [u8]) -> Result<(), SPI::Error> {
         for chunk in buffer.chunks_mut(SD_SPI_CHUNK_BYTES) {
-            let mut bounce = AlignedSdChunk([0xFF; SD_SPI_CHUNK_BYTES]);
-            self.spi.transfer_in_place(&mut bounce.0[..chunk.len()])?;
-            chunk.copy_from_slice(&bounce.0[..chunk.len()]);
+            with_sd_bounce(|bounce| {
+                self.spi.transfer_in_place(&mut bounce.0[..chunk.len()])?;
+                chunk.copy_from_slice(&bounce.0[..chunk.len()]);
+                Ok(())
+            })?;
         }
         Ok(())
     }
 
     fn write_chunked(&mut self, buffer: &[u8]) -> Result<(), SPI::Error> {
         for chunk in buffer.chunks(SD_SPI_CHUNK_BYTES) {
-            let mut bounce = AlignedSdChunk([0xFF; SD_SPI_CHUNK_BYTES]);
-            bounce.0[..chunk.len()].copy_from_slice(chunk);
-            self.spi.transfer_in_place(&mut bounce.0[..chunk.len()])?;
+            with_sd_bounce(|bounce| {
+                bounce.0[..chunk.len()].copy_from_slice(chunk);
+                self.spi.transfer_in_place(&mut bounce.0[..chunk.len()])
+            })?;
         }
         Ok(())
     }
@@ -210,11 +255,13 @@ where
             .chunks_mut(SD_SPI_CHUNK_BYTES)
             .zip(write_common.chunks(SD_SPI_CHUNK_BYTES))
         {
-            let mut bounce = AlignedSdChunk([0xFF; SD_SPI_CHUNK_BYTES]);
-            bounce.0[..write_chunk.len()].copy_from_slice(write_chunk);
-            self.spi
-                .transfer_in_place(&mut bounce.0[..write_chunk.len()])?;
-            read_chunk.copy_from_slice(&bounce.0[..read_chunk.len()]);
+            with_sd_bounce(|bounce| {
+                bounce.0[..write_chunk.len()].copy_from_slice(write_chunk);
+                self.spi
+                    .transfer_in_place(&mut bounce.0[..write_chunk.len()])?;
+                read_chunk.copy_from_slice(&bounce.0[..read_chunk.len()]);
+                Ok(())
+            })?;
         }
         if !read_tail.is_empty() {
             self.read_with_sd_clocks(read_tail)?;
@@ -227,10 +274,12 @@ where
 
     fn transfer_in_place_chunked(&mut self, buffer: &mut [u8]) -> Result<(), SPI::Error> {
         for chunk in buffer.chunks_mut(SD_SPI_CHUNK_BYTES) {
-            let mut bounce = AlignedSdChunk([0xFF; SD_SPI_CHUNK_BYTES]);
-            bounce.0[..chunk.len()].copy_from_slice(chunk);
-            self.spi.transfer_in_place(&mut bounce.0[..chunk.len()])?;
-            chunk.copy_from_slice(&bounce.0[..chunk.len()]);
+            with_sd_bounce(|bounce| {
+                bounce.0[..chunk.len()].copy_from_slice(chunk);
+                self.spi.transfer_in_place(&mut bounce.0[..chunk.len()])?;
+                chunk.copy_from_slice(&bounce.0[..chunk.len()]);
+                Ok(())
+            })?;
         }
         Ok(())
     }
@@ -537,6 +586,13 @@ where
         let chunk = UPLOAD_CHUNKS.receive().await;
         if !failed && !chunk.abort {
             if let Some(buffer) = &chunk.buffer {
+                // One blocking whole-chunk write, on purpose. Pacing this
+                // as 512-B slices with a yield between them (to keep
+                // net_task fed under the theory that the 10-30 ms write
+                // starves TCP) was tried and measured on hardware
+                // 2026-07-11: it cost ~1 s per 3.2 MB upload and bought
+                // nothing — TCP rides out the stall via buffering. Don't
+                // reintroduce pacing without a timed upload A/B.
                 if pending
                     .write(&buffer[..chunk.len.min(buffer.len())])
                     .is_err()

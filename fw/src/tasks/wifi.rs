@@ -2,8 +2,8 @@
 //!
 //! Parked until the app sends `SyncCommand::Start`. The session is one
 //! way by design: it asks the display task to loan the reader's scratch
-//! memory (plus dram2) as radio heap, joins the saved network in STA
-//! mode, and serves the browser book shelf until the session ends; the
+//! memory as radio heap, joins the saved network in STA mode, and
+//! serves the browser book shelf until the session ends; the
 //! only path back to reading is the software reset on
 //! `SyncCommand::Exit`. With no saved network the session runs the
 //! AP-mode onboarding portal instead.
@@ -126,12 +126,13 @@ pub async fn run(spawner: Spawner, wifi: WIFI<'static>) {
 
     let rng = Rng::new();
     let seed = (u64::from(rng.random()) << 32) | u64::from(rng.random());
-    // The radio serves one short kosync exchange, not a throughput
-    // workload. Default buffering (10 static RX bufs at ~1.6 KB each, 32
-    // dynamic, AMPDU on) would blow the loaned heap, which also lost its
-    // dram2 share to the main stack (see sync_mem). These mirror the old
-    // ESP_WIFI_CONFIG_* compile-time trims that esp-radio no longer
-    // reads. Revisit for the AP file-upload phase.
+    // Deliberately trimmed, and re-validated on hardware 2026-07-11: an
+    // upload A/B (3.2 MB EPUB, X3) measured no win from 8/24 RX buffers
+    // + AMPDU-RX — throughput sits near 160 KB/s with either config, so
+    // radio RX is not the bottleneck — while the bigger buffers cost
+    // ~6.6 KB of the loaned heap at join. Before spending heap here
+    // again, first find what actually caps upload throughput (the
+    // per-upload heap log makes the slack observable).
     let radio_config = ControllerConfig::default()
         .with_static_rx_buf_num(4)
         .with_dynamic_rx_buf_num(8)
@@ -524,6 +525,13 @@ async fn stream_book(
     // Refill the pool for the next file.
     let result = UPLOAD_RESULTS.receive().await;
     crate::upload::UPLOAD_IN_FLIGHT.store(false, portable_atomic::Ordering::SeqCst);
+    // Heap slack per upload: the join-time log plus this one bound the
+    // radio buffering budget (AMPDU reorder buffers allocate under load).
+    esp_println::println!(
+        "upload: heap used={} free={}",
+        esp_alloc::HEAP.used(),
+        esp_alloc::HEAP.free()
+    );
     while pool.len() < 2 {
         match UPLOAD_RETURNS.try_receive() {
             Ok(buffer) => {
