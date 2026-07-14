@@ -375,6 +375,7 @@ impl WebEmulator {
             library_status: UiLibraryStatus::Ready,
             library_entries: &titles,
             library_window_start: 0,
+            firmware_entries: &[],
             chapters: &toc,
             chapters_window_start: 0,
             chapters_total: toc.len() as u16,

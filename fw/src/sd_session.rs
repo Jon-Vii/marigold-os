@@ -456,7 +456,7 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) -
     // New books invalidate the catalog snapshot: the next boot's cache
     // load misses and runs a full scan, which is how uploads surface.
     if let Ok(xteink) = root.open_dir("XTEINK") {
-        let _ = xteink.delete_file_in_dir("CATALOG.BIN");
+        let _ = remove_file_reclaiming_clusters(&xteink, "CATALOG.BIN");
         esp_println::println!("upload: catalog snapshot invalidated");
     }
     let books = match root.open_dir("BOOKS") {
@@ -474,9 +474,9 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) -
         let begin = UPLOAD_BEGINS.receive().await;
         let ok = if begin.delete {
             let removed = if begin.in_books {
-                books.delete_file_in_dir(begin.name.as_str()).is_ok()
+                remove_file_reclaiming_clusters(&books, begin.name.as_str())
             } else {
-                root.delete_file_in_dir(begin.name.as_str()).is_ok()
+                remove_file_reclaiming_clusters(&root, begin.name.as_str())
             };
             if removed {
                 crate::reader_cache_files::delete_upload_label(&root, begin.name.as_str());
@@ -503,6 +503,36 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) -
         );
         UPLOAD_RESULTS.send(ok).await;
     }
+}
+
+/// Remove a file without leaking its FAT cluster chain.
+///
+/// The pinned embedded-sdmmc delete operation only marks the directory entry
+/// deleted; it does not release the file's clusters. Truncating through the
+/// public API first releases that chain, after which deleting removes the now
+/// empty directory entry. Keep the file handle in its own scope so deletion
+/// cannot fail with `FileAlreadyOpen` and leave the zero-length entry behind.
+pub(crate) fn remove_file_reclaiming_clusters<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    directory: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    name: &str,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    {
+        let Ok(file) = directory.open_file_in_dir(name, Mode::ReadWriteTruncate) else {
+            return false;
+        };
+        drop(file);
+    }
+    directory.delete_file_in_dir(name).is_ok()
 }
 
 async fn write_one_book<
@@ -544,7 +574,7 @@ where
     }
     drop(file);
     if failed || aborted {
-        let _ = books.delete_file_in_dir(begin.name.as_str());
+        let _ = remove_file_reclaiming_clusters(books, begin.name.as_str());
         return false;
     }
     true

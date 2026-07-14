@@ -1,0 +1,29 @@
+# Settings opens a native firmware list, which uses the same wrapped browse
+# controls as Library and requires a separate confirmation press.
+
+[[steps]]
+button = "Next"
+
+# Firmware update is the eighth Settings row.
+[[steps]]
+button = "Previous"
+
+[[steps]]
+button = "Confirm"
+
+[[steps]]
+library = "FirmwareFiles"
+count = 3
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Confirm"
+
+[expect]
+view = "FirmwareUpdate"
+selection = 1
+firmware_count = 3
+firmware_status = "confirming"
+pending_storage = "ScanFirmwareFiles"

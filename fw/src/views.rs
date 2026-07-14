@@ -1,5 +1,7 @@
 use crate::reader_layout;
-use crate::reader_store::{BookLoadStatus, LibraryScanStatus, ReaderStore, LIBRARY_WINDOW};
+use crate::reader_store::{
+    BookLoadStatus, LibraryScanStatus, ReaderStore, LIBRARY_WINDOW, MAX_FIRMWARE_FILES,
+};
 use crate::{catalog, AppView, DisplayOrientation, ReaderSource, RenderRequest};
 use core::fmt::Write;
 use display::fb::Framebuffer;
@@ -24,12 +26,19 @@ pub(crate) fn render(fb: &mut Framebuffer, request: RenderRequest, sd_library: &
         draw_sd_reader_page(fb, request, sd_library);
     } else {
         let mut library_entries = [""; LIBRARY_WINDOW];
+        let mut firmware_entries = [""; MAX_FIRMWARE_FILES];
         let mut chapters = [UiTocItem {
             title: "",
             level: 1,
             page: 0,
         }; MAX_UI_CHAPTERS];
-        let model = ui_model(request, sd_library, &mut library_entries, &mut chapters);
+        let model = ui_model(
+            request,
+            sd_library,
+            &mut library_entries,
+            &mut firmware_entries,
+            &mut chapters,
+        );
         app_render::render_request(fb, request, &model);
     }
 
@@ -61,12 +70,19 @@ pub(crate) fn render_custom_reader_from_root(
 
 pub(crate) fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, sd_library: &ReaderStore) {
     let mut library_entries = [""; LIBRARY_WINDOW];
+    let mut firmware_entries = [""; MAX_FIRMWARE_FILES];
     let mut chapters = [UiTocItem {
         title: "",
         level: 1,
         page: 0,
     }; MAX_UI_CHAPTERS];
-    let model = ui_model(request, sd_library, &mut library_entries, &mut chapters);
+    let model = ui_model(
+        request,
+        sd_library,
+        &mut library_entries,
+        &mut firmware_entries,
+        &mut chapters,
+    );
     app_render::render_sleep(fb, request, &model);
 }
 
@@ -87,6 +103,7 @@ fn ui_model<'a>(
     request: RenderRequest,
     sd_library: &'a ReaderStore,
     library_entries: &'a mut [&'a str; LIBRARY_WINDOW],
+    firmware_entries: &'a mut [&'a str; MAX_FIRMWARE_FILES],
     chapters: &'a mut [UiTocItem<'a>; MAX_UI_CHAPTERS],
 ) -> UiRenderModel<'a> {
     // The resident list window over the streamed catalog: `library_entries[i]`
@@ -103,6 +120,18 @@ fn ui_model<'a>(
             } else {
                 entry.display_label.as_str()
             };
+    }
+    let firmware_count = sd_library
+        .firmware_files()
+        .len()
+        .min(firmware_entries.len());
+    for (index, entry) in sd_library
+        .firmware_files()
+        .iter()
+        .take(firmware_count)
+        .enumerate()
+    {
+        firmware_entries[index] = entry.display_name.as_str();
     }
     let (chapter_count, chapters_window_start, chapters_total) =
         fill_chapters(chapters, request, sd_library);
@@ -140,6 +169,7 @@ fn ui_model<'a>(
         library_status: ui_library_status(sd_library.status),
         library_entries: &library_entries[..library_count],
         library_window_start: window_start as u16,
+        firmware_entries: &firmware_entries[..firmware_count],
         chapters: &chapters[..chapter_count],
         chapters_window_start: chapters_window_start as u16,
         chapters_total: chapters_total.min(u16::MAX as usize) as u16,

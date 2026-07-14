@@ -214,6 +214,7 @@ pub struct Emulator {
     sleeping: bool,
     _sd_root: Option<PathBuf>,
     library_entries: Vec<String>,
+    firmware_entries: Vec<String>,
     last_storage: Option<StorageCommand>,
     sd_reader_status: EmulatedReaderStatus,
 }
@@ -238,6 +239,7 @@ impl Emulator {
             sleeping: false,
             _sd_root: sd_root,
             library_entries: Vec::new(),
+            firmware_entries: Vec::new(),
             last_storage: None,
             sd_reader_status: EmulatedReaderStatus::Empty,
         };
@@ -293,6 +295,12 @@ impl Emulator {
         if matches!(event, LibraryEvent::Loaded { .. }) {
             self.sd_reader_status = EmulatedReaderStatus::Ready;
         }
+        if let LibraryEvent::FirmwareFiles { count } = event {
+            self.firmware_entries.clear();
+            self.firmware_entries.extend(
+                (0..count).map(|index| format!("firmware-{}.bin", index + 1)),
+            );
+        }
         self.state = self.state.apply_library_event(self.ctx, event);
         self.render(app_core::RenderKind::Page);
     }
@@ -328,6 +336,8 @@ impl Emulator {
             Some(StorageCommand::LoanSyncMemory) => Some("LoanSyncMemory"),
             Some(StorageCommand::StoreWifiCredentials(_)) => Some("StoreWifiCredentials"),
             Some(StorageCommand::ForgetWifiCredentials) => Some("ForgetWifiCredentials"),
+            Some(StorageCommand::ScanFirmwareFiles) => Some("ScanFirmwareFiles"),
+            Some(StorageCommand::StageFirmwareUpdate { .. }) => Some("StageFirmwareUpdate"),
             Some(StorageCommand::ReceiveUpload) => Some("ReceiveUpload"),
             Some(StorageCommand::LoadChapters { .. }) => Some("LoadChapters"),
             Some(StorageCommand::JumpChapter { .. }) => Some("JumpChapter"),
@@ -356,7 +366,12 @@ impl Emulator {
             self.fb.clear(true);
             display::render::draw_ascii(&mut self.fb, "OPENING EPUB", 20, 72, false);
         } else {
-            crate::render::render_request(&mut self.fb, request, &self.library_entries);
+            crate::render::render_request(
+                &mut self.fb,
+                request,
+                &self.library_entries,
+                &self.firmware_entries,
+            );
         }
         let mode = self.refresh_planner.mode_for(request);
         let effective_mode = self
@@ -376,6 +391,7 @@ impl Emulator {
             &mut self.fb,
             self.state.render_request(app_core::RenderKind::Page),
             &self.library_entries,
+            &self.firmware_entries,
         );
         self.panel
             .flush(
@@ -396,6 +412,17 @@ fn storage_command_for_transition(
     previous: app_core::ReaderState,
     next: app_core::ReaderState,
 ) -> Option<StorageCommand> {
+    if next.view == AppView::FirmwareUpdate && previous.view != AppView::FirmwareUpdate {
+        return Some(StorageCommand::ScanFirmwareFiles);
+    }
+    if next.view == AppView::FirmwareUpdate
+        && previous.firmware_status != app_core::FirmwareUpdateStatus::Staging
+        && next.firmware_status == app_core::FirmwareUpdateStatus::Staging
+    {
+        return Some(StorageCommand::StageFirmwareUpdate {
+            index: next.selection,
+        });
+    }
     let index = ReaderSource::from_book_id(next.book_id).sd_index()?;
     if next.view != AppView::Reading {
         return None;

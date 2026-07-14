@@ -68,8 +68,7 @@ Produces local images in `target/release-images/`:
 
 - **`firmware.bin`** — app image for `ota_0`. Flash to `0x10000`. Updates the
   app in place and leaves the bootloader untouched. This is what the web
-  flasher, `esptool write_flash 0x10000`, and (once implemented) the in-app
-  updater consume.
+  flasher, `esptool write_flash 0x10000`, and in-app updater consume.
 - **`firmware-x3.bin`** — the same app image contract for X3 builds.
 - **`update.bin`** — byte-identical to `firmware.bin`, under the filename the
   stock OEM SD-card updater looks for. The OEM updater writes it to the app
@@ -169,6 +168,26 @@ Two mechanisms exist, both pioneered by CrossPoint:
 Once *any* build of this firmware is running, it can update itself from the card
 with no computer — this is what keeps a locked unit from being a one-way trip:
 
+### Settings picker
+
+Place one or more app-image `.BIN` files at the card root, then open
+**Settings → Firmware update**. The picker uses the same Previous/Next list
+controls as Library. Confirm selects an image; a second confirmation schedules
+it and restarts the device. The selected image remains on the card so one card
+can act as a reusable firmware shelf.
+
+The picker stores only the selected file's FAT 8.3 alias in
+`/XTEINK/FWPEND.BIN`. On the next boot the existing updater reopens that exact
+source, validates the complete ESP application image, writes the inactive OTA
+slot, and switches `otadata`. A failed or completed attempt clears only the
+pending-selection record.
+
+Only app images intended for the current X3/X4 should be selected. Generic ESP
+image validation proves integrity and partition fit, but cannot prove that a
+third-party image drives the correct panel or retains an SD recovery path.
+
+### Automatic trigger
+
 1. Copy a new app image to the card root as **`FWUPDATE.BIN`** (the file
    `tools/build-release.sh` produces for X4; the `FWUPDATE.BIN` name
    is the one-shot trigger, kept distinct from a permanent `update.bin` you may
@@ -224,6 +243,10 @@ Implemented and verified on host tooling:
       validated, written to the inactive OTA slot with `esp-storage`, selected
       via `otadata`, deleted, and the device resets into it. Only the inactive
       slot/sector are touched.
+- [x] **Settings firmware picker** — scans root-level `.BIN` app images into a
+      bounded native list, requires an explicit second confirmation, persists
+      the selected FAT alias, and reuses the boot-time validator/flasher while
+      leaving reusable source images on the card.
 - [x] **OTA rollback acknowledgement** (`fw::ota_update::mark_running_slot_valid`)
       — early boot rewrites an active `NEW`/`PENDING_VERIFY` select entry as
       `VALID`. This covers installs launched from CrossInk/CrossPoint's

@@ -1038,7 +1038,6 @@ where
                 library,
                 root,
                 sections_dir,
-                cache_key,
                 source_identity,
                 font_metrics: &mut *font_metrics,
                 sections: &mut *sections,
@@ -1467,7 +1466,6 @@ struct LibraryBlockSink<
     /// `None` when the cache directories could not be created — section
     /// writes then fail per section and the book publishes as partial.
     sections_dir: Option<&'r Directory<'r, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>,
-    cache_key: &'r str,
     source_identity: (u32, u32),
     font_metrics: &'a mut crate::custom_font::MetricCache,
     sections: &'a mut [BookV2SectionRecord; MAX_BOOK_SECTIONS],

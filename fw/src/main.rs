@@ -81,6 +81,7 @@ use tasks::input::InputPins;
 pub mod catalog;
 mod custom_font;
 mod display_flush;
+mod firmware_files;
 mod library_sd;
 mod ota_update;
 mod reader_cache;

@@ -4,7 +4,7 @@
 use display::font::{FontFamily, FontSize, FontWeight, LineSpacing, TypeSettings};
 use display::{epd::RefreshMode, Rect};
 
-pub const SETTINGS_ITEMS: u8 = 7;
+pub const SETTINGS_ITEMS: u8 = 8;
 pub const MAX_SD_CHAPTERS: usize = 128;
 pub const FIRST_SD_BOOK_ID: u32 = 2;
 
@@ -109,6 +109,17 @@ pub enum AppView {
     Chapters,
     Wireless,
     Settings,
+    FirmwareUpdate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FirmwareUpdateStatus {
+    Scanning,
+    Ready,
+    Empty,
+    Confirming,
+    Staging,
+    Failed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -268,6 +279,8 @@ pub struct RenderRequest {
     pub battery_mv: u16,
     pub battery_percent: u8,
     pub library_count: u16,
+    pub firmware_count: u16,
+    pub firmware_status: FirmwareUpdateStatus,
     pub sync_status: SyncStatus,
     /// Saved network name for the Wireless screen; len 0 when none.
     pub wifi_ssid: [u8; 32],
@@ -336,6 +349,14 @@ pub enum StorageCommand {
     /// the Wireless screen, which is only reachable before the radio
     /// starts, so it never runs during a sync session.
     ForgetWifiCredentials,
+    /// Scan the card root for app-image `.BIN` files shown by the firmware
+    /// update picker.
+    ScanFirmwareFiles,
+    /// Persist the selected firmware catalog entry and reboot into the
+    /// boot-time validator/flasher after the confirmation screen settles.
+    StageFirmwareUpdate {
+        index: u16,
+    },
     /// Enter the upload session: the display task parks on the upload
     /// channels and writes browser-sent books to /BOOKS until the
     /// session's reset. Sent by the wifi task at the first upload.
@@ -500,6 +521,10 @@ pub enum LibraryEvent {
     CustomFont {
         available: bool,
     },
+    FirmwareFiles {
+        count: u16,
+    },
+    FirmwareStageFailed,
     Restored {
         book_id: u32,
         chapter: u8,
@@ -642,6 +667,8 @@ pub struct ReaderState {
     pub battery_mv: u16,
     pub battery_percent: u8,
     pub library_count: u16,
+    pub firmware_count: u16,
+    pub firmware_status: FirmwareUpdateStatus,
     pub sd_page_count: u32,
     pub sd_chapter_count: u8,
     pub sd_chapter_pages: [u16; MAX_SD_CHAPTERS],
@@ -678,6 +705,8 @@ impl ReaderState {
             battery_mv: 0,
             battery_percent: 100,
             library_count: 0,
+            firmware_count: 0,
+            firmware_status: FirmwareUpdateStatus::Scanning,
             sd_page_count: 1,
             sd_chapter_count: 1,
             sd_chapter_pages: [0; MAX_SD_CHAPTERS],
@@ -883,11 +912,48 @@ impl ReaderState {
                 next.selection = wrap_prev(self.selection, SETTINGS_ITEMS as u16);
             }
             (AppView::Settings, Some(Button::Confirm)) => {
-                next = apply_setting(next);
+                if self.selection == 7 {
+                    next.view = AppView::FirmwareUpdate;
+                    next.selection = 0;
+                    next.firmware_count = 0;
+                    next.firmware_status = FirmwareUpdateStatus::Scanning;
+                } else {
+                    next = apply_setting(next);
+                }
             }
             (AppView::Settings, Some(Button::Back)) => {
                 next.view = AppView::Home;
                 next.selection = 0;
+            }
+            (AppView::FirmwareUpdate, Some(Button::Next | Button::PageNext)) => {
+                if self.firmware_status == FirmwareUpdateStatus::Ready {
+                    next.selection = wrap_next(self.selection, self.firmware_count.max(1));
+                }
+            }
+            (AppView::FirmwareUpdate, Some(Button::Previous | Button::PagePrevious)) => {
+                if self.firmware_status == FirmwareUpdateStatus::Ready {
+                    next.selection = wrap_prev(self.selection, self.firmware_count.max(1));
+                }
+            }
+            (AppView::FirmwareUpdate, Some(Button::Confirm)) => match self.firmware_status {
+                FirmwareUpdateStatus::Ready if self.firmware_count > 0 => {
+                    next.firmware_status = FirmwareUpdateStatus::Confirming;
+                }
+                FirmwareUpdateStatus::Confirming => {
+                    next.firmware_status = FirmwareUpdateStatus::Staging;
+                }
+                FirmwareUpdateStatus::Failed => {
+                    next.firmware_status = FirmwareUpdateStatus::Scanning;
+                }
+                _ => {}
+            },
+            (AppView::FirmwareUpdate, Some(Button::Back)) => {
+                if self.firmware_status == FirmwareUpdateStatus::Confirming {
+                    next.firmware_status = FirmwareUpdateStatus::Ready;
+                } else if self.firmware_status != FirmwareUpdateStatus::Staging {
+                    next.view = AppView::Settings;
+                    next.selection = 7;
+                }
             }
         }
 
@@ -973,6 +1039,20 @@ impl ReaderState {
                 if !available && self.font_family == FontFamily::Custom {
                     self.font_family = FontFamily::Literata;
                 }
+                self.dirty = Rect::FULL;
+            }
+            LibraryEvent::FirmwareFiles { count } => {
+                self.firmware_count = count;
+                self.selection = self.selection.min(count.saturating_sub(1));
+                self.firmware_status = if count == 0 {
+                    FirmwareUpdateStatus::Empty
+                } else {
+                    FirmwareUpdateStatus::Ready
+                };
+                self.dirty = Rect::FULL;
+            }
+            LibraryEvent::FirmwareStageFailed => {
+                self.firmware_status = FirmwareUpdateStatus::Failed;
                 self.dirty = Rect::FULL;
             }
             LibraryEvent::Restored {
@@ -1107,6 +1187,8 @@ impl ReaderState {
             battery_mv: self.battery_mv,
             battery_percent: self.battery_percent,
             library_count: self.library_count,
+            firmware_count: self.firmware_count,
+            firmware_status: self.firmware_status,
             sync_status: self.sync_status,
             wifi_ssid: self.wifi_ssid,
             wifi_ssid_len: self.wifi_ssid_len,
@@ -1783,6 +1865,8 @@ mod tests {
         let state = press(state, Button::Next);
         assert_eq!(state.selection, 6);
         let state = press(state, Button::Next);
+        assert_eq!(state.selection, 7);
+        let state = press(state, Button::Next);
         assert_eq!(state.selection, 0, "selection wraps after the last row");
     }
 
@@ -1966,6 +2050,28 @@ mod tests {
     }
 
     #[test]
+    fn firmware_picker_uses_list_navigation_and_two_step_confirmation() {
+        let mut state = ReaderState::boot();
+        state.view = AppView::Settings;
+        state.selection = 7;
+        state = press(state, Button::Confirm);
+        assert_eq!(state.view, AppView::FirmwareUpdate);
+        assert_eq!(state.firmware_status, FirmwareUpdateStatus::Scanning);
+
+        state = state.apply_library_event(CTX, LibraryEvent::FirmwareFiles { count: 3 });
+        assert_eq!(state.firmware_status, FirmwareUpdateStatus::Ready);
+        state = press(state, Button::Next);
+        assert_eq!(state.selection, 1);
+        state = press(state, Button::Confirm);
+        assert_eq!(state.firmware_status, FirmwareUpdateStatus::Confirming);
+        state = press(state, Button::Back);
+        assert_eq!(state.firmware_status, FirmwareUpdateStatus::Ready);
+        state = press(state, Button::Confirm);
+        state = press(state, Button::Confirm);
+        assert_eq!(state.firmware_status, FirmwareUpdateStatus::Staging);
+    }
+
+    #[test]
     fn refresh_plan_cleans_after_orientation_change() {
         let mut planner = RefreshPlanner::new();
         let mut state = ReaderState::boot();
@@ -2080,7 +2186,7 @@ mod tests {
     /// One of every StorageCommand variant, so the admission table below is
     /// exhaustive by construction: a new variant fails the count assertion
     /// until it is classified here.
-    fn every_storage_command() -> [StorageCommand; 10] {
+    fn every_storage_command() -> [StorageCommand; 12] {
         let persisted = PersistedAppState {
             book_id: 0,
             chapter: 0,
@@ -2135,6 +2241,8 @@ mod tests {
             StorageCommand::LoanSyncMemory,
             StorageCommand::StoreWifiCredentials(credentials),
             StorageCommand::ForgetWifiCredentials,
+            StorageCommand::ScanFirmwareFiles,
+            StorageCommand::StageFirmwareUpdate { index: 0 },
         ]
     }
 

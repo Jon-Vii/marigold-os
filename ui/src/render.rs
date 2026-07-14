@@ -8,8 +8,8 @@
 //! only — the device does not tell time.
 
 use crate::{
-    qr_generated, UiLibraryStatus, UiOrientation, UiRefreshPolicy, UiShell, UiSyncStatus,
-    UiTocItem, UiView,
+    qr_generated, UiFirmwareStatus, UiLibraryStatus, UiOrientation, UiRefreshPolicy, UiShell,
+    UiSyncStatus, UiTocItem, UiView,
 };
 use display::fb::{FbFrame, Framebuffer};
 use display::font::{
@@ -171,6 +171,7 @@ pub fn render_shell(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         UiView::Chapters => render_chapters(fb, shell),
         UiView::Wireless => render_wireless(fb, shell),
         UiView::Settings => render_settings(fb, shell),
+        UiView::FirmwareUpdate => render_firmware_update(fb, shell),
     }
 }
 
@@ -529,10 +530,10 @@ fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     dash_key(fb, layout, 3, "next", false);
     heading(fb, layout, "Settings");
 
-    // Seven rows must clear the landscape footer line, so the settings
+    // Eight rows must clear the landscape footer line, so the settings
     // index runs tighter than the Library's ROW_STEP.
-    const SETTINGS_ROW_STEP: i16 = 52;
-    let rows: [(&str, &str); 7] = [
+    const SETTINGS_ROW_STEP: i16 = 45;
+    let rows: [(&str, &str); 8] = [
         (
             "Typeface",
             font_family_label(shell.font_family, shell.custom_font_name),
@@ -543,6 +544,7 @@ fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         ("Refresh", refresh_policy_label(shell.refresh_policy)),
         ("Orientation", orientation_label(shell.orientation)),
         ("Front buttons", front_buttons_label(shell.front_pages_left)),
+        ("Firmware update", "choose from SD card"),
     ];
     for (index, (name, value)) in rows.into_iter().enumerate() {
         index_row(
@@ -555,6 +557,128 @@ fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         );
     }
 
+    finish_working_screen(fb, shell, layout);
+}
+
+fn render_firmware_update(fb: &mut Framebuffer, shell: &UiShell<'_>) {
+    fb.clear(true);
+    let layout = shell_layout(shell);
+    dash_key(
+        fb,
+        layout,
+        0,
+        if shell.firmware_status == UiFirmwareStatus::Confirming {
+            "cancel"
+        } else {
+            "settings"
+        },
+        false,
+    );
+    dash_key(
+        fb,
+        layout,
+        1,
+        if shell.firmware_status == UiFirmwareStatus::Confirming {
+            "install"
+        } else if shell.firmware_status == UiFirmwareStatus::Failed {
+            "again"
+        } else {
+            "select"
+        },
+        true,
+    );
+    if shell.firmware_status == UiFirmwareStatus::Ready {
+        dash_key(fb, layout, 2, "previous", false);
+        dash_key(fb, layout, 3, "next", false);
+    } else {
+        dash_unused(fb, layout, 2);
+        dash_unused(fb, layout, 3);
+    }
+    heading(fb, layout, "Firmware update");
+
+    match shell.firmware_status {
+        UiFirmwareStatus::Scanning => {
+            centered_note(fb, layout, "looking for firmware…");
+            finish_working_screen(fb, shell, layout);
+            return;
+        }
+        UiFirmwareStatus::Empty => {
+            centered_note(fb, layout, "no .BIN firmware files at card root");
+            finish_working_screen(fb, shell, layout);
+            return;
+        }
+        UiFirmwareStatus::Failed => {
+            centered_note(fb, layout, "could not schedule the update");
+            finish_working_screen(fb, shell, layout);
+            return;
+        }
+        UiFirmwareStatus::Staging => {
+            centered_note(fb, layout, "restarting into the updater…");
+            finish_working_screen(fb, shell, layout);
+            return;
+        }
+        UiFirmwareStatus::Confirming => {
+            let selected = shell.selection as usize;
+            let name = shell
+                .firmware_entries
+                .get(selected)
+                .copied()
+                .unwrap_or("firmware.bin");
+            draw_text_centered(
+                fb,
+                literata(FontStyle::Regular),
+                "Install this firmware?",
+                layout.heading_cx,
+                180,
+            );
+            draw_text_centered(
+                fb,
+                literata(FontStyle::Italic),
+                name,
+                layout.heading_cx,
+                235,
+            );
+            draw_text_centered(
+                fb,
+                literata_small(FontStyle::Regular),
+                "Use an app image for this device. Do not remove power.",
+                layout.heading_cx,
+                300,
+            );
+            finish_working_screen(fb, shell, layout);
+            return;
+        }
+        UiFirmwareStatus::Ready => {}
+    }
+
+    let total = shell.firmware_total as usize;
+    if total == 0 || shell.firmware_entries.is_empty() {
+        centered_note(fb, layout, "no .BIN firmware files at card root");
+        finish_working_screen(fb, shell, layout);
+        return;
+    }
+    let selected = (shell.selection as usize).min(total - 1);
+    let start = library_scroll_start(selected, total, layout.portrait);
+    let body = literata(FontStyle::Regular);
+    let mut y = FIRST_ROW_Y;
+    for index in start..(start + library_visible_rows(layout.portrait)).min(total) {
+        if index == selected {
+            selection_arrow(fb, layout, y);
+        }
+        if let Some(name) = shell.firmware_entries.get(index) {
+            draw_text_truncated(
+                fb,
+                body,
+                name,
+                layout.content_x,
+                y,
+                layout.content_width() as usize,
+                false,
+            );
+        }
+        y += ROW_STEP;
+    }
+    position_footer(fb, layout, selected + 1, total);
     finish_working_screen(fb, shell, layout);
 }
 

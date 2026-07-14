@@ -39,6 +39,11 @@ const TRIGGER_FILE: &str = "FWUPDATE.BIN";
 #[cfg(feature = "device-x3")]
 const TRIGGER_FILE: &str = "FWUPDX3.BIN";
 
+const UPDATE_STATE_DIR: &str = "XTEINK";
+const SELECTED_UPDATE_FILE: &str = "FWPEND.BIN";
+const SELECTED_UPDATE_MAGIC: [u8; 4] = *b"MGUP";
+const SELECTED_UPDATE_RECORD_LEN: usize = 22;
+
 // Absolute flash offsets — must match `partitions.csv`.
 const OTADATA_OFFSET: u32 = 0x0000_e000;
 const OTADATA_SECTOR_STRIDE: u32 = 0x0000_1000; // one 4 KiB sector per entry
@@ -99,27 +104,45 @@ fn read_file_exact<
 /// the trigger file is removed so a corrupt image can't wedge every boot, and
 /// the running firmware is left untouched.
 pub fn apply_pending_update(root: &SdRoot) -> bool {
-    match try_apply(root) {
+    let selected = read_selected_update(root);
+    let source_name = selected.as_deref().unwrap_or(TRIGGER_FILE);
+    match try_apply(root, source_name) {
         Ok(()) => {
+            if selected.is_some() {
+                clear_selected_update(root);
+            } else {
+                let _ = crate::sd_session::remove_file_reclaiming_clusters(root, TRIGGER_FILE);
+            }
             esp_println::println!("ota: update applied; resetting");
             true
         }
-        Err(UpdateError::NoTrigger) => false,
+        Err(UpdateError::NoTrigger) => {
+            if selected.is_some() {
+                clear_selected_update(root);
+            }
+            false
+        }
         Err(e) => {
             esp_println::println!("ota: update failed: {:?}", e);
-            // A bad trigger file must not re-run forever.
-            let _ = root.delete_file_in_dir(TRIGGER_FILE);
+            // A bad selection must not re-run forever. Picker-selected source
+            // images stay on the card so the user can keep a firmware shelf;
+            // the legacy one-shot trigger retains its historical deletion.
+            if selected.is_some() {
+                clear_selected_update(root);
+            } else {
+                let _ = crate::sd_session::remove_file_reclaiming_clusters(root, TRIGGER_FILE);
+            }
             false
         }
     }
 }
 
-fn try_apply(root: &SdRoot) -> Result<(), UpdateError> {
+fn try_apply(root: &SdRoot, source_name: &str) -> Result<(), UpdateError> {
     let file = root
-        .open_file_in_dir(TRIGGER_FILE, Mode::ReadOnly)
+        .open_file_in_dir(source_name, Mode::ReadOnly)
         .map_err(|_| UpdateError::NoTrigger)?;
     let len = file.length() as usize;
-    esp_println::println!("ota: {} found, {} bytes", TRIGGER_FILE, len);
+    esp_println::println!("ota: {} selected, {} bytes", source_name, len);
 
     // Pass 1: prove the whole image before touching flash.
     ota::validate_image(&mut SdFile(&file), len, Some(OTA_SLOT_SIZE as usize))
@@ -148,9 +171,79 @@ fn try_apply(root: &SdRoot) -> Result<(), UpdateError> {
         switch.entry.ota_seq
     );
 
-    // One-shot: drop the trigger so the next boot runs the new firmware once.
-    let _ = root.delete_file_in_dir(TRIGGER_FILE);
     Ok(())
+}
+
+/// Persist the picker selection as an 8.3 root alias. The source image itself
+/// is not renamed or copied, so users can keep several firmware images on one
+/// card and switch among them without rewriting multi-megabyte files.
+pub(crate) fn stage_selected_update(root: &SdRoot, open_name: &str) -> bool {
+    if open_name.is_empty()
+        || open_name.len() > 12
+        || !open_name.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return false;
+    }
+    let xteink = match root.open_dir(UPDATE_STATE_DIR) {
+        Ok(dir) => dir,
+        Err(_) => {
+            if root.make_dir_in_dir(UPDATE_STATE_DIR).is_err() {
+                return false;
+            }
+            let Ok(dir) = root.open_dir(UPDATE_STATE_DIR) else {
+                return false;
+            };
+            dir
+        }
+    };
+    let mut record = [0u8; SELECTED_UPDATE_RECORD_LEN];
+    record[..4].copy_from_slice(&SELECTED_UPDATE_MAGIC);
+    record[4] = 1;
+    record[5] = open_name.len() as u8;
+    record[6..6 + open_name.len()].copy_from_slice(open_name.as_bytes());
+    let checksum = selected_update_checksum(&record[..18]);
+    record[18..22].copy_from_slice(&checksum.to_le_bytes());
+    let Ok(file) = xteink.open_file_in_dir(SELECTED_UPDATE_FILE, Mode::ReadWriteCreateOrTruncate)
+    else {
+        return false;
+    };
+    file.write(&record).is_ok()
+}
+
+fn read_selected_update(root: &SdRoot) -> Option<heapless::String<12>> {
+    let xteink = root.open_dir(UPDATE_STATE_DIR).ok()?;
+    let file = xteink
+        .open_file_in_dir(SELECTED_UPDATE_FILE, Mode::ReadOnly)
+        .ok()?;
+    let mut record = [0u8; SELECTED_UPDATE_RECORD_LEN];
+    read_file_exact(&file, &mut record).ok()?;
+    if record[..4] != SELECTED_UPDATE_MAGIC || record[4] != 1 {
+        return None;
+    }
+    let len = record[5] as usize;
+    if len == 0 || len > 12 {
+        return None;
+    }
+    let stored = u32::from_le_bytes([record[18], record[19], record[20], record[21]]);
+    if selected_update_checksum(&record[..18]) != stored {
+        return None;
+    }
+    let name = core::str::from_utf8(&record[6..6 + len]).ok()?;
+    let mut out = heapless::String::new();
+    out.push_str(name).ok()?;
+    Some(out)
+}
+
+fn clear_selected_update(root: &SdRoot) {
+    if let Ok(xteink) = root.open_dir(UPDATE_STATE_DIR) {
+        let _ = crate::sd_session::remove_file_reclaiming_clusters(&xteink, SELECTED_UPDATE_FILE);
+    }
+}
+
+fn selected_update_checksum(bytes: &[u8]) -> u32 {
+    bytes.iter().fold(0x811c_9dc5, |hash, byte| {
+        (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193)
+    })
 }
 
 /// On-device validation of the flash + otadata path when no SD card reader is

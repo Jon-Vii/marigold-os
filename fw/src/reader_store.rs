@@ -13,6 +13,7 @@ use proto::text::{TextAlign, TextRole};
 /// little above `ui::render::library_visible_rows(true)` so ordinary scrolling stays
 /// inside one loaded window and only crossings re-read the card.
 pub(crate) const LIBRARY_WINDOW: usize = 16;
+pub(crate) const MAX_FIRMWARE_FILES: usize = 16;
 pub(crate) const MAX_SD_TOC_ITEMS: usize = 128;
 /// Chapter-page map covering the whole on-disk TOC (not the 128-capped
 /// resident/event arrays), so the current chapter tracks reading position
@@ -112,6 +113,22 @@ impl LibraryBookEntry {
     }
 }
 
+pub(crate) struct FirmwareFileEntry {
+    pub(crate) display_name: String<64>,
+    pub(crate) open_name: String<16>,
+    pub(crate) byte_size: u32,
+}
+
+impl FirmwareFileEntry {
+    pub(crate) const fn new() -> Self {
+        Self {
+            display_name: String::new(),
+            open_name: String::new(),
+            byte_size: 0,
+        }
+    }
+}
+
 pub(crate) struct ReaderCover<'a> {
     pub(crate) width: u16,
     pub(crate) height: u16,
@@ -141,6 +158,8 @@ pub(crate) struct ReaderStore {
     /// happens to be scrolled; `catalog_entry` returns it for `active_index`.
     active_entry: LibraryBookEntry,
     active_index: Option<usize>,
+    firmware_files: [FirmwareFileEntry; MAX_FIRMWARE_FILES],
+    firmware_count: usize,
     pub(crate) current_index: Option<usize>,
     pub(crate) loaded_index: Option<usize>,
     pub(crate) loaded_chapter: u8,
@@ -238,6 +257,8 @@ impl ReaderStore {
             window_len: 0,
             active_entry: LibraryBookEntry::new(),
             active_index: None,
+            firmware_files: [const { FirmwareFileEntry::new() }; MAX_FIRMWARE_FILES],
+            firmware_count: 0,
             current_index: None,
             loaded_index: None,
             loaded_chapter: 0,
@@ -294,6 +315,33 @@ impl ReaderStore {
             custom_font_faces: [proto::font_pack::FontPackFaceRecord::EMPTY; MAX_CUSTOM_FONT_FACES],
             custom_font_face_count: 0,
         }
+    }
+
+    pub(crate) fn clear_firmware_files(&mut self) {
+        self.firmware_count = 0;
+        for entry in &mut self.firmware_files {
+            *entry = FirmwareFileEntry::new();
+        }
+    }
+
+    pub(crate) fn push_firmware_file(&mut self, display_name: &str, open_name: &str, size: u32) {
+        let Some(entry) = self.firmware_files.get_mut(self.firmware_count) else {
+            return;
+        };
+        entry.display_name.clear();
+        let _ = entry.display_name.push_str(display_name);
+        entry.open_name.clear();
+        let _ = entry.open_name.push_str(open_name);
+        entry.byte_size = size;
+        self.firmware_count += 1;
+    }
+
+    pub(crate) fn firmware_files(&self) -> &[FirmwareFileEntry] {
+        &self.firmware_files[..self.firmware_count]
+    }
+
+    pub(crate) fn firmware_file(&self, index: usize) -> Option<&FirmwareFileEntry> {
+        self.firmware_files().get(index)
     }
 
     pub(crate) fn set_custom_font(
