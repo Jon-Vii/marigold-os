@@ -334,6 +334,9 @@ fn library_event_affects_view(state: &ReaderState, event: &crate::LibraryEvent) 
         // page-within-chapter, not the chapter), so it never forces a render.
         crate::LibraryEvent::ChapterCursor { .. } => false,
         crate::LibraryEvent::CustomFont { .. } => state.view == AppView::Settings,
+        crate::LibraryEvent::FirmwareFiles { .. } | crate::LibraryEvent::FirmwareStageFailed => {
+            state.view == AppView::FirmwareUpdate
+        }
         crate::LibraryEvent::Restored { .. } => true,
     }
 }
@@ -435,6 +438,12 @@ fn log_storage_command(label: &str, command: StorageCommand) {
         StorageCommand::ReceiveUpload => {
             esp_println::println!("app: storage {label} receive upload")
         }
+        StorageCommand::ScanFirmwareFiles => {
+            esp_println::println!("app: storage {label} scan firmware files")
+        }
+        StorageCommand::StageFirmwareUpdate { index } => {
+            esp_println::println!("app: storage {label} stage firmware index={index}")
+        }
         StorageCommand::LoadChapters {
             request_id,
             book_id,
@@ -494,6 +503,23 @@ fn storage_command_for_transition(
     previous: &ReaderState,
     next: &ReaderState,
 ) -> Option<StorageCommand> {
+    if next.view == AppView::FirmwareUpdate && previous.view != AppView::FirmwareUpdate {
+        return Some(StorageCommand::ScanFirmwareFiles);
+    }
+    if next.view == AppView::FirmwareUpdate
+        && previous.firmware_status != app_core::FirmwareUpdateStatus::Staging
+        && next.firmware_status == app_core::FirmwareUpdateStatus::Staging
+    {
+        return Some(StorageCommand::StageFirmwareUpdate {
+            index: next.selection,
+        });
+    }
+    if next.view == AppView::FirmwareUpdate
+        && previous.firmware_status == app_core::FirmwareUpdateStatus::Failed
+        && next.firmware_status == app_core::FirmwareUpdateStatus::Scanning
+    {
+        return Some(StorageCommand::ScanFirmwareFiles);
+    }
     let index = ReaderSource::from_book_id(next.book_id).sd_index()?;
     // Entering the overview loads the full chapter list into the section
     // buffer; the reading section reloads on exit.

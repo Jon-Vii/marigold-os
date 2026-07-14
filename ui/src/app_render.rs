@@ -3,8 +3,8 @@ use crate::{
     UiSyncStatus, UiTocItem, UiView,
 };
 use app_core::{
-    AppView, Button, DisplayOrientation, FrontButtons, RefreshPolicy, RenderRequest, SyncError,
-    SyncStatus,
+    AppView, Button, DisplayOrientation, FirmwareUpdateStatus, FrontButtons, RefreshPolicy,
+    RenderRequest, SyncError, SyncStatus,
 };
 use display::fb::{FbFrame, Framebuffer};
 use display::font::{draw_text, literata_display, literata_small, measure_text, FontStyle};
@@ -18,6 +18,7 @@ pub struct UiRenderModel<'a> {
     /// Absolute catalog index of `library_entries[0]`; the resident window
     /// the firmware streamed in around the current selection.
     pub library_window_start: u16,
+    pub firmware_entries: &'a [&'a str],
     pub chapters: &'a [UiTocItem<'a>],
     /// Absolute TOC index of `chapters[0]` and the full on-disk chapter
     /// count; long TOCs stream a window around the visible rows.
@@ -70,6 +71,9 @@ pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRe
         library_entries: model.library_entries,
         library_window_start: model.library_window_start,
         library_total: request.library_count,
+        firmware_status: ui_firmware_status(request.firmware_status),
+        firmware_entries: model.firmware_entries,
+        firmware_total: request.firmware_count,
         chapters: model.chapters,
         chapters_window_start: model.chapters_window_start,
         chapters_total: model.chapters_total,
@@ -80,6 +84,17 @@ pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRe
         .unwrap_or(""),
     };
     render_shell(fb, &shell);
+}
+
+fn ui_firmware_status(status: FirmwareUpdateStatus) -> crate::UiFirmwareStatus {
+    match status {
+        FirmwareUpdateStatus::Scanning => crate::UiFirmwareStatus::Scanning,
+        FirmwareUpdateStatus::Ready => crate::UiFirmwareStatus::Ready,
+        FirmwareUpdateStatus::Empty => crate::UiFirmwareStatus::Empty,
+        FirmwareUpdateStatus::Confirming => crate::UiFirmwareStatus::Confirming,
+        FirmwareUpdateStatus::Staging => crate::UiFirmwareStatus::Staging,
+        FirmwareUpdateStatus::Failed => crate::UiFirmwareStatus::Failed,
+    }
 }
 
 fn ui_sync_status(status: SyncStatus) -> UiSyncStatus {
@@ -234,6 +249,7 @@ fn ui_view(view: AppView) -> UiView {
         AppView::Chapters => UiView::Chapters,
         AppView::Wireless => UiView::Wireless,
         AppView::Settings => UiView::Settings,
+        AppView::FirmwareUpdate => UiView::FirmwareUpdate,
     }
 }
 

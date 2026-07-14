@@ -320,11 +320,15 @@ where
     let Ok(xteink) = root.open_dir(CACHE_ROOT_DIR) else {
         return true;
     };
-    match xteink.delete_file_in_dir(WIFI_FILE) {
-        Ok(()) => true,
+    let removed = match xteink.open_file_in_dir(WIFI_FILE, Mode::ReadWriteTruncate) {
+        Ok(file) => {
+            drop(file);
+            xteink.delete_file_in_dir(WIFI_FILE).is_ok()
+        }
         Err(embedded_sdmmc::Error::NotFound) => true,
         Err(_) => false,
-    }
+    };
+    removed
 }
 
 /// Read /XTEINK/WIFI.BIN; None when missing, short, or corrupt.
@@ -731,7 +735,7 @@ pub(crate) fn delete_upload_label<
     };
     let mut file_name = String::<12>::new();
     label_file_name(open_name, &mut file_name);
-    let _ = labels.delete_file_in_dir(file_name.as_str());
+    let _ = crate::sd_session::remove_file_reclaiming_clusters(&labels, file_name.as_str());
 }
 
 /// Read a book cache's v2 header (for its stored source identity and section
@@ -793,14 +797,15 @@ pub(crate) fn empty_cache_dir<
             for spine in 0..section_count {
                 name.clear();
                 section_file_name(spine, &mut name);
-                let _ = sections.delete_file_in_dir(name.as_str());
+                let _ =
+                    crate::sd_session::remove_file_reclaiming_clusters(&sections, name.as_str());
             }
         }
         // The SECTIONS handle has dropped; the empty directory can go now.
         let _ = book.delete_file_in_dir(CACHE_SECTIONS_DIR);
-        let _ = book.delete_file_in_dir(CACHE_BOOK_FILE);
-        let _ = book.delete_file_in_dir(CACHE_TOC_FILE);
-        let _ = book.delete_file_in_dir(CACHE_COVER_FILE);
+        let _ = crate::sd_session::remove_file_reclaiming_clusters(&book, CACHE_BOOK_FILE);
+        let _ = crate::sd_session::remove_file_reclaiming_clusters(&book, CACHE_TOC_FILE);
+        let _ = crate::sd_session::remove_file_reclaiming_clusters(&book, CACHE_COVER_FILE);
     }
     // Likewise the book handle: closed by the scope above, deletable here.
     let _ = cache.delete_file_in_dir(key);

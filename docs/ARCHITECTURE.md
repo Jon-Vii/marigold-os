@@ -213,6 +213,13 @@ full CMD0/ACMD41 init; later ones reuse the remembered card type and skip the
 handshake, falling back to a cold init if a reused session cannot open the
 volume. Deep sleep resets the chip and clears that state.
 
+Settings also exposes a native firmware-file list. Entering it issues a storage
+command that scans root-level `.BIN` files into the reader store. After the
+second confirmation, the display task draws the visible update handoff, writes
+the selected file's FAT alias to `/XTEINK/FWPEND.BIN`, and resets. Boot reopens
+that exact source through the existing whole-image validator and inactive-slot
+updater; the source remains on the card so several firmware images can coexist.
+
 ## Display model
 
 `display::fb::Framebuffer` is the source of truth. White is bit `1`, black is

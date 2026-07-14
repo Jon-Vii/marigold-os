@@ -47,6 +47,8 @@ struct Expect {
     font_family: Option<String>,
     sleeping: Option<bool>,
     library_count: Option<u16>,
+    firmware_count: Option<u16>,
+    firmware_status: Option<String>,
     last_button: Option<String>,
     last_refresh: Option<String>,
     panel_sleeping: Option<bool>,
@@ -96,6 +98,15 @@ impl Scenario {
         }
         if let Some(selection) = self.expect.selection {
             expect_eq("selection", selection, state.selection)?;
+        }
+        if let Some(count) = self.expect.firmware_count {
+            expect_eq("firmware_count", count, state.firmware_count)?;
+        }
+        if let Some(status) = &self.expect.firmware_status {
+            let actual = firmware_status_name(state.firmware_status);
+            if actual != status {
+                return Err(format!("expected firmware status {status}, got {actual}"));
+            }
         }
         if let Some(orientation) = &self.expect.orientation {
             let expected = parse_orientation(orientation)?;
@@ -264,6 +275,17 @@ fn sync_status_name(status: SyncStatus) -> &'static str {
     }
 }
 
+fn firmware_status_name(status: app_core::FirmwareUpdateStatus) -> &'static str {
+    match status {
+        app_core::FirmwareUpdateStatus::Scanning => "scanning",
+        app_core::FirmwareUpdateStatus::Ready => "ready",
+        app_core::FirmwareUpdateStatus::Empty => "empty",
+        app_core::FirmwareUpdateStatus::Confirming => "confirming",
+        app_core::FirmwareUpdateStatus::Staging => "staging",
+        app_core::FirmwareUpdateStatus::Failed => "failed",
+    }
+}
+
 fn parse_library_event(kind: &str, step: &Step) -> Result<LibraryEvent, String> {
     match kind {
         "Scanned" | "scanned" => Ok(LibraryEvent::Scanned {
@@ -281,6 +303,11 @@ fn parse_library_event(kind: &str, step: &Step) -> Result<LibraryEvent, String> 
             chapter: step.chapter.unwrap_or(0),
             page: step.page.unwrap_or(0),
         }),
+        "FirmwareFiles" | "firmware-files" | "firmware_files" => {
+            Ok(LibraryEvent::FirmwareFiles {
+                count: step.count.unwrap_or(0),
+            })
+        }
         _ => Err(format!("unknown library event: {kind}")),
     }
 }
@@ -306,6 +333,9 @@ fn parse_view(value: &str) -> Result<AppView, String> {
         "Chapters" | "chapters" => Ok(AppView::Chapters),
         "Wireless" | "wireless" | "Sync" | "sync" => Ok(AppView::Wireless),
         "Settings" | "settings" => Ok(AppView::Settings),
+        "FirmwareUpdate" | "firmware-update" | "firmware_update" => {
+            Ok(AppView::FirmwareUpdate)
+        }
         _ => Err(format!("unknown view: {value}")),
     }
 }

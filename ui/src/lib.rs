@@ -14,6 +14,7 @@ pub enum UiView {
     Chapters,
     Wireless,
     Settings,
+    FirmwareUpdate,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +55,16 @@ pub enum UiLibraryStatus {
     Ready,
     Empty,
     Error,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UiFirmwareStatus {
+    Scanning,
+    Ready,
+    Empty,
+    Confirming,
+    Staging,
+    Failed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,6 +124,9 @@ pub struct UiShell<'a> {
     /// Total book count across the whole catalog, independent of the resident
     /// window — drives the "x of N" footer and the scroll math.
     pub library_total: u16,
+    pub firmware_status: UiFirmwareStatus,
+    pub firmware_entries: &'a [&'a str],
+    pub firmware_total: u16,
     /// The resident slice of the on-disk TOC the Contents page draws from:
     /// `chapters[i]` is the chapter at absolute index
     /// `chapters_window_start + i`. Long TOCs are windowed like the catalog.

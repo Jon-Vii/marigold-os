@@ -42,9 +42,11 @@ pub fn render_request(
     fb: &mut Framebuffer,
     request: app_core::RenderRequest,
     library_entries: &[String],
+    firmware_entries: &[String],
 ) {
     let borrowed_entries: Vec<&str> = library_entries.iter().map(String::as_str).collect();
-    let model = demo_model(request, &borrowed_entries);
+    let borrowed_firmware: Vec<&str> = firmware_entries.iter().map(String::as_str).collect();
+    let model = demo_model(request, &borrowed_entries, &borrowed_firmware);
     render_shared_request(fb, request, &model);
 }
 
@@ -52,9 +54,11 @@ pub fn render_sleep(
     fb: &mut Framebuffer,
     request: app_core::RenderRequest,
     library_entries: &[String],
+    firmware_entries: &[String],
 ) {
     let borrowed_entries: Vec<&str> = library_entries.iter().map(String::as_str).collect();
-    let model = demo_model(request, &borrowed_entries);
+    let borrowed_firmware: Vec<&str> = firmware_entries.iter().map(String::as_str).collect();
+    let model = demo_model(request, &borrowed_entries, &borrowed_firmware);
     render_shared_sleep(fb, request, &model);
 }
 
@@ -137,6 +141,7 @@ pub fn encode_presented_png<W: Write>(
 fn demo_model<'a>(
     request: app_core::RenderRequest,
     library_entries: &'a [&'a str],
+    firmware_entries: &'a [&'a str],
 ) -> UiRenderModel<'a> {
     // SD books take their title from the scanned entry, mirroring the
     // firmware's catalog labels; the built-in demo book keeps its own.
@@ -163,6 +168,7 @@ fn demo_model<'a>(
         // The emulator keeps the whole catalog resident, so the window is the
         // full list starting at index 0.
         library_window_start: 0,
+        firmware_entries,
         chapters: &DEMO_CHAPTERS,
         chapters_window_start: 0,
         chapters_total: DEMO_CHAPTERS.len() as u16,

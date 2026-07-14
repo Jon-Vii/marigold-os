@@ -793,6 +793,27 @@ fn handle_storage_command(
             let forgotten = reader_cache::forget_wifi_credentials(epd, sd_cs);
             esp_println::println!("storage: wifi credentials forgotten={}", forgotten);
         }
+        StorageCommand::ScanFirmwareFiles => {
+            let count = crate::firmware_files::scan(epd, sd_cs, sd_library);
+            esp_println::println!("storage: firmware files count={}", count);
+            send_library_event(&LibraryEvent::FirmwareFiles { count });
+        }
+        StorageCommand::StageFirmwareUpdate { index } => {
+            flush_pending_progress(
+                epd,
+                sd_cs,
+                sd_library,
+                pending_progress,
+                last_progress_write,
+            );
+            if crate::firmware_files::stage(epd, sd_cs, sd_library, index as usize) {
+                esp_println::println!("storage: firmware update staged index={}", index);
+                esp_hal::system::software_reset();
+            } else {
+                esp_println::println!("storage: firmware update stage failed index={}", index);
+                send_library_event(&LibraryEvent::FirmwareStageFailed);
+            }
+        }
         StorageCommand::StoreProgress(record) => {
             let (source_hash, source_size) = source_identity(sd_library, record.book_id);
             // The reducer derives chapter from the 128-capped sd_chapter_for_page,
@@ -1083,6 +1104,8 @@ fn sleep_request_from_saved_state(
         battery_mv: 0,
         battery_percent: 100,
         library_count: library.catalog_count_u16(),
+        firmware_count: library.firmware_files().len() as u16,
+        firmware_status: app_core::FirmwareUpdateStatus::Scanning,
         sync_status: SyncStatus::NotConfigured,
         wifi_ssid: [0; 32],
         wifi_ssid_len: 0,
