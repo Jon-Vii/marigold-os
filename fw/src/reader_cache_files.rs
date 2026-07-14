@@ -617,10 +617,8 @@ where
     .unwrap_or(false)
 }
 
-/// Subdir under XTEINK holding one `<8.3-stem>.TXT` per uploaded book, each
-/// carrying the prettified original filename. Uploads land as 8.3 names with no
-/// long filename, so this is the only place a readable label survives until the
-/// book is first opened (which then learns the EPUB title).
+/// Legacy subdir under XTEINK holding one `<8.3-stem>.TXT` label for books
+/// uploaded by releases that predate VFAT long-name creation.
 const LABELS_DIR: &str = "LABELS";
 
 fn label_file_name(open_name: &str, out: &mut String<12>) {
@@ -630,47 +628,8 @@ fn label_file_name(open_name: &str, out: &mut String<12>) {
     let _ = out.push_str(".TXT");
 }
 
-/// Stash an uploaded book's label: prettify its original filename the same way
-/// a copied book's name is labelled, and write it to the sidecar keyed by the
-/// 8.3 name. Overwrites any prior label for that name.
-pub(crate) fn write_upload_label<
-    D,
-    T,
-    const MAX_DIRS: usize,
-    const MAX_FILES: usize,
-    const MAX_VOLUMES: usize,
->(
-    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    open_name: &str,
-    raw_filename: &str,
-) -> bool
-where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    let mut label = String::<64>::new();
-    crate::reader_store::derive_catalog_label(raw_filename, open_name, &mut label);
-    if label.is_empty() {
-        return false;
-    }
-    let Ok(xteink) = open_or_make_dir(root, CACHE_ROOT_DIR) else {
-        return false;
-    };
-    let Ok(labels) = open_or_make_dir(&xteink, LABELS_DIR) else {
-        return false;
-    };
-    let mut file_name = String::<12>::new();
-    label_file_name(open_name, &mut file_name);
-    let Ok(file) = labels.open_file_in_dir(file_name.as_str(), Mode::ReadWriteCreateOrTruncate)
-    else {
-        return false;
-    };
-    file.write(label.as_bytes()).is_ok()
-}
-
-/// Read an uploaded book's stashed label into `out`. Returns false (leaving
-/// `out` untouched) when the book has no sidecar -- i.e. it wasn't uploaded, so
-/// the caller falls back to the file-stem label.
+/// Read a legacy uploaded book's stashed label into `out`. Returns false
+/// (leaving `out` untouched) when the book has no sidecar.
 pub(crate) fn read_upload_label<
     D,
     T,

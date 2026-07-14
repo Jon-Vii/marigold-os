@@ -9,3 +9,4 @@ pub mod font_pack;
 pub mod ota;
 pub mod storage;
 pub mod text;
+pub mod upload;
