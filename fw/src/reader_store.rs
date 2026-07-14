@@ -1347,7 +1347,7 @@ fn push_catalog_label(display_name: &str, open_name: &str, out: &mut String<64>)
         .filter(|name| !name.is_empty())
         .unwrap_or(display_name);
     let stem = strip_epub_suffix(file_name).unwrap_or(file_name);
-    push_pretty_file_stem(stem, out);
+    proto::storage::push_pretty_file_stem(stem, out);
     if out.is_empty() {
         let _ = out.push_str(display_name);
     }
@@ -1362,35 +1362,6 @@ fn strip_epub_suffix(name: &str) -> Option<&str> {
         return Some(&name[..name.len() - 4]);
     }
     None
-}
-
-fn push_pretty_file_stem(stem: &str, out: &mut String<64>) {
-    let mut capitalize_next = true;
-    for byte in stem.bytes() {
-        let ch = match byte {
-            b'-' | b'_' => {
-                capitalize_next = true;
-                b' '
-            }
-            b'a'..=b'z' if capitalize_next => {
-                capitalize_next = false;
-                byte - b'a' + b'A'
-            }
-            b'A'..=b'Z' | b'0'..=b'9' => {
-                capitalize_next = false;
-                byte
-            }
-            b'.' => break,
-            _ => byte,
-        };
-        if ch == b' ' && out.as_str().ends_with(' ') {
-            continue;
-        }
-        let _ = out.push(ch as char);
-    }
-    while out.as_str().ends_with(' ') {
-        out.pop();
-    }
 }
 
 fn should_break_before_block(role: TextRole, previous: Option<&BlockRecord>) -> bool {
