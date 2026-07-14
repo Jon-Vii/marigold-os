@@ -72,8 +72,8 @@ pub trait ProgressStorage {
 }
 
 pub fn is_epub_path(path: &str) -> bool {
-    // Uploads are written with 8.3 names, where the extension truncates
-    // to ".epu"; accept both spellings everywhere EPUBs are discovered.
+    // Releases before VFAT upload creation wrote only 8.3 `.epu` names; keep
+    // accepting both spellings everywhere EPUBs are discovered.
     if path.len() >= 4 {
         let tail = &path.as_bytes()[path.len() - 4..];
         if tail[0] == b'.'
@@ -89,6 +89,44 @@ pub fn is_epub_path(path: &str) -> bool {
         .last()
         .map(|suffix| suffix.eq_ignore_ascii_case(b".epub"))
         .unwrap_or(false)
+}
+
+/// Append a readable catalog label from a filename stem without corrupting
+/// multi-byte UTF-8 characters.
+pub fn push_pretty_file_stem<const N: usize>(stem: &str, out: &mut String<N>) {
+    let mut capitalize_next = true;
+    for ch in stem.chars() {
+        let ch = match ch {
+            '-' | '_' => {
+                capitalize_next = true;
+                ' '
+            }
+            'a'..='z' if capitalize_next => {
+                capitalize_next = false;
+                ch.to_ascii_uppercase()
+            }
+            'A'..='Z' | '0'..='9' => {
+                capitalize_next = false;
+                ch
+            }
+            '.' => break,
+            _ => {
+                if ch.is_alphanumeric() {
+                    capitalize_next = false;
+                }
+                ch
+            }
+        };
+        if ch == ' ' && out.as_str().ends_with(' ') {
+            continue;
+        }
+        if out.push(ch).is_err() {
+            break;
+        }
+    }
+    while out.as_str().ends_with(' ') {
+        out.pop();
+    }
 }
 
 /// Store the catalog's display path in its fixed-size field. The FAT short
@@ -166,5 +204,16 @@ mod tests {
             assert!(path.ends_with(".epub"));
             assert!(path.len() <= 64);
         }
+    }
+
+    #[test]
+    fn pretty_file_stems_preserve_utf8() {
+        let mut label = String::<64>::new();
+        push_pretty_file_stem("marigold_wireless_Café_Test", &mut label);
+        assert_eq!(label, "Marigold Wireless Café Test");
+
+        label.clear();
+        push_pretty_file_stem("Märchen 😀", &mut label);
+        assert_eq!(label, "Märchen 😀");
     }
 }
