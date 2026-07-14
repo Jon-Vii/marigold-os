@@ -149,7 +149,7 @@ Scenarios:
 - warm book cache hit;
 - section extend near a boundary;
 - progress write burst;
-- optional upload-created `.EPU` path if wireless serving is in scope.
+- optional upload-created `.epub` long-name path if wireless serving is in scope.
 
 Telemetry to add:
 

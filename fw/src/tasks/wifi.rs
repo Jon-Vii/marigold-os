@@ -9,7 +9,7 @@
 //! AP-mode onboarding portal instead.
 
 use crate::sync_mem::{self, SyncLoan};
-use crate::upload::{sanitized_name, UploadBegin, UploadChunk};
+use crate::upload::{upload_short_alias, wireless_epub_filename, UploadBegin, UploadChunk};
 use crate::{
     StorageCommand, SyncCommand, SyncEvent, STORAGE_COMMANDS, SYNC_COMMANDS, SYNC_EVENTS,
     SYNC_LOANS, UPLOAD_BEGINS, UPLOAD_CHUNKS, UPLOAD_RESULTS, UPLOAD_RETURNS,
@@ -358,7 +358,7 @@ async fn upload_server(
                             name,
                             delete: true,
                             in_books,
-                            label: crate::upload::UploadLabel::new(),
+                            long_name: crate::upload::UploadFilename::new(),
                         })
                         .await;
                     UPLOAD_RESULTS.receive().await
@@ -376,8 +376,8 @@ async fn upload_server(
                 .get(path_at..path_at + path_len)
                 .and_then(raw_query_name)
                 .unwrap_or(b"book");
-            let name = sanitized_name(client_name);
-            let label = crate::upload::readable_filename(client_name);
+            let long_name = wireless_epub_filename(client_name);
+            let name = upload_short_alias(long_name.as_str(), 0);
 
             if !session_started {
                 STORAGE_COMMANDS.send(StorageCommand::ReceiveUpload).await;
@@ -390,7 +390,7 @@ async fn upload_server(
                 leftover_range,
                 content_length,
                 name,
-                label,
+                long_name,
                 &mut pool,
             )
             .await;
@@ -420,7 +420,7 @@ async fn stream_book(
     leftover: core::ops::Range<usize>,
     content_length: usize,
     name: crate::upload::UploadName,
-    label: crate::upload::UploadLabel,
+    long_name: crate::upload::UploadFilename,
     pool: &mut heapless::Vec<&'static mut [u8], 2>,
 ) -> bool {
     esp_println::println!("upload: '{}' {} bytes", name, content_length);
@@ -430,7 +430,7 @@ async fn stream_book(
             name,
             delete: false,
             in_books: true,
-            label,
+            long_name,
         })
         .await;
 

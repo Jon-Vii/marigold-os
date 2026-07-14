@@ -250,8 +250,9 @@ Current code status:
   kosync exchange the session keeps serving at the device's LAN address
   (SyncStatus::Serving screen hands out the URL); POST /upload streams raw
   EPUB bytes through a two-buffer ping-pong into the display task, which
-  holds one SD session for the upload phase and writes /BOOKS/<8.3>.EPU
-  (the catalog filter accepts .epu alongside .epub). Books appear after the
+  holds one SD session for the upload phase and writes a standard VFAT
+  `/BOOKS/<browser filename>.epub` entry with a collision-safe 8.3 alias.
+  Legacy `.EPU` uploads remain supported. Books appear after the
   session-ending reset's rescan. Stack region ~36.7 KB after the upload
   futures; the EPUB-open chain's ~30 KB watermark is the floor to respect.
 - Next: kosync account onboarding via the portal form, and TLS for the

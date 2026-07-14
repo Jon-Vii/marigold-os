@@ -1,5 +1,5 @@
 use crate::display_flush::Epd;
-use crate::upload::{UploadBegin, UploadChunk};
+use crate::upload::{upload_short_alias, UploadBegin, UploadChunk, UploadName};
 use crate::{UPLOAD_BEGINS, UPLOAD_CHUNKS, UPLOAD_RESULTS, UPLOAD_RETURNS};
 use core::sync::atomic::{AtomicU8, Ordering};
 use embedded_hal::delay::DelayNs;
@@ -482,18 +482,13 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) -
                 crate::reader_cache_files::delete_upload_label(&root, begin.name.as_str());
             }
             removed
+        } else if let Some(written_name) = write_one_book(&books, &begin).await {
+            // New uploads carry their display name in VFAT itself. Remove any
+            // stale sidecar that happens to share the chosen short alias.
+            crate::reader_cache_files::delete_upload_label(&root, written_name.as_str());
+            true
         } else {
-            let written = write_one_book(&books, &begin).await;
-            // Stash the readable filename so the Library can label the book
-            // before it is ever opened; the 8.3 name on the card can't carry it.
-            if written && !begin.label.is_empty() {
-                crate::reader_cache_files::write_upload_label(
-                    &root,
-                    begin.name.as_str(),
-                    begin.label.as_str(),
-                );
-            }
-            written
+            false
         };
         esp_println::println!(
             "upload: '{}' {} ok={}",
@@ -507,10 +502,10 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) -
 
 /// Remove a file without leaking its FAT cluster chain.
 ///
-/// The pinned embedded-sdmmc delete operation only marks the directory entry
+/// The pinned embedded-sdmmc delete operation only marks the directory entries
 /// deleted; it does not release the file's clusters. Truncating through the
-/// public API first releases that chain, after which deleting removes the now
-/// empty directory entry. Keep the file handle in its own scope so deletion
+/// public API first releases that chain, after which deleting removes the long
+/// and short name records. Keep the file handle in its own scope so deletion
 /// cannot fail with `FileAlreadyOpen` and leave the zero-length entry behind.
 pub(crate) fn remove_file_reclaiming_clusters<
     D,
@@ -544,15 +539,23 @@ async fn write_one_book<
 >(
     books: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     begin: &UploadBegin,
-) -> bool
+) -> Option<UploadName>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let Ok(file) = books.open_file_in_dir(begin.name.as_str(), Mode::ReadWriteCreateOrTruncate)
-    else {
+    let Some(target) = resolve_upload_target(books, begin) else {
         drain_until_end().await;
-        return false;
+        return None;
+    };
+    let file = if target.existing {
+        books.open_file_in_dir(target.name.as_str(), Mode::ReadWriteTruncate)
+    } else {
+        books.create_file_in_dir_lfn(begin.long_name.as_str(), target.name.as_str())
+    };
+    let Ok(file) = file else {
+        drain_until_end().await;
+        return None;
     };
     let mut failed = false;
     let mut aborted = false;
@@ -574,10 +577,78 @@ where
     }
     drop(file);
     if failed || aborted {
-        let _ = remove_file_reclaiming_clusters(books, begin.name.as_str());
-        return false;
+        let _ = remove_file_reclaiming_clusters(books, target.name.as_str());
+        return None;
     }
-    true
+    Some(target.name)
+}
+
+struct UploadTarget {
+    name: UploadName,
+    existing: bool,
+}
+
+/// Find an existing file with the same VFAT name or a free deterministic 8.3
+/// alias for a new entry. Directory iteration completes before any create/open
+/// call because embedded-sdmmc holds its internal borrow during callbacks.
+fn resolve_upload_target<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    books: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    begin: &UploadBegin,
+) -> Option<UploadTarget>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    use core::fmt::Write;
+
+    if begin.long_name.is_empty() {
+        return None;
+    }
+    for probe in 0..=u16::MAX {
+        let candidate = if probe == 0 {
+            begin.name.clone()
+        } else {
+            upload_short_alias(begin.long_name.as_str(), probe)
+        };
+        let candidate_sfn =
+            embedded_sdmmc::ShortFileName::create_from_str(candidate.as_str()).ok()?;
+        let mut exact_name = UploadName::new();
+        let mut candidate_taken = false;
+        let mut lfn_storage = [0u8; 192];
+        let mut lfn_buffer = embedded_sdmmc::LfnBuffer::new(&mut lfn_storage);
+        books
+            .iterate_dir_lfn(&mut lfn_buffer, |entry, long_name| {
+                if entry.attributes.is_directory() || entry.attributes.is_volume() {
+                    return;
+                }
+                candidate_taken |= entry.name == candidate_sfn;
+                if long_name.is_some_and(|name| name.eq_ignore_ascii_case(begin.long_name.as_str()))
+                {
+                    exact_name.clear();
+                    let _ = write!(exact_name, "{}", entry.name);
+                }
+            })
+            .ok()?;
+        if !exact_name.is_empty() {
+            return Some(UploadTarget {
+                name: exact_name,
+                existing: true,
+            });
+        }
+        if !candidate_taken {
+            return Some(UploadTarget {
+                name: candidate,
+                existing: false,
+            });
+        }
+    }
+    None
 }
 
 /// Consumes one file's worth of chunks without a file to write into.

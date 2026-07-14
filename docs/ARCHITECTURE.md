@@ -153,12 +153,13 @@ bytes, and `POST /delete?name=` removes a book (card-root entries carry
 task — still the single SD owner — through `fw::upload`'s two-buffer
 ping-pong: 4 KB chunks carry loaned buffers one way and the buffers come
 back on a return channel once written. The display task holds one SD
-session for the whole upload phase and writes `/BOOKS/<8.3>.EPU` (the
-catalog scan accepts `.epu` alongside `.epub`), recording the browser's
-original filename in a `/XTEINK/LABELS/<stem>.TXT` sidecar so the shelf
-and Library can label the book with it. The done press waits for
-any in-flight upload before the session-ending reset; the boot rescan
-then surfaces the new books.
+session for the whole upload phase and writes a standard VFAT long name such
+as `/BOOKS/Original Name.epub`, backed by a deterministic collision-safe
+`.EPU` short alias. Re-uploading the same long name replaces that book; an
+alias collision probes another alias instead of overwriting an unrelated
+file. Legacy short-only `.EPU` uploads and their `/XTEINK/LABELS` sidecars
+remain readable. The done press waits for any in-flight upload before the
+session-ending reset; the boot rescan then surfaces the new books.
 
 Station credentials come from `/XTEINK/WIFI.BIN` (written by the
 onboarding portal below), falling back to compile-time `option_env!`
