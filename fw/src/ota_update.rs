@@ -151,18 +151,11 @@ fn try_apply(root: &SdRoot, source_name: &str) -> Result<(), UpdateError> {
     let len = file.length() as usize;
     esp_println::println!("ota: {} selected, {} bytes", source_name, len);
 
-    // Pass 1: prove the whole image before touching flash.
-    #[cfg(not(feature = "device-x3"))]
-    const EXPECTED_PROJECT: &str = ota::PROJECT_X4;
-    #[cfg(feature = "device-x3")]
-    const EXPECTED_PROJECT: &str = ota::PROJECT_X3;
-    ota::validate_image_for_project(
-        &mut SdFile(&file),
-        len,
-        Some(OTA_SLOT_SIZE as usize),
-        EXPECTED_PROJECT,
-    )
-    .map_err(UpdateError::Invalid)?;
+    // Pass 1: prove the whole image before touching flash. The firmware shelf
+    // intentionally accepts app images from other reader projects; the user
+    // chooses the target while the validator enforces integrity and fit.
+    ota::validate_image(&mut SdFile(&file), len, Some(OTA_SLOT_SIZE as usize))
+        .map_err(UpdateError::Invalid)?;
     file.seek_from_start(0).map_err(|_| UpdateError::ReadFile)?;
 
     let mut flash = flash_storage();

@@ -31,13 +31,6 @@ const CHECKSUM_SEED: u8 = 0xEF;
 const SHA_TRAILER_LEN: usize = 32;
 const MIN_IMAGE_LEN: usize = 64 * 1024;
 const STREAM_CHUNK: usize = 512;
-const APP_DESC_FILE_OFFSET: usize = HEADER_LEN + SEG_HEADER_LEN;
-const APP_DESC_MAGIC: [u8; 4] = 0xABCD_5432u32.to_le_bytes();
-const APP_DESC_PROJECT_OFFSET: usize = APP_DESC_FILE_OFFSET + 48;
-const APP_DESC_PROJECT_LEN: usize = 32;
-
-pub const PROJECT_X4: &str = "xteink-x4";
-pub const PROJECT_X3: &str = "xteink-x3";
 
 /// Source of image bytes, read strictly forward. `read_exact` must fill the
 /// whole buffer from the current offset or report an error (a short read at EOF
@@ -67,10 +60,6 @@ pub enum ImageError {
     BadSize,
     /// The source reported a read error / short read.
     Read,
-    /// The ESP application descriptor is absent or malformed.
-    BadAppDescriptor,
-    /// The image targets a different board revision.
-    WrongBoard,
 }
 
 /// Validate a candidate ESP-IDF image end to end.
@@ -82,26 +71,6 @@ pub fn validate_image<S: ImageSource>(
     src: &mut S,
     image_len: usize,
     partition_len: Option<usize>,
-) -> Result<(), ImageError> {
-    validate_image_inner(src, image_len, partition_len, None)
-}
-
-/// Validate an image and require its `esp_app_desc_t.project_name` to match
-/// the board being updated. This check completes before callers erase flash.
-pub fn validate_image_for_project<S: ImageSource>(
-    src: &mut S,
-    image_len: usize,
-    partition_len: Option<usize>,
-    expected_project: &str,
-) -> Result<(), ImageError> {
-    validate_image_inner(src, image_len, partition_len, Some(expected_project))
-}
-
-fn validate_image_inner<S: ImageSource>(
-    src: &mut S,
-    image_len: usize,
-    partition_len: Option<usize>,
-    expected_project: Option<&str>,
 ) -> Result<(), ImageError> {
     if image_len < MIN_IMAGE_LEN {
         return Err(ImageError::TooSmall);
@@ -126,8 +95,6 @@ fn validate_image_inner<S: ImageSource>(
     // The XOR checksum is seeded with 0xEF and covers segment *data* only.
     let mut checksum = CHECKSUM_SEED;
     let mut pos = HEADER_LEN;
-    let mut app_desc_magic = [0u8; 4];
-    let mut project_name = [0u8; APP_DESC_PROJECT_LEN];
 
     let mut buf = [0u8; STREAM_CHUNK];
     for _ in 0..segment_count {
@@ -152,19 +119,6 @@ fn validate_image_inner<S: ImageSource>(
             let want = remaining.min(STREAM_CHUNK);
             let chunk = &mut buf[..want];
             src.read_exact(chunk).map_err(|_| ImageError::Read)?;
-            let chunk_start = pos + (data_len - remaining);
-            copy_overlap(
-                chunk,
-                chunk_start,
-                APP_DESC_FILE_OFFSET,
-                &mut app_desc_magic,
-            );
-            copy_overlap(
-                chunk,
-                chunk_start,
-                APP_DESC_PROJECT_OFFSET,
-                &mut project_name,
-            );
             sha.update(&chunk[..]);
             for &b in chunk.iter() {
                 checksum ^= b;
@@ -204,31 +158,7 @@ fn validate_image_inner<S: ImageSource>(
         }
     }
 
-    if let Some(expected) = expected_project {
-        if app_desc_magic != APP_DESC_MAGIC {
-            return Err(ImageError::BadAppDescriptor);
-        }
-        let end = project_name
-            .iter()
-            .position(|byte| *byte == 0)
-            .unwrap_or(project_name.len());
-        if &project_name[..end] != expected.as_bytes() {
-            return Err(ImageError::WrongBoard);
-        }
-    }
-
     Ok(())
-}
-
-fn copy_overlap(chunk: &[u8], chunk_start: usize, target_start: usize, target: &mut [u8]) {
-    let chunk_end = chunk_start + chunk.len();
-    let target_end = target_start + target.len();
-    let start = chunk_start.max(target_start);
-    let end = chunk_end.min(target_end);
-    if start < end {
-        target[start - target_start..end - target_start]
-            .copy_from_slice(&chunk[start - chunk_start..end - chunk_start]);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -532,9 +462,14 @@ mod tests {
         build_image(&[70_000, 8, 513, 1], hash_appended)
     }
 
-    fn project_image(project: &str) -> Vec<u8> {
+    fn image_with_project_name(project: &str) -> Vec<u8> {
+        const APP_DESC_FILE_OFFSET: usize = HEADER_LEN + SEG_HEADER_LEN;
+        const APP_DESC_PROJECT_OFFSET: usize = APP_DESC_FILE_OFFSET + 48;
+        const APP_DESC_PROJECT_LEN: usize = 32;
+
         let mut img = valid_image(false);
-        img[APP_DESC_FILE_OFFSET..APP_DESC_FILE_OFFSET + 4].copy_from_slice(&APP_DESC_MAGIC);
+        img[APP_DESC_FILE_OFFSET..APP_DESC_FILE_OFFSET + 4]
+            .copy_from_slice(&0xABCD_5432u32.to_le_bytes());
         img[APP_DESC_PROJECT_OFFSET..APP_DESC_PROJECT_OFFSET + APP_DESC_PROJECT_LEN].fill(0);
         img[APP_DESC_PROJECT_OFFSET..APP_DESC_PROJECT_OFFSET + project.len()]
             .copy_from_slice(project.as_bytes());
@@ -573,16 +508,12 @@ mod tests {
     }
 
     #[test]
-    fn accepts_only_the_expected_board_project() {
-        let img = project_image(PROJECT_X4);
+    fn accepts_valid_images_from_other_firmware_projects() {
+        let img = image_with_project_name("crosspoint-reader");
         let len = img.len();
         assert_eq!(
-            validate_image_for_project(&mut cursor(img.clone()), len, None, PROJECT_X4),
+            validate_image(&mut cursor(img), len, Some(0x640000)),
             Ok(())
-        );
-        assert_eq!(
-            validate_image_for_project(&mut cursor(img), len, None, PROJECT_X3),
-            Err(ImageError::WrongBoard)
         );
     }
 
