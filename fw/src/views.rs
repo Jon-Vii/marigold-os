@@ -219,7 +219,7 @@ fn fill_chapters<'a>(
         let count = sd_library
             .chapter_count_for_ui()
             .max(1)
-            .min(chapters.len() as u8) as usize;
+            .min(chapters.len() as u16) as usize;
         for item in chapters.iter_mut().take(count) {
             // Empty titles render as numbered chapters in the contents view.
             *item = UiTocItem {

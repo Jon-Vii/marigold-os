@@ -2,6 +2,7 @@
   "name": "MarigoldOS X3",
   "version": "latest",
   "new_install_prompt_erase": false,
+  "full_erase_allowed": false,
   "builds": [
     {
       "chipFamily": "ESP32-C3",

@@ -68,7 +68,9 @@ Produces local images in `target/release-images/`:
 
 - **`firmware.bin`** — app image for `ota_0`. Flash to `0x10000`. Updates the
   app in place and leaves the bootloader untouched. This is what the web
-  flasher, `esptool write_flash 0x10000`, and in-app updater consume.
+  flasher, `esptool write_flash 0x10000`, and in-app updater consume. The web
+  installer explicitly forbids whole-chip erase for these app-only manifests;
+  CI verifies that contract before Pages deployment.
 - **`firmware-x3.bin`** — the same app image contract for X3 builds.
 - **`update.bin`** — byte-identical to `firmware.bin`, under the filename the
   stock OEM SD-card updater looks for. The OEM updater writes it to the app

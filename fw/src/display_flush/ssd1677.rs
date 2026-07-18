@@ -1,4 +1,4 @@
-use super::{Epd, SpiError};
+use super::{Epd, PanelError};
 use display::epd::{
     fill_transformed_band, ram_x_counter, ram_x_range, ram_y_counter, ram_y_range,
     update_control_1, update_control_2, RefreshMode, SpiOp, CMD_DEEP_SLEEP,
@@ -11,16 +11,17 @@ use display::fb::Framebuffer;
 use display::{Rect, BAND_BYTES, BAND_ROWS, HEIGHT};
 use embassy_time::Instant;
 
-pub(crate) async fn init_panel(epd: &mut Epd) {
+pub(crate) async fn init_panel(epd: &mut Epd) -> Result<(), PanelError> {
     for op in INIT_SEQUENCE {
         match *op {
             SpiOp::Reset => epd.reset().await,
-            SpiOp::WaitBusy => epd.wait_ready().await,
+            SpiOp::WaitBusy => epd.wait_ready().await?,
             SpiOp::Command { cmd, data } => {
-                epd.command(cmd, data).await.unwrap();
+                epd.command(cmd, data).await?;
             }
         }
     }
+    Ok(())
 }
 
 pub(crate) async fn flush(
@@ -31,7 +32,7 @@ pub(crate) async fn flush(
     screen_on: bool,
     mode: RefreshMode,
     prev_staged: bool,
-) -> Result<(), SpiError> {
+) -> Result<(), PanelError> {
     let bw_start = Instant::now();
     write_ram(epd, CMD_WRITE_RAM_BW, fb, tx_band).await?;
     esp_println::println!(
@@ -75,7 +76,7 @@ pub(crate) async fn flush(
     .await?;
     epd.command(CMD_MASTER_ACTIVATION, &[]).await?;
     let start = Instant::now();
-    epd.wait_ready().await;
+    epd.wait_ready().await?;
     let elapsed = start.elapsed();
     esp_println::println!("display: refresh busy {} ms", elapsed.as_millis());
     esp_println::println!(
@@ -91,7 +92,7 @@ pub(crate) async fn flush(
         epd.command(CMD_DISPLAY_UPDATE_CTRL2, &[UPDATE_SEQUENCE_LOAD_TEMP])
             .await?;
         epd.command(CMD_MASTER_ACTIVATION, &[]).await?;
-        epd.wait_ready().await;
+        epd.wait_ready().await?;
     }
     Ok(())
 }
@@ -103,11 +104,11 @@ pub(crate) async fn prestage_previous(
     epd: &mut Epd,
     fb: &Framebuffer,
     tx_band: &mut [u8; BAND_BYTES],
-) -> Result<(), SpiError> {
+) -> Result<(), PanelError> {
     write_ram(epd, CMD_WRITE_RAM_RED, fb, tx_band).await
 }
 
-pub(crate) async fn sleep_panel(epd: &mut Epd) -> Result<(), SpiError> {
+pub(crate) async fn sleep_panel(epd: &mut Epd) -> Result<(), PanelError> {
     let start = Instant::now();
     esp_println::println!("display: sleep start");
     esp_println::println!(
@@ -120,14 +121,14 @@ pub(crate) async fn sleep_panel(epd: &mut Epd) -> Result<(), SpiError> {
     )
     .await?;
     epd.command(CMD_MASTER_ACTIVATION, &[]).await?;
-    epd.wait_ready().await;
+    epd.wait_ready().await?;
     esp_println::println!("display: sleep deep");
     esp_println::println!(
         "bench: sleep phase=power_down_done elapsed_ms={} t_ms={}",
         start.elapsed().as_millis(),
         Instant::now().as_millis(),
     );
-    epd.command(CMD_DEEP_SLEEP, &[0x01]).await
+    Ok(epd.command(CMD_DEEP_SLEEP, &[0x01]).await?)
 }
 
 async fn write_ram(
@@ -135,7 +136,7 @@ async fn write_ram(
     ram_command: u8,
     fb: &Framebuffer,
     tx_band: &mut [u8; BAND_BYTES],
-) -> Result<(), SpiError> {
+) -> Result<(), PanelError> {
     let rect = Rect::FULL;
     epd.command(CMD_SET_RAM_X_RANGE, &ram_x_range(rect)).await?;
     epd.command(CMD_SET_RAM_Y_RANGE, &ram_y_range(rect)).await?;
@@ -158,5 +159,5 @@ async fn write_ram(
         y += BAND_ROWS;
     }
     epd.end_ram_write();
-    result
+    Ok(result?)
 }

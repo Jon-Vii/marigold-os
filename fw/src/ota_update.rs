@@ -39,6 +39,13 @@ const TRIGGER_FILE: &str = "FWUPDATE.BIN";
 #[cfg(feature = "device-x3")]
 const TRIGGER_FILE: &str = "FWUPDX3.BIN";
 
+/// Legacy boot triggers are one-shot control files, never picker sources.
+/// Reject both aliases on both boards so a moved SD card cannot expose the
+/// other board's trigger as an ordinary selectable image.
+pub(crate) fn is_trigger_alias(name: &str) -> bool {
+    ota::is_legacy_trigger_alias(name)
+}
+
 const UPDATE_STATE_DIR: &str = "XTEINK";
 const SELECTED_UPDATE_FILE: &str = "FWPEND.BIN";
 const SELECTED_UPDATE_MAGIC: [u8; 4] = *b"MGUP";
@@ -145,8 +152,17 @@ fn try_apply(root: &SdRoot, source_name: &str) -> Result<(), UpdateError> {
     esp_println::println!("ota: {} selected, {} bytes", source_name, len);
 
     // Pass 1: prove the whole image before touching flash.
-    ota::validate_image(&mut SdFile(&file), len, Some(OTA_SLOT_SIZE as usize))
-        .map_err(UpdateError::Invalid)?;
+    #[cfg(not(feature = "device-x3"))]
+    const EXPECTED_PROJECT: &str = ota::PROJECT_X4;
+    #[cfg(feature = "device-x3")]
+    const EXPECTED_PROJECT: &str = ota::PROJECT_X3;
+    ota::validate_image_for_project(
+        &mut SdFile(&file),
+        len,
+        Some(OTA_SLOT_SIZE as usize),
+        EXPECTED_PROJECT,
+    )
+    .map_err(UpdateError::Invalid)?;
     file.seek_from_start(0).map_err(|_| UpdateError::ReadFile)?;
 
     let mut flash = flash_storage();
@@ -178,7 +194,8 @@ fn try_apply(root: &SdRoot, source_name: &str) -> Result<(), UpdateError> {
 /// is not renamed or copied, so users can keep several firmware images on one
 /// card and switch among them without rewriting multi-megabyte files.
 pub(crate) fn stage_selected_update(root: &SdRoot, open_name: &str) -> bool {
-    if open_name.is_empty()
+    if is_trigger_alias(open_name)
+        || open_name.is_empty()
         || open_name.len() > 12
         || !open_name.bytes().all(|byte| byte.is_ascii_graphic())
     {

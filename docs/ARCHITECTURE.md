@@ -152,14 +152,15 @@ bytes, and `POST /delete?name=` removes a book (card-root entries carry
 `root=1`; uploads always land in /BOOKS). Upload bytes reach the display
 task — still the single SD owner — through `fw::upload`'s two-buffer
 ping-pong: 4 KB chunks carry loaned buffers one way and the buffers come
-back on a return channel once written. The display task holds one SD
-session for the whole upload phase and writes a standard VFAT long name such
+back on a return channel once written. The display task holds one interruptible
+SD session for the upload phase and writes a standard VFAT long name such
 as `/BOOKS/Original Name.epub`, backed by a deterministic collision-safe
-`.EPU` short alias. Re-uploading the same long name replaces that book; an
-alias collision probes another alias instead of overwriting an unrelated
-file. Legacy short-only `.EPU` uploads and their `/XTEINK/LABELS` sidecars
-remain readable. The done press waits for any in-flight upload before the
-session-ending reset; the boot rescan then surfaces the new books.
+`.EPU` short alias. Existing long names are rejected without opening or
+truncating the original; an alias collision probes another alias instead of
+overwriting an unrelated file. Legacy short-only `.EPU` uploads and their
+`/XTEINK/LABELS` sidecars remain readable. Power/idle sleep and the done press
+abort an active writer, reclaim the incomplete file's FAT chain, close the SD
+session, and only then sleep or reset. The boot rescan surfaces new books.
 
 Station credentials come from `/XTEINK/WIFI.BIN` (written by the
 onboarding portal below), falling back to compile-time `option_env!`
@@ -202,7 +203,8 @@ Storage is also explicit. Files/Home/Reading transitions enqueue
 FAT, open EPUBs, build caches, or write progress. Open/extend requests whose
 page already sits inside the loaded section window are answered from RAM
 without an SD session, and reading-progress writes are coalesced (at most one
-STATE.BIN write per 15 s, flushed before display sleep). The board I/O task is still
+alternating STATEA/STATEB generation per 15 s, flushed before display sleep).
+The board I/O task is still
 the single SPI owner, so display refresh and SD transactions cannot overlap, but
 the user-facing view is always drawn from the latest already-owned snapshot.
 SD/FAT access goes through an SD session: the board I/O task deselects the

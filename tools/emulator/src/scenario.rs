@@ -22,8 +22,8 @@ struct Step {
     count: Option<u16>,
     book_id: Option<u32>,
     pages: Option<u32>,
-    chapters: Option<u8>,
-    chapter: Option<u8>,
+    chapters: Option<u16>,
+    chapter: Option<u16>,
     page: Option<u32>,
     sync: Option<String>,
     ip: Option<[u8; 4]>,
@@ -35,7 +35,7 @@ struct Step {
 struct Expect {
     view: Option<String>,
     book_id: Option<u32>,
-    chapter: Option<u8>,
+    chapter: Option<u16>,
     page: Option<u32>,
     selection: Option<u16>,
     orientation: Option<String>,
@@ -295,7 +295,7 @@ fn parse_library_event(kind: &str, step: &Step) -> Result<LibraryEvent, String> 
             book_id: step.book_id.unwrap_or(2),
             pages: step.pages.unwrap_or(1),
             chapters: step.chapters.unwrap_or(1),
-            current_chapter: u16::from(step.chapter.unwrap_or(0)),
+            current_chapter: step.chapter.unwrap_or(0),
             chapter_pages: [0; app_core::MAX_SD_CHAPTERS],
         }),
         "ChapterPage" | "chapter-page" | "chapter_page" => Ok(LibraryEvent::ChapterPage {

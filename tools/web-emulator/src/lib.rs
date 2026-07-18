@@ -234,7 +234,7 @@ impl WebEmulator {
         let event = LibraryEvent::Loaded {
             book_id: ReaderSource::sd(book_index).book_id(),
             pages: store.page_count(),
-            chapters: store.chapters.len().max(1) as u8,
+            chapters: store.chapters.len().max(1).min(u16::MAX as usize) as u16,
             current_chapter: store.chapter_for_page(self.state.page),
             chapter_pages,
         };
@@ -246,7 +246,7 @@ impl WebEmulator {
             self.ctx,
             LibraryEvent::Restored {
                 book_id,
-                chapter: chapter.min(u8::MAX as u32) as u8,
+                chapter: chapter.min(u16::MAX as u32) as u16,
                 page,
                 page_count: 0,
                 reading_orientation: self.state.orientation as u8,
@@ -265,7 +265,7 @@ impl WebEmulator {
             self.ctx,
             LibraryEvent::Restored {
                 book_id: snapshot[0],
-                chapter: snapshot[1].min(u8::MAX as u32) as u8,
+                chapter: snapshot[1].min(u16::MAX as u32) as u16,
                 page: snapshot[2],
                 page_count: 0,
                 reading_orientation: snapshot[3] as u8,

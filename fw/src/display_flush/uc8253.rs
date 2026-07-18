@@ -13,7 +13,7 @@
 //! orientation, and whether the ported waveforms hold at the chosen SPI
 //! clock are all first-boot iteration points.
 
-use super::{Epd, SpiError};
+use super::{Epd, PanelError};
 use display::epd::uc8253::fill_transformed_band;
 use display::epd::uc8253::{
     bank_for, flush_plan, sleep_plan, FlushStep, FrameSource, LutBank, RamPlane, SleepStep,
@@ -33,7 +33,7 @@ use portable_atomic::{AtomicBool, Ordering};
 /// down. `init_panel` resets it to off. Single writer (the display task).
 static SCREEN_POWERED: AtomicBool = AtomicBool::new(false);
 
-pub(crate) async fn init_panel(epd: &mut Epd) {
+pub(crate) async fn init_panel(epd: &mut Epd) -> Result<(), PanelError> {
     // Bring-up probe: a live UC8253 twitches BUSY across a hardware reset;
     // a line that reads high at every sample never left power-up, which is
     // a board/RST problem, not a command-stream one.
@@ -45,20 +45,21 @@ pub(crate) async fn init_panel(epd: &mut Epd) {
 
     for op in INIT_SEQUENCE {
         if let SpiOp::Command { cmd, data } = *op {
-            let _ = epd.command(cmd, data).await;
+            epd.command(cmd, data).await?;
         }
     }
     esp_println::println!("display: x3 busy post-init high={:?}", epd.busy_is_high());
 
     // UC8253 has no auto RAM clear; whiten both planes so the first
     // differential diffs against white rather than power-on garbage.
-    let _ = fill_plane(epd, CMD_DTM1, 0xFF).await;
-    let _ = epd.command(CMD_DATA_STOP, &[]).await;
-    let _ = fill_plane(epd, CMD_DTM2, 0xFF).await;
-    let _ = epd.command(CMD_DATA_STOP, &[]).await;
+    fill_plane(epd, CMD_DTM1, 0xFF).await?;
+    epd.command(CMD_DATA_STOP, &[]).await?;
+    fill_plane(epd, CMD_DTM2, 0xFF).await?;
+    epd.command(CMD_DATA_STOP, &[]).await?;
 
     SCREEN_POWERED.store(false, Ordering::Relaxed);
     esp_println::println!("display: x3 init done");
+    Ok(())
 }
 
 pub(crate) async fn flush(
@@ -69,7 +70,7 @@ pub(crate) async fn flush(
     _screen_on: bool,
     mode: RefreshMode,
     prev_staged: bool,
-) -> Result<(), SpiError> {
+) -> Result<(), PanelError> {
     let plan = flush_plan(mode, SCREEN_POWERED.load(Ordering::Relaxed), prev_staged);
     esp_println::println!(
         "display: x3 flush requested={:?} effective={:?}",
@@ -86,11 +87,11 @@ pub(crate) async fn prestage_previous(
     epd: &mut Epd,
     fb: &Framebuffer,
     tx_band: &mut [u8; BAND_BYTES],
-) -> Result<(), SpiError> {
+) -> Result<(), PanelError> {
     execute_steps(epd, fb, fb, tx_band, RefreshMode::Fast, PRESTAGE_STEPS).await
 }
 
-pub(crate) async fn sleep_panel(epd: &mut Epd) -> Result<(), SpiError> {
+pub(crate) async fn sleep_panel(epd: &mut Epd) -> Result<(), PanelError> {
     let start = Instant::now();
     esp_println::println!(
         "bench: sleep phase=power_down_start t_ms={}",
@@ -119,7 +120,7 @@ async fn execute_steps(
     tx_band: &mut [u8; BAND_BYTES],
     mode: RefreshMode,
     steps: &[FlushStep],
-) -> Result<(), SpiError> {
+) -> Result<(), PanelError> {
     for step in steps {
         match *step {
             FlushStep::LoadBank(mode) => {
@@ -146,12 +147,12 @@ async fn execute_steps(
     Ok(())
 }
 
-async fn power_on(epd: &mut Epd) -> Result<(), SpiError> {
+async fn power_on(epd: &mut Epd) -> Result<(), PanelError> {
     epd.command(CMD_POWER_ON, &[]).await?;
-    let (low, ms) = epd.wait_two_phase().await;
+    let ms = epd.wait_two_phase().await?;
     esp_println::println!(
         "display: x3 PON busy_low={} {}ms level_high={:?}",
-        low,
+        true,
         ms,
         epd.busy_is_high()
     );
@@ -159,13 +160,13 @@ async fn power_on(epd: &mut Epd) -> Result<(), SpiError> {
     Ok(())
 }
 
-async fn display_refresh(epd: &mut Epd, mode: RefreshMode) -> Result<(), SpiError> {
+async fn display_refresh(epd: &mut Epd, mode: RefreshMode) -> Result<(), PanelError> {
     let start = Instant::now();
     epd.command(CMD_DISPLAY_REFRESH, &[]).await?;
-    let (low, ms) = epd.wait_two_phase().await;
+    let ms = epd.wait_two_phase().await?;
     esp_println::println!(
         "display: x3 DRF busy_low={} {}ms level_high={:?}",
-        low,
+        true,
         ms,
         epd.busy_is_high()
     );
@@ -173,7 +174,7 @@ async fn display_refresh(epd: &mut Epd, mode: RefreshMode) -> Result<(), SpiErro
         "bench: refresh mode={:?} busy_ms={} busy_low={} elapsed_ms={} screen_on={} t_ms={}",
         mode,
         ms,
-        low,
+        true,
         start.elapsed().as_millis(),
         SCREEN_POWERED.load(Ordering::Relaxed),
         Instant::now().as_millis(),
@@ -181,14 +182,14 @@ async fn display_refresh(epd: &mut Epd, mode: RefreshMode) -> Result<(), SpiErro
     Ok(())
 }
 
-async fn power_off(epd: &mut Epd, start: Instant) -> Result<(), SpiError> {
+async fn power_off(epd: &mut Epd, start: Instant) -> Result<(), PanelError> {
     epd.command(CMD_POWER_OFF, &[]).await?;
-    let (low, ms) = epd.wait_two_phase().await;
-    esp_println::println!("display: x3 POF busy_low={} {}ms", low, ms);
+    let ms = epd.wait_two_phase().await?;
+    esp_println::println!("display: x3 POF busy_low=true {}ms", ms);
     esp_println::println!(
         "bench: sleep phase=power_off busy_ms={} busy_low={} elapsed_ms={} t_ms={}",
         ms,
-        low,
+        true,
         start.elapsed().as_millis(),
         Instant::now().as_millis(),
     );
@@ -196,7 +197,7 @@ async fn power_off(epd: &mut Epd, start: Instant) -> Result<(), SpiError> {
     Ok(())
 }
 
-async fn load_bank(epd: &mut Epd, cdi0: u8, bank: &LutBank) -> Result<(), SpiError> {
+async fn load_bank(epd: &mut Epd, cdi0: u8, bank: &LutBank) -> Result<(), PanelError> {
     epd.command(CMD_VCOM_DATA_INTERVAL, &[cdi0, CDI_INTERVAL])
         .await?;
     epd.command(CMD_LUT_VCOM, bank.vcom).await?;
@@ -219,7 +220,7 @@ async fn send_plane(
     ram_cmd: u8,
     fb: &Framebuffer,
     tx_band: &mut [u8; BAND_BYTES],
-) -> Result<(), SpiError> {
+) -> Result<(), PanelError> {
     epd.begin_ram_write(ram_cmd).await?;
     let mut y = 0;
     let mut result = Ok(());
@@ -232,14 +233,14 @@ async fn send_plane(
         y += BAND_ROWS;
     }
     epd.end_ram_write();
-    result
+    Ok(result?)
 }
 
 /// Fill a RAM plane with a constant byte (0xFF = white), row by row.
 ///
 /// Deliberately does NOT send DATA_STOP, for the same reason as `send_plane`
 /// above: callers add it where the reference driver does.
-async fn fill_plane(epd: &mut Epd, ram_cmd: u8, fill: u8) -> Result<(), SpiError> {
+async fn fill_plane(epd: &mut Epd, ram_cmd: u8, fill: u8) -> Result<(), PanelError> {
     let mut row = [0u8; ROW_BYTES];
     row.fill(fill);
     epd.begin_ram_write(ram_cmd).await?;
@@ -251,5 +252,5 @@ async fn fill_plane(epd: &mut Epd, ram_cmd: u8, fill: u8) -> Result<(), SpiError
         }
     }
     epd.end_ram_write();
-    result
+    Ok(result?)
 }

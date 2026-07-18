@@ -26,7 +26,10 @@ pub(crate) fn scan(epd: &mut Epd, sd_cs: &mut Output<'static>, store: &mut Reade
             let mut open_name = String::<16>::new();
             let _ = write!(open_name, "{}", entry.name);
             let display_name = long_name.unwrap_or(open_name.as_str());
-            if !is_bin_name(display_name) {
+            if !is_bin_name(display_name)
+                || crate::ota_update::is_trigger_alias(display_name)
+                || crate::ota_update::is_trigger_alias(open_name.as_str())
+            {
                 return;
             }
             store.push_firmware_file(display_name, open_name.as_str(), entry.size);
@@ -67,5 +70,12 @@ mod tests {
         assert!(is_bin_name("CROSSPOINT.BIN"));
         assert!(!is_bin_name("firmware.bin.txt"));
         assert!(!is_bin_name("bin"));
+    }
+
+    #[test]
+    fn legacy_update_triggers_are_never_picker_images() {
+        assert!(crate::ota_update::is_trigger_alias("FWUPDATE.BIN"));
+        assert!(crate::ota_update::is_trigger_alias("fwupdx3.bin"));
+        assert!(!crate::ota_update::is_trigger_alias("marigold-x4.bin"));
     }
 }

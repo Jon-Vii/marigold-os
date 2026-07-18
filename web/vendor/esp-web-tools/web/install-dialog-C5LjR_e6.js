@@ -533,7 +533,7 @@ import{e,_ as t,o as i,i as r,x as o,a,n as s,t as n,m as l,b as d,E as c,c as h
           ${this._isSameVersion?"":o`
                 <ew-list-item
                   type="button"
-                  @click=${()=>{this._isSameFirmware?this._startInstall(!1):this._manifest.new_install_prompt_erase?this._state="ASK_ERASE":this._startInstall(!0)}}
+                  @click=${()=>this._startInstall(!1)}
                 >
                   ${Sa}
                   <div slot="headline">
@@ -587,7 +587,7 @@ import{e,_ as t,o as i,i as r,x as o,a,n as s,t as n,m as l,b as d,E as c,c as h
                   <div slot="headline">Fund Development</div>
                 </ew-list-item>
               `:""}
-          ${this._isSameVersion?o`
+          ${this._isSameVersion&&this._manifest.full_erase_allowed&&this._manifest.builds.every((e=>[0,32768,57344,65536].every((t=>e.parts.some((e=>e.offset===t))))))?o`
                 <ew-list-item
                   type="button"
                   class="danger"
@@ -604,7 +604,7 @@ import{e,_ as t,o as i,i as r,x as o,a,n as s,t as n,m as l,b as d,E as c,c as h
         <ew-list>
           <ew-list-item
             type="button"
-            @click=${()=>{this._manifest.new_install_prompt_erase?this._state="ASK_ERASE":this._startInstall(!0)}}
+            @click=${()=>this._startInstall(!1)}
           >
             ${Sa}
             <div slot="headline">${`Install ${this._manifest.name}`}</div>
@@ -735,7 +735,7 @@ import{e,_ as t,o as i,i as r,x as o,a,n as s,t as n,m as l,b as d,E as c,c as h
           Back
         </ew-text-button>
         <ew-text-button
-          @click=${()=>{const e=this.shadowRoot.querySelector("ew-checkbox");this._startInstall(e.checked)}}
+          @click=${()=>this._startInstall(!1)}
         >
           Next
         </ew-text-button>

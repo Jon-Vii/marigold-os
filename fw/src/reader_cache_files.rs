@@ -22,6 +22,149 @@ use proto::font_pack::{
     FONT_PACK_FACE_RECORD_BYTES, FONT_PACK_FILE, FONT_PACK_HEADER_BYTES,
 };
 
+const DURABLE_VERSION: u8 = 1;
+const DURABLE_OVERHEAD: usize = 13;
+const DURABLE_MAX_BYTES: usize = 128;
+
+fn durable_checksum(bytes: &[u8]) -> u32 {
+    bytes.iter().fold(0x811c_9dc5, |hash, byte| {
+        (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193)
+    })
+}
+
+fn read_generation_file<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    directory: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    name: &str,
+    magic: [u8; 4],
+    payload: &mut [u8],
+) -> Option<u32>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let total = payload.len().checked_add(DURABLE_OVERHEAD)?;
+    if total > DURABLE_MAX_BYTES {
+        return None;
+    }
+    let file = directory.open_file_in_dir(name, Mode::ReadOnly).ok()?;
+    if file.length() as usize != total {
+        return None;
+    }
+    let mut bytes = [0u8; DURABLE_MAX_BYTES];
+    read_exact_file(&file, &mut bytes[..total]).ok()?;
+    if bytes[..4] != magic || bytes[4] != DURABLE_VERSION {
+        return None;
+    }
+    let stored = u32::from_le_bytes(bytes[total - 4..total].try_into().ok()?);
+    if durable_checksum(&bytes[..total - 4]) != stored {
+        return None;
+    }
+    payload.copy_from_slice(&bytes[9..total - 4]);
+    Some(u32::from_le_bytes(bytes[5..9].try_into().ok()?))
+}
+
+fn generation_is_newer(candidate: u32, current: u32) -> bool {
+    let distance = candidate.wrapping_sub(current);
+    distance != 0 && distance < 0x8000_0000
+}
+
+fn read_two_generation<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    directory: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    names: [&str; 2],
+    magic: [u8; 4],
+    payload: &mut [u8],
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut other = [0u8; DURABLE_MAX_BYTES];
+    let a = read_generation_file(directory, names[0], magic, payload);
+    let b = read_generation_file(directory, names[1], magic, &mut other[..payload.len()]);
+    match (a, b) {
+        (None, None) => false,
+        (Some(_), None) => true,
+        (None, Some(_)) => {
+            payload.copy_from_slice(&other[..payload.len()]);
+            true
+        }
+        (Some(a), Some(b)) if generation_is_newer(b, a) => {
+            payload.copy_from_slice(&other[..payload.len()]);
+            true
+        }
+        (Some(_), Some(_)) => true,
+    }
+}
+
+fn write_two_generation<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    directory: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    names: [&str; 2],
+    magic: [u8; 4],
+    payload: &[u8],
+) -> Result<(), ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let total = payload.len().checked_add(DURABLE_OVERHEAD).ok_or(())?;
+    if total > DURABLE_MAX_BYTES {
+        return Err(());
+    }
+    let mut scratch = [0u8; DURABLE_MAX_BYTES];
+    let a = read_generation_file(directory, names[0], magic, &mut scratch[..payload.len()]);
+    let b = read_generation_file(directory, names[1], magic, &mut scratch[..payload.len()]);
+    let (target, generation) = match (a, b) {
+        (Some(a), Some(b)) if generation_is_newer(b, a) => (0, b.wrapping_add(1)),
+        (Some(a), Some(_)) => (1, a.wrapping_add(1)),
+        (Some(a), None) => (1, a.wrapping_add(1)),
+        (None, Some(b)) => (0, b.wrapping_add(1)),
+        (None, None) => (0, 1),
+    };
+    let mut record = [0u8; DURABLE_MAX_BYTES];
+    record[..4].copy_from_slice(&magic);
+    record[4] = DURABLE_VERSION;
+    record[5..9].copy_from_slice(&generation.to_le_bytes());
+    record[9..9 + payload.len()].copy_from_slice(payload);
+    let checksum = durable_checksum(&record[..total - 4]);
+    record[total - 4..total].copy_from_slice(&checksum.to_le_bytes());
+    {
+        let file = directory
+            .open_file_in_dir(names[target], Mode::ReadWriteCreateOrTruncate)
+            .map_err(|_| ())?;
+        file.write(&record[..total]).map_err(|_| ())?;
+    }
+    let mut verify = [0u8; DURABLE_MAX_BYTES];
+    let verified = read_generation_file(
+        directory,
+        names[target],
+        magic,
+        &mut verify[..payload.len()],
+    );
+    if verified == Some(generation) && &verify[..payload.len()] == payload {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CustomFontManifest {
     pub(crate) name: heapless::String<{ crate::reader_store::MAX_CUSTOM_FONT_NAME }>,
@@ -74,6 +217,8 @@ where
 }
 
 const POSITION_FILE: &str = "POS.BIN";
+const POSITION_GENERATIONS: [&str; 2] = ["POSA.BIN", "POSB.BIN"];
+const POSITION_DURABLE_MAGIC: [u8; 4] = *b"MGPS";
 const POSITION_MAGIC: &[u8; 4] = b"X4PS";
 const POSITION_VERSION: u8 = 1;
 const POSITION_BYTES: usize = 15;
@@ -151,11 +296,12 @@ where
     let xteink = open_or_make_dir(root, CACHE_ROOT_DIR)?;
     let cache = open_or_make_dir(&xteink, CACHE_V2_DIR)?;
     let book = open_or_make_dir(&cache, key)?;
-    let file = book
-        .open_file_in_dir(POSITION_FILE, Mode::ReadWriteCreateOrTruncate)
-        .map_err(|_| ())?;
-    file.write(&encode_position(chapter, screen))
-        .map_err(|_| ())
+    write_two_generation(
+        &book,
+        POSITION_GENERATIONS,
+        POSITION_DURABLE_MAGIC,
+        &encode_position(chapter, screen),
+    )
 }
 
 pub(crate) fn read_position_file<
@@ -175,11 +321,22 @@ where
     let xteink = root.open_dir(CACHE_ROOT_DIR).ok()?;
     let cache = xteink.open_dir(CACHE_V2_DIR).ok()?;
     let book = cache.open_dir(key).ok()?;
-    let file = book.open_file_in_dir(POSITION_FILE, Mode::ReadOnly).ok()?;
     let mut bytes = [0u8; POSITION_BYTES];
+    if read_two_generation(
+        &book,
+        POSITION_GENERATIONS,
+        POSITION_DURABLE_MAGIC,
+        &mut bytes,
+    ) {
+        return decode_position(&bytes);
+    }
+    let file = book.open_file_in_dir(POSITION_FILE, Mode::ReadOnly).ok()?;
     let len = file.read(&mut bytes).ok()?;
     decode_position(&bytes[..len])
 }
+
+const STATE_GENERATIONS: [&str; 2] = ["STATEA.BIN", "STATEB.BIN"];
+const STATE_DURABLE_MAGIC: [u8; 4] = *b"MGST";
 
 pub(crate) fn write_state_file<
     D,
@@ -196,14 +353,16 @@ where
     T: TimeSource,
 {
     let xteink = open_or_make_dir(root, CACHE_ROOT_DIR)?;
-    let file = xteink
-        .open_file_in_dir(CACHE_STATE_FILE, Mode::ReadWriteCreateOrTruncate)
-        .map_err(|_| ())?;
-    file.write(&record.encode()).map_err(|_| ())
+    write_two_generation(
+        &xteink,
+        STATE_GENERATIONS,
+        STATE_DURABLE_MAGIC,
+        &record.encode(),
+    )
 }
 
-/// Read and decode `/XTEINK/STATE.BIN`. Returns None when the directory
-/// or file is missing, short, or fails the record checksum.
+/// Read the newest valid STATEA/STATEB generation, falling back to the legacy
+/// `/XTEINK/STATE.BIN`. Returns None when every copy is absent or corrupt.
 pub(crate) fn read_state_file<
     D,
     T,
@@ -218,10 +377,13 @@ where
     T: TimeSource,
 {
     let xteink = root.open_dir(CACHE_ROOT_DIR).ok()?;
+    let mut bytes = [0u8; hal_ext::nvm::AppStateRecord::ENCODED_LEN];
+    if read_two_generation(&xteink, STATE_GENERATIONS, STATE_DURABLE_MAGIC, &mut bytes) {
+        return hal_ext::nvm::AppStateRecord::decode(&bytes);
+    }
     let file = xteink
         .open_file_in_dir(CACHE_STATE_FILE, Mode::ReadOnly)
         .ok()?;
-    let mut bytes = [0u8; hal_ext::nvm::AppStateRecord::ENCODED_LEN];
     // One read suffices for a 32-byte record; shorter V1/V2 files decode
     // from their actual length.
     let len = file.read(&mut bytes).ok()?;
@@ -280,8 +442,10 @@ where
 }
 
 const WIFI_FILE: &str = "WIFI.BIN";
+const WIFI_GENERATIONS: [&str; 2] = ["WIFIA.BIN", "WIFIB.BIN"];
+const WIFI_DURABLE_MAGIC: [u8; 4] = *b"MGWF";
 
-/// Write the onboarding portal's captured credentials to /XTEINK/WIFI.BIN.
+/// Write the onboarding portal's credentials to alternating WIFIA/WIFIB.
 pub(crate) fn write_wifi_file<
     D,
     T,
@@ -297,10 +461,12 @@ where
     T: TimeSource,
 {
     let xteink = open_or_make_dir(root, CACHE_ROOT_DIR)?;
-    let file = xteink
-        .open_file_in_dir(WIFI_FILE, Mode::ReadWriteCreateOrTruncate)
-        .map_err(|_| ())?;
-    file.write(&record.encode()).map_err(|_| ())
+    write_two_generation(
+        &xteink,
+        WIFI_GENERATIONS,
+        WIFI_DURABLE_MAGIC,
+        &record.encode(),
+    )
 }
 
 /// Delete /XTEINK/WIFI.BIN; missing file counts as success.
@@ -320,18 +486,21 @@ where
     let Ok(xteink) = root.open_dir(CACHE_ROOT_DIR) else {
         return true;
     };
-    let removed = match xteink.open_file_in_dir(WIFI_FILE, Mode::ReadWriteTruncate) {
-        Ok(file) => {
-            drop(file);
-            xteink.delete_file_in_dir(WIFI_FILE).is_ok()
-        }
-        Err(embedded_sdmmc::Error::NotFound) => true,
-        Err(_) => false,
-    };
-    removed
+    let mut ok = true;
+    for name in [WIFI_FILE, WIFI_GENERATIONS[0], WIFI_GENERATIONS[1]] {
+        ok &= match xteink.open_file_in_dir(name, Mode::ReadWriteTruncate) {
+            Ok(file) => {
+                drop(file);
+                xteink.delete_file_in_dir(name).is_ok()
+            }
+            Err(embedded_sdmmc::Error::NotFound) => true,
+            Err(_) => false,
+        };
+    }
+    ok
 }
 
-/// Read /XTEINK/WIFI.BIN; None when missing, short, or corrupt.
+/// Read the newest WIFIA/WIFIB generation, falling back to legacy WIFI.BIN.
 pub(crate) fn read_wifi_file<
     D,
     T,
@@ -346,8 +515,11 @@ where
     T: TimeSource,
 {
     let xteink = root.open_dir(CACHE_ROOT_DIR).ok()?;
-    let file = xteink.open_file_in_dir(WIFI_FILE, Mode::ReadOnly).ok()?;
     let mut bytes = [0u8; hal_ext::nvm::WifiCredentialsRecord::ENCODED_LEN];
+    if read_two_generation(&xteink, WIFI_GENERATIONS, WIFI_DURABLE_MAGIC, &mut bytes) {
+        return hal_ext::nvm::WifiCredentialsRecord::decode(&bytes);
+    }
+    let file = xteink.open_file_in_dir(WIFI_FILE, Mode::ReadOnly).ok()?;
     let len = file.read(&mut bytes).ok()?;
     hal_ext::nvm::WifiCredentialsRecord::decode(&bytes[..len])
 }

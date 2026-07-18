@@ -475,7 +475,7 @@
     <div class="stage">
       <p class="stitle"><span class="no">2</span>Flash over USB</p>
       <div class="asset">
-        <div><span class="k">Version</span><b>v0.3.1</b></div>
+        <div><span class="k">Version</span><b>v0.4.0</b></div>
         <div><span class="k">Image</span><b id="img">firmware-x4.bin</b></div>
         <div><span class="k">Size</span><b>~2.0 MB</b></div>
       </div>
@@ -501,7 +501,7 @@
     <p class="txt">Already running Marigold on an X4? Use <a href="https://github.com/Jon-Vii/marigold-os/releases/latest/download/FWUPDATE.BIN">FWUPDATE.BIN</a> instead and reboot normally.</p>
   </div>
 
-  <p class="rel"><a href="https://github.com/Jon-Vii/marigold-os/releases/latest">v0.3.1 release notes &#8599;</a></p>
+  <p class="rel"><a href="https://github.com/Jon-Vii/marigold-os/releases/latest">v0.4.0 release notes &#8599;</a></p>
 </section>
 
 <div class="colophon">
@@ -642,47 +642,52 @@
 
   // mode: 1 full (~3.5 s real; abridged here), 2 fast (421 ms), 3 fast-clean.
   async function refresh(mode) {
-    const pixels = frame();
+    // Own the pixels on the JS heap before the first await. A later WASM
+    // memory.grow may detach views into wasm.memory.buffer.
+    const pixels = new Uint8ClampedArray(frame());
     busy = true;
     led.classList.add("on");
-    if (reduceMotion) {
-      ghosting = false;
-      putFinal(pixels);
-    } else if (mode === 2) {
-      // A fast update does not flash: changed pixels just redraw, and a
-      // faint imprint of the outgoing page stays behind until a cleaning
-      // refresh. The panel is still busy for the rated 421 ms.
-      workCtx.drawImage(page, 0, 0);
-      ghostCtx.drawImage(work, 0, 0);
-      ghosting = true;
-      putFinal(pixels);
-      await sleep(420);
-    } else {
-      // FastClean is the panel's one-flicker cleaning waveform; full runs
-      // several inversion passes.
-      const flashes = mode === 1 ? 3 : 1;
-      for (let i = 0; i < flashes; i++) {
-        putInverted(pixels);
-        await sleep(150);
-        ctx.fillStyle = "#161614";
-        ctx.fillRect(0, 0, WIDTH, HEIGHT);
-        present();
-        await sleep(120);
-        ctx.fillStyle = "#eeece2";
-        ctx.fillRect(0, 0, WIDTH, HEIGHT);
-        present();
-        await sleep(120);
+    try {
+      if (reduceMotion) {
+        ghosting = false;
+        putFinal(pixels);
+      } else if (mode === 2) {
+        // A fast update does not flash: changed pixels just redraw, and a
+        // faint imprint of the outgoing page stays behind until a cleaning
+        // refresh. The panel is still busy for the rated 421 ms.
+        workCtx.drawImage(page, 0, 0);
+        ghostCtx.drawImage(work, 0, 0);
+        ghosting = true;
+        putFinal(pixels);
+        await sleep(420);
+      } else {
+        // FastClean is the panel's one-flicker cleaning waveform; full runs
+        // several inversion passes.
+        const flashes = mode === 1 ? 3 : 1;
+        for (let i = 0; i < flashes; i++) {
+          putInverted(pixels);
+          await sleep(150);
+          ctx.fillStyle = "#161614";
+          ctx.fillRect(0, 0, WIDTH, HEIGHT);
+          present();
+          await sleep(120);
+          ctx.fillStyle = "#eeece2";
+          ctx.fillRect(0, 0, WIDTH, HEIGHT);
+          present();
+          await sleep(120);
+        }
+        ghosting = false;
+        putFinal(pixels);
+        await sleep(160);
       }
-      ghosting = false;
-      putFinal(pixels);
-      await sleep(160);
-    }
-    led.classList.remove("on");
-    busy = false;
-    if (queued !== null) {
-      const next = queued;
-      queued = null;
-      press(next);
+    } finally {
+      led.classList.remove("on");
+      busy = false;
+      if (queued !== null) {
+        const next = queued;
+        queued = null;
+        press(next);
+      }
     }
   }
 

@@ -255,7 +255,7 @@ fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>) {
 pub(crate) fn draw_chapter_colophon(
     fb: &mut Framebuffer,
     chapters: &[UiTocItem<'_>],
-    chapter: u8,
+    chapter: u16,
     title_override: &str,
     x: i16,
     baseline: i16,
@@ -286,7 +286,7 @@ pub(crate) fn draw_chapter_colophon(
 /// present (covers the whole book), else the resident list entry.
 fn colophon_chapter_name<'a>(
     chapters: &'a [UiTocItem<'a>],
-    chapter: u8,
+    chapter: u16,
     title_override: &'a str,
 ) -> &'a str {
     if !title_override.is_empty() {
@@ -301,7 +301,7 @@ fn colophon_chapter_name<'a>(
 /// Width the colophon will occupy, for centered layouts.
 pub(crate) fn chapter_colophon_width(
     chapters: &[UiTocItem<'_>],
-    chapter: u8,
+    chapter: u16,
     title_override: &str,
     max_w: i16,
 ) -> i16 {

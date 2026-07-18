@@ -33,7 +33,10 @@ pub static _ESP_APP_DESC: EspAppDesc = EspAppDesc {
     secure_version: 0,
     reserv1: [0; 2],
     version: [0; 32],
-    project_name: [0; 32],
+    #[cfg(not(feature = "device-x3"))]
+    project_name: *b"xteink-x4\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+    #[cfg(feature = "device-x3")]
+    project_name: *b"xteink-x3\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
     time: *b"00:00:00\0\0\0\0\0\0\0\0",
     date: *b"2026-05-20\0\0\0\0\0\0",
     idf_ver: [0; 32],
@@ -66,14 +69,12 @@ use esp_hal::analog::adc::{
 };
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
 use esp_hal::interrupt::software::SoftwareInterruptControl;
-#[cfg(not(feature = "device-x3"))]
 use esp_hal::interrupt::Priority;
 use esp_hal::peripherals::ADC1;
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_rtos::embassy::Executor;
-#[cfg(not(feature = "device-x3"))]
 use esp_rtos::embassy::InterruptExecutor;
 use static_cell::StaticCell;
 use tasks::input::InputPins;
@@ -110,9 +111,11 @@ pub static UPLOAD_BEGINS: Channel<CriticalSectionRawMutex, upload::UploadBegin, 
 pub static UPLOAD_CHUNKS: Channel<CriticalSectionRawMutex, upload::UploadChunk, 2> = Channel::new();
 pub static UPLOAD_RETURNS: Channel<CriticalSectionRawMutex, &'static mut [u8], 2> = Channel::new();
 pub static UPLOAD_RESULTS: Channel<CriticalSectionRawMutex, bool, 1> = Channel::new();
+pub static UPLOAD_STOP_REQUESTS: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
+pub static UPLOAD_STOPPED: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
+pub static WIFI_STORAGE_RESULTS: Channel<CriticalSectionRawMutex, bool, 1> = Channel::new();
 
 static EXECUTOR: StaticCell<Executor> = StaticCell::new();
-#[cfg(not(feature = "device-x3"))]
 static INPUT_EXECUTOR: StaticCell<InterruptExecutor<1>> = StaticCell::new();
 
 type BoardAdc = ADC1<'static>;
@@ -242,7 +245,6 @@ fn main() -> ! {
     // keeps running while the thread executor blocks on SD/EPUB work; a
     // cold cache build no longer deafens the buttons. Channels between the
     // tasks already use CriticalSectionRawMutex, so handoff is unchanged.
-    #[cfg(not(feature = "device-x3"))]
     {
         let input_executor =
             INPUT_EXECUTOR.init(InterruptExecutor::new(sw_ints.software_interrupt1));
@@ -253,6 +255,7 @@ fn main() -> ! {
                 adc1,
                 InputPins {
                     power: power_button,
+                    #[cfg(not(feature = "device-x3"))]
                     aux_pin: aux_adc,
                     nav_pin: nav_adc,
                     page_pin: page_adc,
@@ -265,21 +268,7 @@ fn main() -> ! {
     let executor = EXECUTOR.init(Executor::new());
     executor.run(|spawner: Spawner| {
         #[cfg(feature = "device-x3")]
-        {
-            esp_println::println!("main: spawn input");
-            spawner.spawn(
-                tasks::input::run(
-                    adc1,
-                    InputPins {
-                        power: power_button,
-                        nav_pin: nav_adc,
-                        page_pin: page_adc,
-                        gauge: battery_gauge,
-                    },
-                )
-                .unwrap(),
-            );
-        }
+        spawner.spawn(tasks::input::battery_run(battery_gauge).unwrap());
         esp_println::println!("main: spawn display");
         spawner.spawn(tasks::display::run(epd_bus, sd_cs).unwrap());
         esp_println::println!("main: spawn power");

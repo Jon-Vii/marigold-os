@@ -5,6 +5,8 @@ use esp_hal::gpio::Input;
 #[cfg(not(feature = "device-x3"))]
 use esp_hal::peripherals::GPIO0;
 use esp_hal::peripherals::{ADC1, GPIO1, GPIO2};
+#[cfg(feature = "device-x3")]
+use portable_atomic::{AtomicU32, Ordering};
 
 type BoardAdc = ADC1<'static>;
 type BoardAdcDriver = Adc<'static, BoardAdc, esp_hal::Blocking>;
@@ -28,10 +30,8 @@ const REPEAT_COOLDOWN_TICKS: u8 = 32;
 const NAV_BACK_MIN_MV: u16 = 2400;
 const NAV_BACK_MAX_MV: u16 = 2700;
 const RAW_LOG_TICKS: u8 = 67;
-// A dead gauge fails on every 15 ms poll; log the first error (with its
-// kind) and then one line per ~10 s instead of ~66 lines/s.
 #[cfg(feature = "device-x3")]
-const GAUGE_ERR_LOG_TICKS: u32 = 667;
+static CACHED_GAUGE: AtomicU32 = AtomicU32::new(100 << 16);
 
 #[derive(Clone, Copy)]
 struct Band {
@@ -48,8 +48,6 @@ pub struct InputPins {
     pub aux_pin: AdcPin<GPIO0<'static>, BoardAdc, AdcCalCurve<BoardAdc>>,
     pub nav_pin: AdcPin<GPIO1<'static>, BoardAdc, AdcCalCurve<BoardAdc>>,
     pub page_pin: AdcPin<GPIO2<'static>, BoardAdc, AdcCalCurve<BoardAdc>>,
-    #[cfg(feature = "device-x3")]
-    pub gauge: BatteryGauge,
 }
 
 #[derive(Clone, Copy)]
@@ -143,13 +141,11 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
     let mut raw_log_ticks = 0u8;
     let mut reported_percent: Option<u8> = None;
     let mut battery_seeded = false;
-    let mut gauge_failures: u32 = 0;
 
     loop {
         Timer::after_millis(POLL_MS).await;
 
-        let (battery_mv, raw_percent, aux) =
-            read_power(&mut adc, &mut pins, &mut gauge_failures).await;
+        let (battery_mv, raw_percent, aux) = read_power(&mut adc, &mut pins).await;
         let sample = RawSample {
             aux,
             nav: read_adc(&mut adc, &mut pins.nav_pin).await,
@@ -215,43 +211,44 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
 /// the X4, the gauge voltage on the X3 (which has no aux ADC). On an I2C
 /// error the X3 reports a flat full battery rather than a spurious 0%.
 #[cfg(not(feature = "device-x3"))]
-async fn read_power(
-    adc: &mut BoardAdcDriver,
-    pins: &mut InputPins,
-    _gauge_failures: &mut u32,
-) -> (u16, u8, u16) {
+async fn read_power(adc: &mut BoardAdcDriver, pins: &mut InputPins) -> (u16, u8, u16) {
     let aux = read_adc(adc, &mut pins.aux_pin).await;
     (battery_mv(aux), battery_percent(aux), aux)
 }
 
 #[cfg(feature = "device-x3")]
-async fn read_power(
-    _adc: &mut BoardAdcDriver,
-    pins: &mut InputPins,
-    gauge_failures: &mut u32,
-) -> (u16, u8, u16) {
-    match pins.gauge.read().await {
-        Ok((mv, percent)) => {
-            if *gauge_failures > 0 {
-                esp_println::println!(
-                    "input: bq27220 recovered after {} failed reads",
-                    *gauge_failures
+async fn read_power(_adc: &mut BoardAdcDriver, _pins: &mut InputPins) -> (u16, u8, u16) {
+    let packed = CACHED_GAUGE.load(Ordering::Relaxed);
+    let mv = packed as u16;
+    let percent = (packed >> 16) as u8;
+    (mv, percent, mv)
+}
+
+/// X3 battery telemetry is deliberately independent of the 15 ms button
+/// scanner. The slow-changing gauge is sampled every 30 seconds and the
+/// interrupt executor reads this cached word without touching I2C.
+#[cfg(feature = "device-x3")]
+#[embassy_executor::task]
+pub async fn battery_run(mut gauge: BatteryGauge) {
+    let mut failures = 0u32;
+    loop {
+        match gauge.read().await {
+            Ok((mv, percent)) => {
+                if failures > 0 {
+                    esp_println::println!("battery: gauge recovered after {} failures", failures);
+                    failures = 0;
+                }
+                CACHED_GAUGE.store(
+                    u32::from(mv) | (u32::from(percent) << 16),
+                    Ordering::Relaxed,
                 );
-                *gauge_failures = 0;
             }
-            (mv, percent, mv)
-        }
-        Err(err) => {
-            *gauge_failures = gauge_failures.saturating_add(1);
-            if *gauge_failures == 1 || (*gauge_failures).is_multiple_of(GAUGE_ERR_LOG_TICKS) {
-                esp_println::println!(
-                    "input: bq27220 read failed ({:?}, {} consecutive)",
-                    err,
-                    *gauge_failures
-                );
+            Err(error) => {
+                failures = failures.saturating_add(1);
+                esp_println::println!("battery: gauge read failed ({:?})", error);
             }
-            (0, 100, 0)
         }
+        Timer::after_secs(30).await;
     }
 }
 

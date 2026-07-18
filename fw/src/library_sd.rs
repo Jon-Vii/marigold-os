@@ -53,13 +53,15 @@ pub(crate) fn scan_books(epd: &mut Epd, sd_cs: &mut Output<'static>, library: &m
             Ok(0) => LibraryScanStatus::Empty,
             Ok(count) => {
                 esp_println::println!("sd: catalog written, {} epub(s)", count);
+                // Re-open and fully validate the finalized catalog before it
+                // is allowed to drive destructive orphan reclamation.
+                if read_catalog_window(root, library, 0).is_err() {
+                    return LibraryScanStatus::Error;
+                }
                 // Drop the cached data of books no longer on the card before
                 // reloading the window: this is the one moment the full book
                 // set is known and the catalog is fresh.
                 sweep_orphan_caches(root);
-                // Reload the header count + the first list window from the file
-                // we just wrote, so the streaming readers and the store agree.
-                let _ = read_catalog_window(root, library, 0);
                 LibraryScanStatus::Ready
             }
             Err(()) => LibraryScanStatus::Error,
@@ -129,14 +131,16 @@ pub(crate) fn load_catalog_cache(
 fn walk_epubs<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     visit: &mut impl FnMut(&str, &str, bool, u32),
-) where
+) -> Result<(), ()>
+where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    collect_epubs(root, "/", false, visit);
+    collect_epubs(root, "/", false, visit)?;
     if let Ok(books) = root.open_dir("BOOKS") {
-        collect_epubs(&books, "/books/", true, visit);
+        collect_epubs(&books, "/books/", true, visit)?;
     }
+    Ok(())
 }
 
 /// Write CATALOG.BIN from the card without ever holding the whole library in
@@ -166,14 +170,19 @@ where
     let mut counted = 0usize;
     {
         let mut count = |_: &str, _: &str, _: bool, _: u32| counted += 1;
-        walk_epubs(root, &mut count);
+        walk_epubs(root, &mut count)?;
     }
     let count = counted.min(u16::MAX as usize) as u16;
 
     let mut header = [0u8; CATALOG_HEADER_BYTES];
     header[..4].copy_from_slice(CATALOG_MAGIC);
-    header[4] = CATALOG_VERSION;
-    header[5..7].copy_from_slice(&count.to_le_bytes());
+    // Version zero is never accepted by readers; the valid version byte is
+    // the final one-byte commit after every record is durable.
+    header[4] = 0;
+    // Keep the header deliberately invalid while records are being written.
+    // For a non-empty partial file, count=0 cannot agree with its length.
+    // The real count is committed only after every directory pass succeeded.
+    header[5..7].copy_from_slice(&0u16.to_le_bytes());
     file.write(&header).map_err(|_| ())?;
 
     let total = count as usize;
@@ -196,16 +205,24 @@ where
                 }
                 seen += 1;
             };
-            walk_epubs(root, &mut collect);
+            walk_epubs(root, &mut collect)?;
+        }
+        let expected = SCAN_BATCH.min(total - cursor);
+        if batch_len != expected || seen < total {
+            return Err(());
         }
         for record in &batch[..batch_len] {
             file.write(record).map_err(|_| ())?;
         }
-        if batch_len == 0 {
-            break;
-        }
         cursor += batch_len;
     }
+    if cursor != total {
+        return Err(());
+    }
+    header[4] = CATALOG_VERSION;
+    header[5..7].copy_from_slice(&count.to_le_bytes());
+    file.seek_from_start(0).map_err(|_| ())?;
+    file.write(&header).map_err(|_| ())?;
     Ok(count)
 }
 
@@ -237,6 +254,12 @@ where
         return Err(());
     }
     let count = u16::from_le_bytes([header[5], header[6]]);
+    let expected_len = CATALOG_HEADER_BYTES
+        .checked_add((count as usize).saturating_mul(CATALOG_RECORD_BYTES))
+        .ok_or(())?;
+    if file.length() as usize != expected_len {
+        return Err(());
+    }
     f(&file, count)
 }
 
@@ -707,13 +730,14 @@ fn collect_epubs<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_
     prefix: &str,
     in_books_dir: bool,
     visit: &mut impl FnMut(&str, &str, bool, u32),
-) where
+) -> Result<(), ()>
+where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
     let mut lfn_storage = [0u8; 192];
     let mut lfn_buffer = LfnBuffer::new(&mut lfn_storage);
-    let _ = dir.iterate_dir_lfn(&mut lfn_buffer, |entry, long_name| {
+    dir.iterate_dir_lfn(&mut lfn_buffer, |entry, long_name| {
         if entry.attributes.is_directory() || entry.attributes.is_volume() {
             return;
         }
@@ -741,7 +765,8 @@ fn collect_epubs<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_
                 visit,
             );
         }
-    });
+    })
+    .map_err(|_| ())
 }
 
 fn visit_prefixed(

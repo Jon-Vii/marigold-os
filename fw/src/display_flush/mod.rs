@@ -31,3 +31,22 @@ pub(crate) type Epd = hal_ext::spi_dma::EpdBus<
 >;
 
 pub(crate) type SpiError = <SpiDmaBus<'static, Async> as embedded_hal_async::spi::ErrorType>::Error;
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) enum PanelError {
+    Spi(SpiError),
+    Busy(hal_ext::spi_dma::BusyError),
+}
+
+impl From<esp_hal::spi::Error> for PanelError {
+    fn from(value: esp_hal::spi::Error) -> Self {
+        Self::Spi(value)
+    }
+}
+
+impl From<hal_ext::spi_dma::BusyError> for PanelError {
+    fn from(value: hal_ext::spi_dma::BusyError) -> Self {
+        Self::Busy(value)
+    }
+}

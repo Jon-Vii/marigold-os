@@ -105,7 +105,7 @@ pub struct UiShell<'a> {
     pub font_family: display::font::FontFamily,
     pub custom_font_name: &'a str,
     pub selection: u16,
-    pub chapter: u8,
+    pub chapter: u16,
     /// The current chapter's title resolved over the whole book (past the
     /// resident `chapters` cap). When non-empty the colophon prefers it over
     /// `chapters[chapter]`; empty falls back to the list or a numeral.
