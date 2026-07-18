@@ -24,7 +24,9 @@ pub async fn run(lpwr: LPWR<'static>) {
                     // Only reached if a late button press aborted the handshake.
                     deadline = Instant::now() + IDLE_TIMEOUT;
                 }
-                PowerEvent::DisplaySettled | PowerEvent::DisplayAsleep => {}
+                PowerEvent::DisplaySettled
+                | PowerEvent::DisplayAsleep
+                | PowerEvent::DisplayFailed => {}
             },
             // Idle timeout elapsed with no activity.
             Either::Second(_) => {
@@ -55,6 +57,10 @@ async fn enter_sleep(rtc: &mut Rtc<'_>) {
                 esp_println::println!("power: deep sleep");
                 let mut button = steal_wake_button();
                 hal_ext::rtc::enter_deep_sleep_button(rtc, &mut button);
+            }
+            PowerEvent::DisplayFailed => {
+                esp_println::println!("power: display sleep failed; staying awake");
+                return;
             }
             PowerEvent::Activity => return,
             PowerEvent::DisplaySettled | PowerEvent::SleepNow => {}

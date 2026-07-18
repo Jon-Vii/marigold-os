@@ -28,8 +28,8 @@ use embassy_time::{with_timeout, Duration, Timer};
 use esp_hal::peripherals::WIFI;
 use esp_hal::rng::Rng;
 use esp_radio::wifi::{
-    ap::AccessPointConfig, sta::StationConfig, AuthenticationMethod, Config as WifiConfig,
-    ControllerConfig, Interface, WifiController,
+    ap::AccessPointConfig, scan::ScanConfig, sta::StationConfig, AuthenticationMethod,
+    Config as WifiConfig, ControllerConfig, Interface, WifiController,
 };
 use proto::captive;
 
@@ -169,17 +169,15 @@ pub async fn run(spawner: Spawner, wifi: WIFI<'static>) {
     unreachable!()
 }
 
-/// Exit during the serving phase defers the reset until any in-flight
-/// book finishes writing (bounded), so a done press cannot truncate it.
+/// Exit first stops socket intake (the sibling server future is cancelled
+/// when this completes), then asks the board I/O task to abort/close any FAT
+/// writer and waits for proof that the SD session has been reclaimed.
 async fn exit_after_uploads() -> ! {
     loop {
         if let SyncCommand::Exit = SYNC_COMMANDS.receive().await {
-            let mut waited_ms = 0u32;
-            while crate::upload::UPLOAD_IN_FLIGHT.load(portable_atomic::Ordering::SeqCst)
-                && waited_ms < 120_000
-            {
-                Timer::after_millis(100).await;
-                waited_ms += 100;
+            if crate::upload::UPLOAD_SESSION_ACTIVE.load(portable_atomic::Ordering::SeqCst) {
+                crate::UPLOAD_STOP_REQUESTS.send(()).await;
+                crate::UPLOAD_STOPPED.receive().await;
             }
             reset_now();
         }
@@ -350,6 +348,8 @@ async fn upload_server(
             let ok = match name {
                 Some(name) => {
                     if !session_started {
+                        crate::upload::UPLOAD_SESSION_ACTIVE
+                            .store(true, portable_atomic::Ordering::SeqCst);
                         STORAGE_COMMANDS.send(StorageCommand::ReceiveUpload).await;
                         session_started = true;
                     }
@@ -380,6 +380,7 @@ async fn upload_server(
             let name = upload_short_alias(long_name.as_str(), 0);
 
             if !session_started {
+                crate::upload::UPLOAD_SESSION_ACTIVE.store(true, portable_atomic::Ordering::SeqCst);
                 STORAGE_COMMANDS.send(StorageCommand::ReceiveUpload).await;
                 session_started = true;
             }
@@ -501,21 +502,26 @@ async fn stream_book(
 // Onboarding portal
 // ------------------------------------------------------------------
 
-const PORTAL_PAGE: &str = concat!(
+const PORTAL_PAGE_PREFIX: &str = concat!(
     "<!doctype html><html><head>",
     "<meta name=viewport content=\"width=device-width,initial-scale=1\">",
     "<title>XTEINK X4</title>",
     "<style>body{font-family:Georgia,serif;margin:2.5em auto;max-width:22em;",
     "padding:0 1em;color:#222}h1{font-size:1.25em;letter-spacing:.08em}",
     "label{display:block;margin:1em 0 .2em}",
-    "input{width:100%;font-size:1.05em;padding:.5em;border:1px solid #999;",
+    "input,select{width:100%;font-size:1.05em;padding:.5em;border:1px solid #999;",
     "border-radius:4px;box-sizing:border-box}",
     "button{margin-top:1.2em;font-size:1.05em;padding:.6em 1.6em;",
     "border:1px solid #222;background:#222;color:#fff;border-radius:4px}",
     "</style></head><body><h1>XTEINK&nbsp;X4</h1>",
     "<p>Connect this reader to your Wi-Fi network.</p>",
     "<form method=post action=/save>",
-    "<label>Network name</label><input name=ssid maxlength=32 required>",
+    "<label>Network</label><select name=ssid>",
+);
+
+const PORTAL_PAGE_SUFFIX: &str = concat!(
+    "<option value=\"\">Other or hidden network</option></select>",
+    "<label>Other network name</label><input name=ssid_custom maxlength=32>",
     "<label>Password</label><input name=pass type=password maxlength=64>",
     "<button>Save</button></form></body></html>",
 );
@@ -544,6 +550,7 @@ async fn run_portal(
     http_a: &'static mut [u8],
     http_b: &'static mut [u8],
 ) -> ! {
+    let options_len = scan_network_options(controller, http_b).await;
     let device = Interface::access_point();
     let config = WifiConfig::AccessPoint(AccessPointConfig::default().with_ssid(PORTAL_SSID));
     if controller.set_config(&config).is_err() {
@@ -578,7 +585,7 @@ async fn run_portal(
         join3(
             dhcp_server(stack),
             dns_server(stack),
-            credential_portal(stack, tcp_rx, tcp_tx, http_a, http_b),
+            credential_portal(stack, tcp_rx, tcp_tx, http_a, http_b, options_len),
         ),
     )
     .await;
@@ -638,7 +645,8 @@ async fn credential_portal(
     tcp_rx: &'static mut [u8],
     tcp_tx: &'static mut [u8],
     request_buf: &'static mut [u8],
-    _spare: &'static mut [u8],
+    network_options: &'static mut [u8],
+    network_options_len: usize,
 ) -> ! {
     loop {
         let mut socket = TcpSocket::new(stack, &mut *tcp_rx, &mut *tcp_tx);
@@ -664,8 +672,11 @@ async fn credential_portal(
             }
         };
 
-        let body = if saved { SAVED_PAGE } else { PORTAL_PAGE };
-        let _ = write_http_page(&mut socket, body).await;
+        if saved {
+            let _ = write_http_page(&mut socket, SAVED_PAGE).await;
+        } else {
+            let _ = write_portal_page(&mut socket, &network_options[..network_options_len]).await;
+        }
         socket.close();
         let _ = with_timeout(Duration::from_secs(2), socket.flush()).await;
     }
@@ -678,8 +689,12 @@ async fn handle_portal_request(request: &captive::HttpRequest<'_>) -> bool {
         return false;
     }
     let mut ssid_buf = [0u8; 32];
+    let mut custom_ssid_buf = [0u8; 32];
     let mut pass_buf = [0u8; 64];
-    let ssid = captive::form_value(request.body, "ssid", &mut ssid_buf).unwrap_or("");
+    let selected = captive::form_value(request.body, "ssid", &mut ssid_buf).unwrap_or("");
+    let custom =
+        captive::form_value(request.body, "ssid_custom", &mut custom_ssid_buf).unwrap_or("");
+    let ssid = if custom.is_empty() { selected } else { custom };
     let password = captive::form_value(request.body, "pass", &mut pass_buf).unwrap_or("");
     let Some(credentials) = WifiCredentials::from_strs(ssid, password) else {
         return false;
@@ -689,8 +704,85 @@ async fn handle_portal_request(request: &captive::HttpRequest<'_>) -> bool {
     STORAGE_COMMANDS
         .send(StorageCommand::StoreWifiCredentials(credentials))
         .await;
+    if !crate::WIFI_STORAGE_RESULTS.receive().await {
+        esp_println::println!("portal: credential storage failed");
+        return false;
+    }
     send_event(SyncEvent::CredentialsSaved(ssid));
     true
+}
+
+async fn scan_network_options(controller: &mut WifiController<'static>, out: &mut [u8]) -> usize {
+    let config = ScanConfig::default().with_max(20);
+    let Ok(mut networks) = controller.scan_async(&config).await else {
+        esp_println::println!("portal: network scan failed; manual entry remains available");
+        return 0;
+    };
+    networks.sort_by(|left, right| right.signal_strength.cmp(&left.signal_strength));
+    let mut at = 0usize;
+    for (index, network) in networks.iter().enumerate() {
+        let ssid = network.ssid.as_str();
+        if ssid.is_empty()
+            || networks[..index]
+                .iter()
+                .any(|earlier| earlier.ssid.as_str() == ssid)
+        {
+            continue;
+        }
+        if !push_bytes(out, &mut at, b"<option value=\"")
+            || !push_html_escaped(out, &mut at, ssid.as_bytes())
+            || !push_bytes(out, &mut at, b"\">")
+            || !push_html_escaped(out, &mut at, ssid.as_bytes())
+            || !push_bytes(out, &mut at, b"</option>")
+        {
+            break;
+        }
+    }
+    esp_println::println!("portal: listed {} bytes of nearby networks", at);
+    at
+}
+
+fn push_html_escaped(out: &mut [u8], at: &mut usize, value: &[u8]) -> bool {
+    for byte in value.iter().copied() {
+        let escaped: &[u8] = match byte {
+            b'&' => b"&amp;",
+            b'<' => b"&lt;",
+            b'>' => b"&gt;",
+            b'\"' => b"&quot;",
+            b'\'' => b"&#39;",
+            _ => core::slice::from_ref(&byte),
+        };
+        if !push_bytes(out, at, escaped) {
+            return false;
+        }
+    }
+    true
+}
+
+fn push_bytes(out: &mut [u8], at: &mut usize, value: &[u8]) -> bool {
+    let Some(end) = at.checked_add(value.len()) else {
+        return false;
+    };
+    if end > out.len() {
+        return false;
+    }
+    out[*at..end].copy_from_slice(value);
+    *at = end;
+    true
+}
+
+async fn write_portal_page(
+    socket: &mut TcpSocket<'_>,
+    options: &[u8],
+) -> Result<(), embassy_net::tcp::Error> {
+    write_all(
+        socket,
+        b"HTTP/1.1 200 OK\r\ncache-control: no-store\r\ncontent-type: text/html; charset=utf-8\r\nconnection: close\r\n\r\n",
+    )
+    .await?;
+    write_all(socket, PORTAL_PAGE_PREFIX.as_bytes()).await?;
+    write_all(socket, options).await?;
+    write_all(socket, PORTAL_PAGE_SUFFIX.as_bytes()).await
 }
 
 fn window_contains(haystack: &[u8], needle: &[u8]) -> bool {

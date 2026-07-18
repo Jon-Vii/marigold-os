@@ -13,6 +13,7 @@ use proto::font_pack::{
 use proto::text::TextAlign;
 
 const MAX_ROW_BYTES: usize = 32;
+const MAX_GLYPH_BYTES: usize = 512;
 
 /// Printable ASCII is the first codepoint range of the pack
 /// (`font_pack_codepoint_index(0x20) == 0`), so a face's ASCII metrics are
@@ -22,6 +23,9 @@ const ASCII_FIRST: u16 = 0x20;
 const ASCII_LAST: u16 = 0x7E;
 /// Regular/Italic/Bold/BoldItalic of the active size all stay resident.
 const METRIC_CACHE_SLOTS: usize = 4;
+// Enough to retain a multilingual paragraph's working set without consuming
+// the X3's tightly budgeted main-stack gap in static RAM.
+const NON_ASCII_METRIC_SLOTS: usize = 16;
 
 /// RAM cache of the printable-ASCII metric rows for custom font faces.
 ///
@@ -36,6 +40,8 @@ const METRIC_CACHE_SLOTS: usize = 4;
 pub(crate) struct MetricCache {
     slots: [MetricSlot; METRIC_CACHE_SLOTS],
     next_evict: usize,
+    non_ascii: [NonAsciiMetricSlot; NON_ASCII_METRIC_SLOTS],
+    next_non_ascii_evict: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -49,11 +55,34 @@ const EMPTY_METRIC_SLOT: MetricSlot = MetricSlot {
     records: [[0u8; FONT_PACK_METRIC_BYTES]; ASCII_METRIC_COUNT],
 };
 
+#[derive(Clone, Copy)]
+struct NonAsciiMetricSlot {
+    key: Option<(u64, u32, u16)>,
+    metric: GlyphMetric,
+}
+
+const EMPTY_GLYPH_METRIC: GlyphMetric = GlyphMetric {
+    offset: 0,
+    len: 0,
+    width: 0,
+    height: 0,
+    x_offset: 0,
+    y_offset: 0,
+    advance_fp: 0,
+};
+
+const EMPTY_NON_ASCII_SLOT: NonAsciiMetricSlot = NonAsciiMetricSlot {
+    key: None,
+    metric: EMPTY_GLYPH_METRIC,
+};
+
 impl MetricCache {
     pub(crate) const fn new() -> Self {
         Self {
             slots: [EMPTY_METRIC_SLOT; METRIC_CACHE_SLOTS],
             next_evict: 0,
+            non_ascii: [EMPTY_NON_ASCII_SLOT; NON_ASCII_METRIC_SLOTS],
+            next_non_ascii_evict: 0,
         }
     }
 
@@ -66,6 +95,14 @@ impl MetricCache {
     /// Serve a cached ASCII metric without touching the card. `None` means
     /// the caller must open the pack: non-ASCII char or unfilled face.
     fn lookup(&self, identity: u64, face: FontPackFaceRecord, ch: char) -> Option<GlyphMetric> {
+        if Self::ascii_index(ch).is_none() {
+            let codepoint = u16::try_from(ch as u32).unwrap_or(b'?' as u16);
+            return self
+                .non_ascii
+                .iter()
+                .find(|slot| slot.key == Some((identity, face.metrics_offset, codepoint)))
+                .map(|slot| slot.metric);
+        }
         let index = Self::ascii_index(ch)?;
         let key = (identity, face.metrics_offset);
         self.slots
@@ -95,7 +132,27 @@ impl MetricCache {
         T: TimeSource,
     {
         let Some(index) = Self::ascii_index(ch) else {
-            return metric_for_char(file, face, ch);
+            let codepoint = u16::try_from(ch as u32).unwrap_or(b'?' as u16);
+            let key = (identity, face.metrics_offset, codepoint);
+            if let Some(slot) = self.non_ascii.iter().find(|slot| slot.key == Some(key)) {
+                return Some(slot.metric);
+            }
+            let metric = metric_for_char(file, face, ch)?;
+            let slot_index = self
+                .non_ascii
+                .iter()
+                .position(|slot| slot.key.is_none())
+                .unwrap_or_else(|| {
+                    let evict = self.next_non_ascii_evict;
+                    self.next_non_ascii_evict =
+                        (self.next_non_ascii_evict + 1) % NON_ASCII_METRIC_SLOTS;
+                    evict
+                });
+            self.non_ascii[slot_index] = NonAsciiMetricSlot {
+                key: Some(key),
+                metric,
+            };
+            return Some(metric);
         };
         let key = (identity, face.metrics_offset);
         if let Some(slot) = self.slots.iter().find(|slot| slot.key == Some(key)) {
@@ -194,7 +251,10 @@ where
     ok
 }
 
-pub(crate) fn measure_char<
+/// Measure a whole styled text run while keeping one font-pack handle open.
+/// Pagination feeds many short XHTML chunks through this path, so the handle
+/// reuse removes the former open/seek/close cycle for every cache miss.
+pub(crate) fn for_each_metric<
     D,
     T,
     const MAX_DIRS: usize,
@@ -206,26 +266,57 @@ pub(crate) fn measure_char<
     cache: &mut MetricCache,
     size: FontSize,
     weight: FontWeight,
-    style: FontStyle,
-    ch: char,
-) -> Option<GlyphMetric>
-where
+    default_style: FontStyle,
+    text: &str,
+    mut visit: impl FnMut(FontStyle, Option<GlyphMetric>),
+) where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let face = custom_face(source, size, weight, style)?;
+    let Ok(xteink) = root.open_dir(proto::cache::CACHE_ROOT_DIR) else {
+        visit_missing_metrics(text, default_style, &mut visit);
+        return;
+    };
+    let Ok(fonts) = xteink.open_dir(FONT_PACK_DIR) else {
+        visit_missing_metrics(text, default_style, &mut visit);
+        return;
+    };
+    let Ok(file) = fonts.open_file_in_dir(FONT_PACK_FILE, Mode::ReadOnly) else {
+        visit_missing_metrics(text, default_style, &mut visit);
+        return;
+    };
     let identity = source.custom_font_identity();
-    if let Some(metric) = cache.lookup(identity, face, ch) {
-        return Some(metric);
+    let mut style = default_style;
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch == STYLE_MARKER {
+            if let Some(code) = chars.next() {
+                style = display::font::style_from_marker_code(code).unwrap_or(style);
+            }
+            continue;
+        }
+        let metric = custom_face(source, size, weight, style)
+            .and_then(|face| cache.fill_and_lookup(&file, identity, face, ch));
+        visit(style, metric);
     }
-    // Cache miss (unfilled face or non-ASCII): open the pack once for this
-    // char; an ASCII miss fills the face's whole slot while it's open.
-    let xteink = root.open_dir(proto::cache::CACHE_ROOT_DIR).ok()?;
-    let fonts = xteink.open_dir(FONT_PACK_DIR).ok()?;
-    let file = fonts
-        .open_file_in_dir(FONT_PACK_FILE, Mode::ReadOnly)
-        .ok()?;
-    cache.fill_and_lookup(&file, identity, face, ch)
+}
+
+fn visit_missing_metrics(
+    text: &str,
+    default_style: FontStyle,
+    visit: &mut impl FnMut(FontStyle, Option<GlyphMetric>),
+) {
+    let mut style = default_style;
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch == STYLE_MARKER {
+            if let Some(code) = chars.next() {
+                style = display::font::style_from_marker_code(code).unwrap_or(style);
+            }
+        } else {
+            visit(style, None);
+        }
+    }
 }
 
 struct CustomFontFile<
@@ -383,14 +474,16 @@ where
         }
         let glyph_x = x + metric.x_offset as i16;
         let glyph_y = baseline_y + metric.y_offset as i16;
-        let mut row = [0u8; MAX_ROW_BYTES];
+        let glyph_len = row_bytes.checked_mul(metric.height as usize)?;
+        if glyph_len > MAX_GLYPH_BYTES || glyph_len > metric.len {
+            return None;
+        }
+        let offset = face.bitmap_offset.checked_add(metric.offset as u32)?;
+        self.file.seek_from_start(offset).ok()?;
+        let mut bitmap = [0u8; MAX_GLYPH_BYTES];
+        read_full(&self.file, &mut bitmap[..glyph_len])?;
         for y in 0..metric.height as usize {
-            let offset = face
-                .bitmap_offset
-                .checked_add(metric.offset as u32)?
-                .checked_add((y * row_bytes) as u32)?;
-            self.file.seek_from_start(offset).ok()?;
-            read_full(&self.file, &mut row[..row_bytes])?;
+            let row = &bitmap[y * row_bytes..(y + 1) * row_bytes];
             for x_byte in 0..row_bytes {
                 let byte = row[x_byte];
                 if byte == 0 {

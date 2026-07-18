@@ -231,6 +231,11 @@ pub async fn run() {
                     suppress_input_until_open_settled = false;
                     block_confirm_until = None;
                 }
+                DisplayEvent::Failed => {
+                    esp_println::println!("app: display transition failed");
+                    rendering = false;
+                    render_pending = false;
+                }
                 DisplayEvent::Library(event) => {
                     if let Some(book_id) = loaded_book_id(&event) {
                         if opening_book == Some(book_id) {

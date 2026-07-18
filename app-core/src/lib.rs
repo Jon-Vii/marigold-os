@@ -262,7 +262,7 @@ pub struct RenderRequest {
     pub view: AppView,
     pub page: u32,
     pub page_count: u32,
-    pub chapter: u8,
+    pub chapter: u16,
     pub selection: u16,
     pub book_id: u32,
     pub orientation: DisplayOrientation,
@@ -302,7 +302,7 @@ pub enum StorageCommand {
         request_id: u32,
         book_id: u32,
         index: u16,
-        chapter: u8,
+        chapter: u16,
         target_pages: u16,
         type_settings: TypeSettings,
         /// Paginate into the portrait page box. Rides beside the type
@@ -313,7 +313,7 @@ pub enum StorageCommand {
         request_id: u32,
         book_id: u32,
         index: u16,
-        chapter: u8,
+        chapter: u16,
         target_pages: u16,
         type_settings: TypeSettings,
         portrait: bool,
@@ -332,7 +332,7 @@ pub enum StorageCommand {
         request_id: u32,
         book_id: u32,
         index: u16,
-        chapter: u8,
+        chapter: u16,
         type_settings: TypeSettings,
         portrait: bool,
     },
@@ -357,9 +357,9 @@ pub enum StorageCommand {
     StageFirmwareUpdate {
         index: u16,
     },
-    /// Enter the upload session: the display task parks on the upload
-    /// channels and writes browser-sent books to /BOOKS until the
-    /// session's reset. Sent by the wifi task at the first upload.
+    /// Enter the interruptible upload session: the display task writes
+    /// browser-sent books to /BOOKS until sleep or wireless Exit closes it.
+    /// Sent by the wifi task at the first upload.
     ReceiveUpload,
 }
 
@@ -485,6 +485,7 @@ impl WifiSsid {
 pub enum DisplayEvent {
     Settled,
     Asleep,
+    Failed,
     Library(LibraryEvent),
 }
 
@@ -497,7 +498,7 @@ pub enum LibraryEvent {
     Loaded {
         book_id: u32,
         pages: u32,
-        chapters: u8,
+        chapters: u16,
         /// The chapter the reading page currently sits in, computed by the
         /// firmware over the whole book. Unlike `chapter_pages` (capped at
         /// `MAX_SD_CHAPTERS`), this tracks position into a long book so the
@@ -507,7 +508,7 @@ pub enum LibraryEvent {
     },
     ChapterPage {
         book_id: u32,
-        chapter: u8,
+        chapter: u16,
         page: u32,
     },
     /// The firmware re-resolved the current chapter for the page just rendered,
@@ -527,7 +528,7 @@ pub enum LibraryEvent {
     FirmwareStageFailed,
     Restored {
         book_id: u32,
-        chapter: u8,
+        chapter: u16,
         page: u32,
         /// The book's total page count, read from the cache index header at
         /// restore so the Home progress bar has a denominator before the book
@@ -610,7 +611,19 @@ pub enum PowerEvent {
     Activity,
     DisplaySettled,
     DisplayAsleep,
+    DisplayFailed,
     SleepNow,
+}
+
+/// Keep the display and power acknowledgements for a panel refresh paired.
+/// A failed transfer must never advance the app render queue or authorize a
+/// later power transition as though the panel had settled.
+pub const fn display_refresh_outcome(success: bool) -> (DisplayEvent, PowerEvent) {
+    if success {
+        (DisplayEvent::Settled, PowerEvent::DisplaySettled)
+    } else {
+        (DisplayEvent::Failed, PowerEvent::DisplayFailed)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -650,7 +663,7 @@ pub struct ReaderState {
     pub view: AppView,
     pub page: u32,
     pub selection: u16,
-    pub chapter: u8,
+    pub chapter: u16,
     pub book_id: u32,
     pub orientation: DisplayOrientation,
     pub front_buttons: FrontButtons,
@@ -670,7 +683,7 @@ pub struct ReaderState {
     pub firmware_count: u16,
     pub firmware_status: FirmwareUpdateStatus,
     pub sd_page_count: u32,
-    pub sd_chapter_count: u8,
+    pub sd_chapter_count: u16,
     pub sd_chapter_pages: [u16; MAX_SD_CHAPTERS],
     pub read_request_pending: bool,
     pub sync_status: SyncStatus,
@@ -804,7 +817,7 @@ impl ReaderState {
                     next.chapter = wrap_next(
                         self.chapter as u16,
                         (ctx.builtin_chapter_count as u16).max(1),
-                    ) as u8;
+                    );
                     next.selection = next.chapter as u16;
                     next.page = 0;
                 }
@@ -820,7 +833,7 @@ impl ReaderState {
                     next.chapter = wrap_prev(
                         self.chapter as u16,
                         (ctx.builtin_chapter_count as u16).max(1),
-                    ) as u8;
+                    );
                     next.selection = next.chapter as u16;
                     next.page = 0;
                 }
@@ -843,7 +856,7 @@ impl ReaderState {
                 next.selection = wrap_prev(self.selection, self.chapter_item_count(ctx) as u16);
             }
             (AppView::Chapters, Some(Button::Confirm)) => {
-                next.chapter = self.selection as u8;
+                next.chapter = self.selection;
                 next.page = if ReaderSource::from_book_id(self.book_id).is_sd() {
                     u32::from(
                         self.sd_chapter_pages
@@ -1006,7 +1019,7 @@ impl ReaderState {
                     // The firmware owns the true current chapter over the whole
                     // book; adopt it so the cursor tracks past the cap that the
                     // page-turn recompute (sd_chapter_for_page) saturates at.
-                    self.chapter = current_chapter.min(u8::MAX as u16) as u8;
+                    self.chapter = current_chapter;
                     self.dirty = Rect::FULL;
                 }
             }
@@ -1031,7 +1044,7 @@ impl ReaderState {
                     // view shows page-within-chapter, not the chapter itself, so no
                     // repaint is needed -- Home/sleep/Chapters and the persisted
                     // position pick up the corrected value when next used.
-                    self.chapter = current_chapter.min(u8::MAX as u16) as u8;
+                    self.chapter = current_chapter;
                 }
             }
             LibraryEvent::CustomFont { available } => {
@@ -1227,17 +1240,17 @@ impl ReaderState {
         self.library_count.max(ctx.builtin_book_count as u16).max(1)
     }
 
-    pub fn chapter_item_count(self, ctx: ReducerContext) -> u8 {
+    pub fn chapter_item_count(self, ctx: ReducerContext) -> u16 {
         if ReaderSource::from_book_id(self.book_id).is_sd() {
             self.sd_chapter_count.max(1)
         } else {
-            ctx.builtin_chapter_count.max(1)
+            u16::from(ctx.builtin_chapter_count.max(1))
         }
     }
 
-    pub fn sd_chapter_for_page(self, page: u32) -> u8 {
-        let mut selected = 0u8;
-        for index in 0..self.sd_chapter_count.min(MAX_SD_CHAPTERS as u8) {
+    pub fn sd_chapter_for_page(self, page: u32) -> u16 {
+        let mut selected = 0u16;
+        for index in 0..self.sd_chapter_count.min(MAX_SD_CHAPTERS as u16) {
             if u32::from(self.sd_chapter_pages[index as usize]) <= page {
                 selected = index;
             } else {
@@ -1689,6 +1702,21 @@ mod tests {
         assert_eq!(state.view, AppView::Reading);
         assert_eq!(state.chapter, 1);
         assert_eq!(state.page, 12);
+    }
+
+    #[test]
+    fn long_toc_selection_keeps_u16_indices() {
+        let ctx = ReducerContext::new(1, 1);
+        for chapter_count in [255u16, 256, 257, 322] {
+            let mut state = ReaderState::boot();
+            state.book_id = ReaderSource::sd(0).book_id();
+            state.view = AppView::Chapters;
+            state.sd_chapter_count = chapter_count;
+            state.selection = chapter_count - 1;
+            let state = press(state, Button::Confirm);
+            assert_eq!(state.chapter, chapter_count - 1);
+            assert_eq!(state.chapter_item_count(ctx), chapter_count);
+        }
     }
 
     #[test]
@@ -2161,6 +2189,18 @@ mod tests {
         // firmware drew, so wake also needs only the one-flicker clean.
         planner.record_sleep();
         assert_eq!(planner.mode_for(request), RefreshMode::FastClean);
+    }
+
+    #[test]
+    fn panel_refresh_failure_is_never_acknowledged_as_settled() {
+        assert_eq!(
+            display_refresh_outcome(true),
+            (DisplayEvent::Settled, PowerEvent::DisplaySettled)
+        );
+        assert_eq!(
+            display_refresh_outcome(false),
+            (DisplayEvent::Failed, PowerEvent::DisplayFailed)
+        );
     }
 
     #[test]

@@ -24,7 +24,7 @@ use esp_hal::gpio::Output;
 use hal_ext::nvm::AppStateRecord;
 use static_cell::ConstStaticCell;
 
-/// Same-book page-turn progress is coalesced: at most one STATE.BIN write
+/// Same-book page-turn progress is coalesced: at most one durable state write
 /// per this interval, with a guaranteed flush before display sleep. A
 /// battery pull can lose at most this many seconds of reading position.
 const PROGRESS_WRITE_MIN_SECS: u64 = 15;
@@ -66,7 +66,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
     let mut refresh_planner = RefreshPlanner::new();
     let mut pending_progress: Option<AppStateRecord> = None;
     let mut last_progress_write: Option<Instant> = None;
-    // STATE.BIN is consulted once per boot, after the first catalog with
+    // Durable state is consulted once per boot, after the first catalog with
     // entries lands; later catalog refreshes must not yank reading state.
     let mut state_restored = false;
     // True while RED RAM is known to hold exactly prev_fb's content, letting
@@ -82,7 +82,15 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
     let font_metrics = FONT_METRICS.take();
 
     esp_println::println!("display: init start");
-    display_flush::init_panel(&mut epd).await;
+    loop {
+        match display_flush::init_panel(&mut epd).await {
+            Ok(()) => break,
+            Err(error) => {
+                esp_println::println!("display: init failed: {:?}; retrying", error);
+                embassy_time::Timer::after_secs(1).await;
+            }
+        }
+    }
     esp_println::println!("display: init complete");
 
     // One-shot firmware self-update: if the card holds a pending image, flash it
@@ -171,7 +179,13 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
 
                 if !refresh_planner.screen_on() && refresh_planner.last_request().is_none() {
                     esp_println::println!("display: wake init start");
-                    display_flush::init_panel(&mut epd).await;
+                    if let Err(error) = display_flush::init_panel(&mut epd).await {
+                        esp_println::println!("display: wake init failed: {:?}", error);
+                        prev_prestaged = false;
+                        send_required_display_event(&DisplayEvent::Failed);
+                        let _ = POWER_EVENTS.try_send(PowerEvent::DisplayFailed);
+                        continue;
+                    }
                     esp_println::println!("display: wake init complete");
                     prev_prestaged = false;
                 }
@@ -232,12 +246,15 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                             });
                         }
                     }
-                    send_required_display_event(&DisplayEvent::Settled);
-                    let _ = POWER_EVENTS.try_send(PowerEvent::DisplaySettled);
+                    let (display_event, power_event) = app_core::display_refresh_outcome(true);
+                    send_required_display_event(&display_event);
+                    let _ = POWER_EVENTS.try_send(power_event);
                 } else {
                     esp_println::println!("display: SPI transfer failed");
                     prev_prestaged = false;
-                    send_required_display_event(&DisplayEvent::Settled);
+                    let (display_event, power_event) = app_core::display_refresh_outcome(false);
+                    send_required_display_event(&display_event);
+                    let _ = POWER_EVENTS.try_send(power_event);
                 }
             }
             Either::First(DisplayCommand::Sleep) => {
@@ -247,13 +264,16 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                     refresh_planner.screen_on(),
                     sleep_start.as_millis(),
                 );
-                flush_pending_progress(
+                if !flush_pending_progress(
                     &mut epd,
                     &mut sd_cs,
                     sd_library,
                     &mut pending_progress,
                     &mut last_progress_write,
-                );
+                ) {
+                    esp_println::println!("display: sleep deferred; progress persistence failed");
+                    continue;
+                }
                 let request = refresh_planner.last_request().or_else(|| {
                     sleep_request_from_saved_state(
                         &mut epd,
@@ -296,10 +316,8 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                     false
                 };
                 prev_prestaged = false;
-                if display_flush::sleep_panel(&mut epd).await.is_ok() {
-                    if sleep_frame_settled {
-                        refresh_planner.record_sleep();
-                    }
+                if display_flush::sleep_panel(&mut epd).await.is_ok() && sleep_frame_settled {
+                    refresh_planner.record_sleep();
                     send_required_display_event(&DisplayEvent::Asleep);
                     let _ = POWER_EVENTS.try_send(PowerEvent::DisplayAsleep);
                     esp_println::println!(
@@ -308,9 +326,9 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                         Instant::now().as_millis(),
                     );
                 } else {
-                    esp_println::println!("display: sleep command failed");
-                    send_required_display_event(&DisplayEvent::Asleep);
-                    let _ = POWER_EVENTS.try_send(PowerEvent::DisplayAsleep);
+                    esp_println::println!("display: sleep transition failed");
+                    send_required_display_event(&DisplayEvent::Failed);
+                    let _ = POWER_EVENTS.try_send(PowerEvent::DisplayFailed);
                     esp_println::println!(
                         "bench: sleep phase=complete ok=false elapsed_ms={} t_ms={}",
                         sleep_start.elapsed().as_millis(),
@@ -320,9 +338,8 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
             }
             Either::Second(StorageCommand::ReceiveUpload) => {
                 if sync_session.admits(&StorageCommand::ReceiveUpload) {
-                    // Diverges: the display task becomes the upload writer
-                    // for the rest of the sync session.
                     crate::sd_session::upload_session(&mut epd, &mut sd_cs).await;
+                    continue;
                 }
                 esp_println::println!("storage: upload refused outside sync");
             }
@@ -486,13 +503,16 @@ fn handle_storage_command(
         StorageCommand::LoanSyncMemory => {
             // The session only ends in a reset, so any coalesced position
             // must reach the card before the scratch is dismantled.
-            flush_pending_progress(
+            if !flush_pending_progress(
                 epd,
                 sd_cs,
                 sd_library,
                 pending_progress,
                 last_progress_write,
-            );
+            ) {
+                esp_println::println!("storage: sync loan deferred; progress persistence failed");
+                return;
+            }
             ensure_epub_scratch(epub_scratch);
             let Some(scratch) = epub_scratch.take() else {
                 return;
@@ -603,7 +623,7 @@ fn handle_storage_command(
                     reader_cache::load_position(epd, sd_cs, sd_library, index as usize)
                 {
                     if saved_chapter > 0 || saved_screen > 0 {
-                        chapter = saved_chapter.min(u8::MAX as u16) as u8;
+                        chapter = saved_chapter;
                         target_pages = saved_screen.min(u16::MAX as u32) as u16;
                         resumed = true;
                         esp_println::println!(
@@ -777,17 +797,25 @@ fn handle_storage_command(
             // the loop refused it already.
         }
         StorageCommand::StoreWifiCredentials(credentials) => {
-            let stored = reader_cache::store_wifi_credentials(
-                epd,
-                sd_cs,
-                hal_ext::nvm::WifiCredentialsRecord {
-                    ssid: credentials.ssid,
-                    ssid_len: credentials.ssid_len,
-                    password: credentials.password,
-                    password_len: credentials.password_len,
-                },
+            let record = hal_ext::nvm::WifiCredentialsRecord {
+                ssid: credentials.ssid,
+                ssid_len: credentials.ssid_len,
+                password: credentials.password,
+                password_len: credentials.password_len,
+            };
+            let written = reader_cache::store_wifi_credentials(epd, sd_cs, record);
+            // Reacquire the card and use the exact boot-time read path before
+            // telling the portal it may show success. This proves the file
+            // survived handle/volume closure and closes the old reset race.
+            let confirmed = written
+                && reader_cache::load_wifi_credentials(epd, sd_cs)
+                    .is_some_and(|stored| stored == record);
+            esp_println::println!(
+                "storage: wifi credentials written={} confirmed={}",
+                written,
+                confirmed
             );
-            esp_println::println!("storage: wifi credentials stored={}", stored);
+            let _ = crate::WIFI_STORAGE_RESULTS.try_send(confirmed);
         }
         StorageCommand::ForgetWifiCredentials => {
             let forgotten = reader_cache::forget_wifi_credentials(epd, sd_cs);
@@ -799,13 +827,19 @@ fn handle_storage_command(
             send_library_event(&LibraryEvent::FirmwareFiles { count });
         }
         StorageCommand::StageFirmwareUpdate { index } => {
-            flush_pending_progress(
+            if !flush_pending_progress(
                 epd,
                 sd_cs,
                 sd_library,
                 pending_progress,
                 last_progress_write,
-            );
+            ) {
+                esp_println::println!(
+                    "storage: firmware stage deferred; progress persistence failed"
+                );
+                send_library_event(&LibraryEvent::FirmwareStageFailed);
+                return;
+            }
             if crate::firmware_files::stage(epd, sd_cs, sd_library, index as usize) {
                 esp_println::println!("storage: firmware update staged index={}", index);
                 esp_hal::system::software_reset();
@@ -863,21 +897,31 @@ fn handle_storage_command(
                 .map(|pending| pending.book_id != record.book_id)
                 .unwrap_or(false)
             {
-                flush_pending_progress(
+                if !flush_pending_progress(
                     epd,
                     sd_cs,
                     sd_library,
                     pending_progress,
                     last_progress_write,
-                );
+                ) {
+                    esp_println::println!(
+                        "storage: progress context switch deferred after write failure"
+                    );
+                    return;
+                }
             }
             if context_changed || due {
                 let progress_start = Instant::now();
-                reader_cache::store_app_state(epd, sd_cs, sd_library, record);
-                *pending_progress = None;
-                *last_progress_write = Some(Instant::now());
+                let stored = reader_cache::store_app_state(epd, sd_cs, sd_library, record);
+                if stored {
+                    *pending_progress = None;
+                    *last_progress_write = Some(Instant::now());
+                } else {
+                    *pending_progress = Some(record);
+                }
                 esp_println::println!(
-                    "bench: storage_progress action=write book_id={} page={} elapsed_ms={} t_ms={}",
+                    "bench: storage_progress action=write ok={} book_id={} page={} elapsed_ms={} t_ms={}",
+                    stored,
                     record.book_id,
                     record.screen,
                     progress_start.elapsed().as_millis(),
@@ -938,7 +982,7 @@ fn send_required_display_event(event: &DisplayEvent) {
 /// the current display settings unchanged.
 fn send_resumed_position(
     book_id: u32,
-    chapter: u8,
+    chapter: u16,
     target_pages: u16,
     last_request: Option<RenderRequest>,
 ) {
@@ -990,7 +1034,7 @@ fn source_identity(library: &ReaderStore, book_id: u32) -> (u32, u32) {
     library.source_identity(book_id)
 }
 
-/// One boot-time attempt to map `/XTEINK/STATE.BIN` back onto the scanned
+/// One boot-time attempt to map durable reader state back onto the scanned
 /// catalog by stable source identity (path hash + byte size) and hand the
 /// saved position to the app as a `Restored` event. The volatile book id
 /// stored in the record is never trusted directly.
@@ -1005,7 +1049,7 @@ fn restore_saved_state(
     }
     *state_restored = true;
     let Some(record) = reader_cache::load_app_state(epd, sd_cs) else {
-        esp_println::println!("restore: no usable STATE.BIN");
+        esp_println::println!("restore: no usable durable state");
         return;
     };
     let hint = ReaderSource::from_book_id(record.book_id).sd_index();
@@ -1041,7 +1085,7 @@ fn restore_saved_state(
     let page_count = reader_cache::restore_book_page_count(epd, sd_cs, usize::from(index), library);
     send_required_library_event(&LibraryEvent::Restored {
         book_id: ReaderSource::sd(index).book_id(),
-        chapter: record.chapter.min(u8::MAX as u16) as u8,
+        chapter: record.chapter,
         page: record.screen,
         page_count,
         reading_orientation: record.reading_orientation,
@@ -1080,7 +1124,7 @@ fn sleep_request_from_saved_state(
         view: AppView::Home,
         page: record.screen,
         page_count,
-        chapter: record.chapter.min(u8::MAX as u16) as u8,
+        chapter: record.chapter,
         selection: 0,
         book_id: ReaderSource::sd(index).book_id(),
         orientation: display_orientation_from_u8(record.reading_orientation)
@@ -1119,17 +1163,24 @@ fn flush_pending_progress(
     sd_library: &ReaderStore,
     pending_progress: &mut Option<AppStateRecord>,
     last_progress_write: &mut Option<Instant>,
-) {
-    if let Some(record) = pending_progress.take() {
+) -> bool {
+    if let Some(record) = *pending_progress {
         let start = Instant::now();
-        reader_cache::store_app_state(epd, sd_cs, sd_library, record);
-        *last_progress_write = Some(Instant::now());
+        let stored = reader_cache::store_app_state(epd, sd_cs, sd_library, record);
+        if stored {
+            *pending_progress = None;
+            *last_progress_write = Some(Instant::now());
+        }
         esp_println::println!(
-            "bench: storage_progress action=flush book_id={} page={} elapsed_ms={} t_ms={}",
+            "bench: storage_progress action=flush ok={} book_id={} page={} elapsed_ms={} t_ms={}",
+            stored,
             record.book_id,
             record.screen,
             start.elapsed().as_millis(),
             Instant::now().as_millis(),
         );
+        stored
+    } else {
+        true
     }
 }

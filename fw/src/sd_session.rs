@@ -1,7 +1,12 @@
 use crate::display_flush::Epd;
 use crate::upload::{upload_short_alias, UploadBegin, UploadChunk, UploadName};
-use crate::{UPLOAD_BEGINS, UPLOAD_CHUNKS, UPLOAD_RESULTS, UPLOAD_RETURNS};
+use crate::{
+    DISPLAY_COMMANDS, UPLOAD_BEGINS, UPLOAD_CHUNKS, UPLOAD_RESULTS, UPLOAD_RETURNS, UPLOAD_STOPPED,
+    UPLOAD_STOP_REQUESTS,
+};
+use app_core::DisplayCommand;
 use core::sync::atomic::{AtomicU8, Ordering};
+use embassy_futures::select::{select, Either};
 use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::OutputPin;
 use embedded_hal::spi::{Operation, SpiBus as BlockingSpiBus, SpiDevice};
@@ -410,9 +415,11 @@ where
 
 /// The upload phase: one SD session held open for the rest of the sync
 /// session, writing browser-sent books to /BOOKS as they stream in.
-/// Diverges by design — only the session-ending reset leaves it, so the
-/// display task must not be needed for anything else once this starts.
-pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) -> ! {
+/// Returns only after every open FAT handle has been dropped and display-speed
+/// SPI has been restored. Sleep is re-queued for the normal display shutdown
+/// path; wireless Exit receives an explicit stopped acknowledgement.
+pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) {
+    crate::upload::UPLOAD_SESSION_ACTIVE.store(true, portable_atomic::Ordering::SeqCst);
     epd.deselect_display();
     sd_cs.set_high();
     esp_println::println!("upload: session enter");
@@ -434,7 +441,10 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) -
     let card = SdCard::new(spi, SdDelay);
     if card.num_bytes().is_err() {
         esp_println::println!("upload: card init failed");
-        refuse_uploads_forever().await;
+        let exit = refuse_uploads_until_exit().await;
+        drop(card);
+        finish_upload_session(epd, exit).await;
+        return;
     }
     card.spi(|device| {
         let _ = device
@@ -445,12 +455,19 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) -
         VolumeManager::new_with_limits(CountingDevice(card), StaticTime, 5000);
     let Ok(volume) = volume_mgr.open_volume(VolumeIdx(0)) else {
         esp_println::println!("upload: volume open failed");
-        refuse_uploads_forever().await;
+        let exit = refuse_uploads_until_exit().await;
+        drop(volume_mgr);
+        finish_upload_session(epd, exit).await;
+        return;
     };
     let raw_volume = volume.to_raw_volume();
     let Ok(raw_root) = volume_mgr.open_root_dir(raw_volume) else {
         esp_println::println!("upload: root open failed");
-        refuse_uploads_forever().await;
+        let exit = refuse_uploads_until_exit().await;
+        let _ = volume_mgr.close_volume(raw_volume);
+        drop(volume_mgr);
+        finish_upload_session(epd, exit).await;
+        return;
     };
     let root = Directory::new(raw_root, &volume_mgr);
     // New books invalidate the catalog snapshot: the next boot's cache
@@ -464,14 +481,26 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) -
         Err(_) => match root.make_dir_in_dir("BOOKS") {
             Ok(()) => match root.open_dir("BOOKS") {
                 Ok(books) => books,
-                Err(_) => refuse_uploads_forever().await,
+                Err(_) => refuse_uploads_forever_setup().await,
             },
-            Err(_) => refuse_uploads_forever().await,
+            Err(_) => refuse_uploads_forever_setup().await,
         },
     };
 
-    loop {
-        let begin = UPLOAD_BEGINS.receive().await;
+    let exit = loop {
+        let begin = match select(
+            UPLOAD_BEGINS.receive(),
+            select(UPLOAD_STOP_REQUESTS.receive(), DISPLAY_COMMANDS.receive()),
+        )
+        .await
+        {
+            Either::First(begin) => begin,
+            Either::Second(Either::First(())) => break UploadSessionExit::Wireless,
+            Either::Second(Either::Second(DisplayCommand::Sleep)) => {
+                break UploadSessionExit::Sleep
+            }
+            Either::Second(Either::Second(DisplayCommand::Render(_))) => continue,
+        };
         let ok = if begin.delete {
             let removed = if begin.in_books {
                 remove_file_reclaiming_clusters(&books, begin.name.as_str())
@@ -482,13 +511,17 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) -
                 crate::reader_cache_files::delete_upload_label(&root, begin.name.as_str());
             }
             removed
-        } else if let Some(written_name) = write_one_book(&books, &begin).await {
-            // New uploads carry their display name in VFAT itself. Remove any
-            // stale sidecar that happens to share the chosen short alias.
-            crate::reader_cache_files::delete_upload_label(&root, written_name.as_str());
-            true
         } else {
-            false
+            match write_one_book(&books, &begin).await {
+                UploadWrite::Finished(Some(written_name)) => {
+                    // New uploads carry their display name in VFAT itself.
+                    // Remove a stale sidecar sharing the chosen alias.
+                    crate::reader_cache_files::delete_upload_label(&root, written_name.as_str());
+                    true
+                }
+                UploadWrite::Finished(None) => false,
+                UploadWrite::Interrupted(exit) => break exit,
+            }
         };
         esp_println::println!(
             "upload: '{}' {} ok={}",
@@ -497,7 +530,34 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) -
             ok
         );
         UPLOAD_RESULTS.send(ok).await;
+    };
+    drop(books);
+    drop(root);
+    let _ = volume_mgr.close_volume(raw_volume);
+    drop(volume_mgr);
+    finish_upload_session(epd, exit).await;
+}
+
+async fn finish_upload_session(epd: &mut Epd, exit: UploadSessionExit) {
+    let _ = epd
+        .spi_mut()
+        .apply_config(&SpiConfig::default().with_frequency(Rate::from_hz(DISPLAY_FREQ_HZ)));
+    crate::upload::UPLOAD_SESSION_ACTIVE.store(false, portable_atomic::Ordering::SeqCst);
+    match exit {
+        UploadSessionExit::Sleep => DISPLAY_COMMANDS.send(DisplayCommand::Sleep).await,
+        UploadSessionExit::Wireless => UPLOAD_STOPPED.send(()).await,
     }
+}
+
+#[derive(Clone, Copy)]
+enum UploadSessionExit {
+    Sleep,
+    Wireless,
+}
+
+enum UploadWrite {
+    Finished(Option<UploadName>),
+    Interrupted(UploadSessionExit),
 }
 
 /// Remove a file without leaking its FAT cluster chain.
@@ -539,28 +599,35 @@ async fn write_one_book<
 >(
     books: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     begin: &UploadBegin,
-) -> Option<UploadName>
+) -> UploadWrite
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
     let Some(target) = resolve_upload_target(books, begin) else {
-        drain_until_end().await;
-        return None;
+        return match drain_until_end().await {
+            Ok(()) => UploadWrite::Finished(None),
+            Err(exit) => UploadWrite::Interrupted(exit),
+        };
     };
-    let file = if target.existing {
-        books.open_file_in_dir(target.name.as_str(), Mode::ReadWriteTruncate)
-    } else {
-        books.create_file_in_dir_lfn(begin.long_name.as_str(), target.name.as_str())
-    };
+    let file = books.create_file_in_dir_lfn(begin.long_name.as_str(), target.name.as_str());
     let Ok(file) = file else {
-        drain_until_end().await;
-        return None;
+        return match drain_until_end().await {
+            Ok(()) => UploadWrite::Finished(None),
+            Err(exit) => UploadWrite::Interrupted(exit),
+        };
     };
     let mut failed = false;
     let mut aborted = false;
     loop {
-        let chunk = UPLOAD_CHUNKS.receive().await;
+        let chunk = match next_upload_chunk().await {
+            Ok(chunk) => chunk,
+            Err(exit) => {
+                drop(file);
+                let _ = remove_file_reclaiming_clusters(books, target.name.as_str());
+                return UploadWrite::Interrupted(exit);
+            }
+        };
         if !failed && !chunk.abort {
             if let Some(buffer) = &chunk.buffer {
                 if file.write(&buffer[..chunk.len.min(buffer.len())]).is_err() {
@@ -578,14 +645,13 @@ where
     drop(file);
     if failed || aborted {
         let _ = remove_file_reclaiming_clusters(books, target.name.as_str());
-        return None;
+        return UploadWrite::Finished(None);
     }
-    Some(target.name)
+    UploadWrite::Finished(Some(target.name))
 }
 
 struct UploadTarget {
     name: UploadName,
-    existing: bool,
 }
 
 /// Find an existing file with the same VFAT name or a free deterministic 8.3
@@ -636,29 +702,44 @@ where
             })
             .ok()?;
         if !exact_name.is_empty() {
-            return Some(UploadTarget {
-                name: exact_name,
-                existing: true,
-            });
+            // Safe first phase of replacement: never truncate the current
+            // book. The browser gets a failed upload and the original plus
+            // all cache artifacts remain untouched.
+            return None;
         }
         if !candidate_taken {
-            return Some(UploadTarget {
-                name: candidate,
-                existing: false,
-            });
+            return Some(UploadTarget { name: candidate });
         }
     }
     None
 }
 
 /// Consumes one file's worth of chunks without a file to write into.
-async fn drain_until_end() {
+async fn drain_until_end() -> Result<(), UploadSessionExit> {
     loop {
-        let chunk = UPLOAD_CHUNKS.receive().await;
+        let chunk = next_upload_chunk().await?;
         let done = chunk.last || chunk.abort;
         recycle(chunk).await;
         if done {
-            return;
+            return Ok(());
+        }
+    }
+}
+
+async fn next_upload_chunk() -> Result<UploadChunk, UploadSessionExit> {
+    loop {
+        match select(
+            UPLOAD_CHUNKS.receive(),
+            select(UPLOAD_STOP_REQUESTS.receive(), DISPLAY_COMMANDS.receive()),
+        )
+        .await
+        {
+            Either::First(chunk) => return Ok(chunk),
+            Either::Second(Either::First(())) => return Err(UploadSessionExit::Wireless),
+            Either::Second(Either::Second(DisplayCommand::Sleep)) => {
+                return Err(UploadSessionExit::Sleep)
+            }
+            Either::Second(Either::Second(DisplayCommand::Render(_))) => {}
         }
     }
 }
@@ -671,10 +752,46 @@ async fn recycle(chunk: UploadChunk) {
 
 /// Setup failed: answer every upload attempt with failure, forever; the
 /// session ends with the reset like everything else in sync mode.
-async fn refuse_uploads_forever() -> ! {
+async fn refuse_uploads_until_exit() -> UploadSessionExit {
     loop {
-        let _ = UPLOAD_BEGINS.receive().await;
-        drain_until_end().await;
-        UPLOAD_RESULTS.send(false).await;
+        match select(
+            UPLOAD_BEGINS.receive(),
+            select(UPLOAD_STOP_REQUESTS.receive(), DISPLAY_COMMANDS.receive()),
+        )
+        .await
+        {
+            Either::First(_) => match drain_until_end().await {
+                Ok(()) => UPLOAD_RESULTS.send(false).await,
+                Err(exit) => return exit,
+            },
+            Either::Second(Either::First(())) => return UploadSessionExit::Wireless,
+            Either::Second(Either::Second(DisplayCommand::Sleep)) => {
+                return UploadSessionExit::Sleep
+            }
+            Either::Second(Either::Second(DisplayCommand::Render(_))) => {}
+        }
+    }
+}
+
+/// A missing/uncreatable BOOKS directory has no FAT file to protect. Keep
+/// rejecting requests; the next hardware reset remounts from scratch.
+async fn refuse_uploads_forever_setup() -> ! {
+    loop {
+        match select(UPLOAD_BEGINS.receive(), UPLOAD_STOP_REQUESTS.receive()).await {
+            Either::First(_) => match drain_until_end().await {
+                Ok(()) => UPLOAD_RESULTS.send(false).await,
+                Err(UploadSessionExit::Wireless) => {
+                    crate::upload::UPLOAD_SESSION_ACTIVE
+                        .store(false, portable_atomic::Ordering::SeqCst);
+                    UPLOAD_STOPPED.send(()).await;
+                }
+                Err(UploadSessionExit::Sleep) => {}
+            },
+            Either::Second(()) => {
+                crate::upload::UPLOAD_SESSION_ACTIVE
+                    .store(false, portable_atomic::Ordering::SeqCst);
+                UPLOAD_STOPPED.send(()).await;
+            }
+        }
     }
 }
