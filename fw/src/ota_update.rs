@@ -10,8 +10,10 @@
 //! Only the inactive slot and the inactive `otadata` sector are written, so a
 //! failure here never touches the running firmware: the bootloader keeps
 //! selecting the current slot until a complete, valid image flips `otadata`.
-//! The image format, seq CRC, and slot-switch math live in [`proto::ota`] and
-//! are host-tested; this module is the flash I/O around them.
+//! Slot locations come from the partition table already installed on the
+//! device; this is essential for locked X3 units that retain the stock layout.
+//! The image format, partition parsing, seq CRC, and slot-switch math live in
+//! [`proto::ota`] and are host-tested; this module is the flash I/O around them.
 //!
 //! Untested on hardware as of this writing. Validate on the unlocked unit first
 //! (espflash's bootloader is ESP-IDF and honours `otadata` too), then a locked
@@ -31,9 +33,7 @@ use crate::sd_session::SdRoot;
 ///
 /// Device-specific so a card is safe to move between an X4 and an X3: each
 /// build only picks up an image named for its own panel, so an X4 image
-/// (`FWUPDATE.BIN`) is invisible to an X3 and vice versa. Flashing the wrong
-/// build wouldn't brick (same SoC and partition table) but would drive the
-/// wrong panel and battery gauge — a black screen, not a recoverable state.
+/// (`FWUPDATE.BIN`) is invisible to an X3 and vice versa.
 #[cfg(not(feature = "device-x3"))]
 const TRIGGER_FILE: &str = "FWUPDATE.BIN";
 #[cfg(feature = "device-x3")]
@@ -51,11 +51,9 @@ const SELECTED_UPDATE_FILE: &str = "FWPEND.BIN";
 const SELECTED_UPDATE_MAGIC: [u8; 4] = *b"MGUP";
 const SELECTED_UPDATE_RECORD_LEN: usize = 22;
 
-// Absolute flash offsets — must match `partitions.csv`.
-const OTADATA_OFFSET: u32 = 0x0000_e000;
+const PARTITION_TABLE_OFFSET: u32 = 0x0000_8000;
+const PARTITION_TABLE_LEN: usize = 0x1000;
 const OTADATA_SECTOR_STRIDE: u32 = 0x0000_1000; // one 4 KiB sector per entry
-const OTA_SLOT_OFFSET: [u32; 2] = [0x0001_0000, 0x0065_0000];
-const OTA_SLOT_SIZE: u32 = 0x0064_0000;
 const OTA_COUNT: u32 = 2;
 
 const SECTOR: usize = 4096;
@@ -69,6 +67,7 @@ pub enum UpdateError {
     NoTrigger,
     ReadFile,
     Invalid(ImageError),
+    PartitionTable(ota::PartitionTableError),
     Flash,
     /// The one-shot trigger/selection could not be consumed before commit.
     Consume,
@@ -147,23 +146,32 @@ fn try_apply(root: &SdRoot, source_name: &str, picker_selected: bool) -> Result<
     let len = file.length() as usize;
     esp_println::println!("ota: {} selected, {} bytes", source_name, len);
 
+    let mut flash = flash_storage();
+    let layout = read_ota_layout(&mut flash)?;
+
+    // Destination is the slot we are *not* running from. Derive both the
+    // offset and the size from the table the bootloader will actually use.
+    let (s0, s1) = read_otadata(&mut flash, layout.otadata.offset)?;
+    let active = ota::active_app_slot(&s0, &s1, OTA_COUNT).unwrap_or(0);
+    let dest = (active + 1) % OTA_COUNT;
+    let dest_partition = layout.slots[dest as usize];
+
     // Pass 1: prove the whole image before touching flash. The firmware shelf
     // intentionally accepts app images from other reader projects; the user
     // chooses the target while the validator enforces integrity and fit.
-    ota::validate_image(&mut SdFile(&file), len, Some(OTA_SLOT_SIZE as usize))
+    ota::validate_image(&mut SdFile(&file), len, Some(dest_partition.size as usize))
         .map_err(UpdateError::Invalid)?;
     file.seek_from_start(0).map_err(|_| UpdateError::ReadFile)?;
-
-    let mut flash = flash_storage();
-
-    // Destination is the slot we are *not* running from.
-    let (s0, s1) = read_otadata(&mut flash)?;
-    let active = ota::active_app_slot(&s0, &s1, OTA_COUNT).unwrap_or(0);
-    let dest = (active + 1) % OTA_COUNT;
-    esp_println::println!("ota: active slot {}, writing slot {}", active, dest);
+    esp_println::println!(
+        "ota: active slot {}, writing slot {} at {:#x} ({} bytes)",
+        active,
+        dest,
+        dest_partition.offset,
+        dest_partition.size
+    );
 
     // Pass 2: erase + stream the image into the inactive slot.
-    write_image(&mut flash, OTA_SLOT_OFFSET[dest as usize], &file, len)?;
+    write_image(&mut flash, dest_partition.offset, &file, len)?;
     drop(file);
 
     // Consume the one-shot control record before committing the OTA switch.
@@ -178,9 +186,14 @@ fn try_apply(root: &SdRoot, source_name: &str, picker_selected: bool) -> Result<
     // not touch otadata, but re-reading keeps the switch self-consistent). The
     // one-shot source is already consumed, so a reset after this write cannot
     // schedule the same image again.
-    let (s0, s1) = read_otadata(&mut flash)?;
+    let (s0, s1) = read_otadata(&mut flash, layout.otadata.offset)?;
     let switch = ota::plan_switch(&s0, &s1, dest, OTA_COUNT);
-    write_select_entry(&mut flash, switch.target_sector, &switch.entry)?;
+    write_select_entry(
+        &mut flash,
+        layout.otadata.offset,
+        switch.target_sector,
+        &switch.entry,
+    )?;
     esp_println::println!(
         "ota: otadata sector {} -> seq {}",
         switch.target_sector,
@@ -291,7 +304,11 @@ pub fn run_selftest() -> bool {
     const COPY_LEN: u32 = 0x0030_0000;
 
     let mut flash = flash_storage();
-    let (s0, s1) = match read_otadata(&mut flash) {
+    let layout = match read_ota_layout(&mut flash) {
+        Ok(layout) => layout,
+        Err(_) => return false,
+    };
+    let (s0, s1) = match read_otadata(&mut flash, layout.otadata.offset) {
         Ok(v) => v,
         Err(_) => return false,
     };
@@ -301,8 +318,12 @@ pub fn run_selftest() -> bool {
         return false;
     }
 
-    let src = OTA_SLOT_OFFSET[0];
-    let dst = OTA_SLOT_OFFSET[1];
+    if layout.slots[0].size < COPY_LEN || layout.slots[1].size < COPY_LEN {
+        esp_println::println!("selftest: OTA partition too small");
+        return false;
+    }
+    let src = layout.slots[0].offset;
+    let dst = layout.slots[1].offset;
     esp_println::println!("selftest: copy slot 0 -> slot 1 ({} bytes)", COPY_LEN);
     if flash.erase(dst, dst + COPY_LEN).is_err() {
         esp_println::println!("selftest: erase failed");
@@ -322,12 +343,19 @@ pub fn run_selftest() -> bool {
         off += SECTOR as u32;
     }
 
-    let (s0, s1) = match read_otadata(&mut flash) {
+    let (s0, s1) = match read_otadata(&mut flash, layout.otadata.offset) {
         Ok(v) => v,
         Err(_) => return false,
     };
     let switch = ota::plan_switch(&s0, &s1, 1, OTA_COUNT);
-    if write_select_entry(&mut flash, switch.target_sector, &switch.entry).is_err() {
+    if write_select_entry(
+        &mut flash,
+        layout.otadata.offset,
+        switch.target_sector,
+        &switch.entry,
+    )
+    .is_err()
+    {
         esp_println::println!("selftest: otadata write failed");
         return false;
     }
@@ -359,7 +387,11 @@ pub fn recovery_combo_held(nav_mv: u16, page_mv: u16) -> bool {
 /// held combo can be honoured — it must run before the main app takes over.
 pub fn recover_to_slot0() -> bool {
     let mut flash = flash_storage();
-    let (s0, s1) = match read_otadata(&mut flash) {
+    let layout = match read_ota_layout(&mut flash) {
+        Ok(layout) => layout,
+        Err(_) => return false,
+    };
+    let (s0, s1) = match read_otadata(&mut flash, layout.otadata.offset) {
         Ok(v) => v,
         Err(_) => return false,
     };
@@ -370,12 +402,19 @@ pub fn recover_to_slot0() -> bool {
     }
     // Refuse to switch into a slot 0 that isn't a bootable image.
     let mut head = [0u8; 4];
-    if flash.read(OTA_SLOT_OFFSET[0], &mut head).is_err() || head[0] != ota::IMAGE_MAGIC {
+    if flash.read(layout.slots[0].offset, &mut head).is_err() || head[0] != ota::IMAGE_MAGIC {
         esp_println::println!("recovery: slot 0 has no valid image; ignoring combo");
         return false;
     }
     let switch = ota::plan_switch(&s0, &s1, 0, OTA_COUNT);
-    if write_select_entry(&mut flash, switch.target_sector, &switch.entry).is_err() {
+    if write_select_entry(
+        &mut flash,
+        layout.otadata.offset,
+        switch.target_sector,
+        &switch.entry,
+    )
+    .is_err()
+    {
         esp_println::println!("recovery: otadata write failed");
         return false;
     }
@@ -391,14 +430,25 @@ pub fn recover_to_slot0() -> bool {
 /// make rollback-enabled bootloaders return to the previous firmware.
 pub fn mark_running_slot_valid() {
     let mut flash = flash_storage();
-    let (s0, s1) = match read_otadata(&mut flash) {
+    let layout = match read_ota_layout(&mut flash) {
+        Ok(layout) => layout,
+        Err(_) => return,
+    };
+    let (s0, s1) = match read_otadata(&mut flash, layout.otadata.offset) {
         Ok(v) => v,
         Err(_) => return,
     };
     let Some(valid) = ota::plan_mark_app_valid(&s0, &s1) else {
         return;
     };
-    if write_select_entry(&mut flash, valid.target_sector, &valid.entry).is_err() {
+    if write_select_entry(
+        &mut flash,
+        layout.otadata.offset,
+        valid.target_sector,
+        &valid.entry,
+    )
+    .is_err()
+    {
         esp_println::println!("ota: mark-valid failed");
         return;
     }
@@ -417,16 +467,25 @@ fn flash_storage() -> FlashStorage<'static> {
     FlashStorage::new(unsafe { esp_hal::peripherals::FLASH::steal() })
 }
 
+fn read_ota_layout(flash: &mut FlashStorage) -> Result<ota::OtaLayout, UpdateError> {
+    let mut table = [0u8; PARTITION_TABLE_LEN];
+    flash
+        .read(PARTITION_TABLE_OFFSET, &mut table)
+        .map_err(|_| UpdateError::Flash)?;
+    ota::parse_ota_layout(&table, flash.capacity() as u32).map_err(UpdateError::PartitionTable)
+}
+
 fn read_otadata(
     flash: &mut FlashStorage,
+    otadata_offset: u32,
 ) -> Result<([u8; SELECT_ENTRY_LEN], [u8; SELECT_ENTRY_LEN]), UpdateError> {
     let mut s0 = [0u8; SELECT_ENTRY_LEN];
     let mut s1 = [0u8; SELECT_ENTRY_LEN];
     flash
-        .read(OTADATA_OFFSET, &mut s0)
+        .read(otadata_offset, &mut s0)
         .map_err(|_| UpdateError::Flash)?;
     flash
-        .read(OTADATA_OFFSET + OTADATA_SECTOR_STRIDE, &mut s1)
+        .read(otadata_offset + OTADATA_SECTOR_STRIDE, &mut s1)
         .map_err(|_| UpdateError::Flash)?;
     Ok((s0, s1))
 }
@@ -465,10 +524,11 @@ fn write_image<D: BlockDevice, T: TimeSource, const MD: usize, const MF: usize, 
 
 fn write_select_entry(
     flash: &mut FlashStorage,
+    otadata_offset: u32,
     sector: usize,
     entry: &SelectEntry,
 ) -> Result<(), UpdateError> {
-    let offset = OTADATA_OFFSET + sector as u32 * OTADATA_SECTOR_STRIDE;
+    let offset = otadata_offset + sector as u32 * OTADATA_SECTOR_STRIDE;
     flash
         .erase(offset, offset + OTADATA_SECTOR_STRIDE)
         .map_err(|_| UpdateError::Flash)?;
