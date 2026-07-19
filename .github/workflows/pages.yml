@@ -58,11 +58,13 @@ jobs:
           if [ "$RELEASE_TAG" = latest ]; then
             gh release download --repo "$GITHUB_REPOSITORY" \
               --pattern firmware-x4.bin --pattern firmware-x3.bin \
-              --pattern update.bin --pattern FWUPDX3.BIN --dir _site
+              --pattern update.bin --pattern update-x3.bin \
+              --pattern FWUPDX3.BIN --dir _site
           else
             gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
               --pattern firmware-x4.bin --pattern firmware-x3.bin \
-              --pattern update.bin --pattern FWUPDX3.BIN --dir _site
+              --pattern update.bin --pattern update-x3.bin \
+              --pattern FWUPDX3.BIN --dir _site
           fi
           tools/verify_web_flasher.sh _site
       - uses: actions/upload-pages-artifact@v3

@@ -221,7 +221,10 @@ command that scans root-level `.BIN` files into the reader store. After the
 second confirmation, the display task draws the visible update handoff, writes
 the selected file's FAT alias to `/XTEINK/FWPEND.BIN`, and resets. Boot reopens
 that exact source through the existing whole-image validator and inactive-slot
-updater; the source remains on the card so several firmware images can coexist.
+updater. The updater reads the installed ESP-IDF partition table before it
+erases anything, because stock X3 units and Marigold/CrossPoint installations
+place `ota_1` at different offsets. The source remains on the card so several
+firmware images can coexist.
 
 ## Display model
 

@@ -475,7 +475,7 @@
     <div class="stage">
       <p class="stitle"><span class="no">2</span>Flash over USB</p>
       <div class="asset">
-        <div><span class="k">Version</span><b>v0.4.2</b></div>
+        <div><span class="k">Version</span><b>v0.4.3</b></div>
         <div><span class="k">Image</span><b id="img">firmware-x4.bin</b></div>
         <div><span class="k">Size</span><b>~2.0 MB</b></div>
       </div>
@@ -494,14 +494,14 @@
     <p class="txt">For readers with USB flashing locked at the factory. It writes only the app slot and leaves the bootloader intact.</p>
     <ul class="sdsteps">
       <li><span class="n">1</span> Download the SD image for your device.</li>
-      <li><span class="n">2</span> Copy it to the root of the SD card.</li>
+      <li><span class="n">2</span> Copy it to the root of the SD card as <b>update.bin</b>.</li>
       <li><span class="n">3</span> Power on holding <b>Power + Up</b> to flash.</li>
     </ul>
     <a class="dl2" href="#" id="sd">Download SD image &#8595;</a>
-    <p class="txt">Already running Marigold on an X4? Use <a href="https://github.com/Jon-Vii/marigold-os/releases/latest/download/FWUPDATE.BIN">FWUPDATE.BIN</a> instead and reboot normally.</p>
+    <p class="txt">Already running Marigold? Use <a href="https://github.com/Jon-Vii/marigold-os/releases/latest/download/FWUPDATE.BIN">FWUPDATE.BIN</a> on X4 or <a href="https://github.com/Jon-Vii/marigold-os/releases/latest/download/FWUPDX3.BIN">FWUPDX3.BIN</a> on X3 and reboot normally.</p>
   </div>
 
-  <p class="rel"><a href="https://github.com/Jon-Vii/marigold-os/releases/latest">v0.4.2 release notes &#8599;</a></p>
+  <p class="rel"><a href="https://github.com/Jon-Vii/marigold-os/releases/latest">v0.4.3 release notes &#8599;</a></p>
 </section>
 
 <div class="colophon">
@@ -752,7 +752,7 @@
   // ESP Web Tools fetch fail even though opening the release URL works.
   const R="";
   const FW={x4:R+"firmware-x4.bin", x3:R+"firmware-x3.bin"};
-  const SD={x4:R+"update.bin", x3:R+"FWUPDX3.BIN"};
+  const SD={x4:R+"update.bin", x3:R+"update-x3.bin"};
   const IMG={x4:"firmware-x4.bin", x3:"firmware-x3.bin"};
   const btns=document.querySelectorAll(".dev");
   const img=document.getElementById("img"), dl=document.getElementById("dl"), sd=document.getElementById("sd");
