@@ -68,6 +68,318 @@ pub const TOC_FILE_HEADER_BYTES: usize = 16;
 pub const TOC_CHAPTER_TITLE_BYTES: usize = 60;
 pub const TOC_CHAPTER_RECORD_BYTES: usize = 64;
 
+/// Settings-independent content cache: the exact `push_block` argument
+/// stream captured during a full EPUB build (fragment text plus role,
+/// style, align, paragraph_end, and spine boundaries). A type-settings
+/// change replays this file through the same build sink instead of
+/// re-reading, re-inflating, and re-parsing the whole EPUB. Keyed by
+/// source identity and `CONTENT_VERSION` only — never by layout config.
+/// Bump `CONTENT_VERSION` whenever XHTML parsing, entity decoding, or sink
+/// normalization semantics change (the `READER_LAYOUT_VERSION` discipline).
+/// The header also stamps the `CACHE_V2_VERSION` in force at capture time
+/// and decoding rejects any other value, so a BOOK.BIN version bump —
+/// even one the `CACHE_V2_COMPAT_VERSION` window would accept — can never
+/// replay a stream captured under older parse semantics.
+pub const CACHE_CONTENT_FILE: &str = "CONT.BIN";
+pub const CONTENT_MAGIC: u32 = 0x5834_434E; // X4CN
+pub const CONTENT_VERSION: u16 = 3;
+pub const CONTENT_HEADER_BYTES: usize = 24;
+pub const CONTENT_RECORD_HEADER_BYTES: usize = 8;
+const CONTENT_FLAG_COMPLETE: u8 = 1;
+const CONTENT_RECORD_FLAG_PARAGRAPH_END: u8 = 1;
+const CONTENT_RECORD_FLAG_SPINE_END: u8 = 1 << 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContentHeader {
+    pub source_hash: u32,
+    pub source_size: u32,
+    /// False until the capture has recorded the whole spine walk; replay
+    /// only ever runs from a complete capture.
+    pub complete: bool,
+    pub spine_count: u16,
+    pub content_len: u32,
+}
+
+/// One captured `push_block` call (text follows the header), or — with
+/// `spine_end` set and `text_len` 0 — the end-of-spine-item marker that
+/// tells replay to finish the current section run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContentRecordHeader {
+    pub spine_index: u16,
+    pub text_len: u16,
+    pub role: TextRole,
+    pub style: FontStyle,
+    pub align: TextAlign,
+    pub paragraph_end: bool,
+    pub spine_end: bool,
+}
+
+pub fn encode_content_header(header: ContentHeader, out: &mut [u8]) -> Result<usize, CacheError> {
+    require(out, CONTENT_HEADER_BYTES)?;
+    write_u32(out, 0, CONTENT_MAGIC);
+    write_u16(out, 4, CONTENT_VERSION);
+    out[6] = if header.complete {
+        CONTENT_FLAG_COMPLETE
+    } else {
+        0
+    };
+    out[7] = 0;
+    write_u32(out, 8, header.source_hash);
+    write_u32(out, 12, header.source_size);
+    write_u16(out, 16, header.spine_count);
+    write_u16(out, 18, CACHE_V2_VERSION);
+    write_u32(out, 20, header.content_len);
+    Ok(CONTENT_HEADER_BYTES)
+}
+
+pub fn decode_content_header(input: &[u8]) -> Result<ContentHeader, CacheError> {
+    require(input, CONTENT_HEADER_BYTES)?;
+    if read_u32(input, 0)? != CONTENT_MAGIC {
+        return Err(CacheError::BadMagic);
+    }
+    if read_u16(input, 4)? != CONTENT_VERSION {
+        return Err(CacheError::BadVersion);
+    }
+    // Exact match, not the BOOK.BIN compat window: any CACHE_V2_VERSION
+    // bump invalidates captured content even when old indexes stay
+    // readable, so a semantics change can't leak through replay.
+    if read_u16(input, 18)? != CACHE_V2_VERSION {
+        return Err(CacheError::BadVersion);
+    }
+    Ok(ContentHeader {
+        source_hash: read_u32(input, 8)?,
+        source_size: read_u32(input, 12)?,
+        complete: input[6] & CONTENT_FLAG_COMPLETE != 0,
+        spine_count: read_u16(input, 16)?,
+        content_len: read_u32(input, 20)?,
+    })
+}
+
+pub fn encode_content_record_header(
+    record: ContentRecordHeader,
+    out: &mut [u8],
+) -> Result<usize, CacheError> {
+    require(out, CONTENT_RECORD_HEADER_BYTES)?;
+    if record.spine_end && record.text_len != 0 {
+        return Err(CacheError::BadLength);
+    }
+    write_u16(out, 0, record.spine_index);
+    write_u16(out, 2, record.text_len);
+    out[4] = role_byte(record.role);
+    out[5] = style_byte(record.style);
+    out[6] = align_byte(record.align);
+    out[7] = (u8::from(record.paragraph_end) * CONTENT_RECORD_FLAG_PARAGRAPH_END)
+        | (u8::from(record.spine_end) * CONTENT_RECORD_FLAG_SPINE_END);
+    Ok(CONTENT_RECORD_HEADER_BYTES)
+}
+
+pub fn decode_content_record_header(input: &[u8]) -> Result<ContentRecordHeader, CacheError> {
+    require(input, CONTENT_RECORD_HEADER_BYTES)?;
+    let record = ContentRecordHeader {
+        spine_index: read_u16(input, 0)?,
+        text_len: read_u16(input, 2)?,
+        role: role_from_byte(input[4])?,
+        style: style_from_byte(input[5])?,
+        align: align_from_byte(input[6])?,
+        paragraph_end: input[7] & CONTENT_RECORD_FLAG_PARAGRAPH_END != 0,
+        spine_end: input[7] & CONTENT_RECORD_FLAG_SPINE_END != 0,
+    };
+    if record.spine_end && record.text_len != 0 {
+        return Err(CacheError::BadLength);
+    }
+    Ok(record)
+}
+
+/// A content-stream walk failure: the stream is truncated, corrupt, or the
+/// underlying reader failed. Every case gets the same treatment — delete
+/// the file and fall back to the full build — so the error carries no
+/// detail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContentReplayError;
+
+/// Driver verdict after one replayed spine group: keep walking, or stop
+/// early and publish what's built so far (the same early-out a full build
+/// takes when section capacity runs out).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentReplayFlow {
+    Continue,
+    Stop,
+}
+
+/// How a content-stream walk ended: `Complete` means every expected spine
+/// group replayed and the stream ended exactly on the final marker;
+/// `Stopped` means the driver ended the walk early via
+/// [`ContentReplayFlow::Stop`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentReplayOutcome {
+    Complete,
+    Stopped,
+}
+
+/// Ensure at least `need` bytes sit at `buf[*pos..*fill]`, compacting the
+/// buffered remainder to the front and refilling from `read`. `Ok(false)`
+/// is a clean end-of-stream exactly on a record boundary; an error is a
+/// short stream mid-record or a read failure.
+fn refill_content_buf(
+    read: &mut dyn FnMut(&mut [u8]) -> Result<usize, ContentReplayError>,
+    buf: &mut [u8],
+    pos: &mut usize,
+    fill: &mut usize,
+    need: usize,
+) -> Result<bool, ContentReplayError> {
+    if *fill - *pos >= need {
+        return Ok(true);
+    }
+    buf.copy_within(*pos..*fill, 0);
+    *fill -= *pos;
+    *pos = 0;
+    while *fill < need {
+        let read_len = read(&mut buf[*fill..])?;
+        if read_len == 0 {
+            return if *fill == 0 {
+                Ok(false)
+            } else {
+                Err(ContentReplayError)
+            };
+        }
+        *fill += read_len;
+    }
+    Ok(true)
+}
+
+/// Hands the driver one spine group's records in order. Every violation of
+/// the framing discipline — EOF mid-group, a record from another spine
+/// index, undecodable bytes, or text that can't fit the buffer — is an
+/// error: a complete capture never produces any of them.
+pub struct ContentGroupReader<'w> {
+    read: &'w mut dyn FnMut(&mut [u8]) -> Result<usize, ContentReplayError>,
+    buf: &'w mut [u8],
+    pos: &'w mut usize,
+    fill: &'w mut usize,
+    group_spine: u16,
+    done: bool,
+}
+
+impl ContentGroupReader<'_> {
+    /// The next block in this group: `Ok(Some((record, text)))` for a
+    /// captured `push_block`, `Ok(None)` once at the group's spine-end
+    /// marker, an error on any framing or read failure. The text borrows
+    /// the walk buffer, so consume it before the next call.
+    pub fn next_block(
+        &mut self,
+    ) -> Result<Option<(ContentRecordHeader, &str)>, ContentReplayError> {
+        if self.done {
+            return Ok(None);
+        }
+        // A complete capture never ends mid-group: EOF here is corrupt.
+        if !refill_content_buf(
+            self.read,
+            self.buf,
+            self.pos,
+            self.fill,
+            CONTENT_RECORD_HEADER_BYTES,
+        )? {
+            return Err(ContentReplayError);
+        }
+        let record = decode_content_record_header(
+            &self.buf[*self.pos..*self.pos + CONTENT_RECORD_HEADER_BYTES],
+        )
+        .map_err(|_| ContentReplayError)?;
+        if record.spine_index != self.group_spine {
+            return Err(ContentReplayError);
+        }
+        *self.pos += CONTENT_RECORD_HEADER_BYTES;
+        if record.spine_end {
+            self.done = true;
+            return Ok(None);
+        }
+        let text_len = record.text_len as usize;
+        if text_len > self.buf.len() {
+            return Err(ContentReplayError);
+        }
+        if !refill_content_buf(self.read, self.buf, self.pos, self.fill, text_len)? {
+            return Err(ContentReplayError);
+        }
+        let start = *self.pos;
+        *self.pos += text_len;
+        let text = core::str::from_utf8(&self.buf[start..start + text_len])
+            .map_err(|_| ContentReplayError)?;
+        Ok(Some((record, text)))
+    }
+}
+
+/// Walk a CONT.BIN record stream (positioned just past the file header),
+/// calling `on_group` once per spine group with a [`ContentGroupReader`]
+/// the driver drains. This is the single owner of the stream's framing
+/// discipline — both the firmware replay path and the host tests drive
+/// this walker, so writer and reader semantics cannot drift apart:
+///
+/// - every group ends in a spine-end marker and never changes spine index
+///   mid-group;
+/// - group spine indices strictly increase (gaps are fine — the capture
+///   skips navigation items): the writer walks the spine in `enumerate()`
+///   order and its indices can't saturate (`MAX_SPINE_ITEMS` is far below
+///   `u16::MAX`), so a reordered or duplicated group is corruption that
+///   would otherwise publish chapters out of order;
+/// - clean EOF is only accepted on a group boundary with exactly
+///   `expected_spines` groups replayed;
+/// - a driver returning [`ContentReplayFlow::Continue`] must have drained
+///   its group to the marker.
+///
+/// `read` fills a buffer from the stream (`Ok(0)` at EOF); `buf` is the
+/// walk window and bounds the largest replayable text (the capture side
+/// enforces the same bound at write time).
+pub fn replay_content_stream(
+    read: &mut dyn FnMut(&mut [u8]) -> Result<usize, ContentReplayError>,
+    buf: &mut [u8],
+    expected_spines: u16,
+    on_group: &mut dyn FnMut(
+        u16,
+        &mut ContentGroupReader<'_>,
+    ) -> Result<ContentReplayFlow, ContentReplayError>,
+) -> Result<ContentReplayOutcome, ContentReplayError> {
+    let mut pos = 0usize;
+    let mut fill = 0usize;
+    let mut replayed_spines = 0u16;
+    let mut last_group_spine: Option<u16> = None;
+    loop {
+        // Peek the next group's spine index; clean EOF here ends the walk.
+        if !refill_content_buf(read, buf, &mut pos, &mut fill, CONTENT_RECORD_HEADER_BYTES)? {
+            break;
+        }
+        let group_spine =
+            decode_content_record_header(&buf[pos..pos + CONTENT_RECORD_HEADER_BYTES])
+                .map_err(|_| ContentReplayError)?
+                .spine_index;
+        // Rejected before the group runs, so a reordered stream can't
+        // publish a single section in the wrong place.
+        if last_group_spine.is_some_and(|last| group_spine <= last) {
+            return Err(ContentReplayError);
+        }
+        let mut group = ContentGroupReader {
+            read: &mut *read,
+            buf: &mut *buf,
+            pos: &mut pos,
+            fill: &mut fill,
+            group_spine,
+            done: false,
+        };
+        match on_group(group_spine, &mut group)? {
+            ContentReplayFlow::Stop => return Ok(ContentReplayOutcome::Stopped),
+            ContentReplayFlow::Continue => {}
+        }
+        if !group.done {
+            return Err(ContentReplayError);
+        }
+        last_group_spine = Some(group_spine);
+        replayed_spines = replayed_spines.saturating_add(1);
+    }
+    if replayed_spines != expected_spines {
+        return Err(ContentReplayError);
+    }
+    Ok(ContentReplayOutcome::Complete)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CacheError {
     BufferTooSmall,
@@ -913,7 +1225,125 @@ fn align_from_byte(byte: u8) -> Result<TextAlign, CacheError> {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
+
+    #[test]
+    fn content_header_round_trips_and_rejects_foreign_bytes() {
+        for complete in [false, true] {
+            let header = ContentHeader {
+                source_hash: 0xDEAD_BEEF,
+                source_size: 3_200_141,
+                complete,
+                spine_count: 42,
+                content_len: 12345,
+            };
+            let mut bytes = [0u8; CONTENT_HEADER_BYTES];
+            encode_content_header(header, &mut bytes).expect("header encodes");
+            assert_eq!(decode_content_header(&bytes), Ok(header));
+        }
+
+        let mut bytes = [0u8; CONTENT_HEADER_BYTES];
+        encode_content_header(
+            ContentHeader {
+                source_hash: 1,
+                source_size: 2,
+                complete: true,
+                spine_count: 0,
+                content_len: 0,
+            },
+            &mut bytes,
+        )
+        .expect("header encodes");
+        let mut bad_magic = bytes;
+        bad_magic[0] ^= 0xFF;
+        assert_eq!(decode_content_header(&bad_magic), Err(CacheError::BadMagic));
+        let mut bad_version = bytes;
+        bad_version[4] = 0xFF;
+        assert_eq!(
+            decode_content_header(&bad_version),
+            Err(CacheError::BadVersion)
+        );
+        // A stream stamped with a different BOOK.BIN format version was
+        // captured under other parse semantics and must not replay.
+        let mut bad_book_version = bytes;
+        bad_book_version[18] ^= 0xFF;
+        assert_eq!(
+            decode_content_header(&bad_book_version),
+            Err(CacheError::BadVersion)
+        );
+        assert_eq!(
+            decode_content_header(&bytes[..CONTENT_HEADER_BYTES - 1]),
+            Err(CacheError::BufferTooSmall)
+        );
+    }
+
+    #[test]
+    fn content_record_header_round_trips() {
+        let block = ContentRecordHeader {
+            spine_index: 12,
+            text_len: 517,
+            role: TextRole::BlockQuote,
+            style: FontStyle::Italic,
+            align: TextAlign::Center,
+            paragraph_end: true,
+            spine_end: false,
+        };
+        let marker = ContentRecordHeader {
+            spine_index: 12,
+            text_len: 0,
+            role: TextRole::Body,
+            style: FontStyle::Regular,
+            align: TextAlign::Left,
+            paragraph_end: false,
+            spine_end: true,
+        };
+        for record in [block, marker] {
+            let mut bytes = [0u8; CONTENT_RECORD_HEADER_BYTES];
+            encode_content_record_header(record, &mut bytes).expect("record encodes");
+            assert_eq!(decode_content_record_header(&bytes), Ok(record));
+        }
+    }
+
+    #[test]
+    fn content_record_header_rejects_bad_bytes() {
+        let mut bytes = [0u8; CONTENT_RECORD_HEADER_BYTES];
+        encode_content_record_header(
+            ContentRecordHeader {
+                spine_index: 3,
+                text_len: 9,
+                role: TextRole::Body,
+                style: FontStyle::Regular,
+                align: TextAlign::Justify,
+                paragraph_end: false,
+                spine_end: false,
+            },
+            &mut bytes,
+        )
+        .expect("record encodes");
+        let mut bad_role = bytes;
+        bad_role[4] = 9;
+        assert!(decode_content_record_header(&bad_role).is_err());
+        // A spine-end marker carrying text is structurally invalid: replay
+        // would mis-frame the stream.
+        let mut text_on_marker = bytes;
+        text_on_marker[7] = 2;
+        assert!(decode_content_record_header(&text_on_marker).is_err());
+        assert!(encode_content_record_header(
+            ContentRecordHeader {
+                spine_index: 0,
+                text_len: 1,
+                role: TextRole::Body,
+                style: FontStyle::Regular,
+                align: TextAlign::Left,
+                paragraph_end: false,
+                spine_end: true,
+            },
+            &mut bytes,
+        )
+        .is_err());
+    }
 
     #[test]
     fn page_cache_records_round_trip() {
@@ -1253,5 +1683,247 @@ mod tests {
         assert!(record.title_str().len() <= TOC_CHAPTER_TITLE_BYTES);
         assert!(record.title_str().len() >= TOC_CHAPTER_TITLE_BYTES - 3);
         assert!(long.starts_with(record.title_str()));
+    }
+
+    /// Drive the production stream walker over a CONT.BIN byte image the
+    /// way the firmware does: decode the header, require the exact file
+    /// length, then stream the records. Returns the replayed
+    /// `(spine_index, text)` pairs on success.
+    fn run_content_replay(
+        data: &[u8],
+    ) -> Result<
+        (
+            ContentReplayOutcome,
+            std::vec::Vec<(u16, std::string::String)>,
+        ),
+        ContentReplayError,
+    > {
+        if data.len() < CONTENT_HEADER_BYTES {
+            return Err(ContentReplayError);
+        }
+        let header =
+            decode_content_header(&data[..CONTENT_HEADER_BYTES]).map_err(|_| ContentReplayError)?;
+        if data.len() != header.content_len as usize {
+            return Err(ContentReplayError);
+        }
+        let mut cursor = CONTENT_HEADER_BYTES;
+        let mut read = |dst: &mut [u8]| -> Result<usize, ContentReplayError> {
+            let len = dst.len().min(data.len() - cursor);
+            dst[..len].copy_from_slice(&data[cursor..cursor + len]);
+            cursor += len;
+            Ok(len)
+        };
+        let mut blocks = std::vec::Vec::new();
+        let mut on_group = |spine: u16,
+                            group: &mut ContentGroupReader<'_>|
+         -> Result<ContentReplayFlow, ContentReplayError> {
+            while let Some((record, text)) = group.next_block()? {
+                assert_eq!(record.spine_index, spine);
+                blocks.push((spine, std::string::String::from(text)));
+            }
+            Ok(ContentReplayFlow::Continue)
+        };
+        // A deliberately small window forces compaction and refills.
+        let mut buf = [0u8; 32];
+        let outcome =
+            replay_content_stream(&mut read, &mut buf, header.spine_count, &mut on_group)?;
+        Ok((outcome, blocks))
+    }
+
+    #[test]
+    fn test_content_replay_truncation_regression() {
+        use crate::text::{TextAlign, TextRole};
+
+        // Create a buffer for mock CONT.BIN
+        let mut buffer = [0u8; 1024];
+
+        // 1. Initial header (will overwrite at the end)
+        let header = ContentHeader {
+            source_hash: 0x12345678,
+            source_size: 100000,
+            complete: true,
+            spine_count: 2,
+            content_len: 0, // placeholder
+        };
+        encode_content_header(header, &mut buffer[..CONTENT_HEADER_BYTES]).unwrap();
+
+        let mut offset = CONTENT_HEADER_BYTES;
+
+        // Spine 0:
+        // Record 1 (text block)
+        let rec1 = ContentRecordHeader {
+            spine_index: 0,
+            text_len: 4,
+            role: TextRole::Body,
+            style: FontStyle::Regular,
+            align: TextAlign::Left,
+            paragraph_end: true,
+            spine_end: false,
+        };
+        offset += encode_content_record_header(rec1, &mut buffer[offset..]).unwrap();
+        buffer[offset..offset + 4].copy_from_slice(b"abcd");
+        offset += 4;
+
+        // Record 2 (spine end)
+        let rec2 = ContentRecordHeader {
+            spine_index: 0,
+            text_len: 0,
+            role: TextRole::Body,
+            style: FontStyle::Regular,
+            align: TextAlign::Left,
+            paragraph_end: false,
+            spine_end: true,
+        };
+        offset += encode_content_record_header(rec2, &mut buffer[offset..]).unwrap();
+        let spine_0_end_offset = offset;
+
+        // Spine 1:
+        // Record 3 (text block)
+        let rec3 = ContentRecordHeader {
+            spine_index: 1,
+            text_len: 4,
+            role: TextRole::Body,
+            style: FontStyle::Regular,
+            align: TextAlign::Left,
+            paragraph_end: true,
+            spine_end: false,
+        };
+        offset += encode_content_record_header(rec3, &mut buffer[offset..]).unwrap();
+        buffer[offset..offset + 4].copy_from_slice(b"efgh");
+        offset += 4;
+
+        // Record 4 (spine end)
+        let rec4 = ContentRecordHeader {
+            spine_index: 1,
+            text_len: 0,
+            role: TextRole::Body,
+            style: FontStyle::Regular,
+            align: TextAlign::Left,
+            paragraph_end: false,
+            spine_end: true,
+        };
+        offset += encode_content_record_header(rec4, &mut buffer[offset..]).unwrap();
+        let full_len = offset;
+
+        // Update the header with the correct total size
+        let final_header = ContentHeader {
+            source_hash: 0x12345678,
+            source_size: 100000,
+            complete: true,
+            spine_count: 2,
+            content_len: full_len as u32,
+        };
+        encode_content_header(final_header, &mut buffer[..CONTENT_HEADER_BYTES]).unwrap();
+
+        // 2. Validate parsing of the FULL buffer
+        let parsed_header = decode_content_header(&buffer[..CONTENT_HEADER_BYTES]).unwrap();
+        assert_eq!(parsed_header.spine_count, 2);
+        assert_eq!(parsed_header.content_len, full_len as u32);
+
+        // Full replay through the production walker yields every block in
+        // capture order and ends Complete.
+        let (outcome, blocks) = run_content_replay(&buffer[..full_len]).expect("full replay");
+        assert_eq!(outcome, ContentReplayOutcome::Complete);
+        assert_eq!(
+            blocks,
+            std::vec![
+                (0u16, std::string::String::from("abcd")),
+                (1u16, std::string::String::from("efgh")),
+            ]
+        );
+
+        // 3. Truncating immediately after spine 0's spine_end: the stale
+        // header's content_len no longer matches the file length.
+        assert!(run_content_replay(&buffer[..spine_0_end_offset]).is_err());
+
+        // 4. Same truncation with a doctored header whose content_len
+        // matches the truncated length: the walker itself must reject the
+        // stream because only one of the two expected spine groups
+        // replayed before clean EOF.
+        let mut patched = [0u8; 1024];
+        patched[..spine_0_end_offset].copy_from_slice(&buffer[..spine_0_end_offset]);
+        encode_content_header(
+            ContentHeader {
+                source_hash: 0x12345678,
+                source_size: 100000,
+                complete: true,
+                spine_count: 2,
+                content_len: spine_0_end_offset as u32,
+            },
+            &mut patched[..CONTENT_HEADER_BYTES],
+        )
+        .unwrap();
+        assert!(run_content_replay(&patched[..spine_0_end_offset]).is_err());
+
+        // 5. Truncation mid-record (two bytes into spine 1's text), with
+        // the header patched to match: EOF inside a group is corrupt.
+        let cut = spine_0_end_offset + CONTENT_RECORD_HEADER_BYTES + 2;
+        let mut mid_record = [0u8; 1024];
+        mid_record[..cut].copy_from_slice(&buffer[..cut]);
+        encode_content_header(
+            ContentHeader {
+                source_hash: 0x12345678,
+                source_size: 100000,
+                complete: true,
+                spine_count: 2,
+                content_len: cut as u32,
+            },
+            &mut mid_record[..CONTENT_HEADER_BYTES],
+        )
+        .unwrap();
+        assert!(run_content_replay(&mid_record[..cut]).is_err());
+
+        // 6. A record that changes spine index mid-group (spine 1's end
+        // marker rewritten to claim spine 0) violates the group framing.
+        let mut flipped = buffer;
+        let rec4_offset = full_len - CONTENT_RECORD_HEADER_BYTES;
+        encode_content_record_header(
+            ContentRecordHeader {
+                spine_index: 0,
+                text_len: 0,
+                role: TextRole::Body,
+                style: FontStyle::Regular,
+                align: TextAlign::Left,
+                paragraph_end: false,
+                spine_end: true,
+            },
+            &mut flipped[rec4_offset..rec4_offset + CONTENT_RECORD_HEADER_BYTES],
+        )
+        .unwrap();
+        assert!(run_content_replay(&flipped[..full_len]).is_err());
+
+        // 7. Two complete, internally valid groups in the wrong order
+        // (spine 1's group before spine 0's): group indices must strictly
+        // increase, or replay would publish chapters out of order instead
+        // of falling back to the full build.
+        let group_0 = &buffer[CONTENT_HEADER_BYTES..spine_0_end_offset];
+        let group_1 = &buffer[spine_0_end_offset..full_len];
+        let mut swapped = [0u8; 1024];
+        swapped[..CONTENT_HEADER_BYTES].copy_from_slice(&buffer[..CONTENT_HEADER_BYTES]);
+        swapped[CONTENT_HEADER_BYTES..CONTENT_HEADER_BYTES + group_1.len()]
+            .copy_from_slice(group_1);
+        swapped[CONTENT_HEADER_BYTES + group_1.len()..full_len].copy_from_slice(group_0);
+        assert!(run_content_replay(&swapped[..full_len]).is_err());
+
+        // 8. The same complete group twice: a duplicate index is equally
+        // impossible in a real capture and must not publish a chapter
+        // twice.
+        let dup_len = CONTENT_HEADER_BYTES + 2 * group_0.len();
+        let mut duplicated = [0u8; 1024];
+        encode_content_header(
+            ContentHeader {
+                source_hash: 0x12345678,
+                source_size: 100000,
+                complete: true,
+                spine_count: 2,
+                content_len: dup_len as u32,
+            },
+            &mut duplicated[..CONTENT_HEADER_BYTES],
+        )
+        .unwrap();
+        duplicated[CONTENT_HEADER_BYTES..CONTENT_HEADER_BYTES + group_0.len()]
+            .copy_from_slice(group_0);
+        duplicated[CONTENT_HEADER_BYTES + group_0.len()..dup_len].copy_from_slice(group_0);
+        assert!(run_content_replay(&duplicated[..dup_len]).is_err());
     }
 }

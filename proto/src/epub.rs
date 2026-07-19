@@ -1514,6 +1514,42 @@ pub fn load_epub_package<'a>(
     )
 }
 
+/// Helper to extract the OPF path from an EPUB's META-INF/container.xml entry
+/// using the streaming Zip operations. Errors keep their nature — zip
+/// failures stay `EpubError::Zip`, text and structure failures map to
+/// `Utf8`/`MissingOpfPath` — matching `load_epub_package`'s handling of
+/// the identical cases so callers surface the right diagnostics.
+pub fn load_container_xml_and_find_opf_path<Z: EpubZipOps>(
+    zip: &mut Z,
+    header_scratch: &mut [u8; 46],
+    name_scratch: &mut [u8],
+    compressed_scratch: &mut [u8],
+    container_scratch: &mut [u8],
+    zip_inflate: &mut ZipInflateScratch,
+    opf_path_buf: &mut heapless::String<256>,
+) -> Result<(), EpubError> {
+    let container_entry = zip
+        .find_entry("META-INF/container.xml", header_scratch, name_scratch)
+        .map_err(EpubError::Zip)?;
+    let container_len = zip
+        .read_entry_streamed(
+            container_entry,
+            compressed_scratch,
+            container_scratch,
+            zip_inflate,
+        )
+        .map_err(EpubError::Zip)?;
+    let container_xml =
+        core::str::from_utf8(&container_scratch[..container_len]).map_err(|_| EpubError::Utf8)?;
+    let opf_path =
+        find_attr_value(container_xml, "rootfile", "full-path").ok_or(EpubError::MissingOpfPath)?;
+    opf_path_buf.clear();
+    opf_path_buf
+        .push_str(opf_path)
+        .map_err(|_| EpubError::Zip(ZipError::NameTooLong))?;
+    Ok(())
+}
+
 pub fn parse_opf<'a>(
     opf_xml: &'a str,
     book_id: BookId,
@@ -5000,5 +5036,60 @@ mod tests {
 
     fn push_u32(bytes: &mut StdVec<u8>, value: u32) {
         bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn test_load_container_xml_and_find_opf_path_requires_4096_capacity() {
+        let mut container_content = StdVec::new();
+        container_content.extend_from_slice(b"<?xml version=\"1.0\"?>\n<container version=\"1.0\" xmlns=\"urn:oasis:names:tc:opendocument:xmlns:container\">\n  <rootfiles>\n    <rootfile full-path=\"OEBPS/content.opf\" media-type=\"application/oebps-package+xml\"/>\n  </rootfiles>\n  <!-- ");
+        while container_content.len() < 4092 {
+            container_content.push(b'a');
+        }
+        container_content.extend_from_slice(b" -->");
+        assert_eq!(container_content.len(), 4096);
+
+        let zip_bytes = stored_zip(&[("META-INF/container.xml", container_content.as_slice())]);
+
+        let mut header_scratch = [0u8; 46];
+        let mut name_scratch = [0u8; 256];
+        let mut compressed_scratch = [0u8; 1024];
+        let mut zip_inflate = ZipInflateScratch::new();
+        let mut opf_path_buf = heapless::String::<256>::new();
+
+        // 1. With 3840 bytes (the regression limit), it must fail with OutputTooSmall
+        let mut zip_small = ZipLocalStream::new(SliceStream {
+            bytes: &zip_bytes,
+            cursor: 0,
+        });
+        let mut small_container_scratch = [0u8; 3840];
+        let res_small = load_container_xml_and_find_opf_path(
+            &mut zip_small,
+            &mut header_scratch,
+            &mut name_scratch,
+            &mut compressed_scratch,
+            &mut small_container_scratch,
+            &mut zip_inflate,
+            &mut opf_path_buf,
+        );
+        assert_eq!(res_small, Err(EpubError::Zip(ZipError::OutputTooSmall)));
+
+        // 2. With 4096 bytes (the fixed limit), it must succeed
+        let mut zip_full = ZipLocalStream::new(SliceStream {
+            bytes: &zip_bytes,
+            cursor: 0,
+        });
+        let mut full_container_scratch = [0u8; 4096];
+        let mut zip_inflate = ZipInflateScratch::new(); // reset inflation
+        let res_full = load_container_xml_and_find_opf_path(
+            &mut zip_full,
+            &mut header_scratch,
+            &mut name_scratch,
+            &mut compressed_scratch,
+            &mut full_container_scratch,
+            &mut zip_inflate,
+            &mut opf_path_buf,
+        );
+        assert!(res_full.is_ok());
+        assert_eq!(opf_path_buf.as_str(), "OEBPS/content.opf");
     }
 }
