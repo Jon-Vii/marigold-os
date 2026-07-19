@@ -1,8 +1,8 @@
 //! Boot-time firmware self-update from the SD card.
 //!
 //! If `/FWUPDATE.BIN` is present at boot it is validated, written into the
-//! *inactive* OTA slot, selected by flipping `otadata`, deleted (so the next
-//! boot doesn't re-apply it), and the device resets into the new firmware. This
+//! *inactive* OTA slot, deleted (so the next boot cannot re-apply it), selected
+//! by flipping `otadata`, and the device resets into the new firmware. This
 //! is the recovery/update path that keeps flashing onto a locked unit from
 //! being a one-way trip — the same scheme as the FreeInk SDK's `RecoveryBoot`
 //! and CrossPoint's `FirmwareFlasher`/`OtaBootSwitch`, ported to Rust.
@@ -70,6 +70,8 @@ pub enum UpdateError {
     ReadFile,
     Invalid(ImageError),
     Flash,
+    /// The one-shot trigger/selection could not be consumed before commit.
+    Consume,
 }
 
 /// Adapts an open SD file to [`ota::ImageSource`] for the validation pass.
@@ -113,19 +115,15 @@ fn read_file_exact<
 pub fn apply_pending_update(root: &SdRoot) -> bool {
     let selected = read_selected_update(root);
     let source_name = selected.as_deref().unwrap_or(TRIGGER_FILE);
-    match try_apply(root, source_name) {
+    let picker_selected = selected.is_some();
+    match try_apply(root, source_name, picker_selected) {
         Ok(()) => {
-            if selected.is_some() {
-                clear_selected_update(root);
-            } else {
-                let _ = crate::sd_session::remove_file_reclaiming_clusters(root, TRIGGER_FILE);
-            }
             esp_println::println!("ota: update applied; resetting");
             true
         }
         Err(UpdateError::NoTrigger) => {
-            if selected.is_some() {
-                clear_selected_update(root);
+            if picker_selected {
+                let _ = consume_pending_source(root, true);
             }
             false
         }
@@ -134,17 +132,15 @@ pub fn apply_pending_update(root: &SdRoot) -> bool {
             // A bad selection must not re-run forever. Picker-selected source
             // images stay on the card so the user can keep a firmware shelf;
             // the legacy one-shot trigger retains its historical deletion.
-            if selected.is_some() {
-                clear_selected_update(root);
-            } else {
-                let _ = crate::sd_session::remove_file_reclaiming_clusters(root, TRIGGER_FILE);
+            if !consume_pending_source(root, picker_selected) {
+                esp_println::println!("ota: pending source cleanup failed");
             }
             false
         }
     }
 }
 
-fn try_apply(root: &SdRoot, source_name: &str) -> Result<(), UpdateError> {
+fn try_apply(root: &SdRoot, source_name: &str, picker_selected: bool) -> Result<(), UpdateError> {
     let file = root
         .open_file_in_dir(source_name, Mode::ReadOnly)
         .map_err(|_| UpdateError::NoTrigger)?;
@@ -168,9 +164,20 @@ fn try_apply(root: &SdRoot, source_name: &str) -> Result<(), UpdateError> {
 
     // Pass 2: erase + stream the image into the inactive slot.
     write_image(&mut flash, OTA_SLOT_OFFSET[dest as usize], &file, len)?;
+    drop(file);
+
+    // Consume the one-shot control record before committing the OTA switch.
+    // If this fails the freshly-written inactive image is harmless: otadata
+    // still selects the running firmware, which can boot normally and retry.
+    if !consume_pending_source(root, picker_selected) {
+        esp_println::println!("ota: refusing slot switch; pending source remains live");
+        return Err(UpdateError::Consume);
+    }
 
     // Point otadata at the freshly written slot (re-read: the write above did
-    // not touch otadata, but re-reading keeps the switch self-consistent).
+    // not touch otadata, but re-reading keeps the switch self-consistent). The
+    // one-shot source is already consumed, so a reset after this write cannot
+    // schedule the same image again.
     let (s0, s1) = read_otadata(&mut flash)?;
     let switch = ota::plan_switch(&s0, &s1, dest, OTA_COUNT);
     write_select_entry(&mut flash, switch.target_sector, &switch.entry)?;
@@ -244,9 +251,22 @@ fn read_selected_update(root: &SdRoot) -> Option<heapless::String<12>> {
     Some(out)
 }
 
-fn clear_selected_update(root: &SdRoot) {
-    if let Ok(xteink) = root.open_dir(UPDATE_STATE_DIR) {
-        let _ = crate::sd_session::remove_file_reclaiming_clusters(&xteink, SELECTED_UPDATE_FILE);
+fn clear_selected_update(root: &SdRoot) -> bool {
+    let Ok(xteink) = root.open_dir(UPDATE_STATE_DIR) else {
+        return false;
+    };
+    crate::sd_session::remove_file_reclaiming_clusters(&xteink, SELECTED_UPDATE_FILE)
+}
+
+fn clear_trigger_update(root: &SdRoot) -> bool {
+    crate::sd_session::remove_file_reclaiming_clusters(root, TRIGGER_FILE)
+}
+
+fn consume_pending_source(root: &SdRoot, picker_selected: bool) -> bool {
+    if picker_selected {
+        clear_selected_update(root)
+    } else {
+        clear_trigger_update(root)
     }
 }
 

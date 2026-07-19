@@ -200,8 +200,8 @@ third-party image drives the correct panel or retains an SD recovery path.
    controller or battery gauge, so a cross-flash is a black screen).
 2. Reboot. At boot, before the reader starts, the firmware validates the image
    (`proto::ota::validate_image`), writes it into the **inactive** OTA slot,
-   flips `otadata` to select it (`proto::ota::plan_switch`), deletes
-   `FWUPDATE.BIN` so it runs only once, and resets into the new firmware.
+   deletes `FWUPDATE.BIN` so it can run only once, flips `otadata` to select
+   the new slot (`proto::ota::plan_switch`), and resets into the new firmware.
    On the first boot after any OTA-slot install (including CrossInk's
    Settings -> SD firmware update flow), Marigold marks the selected `otadata`
    entry valid before the reader starts, so rollback-enabled bootloaders do not
