@@ -148,7 +148,13 @@ the Wireless screen after the radio ran maps to `SyncCommand::Exit`, which is
 a software reset; boot restore then reloads the saved position.
 
 Before the loan the display task flushes any coalesced reading position
-to STATE.BIN, because the session's only exit is the reset. (An earlier
+to durable state, because the session's only exit is the reset; a failed
+flush refuses the loan rather than dismantling the scratch over an unsaved
+position. The refusal is an answer, not a silence: `SYNC_LOANS` carries
+`Result<SyncLoan, SyncError>`, the wifi task reports `SyncError::Storage`
+to the Wireless screen and re-parks for the next Start, and Confirm
+retries the session (nothing was loaned, so no reset is needed and the
+position write is retried first). (An earlier
 iteration also exchanged the position with a kosync server here; that
 shipped unused and was removed — the session is purely a book server.)
 
@@ -220,7 +226,8 @@ Storage is also explicit. Files/Home/Reading transitions enqueue
 FAT, open EPUBs, build caches, or write progress. Open/extend requests whose
 page already sits inside the loaded section window are answered from RAM
 without an SD session, and reading-progress writes are coalesced (at most one
-STATE.BIN write per 15 s, flushed before display sleep). The board I/O task is still
+alternating STATEA/STATEB generation per 15 s, flushed before display
+sleep, with sleep deferred if the flush fails). The board I/O task is still
 the single SPI owner, so display refresh and SD transactions cannot overlap, but
 the user-facing view is always drawn from the latest already-owned snapshot.
 SD/FAT access goes through an SD session: the board I/O task deselects the
@@ -389,7 +396,7 @@ whole. Entries are labeled with the book's real title from its cached
 8.3-named books, then to the prettified file stem. Each fresh catalog write
 also sweeps `CACHE2` and reclaims caches whose stored source identity no
 longer matches any catalogued book, deleting the data files and the emptied
-directories while leaving `STATE.BIN` intact. Files renders the current
+directories while leaving the durable state files intact. Files renders the current
 snapshot immediately. It may show “Library unavailable” before any successful
 cache/scan, and “No books found” only after a completed scan proves the card
 has no EPUBs.
@@ -402,7 +409,8 @@ has no EPUBs.
 /XTEINK/CACHE2/E<hash>/SECTIONS/S001.BIN
 /XTEINK/CATALOG.BIN
 /XTEINK/LABELS/<stem>.TXT
-/XTEINK/STATE.BIN
+/XTEINK/STATEA.BIN
+/XTEINK/STATEB.BIN
 ```
 
 `BOOK.BIN` holds a `BookV2Header`, one `BookV2SectionRecord` per section (spine,
@@ -415,8 +423,11 @@ The active firmware state keeps only loaded book
 metadata, the full section index, the active section's page/block records and
 text bytes, and small ZIP/XML scratch buffers. Spine XHTML members of any size
 stream completely through the resumable block parser in bounded inflate
-windows, so chapter content is never truncated by scratch-buffer limits. `STATE.BIN`
-stores the encoded `AppStateRecord`; version 2 and later records include the
+windows, so chapter content is never truncated by scratch-buffer limits.
+`STATEA.BIN`/`STATEB.BIN` store the encoded `AppStateRecord` in alternating
+checksummed generations (`proto::durable`), so a torn write never destroys
+the last good position; a legacy `STATE.BIN` is still read as a fallback.
+Record version 2 and later include the
 SD source size and path-derived hash so boot restore can map saved progress
 back onto the scanned SD catalog instead of trusting a volatile list index.
 The current version 3 also persists the type settings (font size and line
@@ -611,7 +622,10 @@ size.
 Persistent app state is represented by `hal_ext::nvm::AppStateRecord`, a compact
 versioned/checksummed record for book id, chapter, rendered screen, shell
 orientation, reading orientation, refresh policy, source hash, and source file
-size. The firmware stores it at `/XTEINK/STATE.BIN` for SD reading progress;
+size. The firmware stores it in alternating `/XTEINK/STATEA.BIN`/`STATEB.BIN`
+generations for SD reading progress (per-book positions use `POSA.BIN`/
+`POSB.BIN` beside the book's cache, and Wi-Fi credentials `WIFIA.BIN`/
+`WIFIB.BIN`, all framed by `proto::durable`);
 flash/NVM fallback remains separate from the record format.
 
 ## Performance

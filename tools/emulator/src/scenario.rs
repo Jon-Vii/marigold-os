@@ -252,6 +252,7 @@ fn parse_sync_error(value: &str) -> Result<SyncError, String> {
         "radio" => Ok(SyncError::RadioInit),
         "join" => Ok(SyncError::Join),
         "dhcp" => Ok(SyncError::Dhcp),
+        "storage" => Ok(SyncError::Storage),
         _ => Err(format!("unknown sync error: {value}")),
     }
 }

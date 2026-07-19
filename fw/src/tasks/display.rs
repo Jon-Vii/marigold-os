@@ -24,7 +24,7 @@ use esp_hal::gpio::Output;
 use hal_ext::nvm::AppStateRecord;
 use static_cell::ConstStaticCell;
 
-/// Same-book page-turn progress is coalesced: at most one STATE.BIN write
+/// Same-book page-turn progress is coalesced: at most one durable state write
 /// per this interval, with a guaranteed flush before display sleep. A
 /// battery pull can lose at most this many seconds of reading position.
 const PROGRESS_WRITE_MIN_SECS: u64 = 15;
@@ -74,7 +74,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
     let mut refresh_planner = RefreshPlanner::new().with_panel_shows_sleep_screen(deep_sleep_wake);
     let mut pending_progress: Option<AppStateRecord> = None;
     let mut last_progress_write: Option<Instant> = None;
-    // STATE.BIN is consulted once per boot, after the first catalog with
+    // Durable state is consulted once per boot, after the first catalog with
     // entries lands; later catalog refreshes must not yank reading state.
     let mut state_restored = false;
     // True while RED RAM is known to hold exactly prev_fb's content, letting
@@ -280,13 +280,21 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>, deep_sleep_wake: bool
                     refresh_planner.screen_on(),
                     sleep_start.as_millis(),
                 );
-                flush_pending_progress(
+                if !flush_pending_progress(
                     &mut epd,
                     &mut sd_cs,
                     sd_library,
                     &mut pending_progress,
                     &mut last_progress_write,
-                );
+                ) {
+                    // Sleeping now would drop the coalesced position for
+                    // good (deep sleep reboots). Stay awake; the pending
+                    // record is retried on the next flush and the power
+                    // task's idle clock re-requests sleep. A button press
+                    // (Activity) releases the power task's handshake wait.
+                    esp_println::println!("display: sleep deferred; progress persistence failed");
+                    continue;
+                }
                 let request = refresh_planner.last_request().or_else(|| {
                     sleep_request_from_saved_state(
                         &mut epd,
@@ -525,15 +533,23 @@ fn handle_storage_command(
         StorageCommand::LoanSyncMemory => {
             // The session only ends in a reset, so any coalesced position
             // must reach the card before the scratch is dismantled.
-            flush_pending_progress(
+            if !flush_pending_progress(
                 epd,
                 sd_cs,
                 sd_library,
                 pending_progress,
                 last_progress_write,
-            );
+            ) {
+                // The wifi task is blocked on this answer; a silent return
+                // would strand it (and the Wireless screen) forever. Refuse
+                // observably so it can report the failure and re-park.
+                esp_println::println!("storage: sync loan refused; progress persistence failed");
+                let _ = crate::SYNC_LOANS.try_send(Err(app_core::SyncError::Storage));
+                return;
+            }
             ensure_epub_scratch(epub_scratch);
             let Some(scratch) = epub_scratch.take() else {
+                let _ = crate::SYNC_LOANS.try_send(Err(app_core::SyncError::Storage));
                 return;
             };
             sync_session.loan_granted();
@@ -547,9 +563,10 @@ fn handle_storage_command(
                 }
             });
             loan.catalog_len = crate::library_sd::write_catalog_listing(epd, sd_cs, loan.http_b);
-            if crate::SYNC_LOANS.try_send(loan).is_err() {
-                // Unreachable in practice: the wifi task requests exactly
-                // one loan per boot. The memory is gone either way.
+            if crate::SYNC_LOANS.try_send(Ok(loan)).is_err() {
+                // Unreachable in practice: the wifi task blocks on each
+                // answer before it can request again. The memory is gone
+                // either way.
                 esp_println::println!("storage: sync loan channel full");
             }
         }
@@ -880,22 +897,33 @@ fn handle_storage_command(
             if pending_progress
                 .map(|pending| pending.book_id != record.book_id)
                 .unwrap_or(false)
-            {
-                flush_pending_progress(
+                && !flush_pending_progress(
                     epd,
                     sd_cs,
                     sd_library,
                     pending_progress,
                     last_progress_write,
+                )
+            {
+                // The other book's position couldn't land; overwriting the
+                // pending record now would silently discard it.
+                esp_println::println!(
+                    "storage: progress context switch deferred after write failure"
                 );
+                return;
             }
             if context_changed || due {
                 let progress_start = Instant::now();
-                reader_cache::store_app_state(epd, sd_cs, sd_library, record);
-                *pending_progress = None;
-                *last_progress_write = Some(Instant::now());
+                let stored = reader_cache::store_app_state(epd, sd_cs, sd_library, record);
+                if stored {
+                    *pending_progress = None;
+                    *last_progress_write = Some(Instant::now());
+                } else {
+                    *pending_progress = Some(record);
+                }
                 esp_println::println!(
-                    "bench: storage_progress action=write book_id={} page={} elapsed_ms={} t_ms={}",
+                    "bench: storage_progress action=write ok={} book_id={} page={} elapsed_ms={} t_ms={}",
+                    stored,
                     record.book_id,
                     record.screen,
                     progress_start.elapsed().as_millis(),
@@ -1008,7 +1036,7 @@ fn source_identity(library: &ReaderStore, book_id: u32) -> (u32, u32) {
     library.source_identity(book_id)
 }
 
-/// One boot-time attempt to map `/XTEINK/STATE.BIN` back onto the scanned
+/// One boot-time attempt to map durable reader state back onto the scanned
 /// catalog by stable source identity (path hash + byte size) and hand the
 /// saved position to the app as a `Restored` event. The volatile book id
 /// stored in the record is never trusted directly.
@@ -1023,7 +1051,7 @@ fn restore_saved_state(
     }
     *state_restored = true;
     let Some(record) = reader_cache::load_app_state(epd, sd_cs) else {
-        esp_println::println!("restore: no usable STATE.BIN");
+        esp_println::println!("restore: no usable durable state");
         return;
     };
     let hint = ReaderSource::from_book_id(record.book_id).sd_index();
@@ -1136,17 +1164,24 @@ fn flush_pending_progress(
     sd_library: &ReaderStore,
     pending_progress: &mut Option<AppStateRecord>,
     last_progress_write: &mut Option<Instant>,
-) {
-    if let Some(record) = pending_progress.take() {
+) -> bool {
+    if let Some(record) = *pending_progress {
         let start = Instant::now();
-        reader_cache::store_app_state(epd, sd_cs, sd_library, record);
-        *last_progress_write = Some(Instant::now());
+        let stored = reader_cache::store_app_state(epd, sd_cs, sd_library, record);
+        if stored {
+            *pending_progress = None;
+            *last_progress_write = Some(Instant::now());
+        }
         esp_println::println!(
-            "bench: storage_progress action=flush book_id={} page={} elapsed_ms={} t_ms={}",
+            "bench: storage_progress action=flush ok={} book_id={} page={} elapsed_ms={} t_ms={}",
+            stored,
             record.book_id,
             record.screen,
             start.elapsed().as_millis(),
             Instant::now().as_millis(),
         );
+        stored
+    } else {
+        true
     }
 }

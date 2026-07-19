@@ -118,6 +118,7 @@ fn sync_error_label(error: SyncError) -> &'static str {
         SyncError::RadioInit => "radio failed",
         SyncError::Join => "wi-fi join failed",
         SyncError::Dhcp => "no network address",
+        SyncError::Storage => "card write failed",
     }
 }
 

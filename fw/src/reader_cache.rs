@@ -350,7 +350,7 @@ pub(crate) fn store_app_state(
     sd_cs: &mut Output<'static>,
     library: &ReaderStore,
     record: AppStateRecord,
-) {
+) -> bool {
     // The same session lands the global record and, for SD books, the
     // per-book position beside that book's cache, so switching books
     // never abandons the previous one's place.
@@ -358,18 +358,22 @@ pub(crate) fn store_app_state(
         .sd_index()
         .and_then(|index| library.catalog_entry(index as usize))
         .map(|entry| proto::cache::cache_key_for(entry.display_name.as_str(), entry.byte_size));
-    let _ = sd_session::with_root(epd, sd_cs, |root| {
+    sd_session::with_root(epd, sd_cs, |root| {
         let state = reader_cache_files::write_state_file(root, record);
-        if let Some(key) = &book_key {
-            let _ = reader_cache_files::write_position_file(
+        let position = if let Some(key) = &book_key {
+            reader_cache_files::write_position_file(
                 root,
                 key.as_str(),
                 record.chapter,
                 record.screen,
-            );
-        }
-        state
-    });
+            )
+        } else {
+            Ok(())
+        };
+        state.and(position)
+    })
+    .ok()
+    .is_some_and(|result| result.is_ok())
 }
 
 /// The saved per-book position for a catalog entry, if any.

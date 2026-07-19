@@ -133,7 +133,15 @@ pub static WAKE_PIN_REQUESTS: Channel<CriticalSectionRawMutex, (), 1> = Channel:
 pub static WAKE_PIN_HANDOFF: Channel<CriticalSectionRawMutex, Input<'static>, 1> = Channel::new();
 pub static SYNC_COMMANDS: Channel<CriticalSectionRawMutex, SyncCommand, 2> = Channel::new();
 pub static SYNC_EVENTS: Channel<CriticalSectionRawMutex, SyncEvent, 4> = Channel::new();
-pub static SYNC_LOANS: Channel<CriticalSectionRawMutex, sync_mem::SyncLoan, 1> = Channel::new();
+// Carries Err when the display task refuses the loan (progress flush failed);
+// the wifi task reports the failure and returns to waiting for Start, so the
+// Wireless screen can offer a retry instead of hanging on a loan that will
+// never arrive.
+pub static SYNC_LOANS: Channel<
+    CriticalSectionRawMutex,
+    Result<sync_mem::SyncLoan, app_core::SyncError>,
+    1,
+> = Channel::new();
 pub static UPLOAD_BEGINS: Channel<CriticalSectionRawMutex, upload::UploadBegin, 1> = Channel::new();
 pub static UPLOAD_CHUNKS: Channel<CriticalSectionRawMutex, upload::UploadChunk, 2> = Channel::new();
 pub static UPLOAD_RETURNS: Channel<CriticalSectionRawMutex, &'static mut [u8], 2> = Channel::new();

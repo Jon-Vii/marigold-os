@@ -639,6 +639,10 @@ pub enum SyncError {
     RadioInit,
     Join,
     Dhcp,
+    /// The pre-loan flush of the coalesced reading position failed, so the
+    /// display task refused to dismantle the reader scratch over an unsaved
+    /// position. Nothing was loaned; Confirm retries the session.
+    Storage,
 }
 
 /// wifi task -> app task progress reports for the Wireless screen. The

@@ -94,19 +94,28 @@ async fn ap_net_task(mut runner: Runner<'static, Interface>) -> ! {
 
 #[embassy_executor::task]
 pub async fn run(spawner: Spawner, wifi: WIFI<'static>) {
-    // Idle until the first Start; Exit before any radio work is a no-op
-    // because nothing has been loaned yet.
-    loop {
-        match SYNC_COMMANDS.receive().await {
-            SyncCommand::Start => break,
-            SyncCommand::Exit => {}
+    // Idle until a Start whose loan is granted; Exit before any radio work
+    // is a no-op because nothing has been loaned yet. A refused loan (the
+    // display task could not flush the reading position to the card) lands
+    // the Wireless screen in Error, where Confirm arms another Start, so
+    // this loops rather than stranding the screen on a loan that will
+    // never arrive.
+    let loan = loop {
+        loop {
+            match SYNC_COMMANDS.receive().await {
+                SyncCommand::Start => break,
+                SyncCommand::Exit => {}
+            }
         }
-    }
 
-    // The loan request runs through the storage queue so it serializes
-    // behind any in-flight SD work, then the memory comes back to us.
-    STORAGE_COMMANDS.send(StorageCommand::LoanSyncMemory).await;
-    let loan = SYNC_LOANS.receive().await;
+        // The loan request runs through the storage queue so it serializes
+        // behind any in-flight SD work, then the memory comes back to us.
+        STORAGE_COMMANDS.send(StorageCommand::LoanSyncMemory).await;
+        match SYNC_LOANS.receive().await {
+            Ok(loan) => break loan,
+            Err(error) => send_event(SyncEvent::Failed(error)),
+        }
+    };
     sync_mem::donate_heap(loan.heap_a, loan.heap_b);
     let SyncLoan {
         tcp_rx,
