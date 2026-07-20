@@ -56,6 +56,127 @@ pub enum ImageError {
     Read,
 }
 
+/// One application partition discovered in the ESP-IDF partition table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppPartition {
+    pub offset: u32,
+    pub size: u32,
+}
+
+/// Flash locations needed by the two-slot OTA updater.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OtaLayout {
+    pub otadata: AppPartition,
+    pub slots: [AppPartition; 2],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionTableError {
+    TooShort,
+    BadEntry,
+    DuplicateOtaData,
+    DuplicateOtaSlot(u8),
+    MissingOtaData,
+    MissingOtaSlot(u8),
+    InvalidBounds,
+    Overlap,
+}
+
+const PARTITION_ENTRY_LEN: usize = 32;
+const PARTITION_MAGIC: u16 = 0x50AA;
+const PARTITION_MD5_MAGIC: u16 = 0xEBEB;
+const PARTITION_TYPE_APP: u8 = 0x00;
+const PARTITION_TYPE_DATA: u8 = 0x01;
+const PARTITION_SUBTYPE_DATA_OTA: u8 = 0x00;
+const PARTITION_SUBTYPE_APP_OTA_0: u8 = 0x10;
+
+/// Discover the actual OTA locations from an ESP-IDF partition table.
+///
+/// Locked X3 units may retain the stock table (`ota_1` at `0x780000`) while
+/// CrossPoint/Marigold/Calendula installations use `ota_1` at `0x650000`. The
+/// updater must follow the table the bootloader will use rather than assuming
+/// either layout. Only the `otadata`, `ota_0`, and `ota_1` entries are
+/// retained.
+pub fn parse_ota_layout(table: &[u8], flash_size: u32) -> Result<OtaLayout, PartitionTableError> {
+    if table.len() < PARTITION_ENTRY_LEN {
+        return Err(PartitionTableError::TooShort);
+    }
+
+    let mut otadata = None;
+    let mut slots = [None, None];
+
+    for raw in table.chunks_exact(PARTITION_ENTRY_LEN) {
+        let magic = u16::from_le_bytes([raw[0], raw[1]]);
+        if magic == u16::MAX || magic == PARTITION_MD5_MAGIC {
+            break;
+        }
+        if magic != PARTITION_MAGIC {
+            return Err(PartitionTableError::BadEntry);
+        }
+
+        let partition = AppPartition {
+            offset: u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]),
+            size: u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]),
+        };
+
+        match (raw[2], raw[3]) {
+            (PARTITION_TYPE_DATA, PARTITION_SUBTYPE_DATA_OTA) => {
+                validate_partition(partition, flash_size)?;
+                if otadata.replace(partition).is_some() {
+                    return Err(PartitionTableError::DuplicateOtaData);
+                }
+            }
+            (PARTITION_TYPE_APP, subtype)
+                if (PARTITION_SUBTYPE_APP_OTA_0..=PARTITION_SUBTYPE_APP_OTA_0 + 1)
+                    .contains(&subtype) =>
+            {
+                validate_partition(partition, flash_size)?;
+                let slot = usize::from(subtype - PARTITION_SUBTYPE_APP_OTA_0);
+                if slots[slot].replace(partition).is_some() {
+                    return Err(PartitionTableError::DuplicateOtaSlot(slot as u8));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let otadata = otadata.ok_or(PartitionTableError::MissingOtaData)?;
+    let slot0 = slots[0].ok_or(PartitionTableError::MissingOtaSlot(0))?;
+    let slot1 = slots[1].ok_or(PartitionTableError::MissingOtaSlot(1))?;
+    if otadata.size < 0x2000 {
+        return Err(PartitionTableError::InvalidBounds);
+    }
+    if partitions_overlap(otadata, slot0)
+        || partitions_overlap(otadata, slot1)
+        || partitions_overlap(slot0, slot1)
+    {
+        return Err(PartitionTableError::Overlap);
+    }
+
+    Ok(OtaLayout {
+        otadata,
+        slots: [slot0, slot1],
+    })
+}
+
+fn validate_partition(partition: AppPartition, flash_size: u32) -> Result<(), PartitionTableError> {
+    let Some(end) = partition.offset.checked_add(partition.size) else {
+        return Err(PartitionTableError::InvalidBounds);
+    };
+    if partition.size == 0
+        || partition.offset & 0xFFF != 0
+        || partition.size & 0xFFF != 0
+        || end > flash_size
+    {
+        return Err(PartitionTableError::InvalidBounds);
+    }
+    Ok(())
+}
+
+fn partitions_overlap(a: AppPartition, b: AppPartition) -> bool {
+    a.offset < b.offset + b.size && b.offset < a.offset + a.size
+}
+
 /// Validate a candidate ESP-IDF image end to end.
 ///
 /// `image_len` is the exact byte length of the source. `partition_len`, when
@@ -437,6 +558,91 @@ mod tests {
     // ones so the segment walk and the streaming chunk boundary both get hit.
     fn valid_image(hash_appended: bool) -> Vec<u8> {
         build_image(&[70_000, 8, 513, 1], hash_appended)
+    }
+
+    fn partition_entry(kind: u8, subtype: u8, offset: u32, size: u32) -> [u8; 32] {
+        let mut entry = [0u8; 32];
+        entry[0..2].copy_from_slice(&PARTITION_MAGIC.to_le_bytes());
+        entry[2] = kind;
+        entry[3] = subtype;
+        entry[4..8].copy_from_slice(&offset.to_le_bytes());
+        entry[8..12].copy_from_slice(&size.to_le_bytes());
+        entry
+    }
+
+    fn partition_table(slot1_offset: u32, slot_size: u32) -> Vec<u8> {
+        let mut table = Vec::new();
+        table.extend_from_slice(&partition_entry(
+            PARTITION_TYPE_DATA,
+            PARTITION_SUBTYPE_DATA_OTA,
+            0xE000,
+            0x2000,
+        ));
+        table.extend_from_slice(&partition_entry(
+            PARTITION_TYPE_APP,
+            PARTITION_SUBTYPE_APP_OTA_0,
+            0x10000,
+            slot_size,
+        ));
+        table.extend_from_slice(&partition_entry(
+            PARTITION_TYPE_APP,
+            PARTITION_SUBTYPE_APP_OTA_0 + 1,
+            slot1_offset,
+            slot_size,
+        ));
+        table.extend_from_slice(&[0xFF; 32]);
+        table
+    }
+
+    #[test]
+    fn discovers_crosspoint_ota_layout() {
+        let table = partition_table(0x650000, 0x640000);
+        let layout = parse_ota_layout(&table, 0x1000000).unwrap();
+        assert_eq!(layout.otadata.offset, 0xE000);
+        assert_eq!(layout.slots[0].offset, 0x10000);
+        assert_eq!(layout.slots[1].offset, 0x650000);
+        assert_eq!(layout.slots[1].size, 0x640000);
+    }
+
+    #[test]
+    fn discovers_stock_x3_ota_layout() {
+        let table = partition_table(0x780000, 0x770000);
+        let layout = parse_ota_layout(&table, 0x1000000).unwrap();
+        assert_eq!(layout.slots[0].offset, 0x10000);
+        assert_eq!(layout.slots[0].size, 0x770000);
+        assert_eq!(layout.slots[1].offset, 0x780000);
+        assert_eq!(layout.slots[1].size, 0x770000);
+    }
+
+    #[test]
+    fn stock_x3_update_targets_the_slot_the_bootloader_will_select() {
+        let table = partition_table(0x780000, 0x770000);
+        let layout = parse_ota_layout(&table, 0x1000000).unwrap();
+        let active_slot0 = SelectEntry::new(1, OTA_IMG_VALID).to_bytes();
+        let erased = [0xFF; SELECT_ENTRY_LEN];
+        let active = active_app_slot(&active_slot0, &erased, 2).unwrap();
+        let destination = (active + 1) % 2;
+        let switch = plan_switch(&active_slot0, &erased, destination, 2);
+
+        assert_eq!(destination, 1);
+        assert_eq!(layout.slots[destination as usize].offset, 0x780000);
+        assert_eq!((switch.entry.ota_seq - 1) % 2, destination);
+    }
+
+    #[test]
+    fn rejects_incomplete_or_out_of_flash_ota_layouts() {
+        let mut missing_slot = partition_table(0x780000, 0x770000);
+        missing_slot.drain(64..96);
+        assert_eq!(
+            parse_ota_layout(&missing_slot, 0x1000000),
+            Err(PartitionTableError::MissingOtaSlot(1))
+        );
+
+        let outside_flash = partition_table(0xF00000, 0x200000);
+        assert_eq!(
+            parse_ota_layout(&outside_flash, 0x1000000),
+            Err(PartitionTableError::InvalidBounds)
+        );
     }
 
     #[test]

@@ -6,6 +6,6 @@
   },
   "sdInstall": {
     "x4": "https://github.com/chongfun/calendula-os/releases/latest/download/update.bin",
-    "x3": "https://github.com/chongfun/calendula-os/releases/latest/download/FWUPDX3.BIN"
+    "x3": "https://github.com/chongfun/calendula-os/releases/latest/download/update-x3.bin"
   }
 }

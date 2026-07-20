@@ -19,10 +19,10 @@ it's locked.
 The author's own X4 is unlocked, so the locked-device path still needs a real
 locked-unit confirmation — see [Status](#status).
 
-## The layout
+## The Calendula/CrossPoint layout
 
-`partitions.csv` mirrors the stock dual-OTA layout so our app lands where the
-stock bootloader expects it:
+`partitions.csv` defines the layout used by Calendula full-flash images and the
+CrossPoint/Marigold firmware family:
 
 | Partition | Type | Offset | Size |
 |---|---|---|---|
@@ -68,13 +68,15 @@ Produces local images in `target/release-images/`:
 
 - **`firmware.bin`** — app image for `ota_0`. Flash to `0x10000`. Updates the
   app in place and leaves the bootloader untouched. This is what the web
-  flasher, `esptool write_flash 0x10000`, and (once implemented) the in-app
-  updater consume. The web installer explicitly forbids whole-chip erase for
+  flasher, `esptool write_flash 0x10000`, and the in-app SD updater consume.
+  The web installer explicitly forbids whole-chip erase for
   these app-only manifests; CI verifies that contract before Pages deployment.
 - **`firmware-x3.bin`** — the same app image contract for X3 builds.
 - **`update.bin`** — byte-identical to `firmware.bin`, under the filename the
-  stock OEM SD-card updater looks for. The OEM updater writes it to the app
+  X4 stock OEM SD-card updater looks for. The OEM updater writes it to the app
   slot at `0x10000`, so it is an **app image, not a full-flash image**.
+- **`update-x3.bin`** — byte-identical to `firmware-x3.bin`; rename it to
+  `update.bin` on the card for X3 OEM bootloaders that use that filename.
 - **`FWUPDATE.BIN`** — byte-identical to `firmware.bin`, under the filename
   CalendulaOS itself looks for on the card root at boot.
 - **`FWUPDX3.BIN`** — the X3 SD-card trigger filename.
@@ -82,10 +84,10 @@ Produces local images in `target/release-images/`:
   app) for local bench recovery on unlocked units only.
 
 Tagged GitHub releases publish only the public app/SD assets:
-`firmware-x4.bin`, `firmware-x3.bin`, `update.bin`, `FWUPDATE.BIN`, and
-`FWUPDX3.BIN`. `firmware-x4.bin` is the release-time name for the default X4
-`target/release-images/firmware.bin`; `FWUPDATE.BIN` is the same X4 app image
-under Calendula's in-app updater trigger name.
+`firmware-x4.bin`, `firmware-x3.bin`, `update.bin`, `update-x3.bin`,
+`FWUPDATE.BIN`, and `FWUPDX3.BIN`. `firmware-x4.bin` is the release-time name
+for the default X4 `target/release-images/firmware.bin`; `FWUPDATE.BIN` is the
+same X4 app image under Calendula's in-app updater trigger name.
 
 > [!CAUTION]
 > Never put `full-flash*.bin` on an SD card and never write it to `0x10000`. The
@@ -97,8 +99,10 @@ under Calendula's in-app updater trigger name.
 
 ## Xteink X3
 
-The X3 is the X4's sibling: same ESP32-C3, same 16 MB flash, same partition
-table and bootloader path, on a smaller 792×528 UC8253 panel with a BQ27220
+The X3 is the X4's sibling: same ESP32-C3 and 16 MB flash, but stock X3 units
+may retain a different dual-OTA partition table (`ota_1` at `0x780000`, with
+7.44 MB slots) from the Calendula/CrossPoint layout (`ota_1` at `0x650000`,
+with 6.25 MB slots). It uses a smaller 792×528 UC8253 panel with a BQ27220
 battery gauge instead of the X4's ADC divider. Support lives behind the
 `device-x3` feature; the default build is unchanged for the X4. X3 support has
 now been validated on hardware, so the web flasher and release pipeline publish
@@ -111,11 +115,12 @@ tools/build-release.sh x3
 ```
 
 Produces, in `target/release-images/`: **`firmware-x3.bin`** (flash to
-`0x10000`), **`FWUPDX3.BIN`** (SD-card trigger — a *device-specific* name, so a
-card can't cross-flash an X4 image onto an X3 or vice versa), and
+`0x10000`), **`update-x3.bin`** (rename to `update.bin` for the stock X3 OEM
+updater), **`FWUPDX3.BIN`** (Calendula's X3 one-shot trigger), and
 **`full-flash-x3.bin`** (local whole-flash image for unlocked bench units only).
-The app-only flash paths are the same as the X4 below, with the `-x3` image
-names.
+Some X3 stock variants also recognize `FWUPDX3.BIN`; publishing both app-image
+aliases covers both bootloader conventions without ever mixing in the X4
+image. The app-only flash paths are otherwise the same as the X4 below.
 
 > [!NOTE]
 > The X3 charges and flashes through a **4-pin magnetic pogo connector**, not
@@ -176,12 +181,13 @@ with no computer — this is what keeps a locked unit from being a one-way trip:
    also keep on the card). On the **X3** the trigger is **`FWUPDX3.BIN`**
    instead — each build only picks up an image named for its own panel, so a
    card is safe to carry between an X4 and an X3 without either grabbing the
-   other's image (they share a SoC and partition table, but not a display
-   controller or battery gauge, so a cross-flash is a black screen).
+   other's image (they share a SoC, but not a display controller or battery
+   gauge, so a cross-flash is a black screen).
 2. Reboot. At boot, before the reader starts, the firmware validates the image
-   (`proto::ota::validate_image`), writes it into the **inactive** OTA slot,
-   flips `otadata` to select it (`proto::ota::plan_switch`), deletes
-   `FWUPDATE.BIN` so it runs only once, and resets into the new firmware.
+   (`proto::ota::validate_image`), discovers the **inactive** OTA slot from the
+   installed partition table, writes it there, deletes `FWUPDATE.BIN` so it can
+   run only once, flips `otadata` to select the new slot
+   (`proto::ota::plan_switch`), and resets into the new firmware.
    On the first boot after any OTA-slot install (including CrossInk's
    Settings -> SD firmware update flow), Calendula marks the selected `otadata`
    entry valid before the reader starts, so rollback-enabled bootloaders do not
@@ -204,13 +210,15 @@ guarantee against every brick.
 
 Implemented and verified on host tooling:
 
-- [x] Stock-compatible dual-OTA partition table (`partitions.csv`).
+- [x] Calendula/CrossPoint dual-OTA partition table (`partitions.csv`) plus
+      runtime discovery of the different stock X3 OTA offsets for app-only
+      installations.
 - [x] App descriptor with the open eFuse range at offset `0x20` (bootloader-gate
       workaround), verified present in the built image.
 - [x] Reproducible app/SD images (`firmware.bin`, `firmware-x3.bin`,
-      `update.bin`, `FWUPDATE.BIN`, `FWUPDX3.BIN`) plus local-only `full-flash*.bin` bench
-      images (`tools/build-release.sh`). The SD images are app images written to
-      `0x10000`, matching the OEM updater.
+      `update.bin`, `update-x3.bin`, `FWUPDATE.BIN`, `FWUPDX3.BIN`) plus
+      local-only `full-flash*.bin` bench images (`tools/build-release.sh`). The
+      SD images are app images written to `0x10000`, matching the OEM updater.
 - [x] `cargo run` flashes the stock-compatible layout.
 - [x] **Image validator** (`proto::ota::validate_image`) — the integrity gate
       (magic / segment walk / XOR checksum / SHA-256 trailer) that must pass
@@ -222,9 +230,9 @@ Implemented and verified on host tooling:
       on-device value: `seq_crc(1) == 0x4743989A`), and the slot-switch math.
       Host-tested.
 - [x] **Boot-time SD updater** (`fw::ota_update`) — on boot, `/FWUPDATE.BIN` is
-      validated, written to the inactive OTA slot with `esp-storage`, selected
-      via `otadata`, deleted, and the device resets into it. Only the inactive
-      slot/sector are touched.
+      validated, written with `esp-storage` to the inactive slot discovered
+      from the installed partition table, deleted, selected via `otadata`, and
+      the device resets into it. Only the inactive slot/sector are touched.
 - [x] **OTA rollback acknowledgement** (`fw::ota_update::mark_running_slot_valid`)
       — early boot rewrites an active `NEW`/`PENDING_VERIFY` select entry as
       `VALID`. This covers installs launched from CrossInk/CrossPoint's
