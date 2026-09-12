@@ -134,7 +134,9 @@ pub(crate) struct SdSpiDevice<'a, SPI, CS> {
 /// Also sizes the shared bus's RX DMA buffer in main.rs: SD traffic is the
 /// only read path on SPI2 (the EPD is write-only), and every SD operation
 /// bounces through one of these chunks.
-pub(crate) const SD_SPI_CHUNK_BYTES: usize = 64;
+/// X4 transfers a full sector per DMA operation. X3 retains the smaller
+/// buffer because its static stack region is close to the link-time floor.
+pub(crate) const SD_SPI_CHUNK_BYTES: usize = if cfg!(feature = "device-x3") { 64 } else { 512 };
 
 #[repr(align(4))]
 struct AlignedSdChunk([u8; SD_SPI_CHUNK_BYTES]);
