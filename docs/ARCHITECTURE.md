@@ -345,32 +345,57 @@ board-I/O owner.
 
 ## SD-backed reader cache
 
-The SD reader uses a V2 whole-book cache. Opening an EPUB parses OPF/TOC/spine,
-then builds the whole book up front: every spine item paginates into one or more
-fixed-size sections, each section is written to its own file, and a book index
-records where each section sits. After that the book reopens from cache in tens
-of milliseconds; only the first build of a large book is slow (minutes for
-something HPMOR-sized).
+The SD reader uses a V2 cache that grows on demand. A cold open parses the
+package metadata and processes at most one eligible spine item per storage
+step, then commits its section files and updated book index. If that prefix
+covers the requested page, reading starts immediately. A distant saved page,
+chapter jump, or Next at the prefix boundary requests further steps until the
+target is covered or the cache reaches its terminal end. There is no idle
+prefetch: opening an early page does not continue building the rest of the book.
 
-A chapter is a spine item, and a long one paginates into several sections. The
-builder closes the current section and opens the next when its in-RAM arena
+Each continuation closes its ZIP/FAT handles, retains only the request and a
+durable next-spine cursor, and reopens the package on the next step. The board
+I/O task yields between steps so queued navigation, sleep, and cancellation can
+run. A request generation rejects stale work and results after leaving the book
+or changing its layout. One spine is the work unit, not a bounded wall-clock
+interval: a large XHTML spine can still block the shared I/O owner until its
+stream finishes. Cancellation does not interrupt that stream mid-spine.
+
+While a next-spine cursor exists, the cached page count is a known prefix, not
+the book's total. Reading publishes an unknown total and holds the displayed
+page while a future page is pending; repeated Next presses coalesce that target.
+An unresolved chapter target stays unresolved rather than aliasing page zero or
+the last cached section. Appending complete spines preserves earlier page
+numbers and chapter boundaries. Reopening can reuse the committed prefix after
+sleep or an interrupted later step.
+
+A source spine item can paginate into several sections, and several TOC
+chapters can refer to the same spine. The builder closes the current section and opens the next when its in-RAM arena
 fills, where the text budget (16 KB) is the binding limit for prose, well ahead
 of the block (384) and page (96) caps. Sections are invisible while reading: the
 reader walks across them seamlessly, and the footer page-in-chapter counter
 aggregates every section sharing a spine. The book index holds up to
-`MAX_BOOK_SECTIONS` (320, on the order of 4,500 pages); a longer book caches
-`partial`.
+`MAX_BOOK_SECTIONS` (320, on the order of 4,500 pages). This cap still applies
+to the active index. A capacity-limited book becomes terminal and `partial`;
+it has no continuation cursor. This differs from a resumable prefix, which has
+more source spines available and must not present its known pages as a final
+total.
 
 Each section header carries a `font_config` that packs `READER_LAYOUT_VERSION`
 with the type size and spacing it was paginated under. A loaded section whose
 version or size no longer matches is invalid and forces a rebuild, so bumping
 `READER_LAYOUT_VERSION` retires every stale cache after a layout or
-cache-encoding change; a spacing-only change re-walks line heights without a
-reparse.
+cache-encoding change. For a complete, non-partial cache, a spacing-only change streams
+all cached pre-wrapped lines through the shared page plan and rewrites the full
+book into the other section bank, without reparsing EPUB/XHTML. The section-cut
+and carry policy is shared with fresh builds. Only after every replacement
+section is written does the new index commit; interruption leaves the previous
+generation readable. This full-book spacing reflow is synchronous. A spacing
+change to an unfinished prefix takes the fresh-build path instead.
 
 Cache paths use FAT 8.3-safe names because `embedded-sdmmc` operates on short
 file names in the firmware path. The library list is a windowed catalog
-snapshot at `/XTEINK/CATALOG.BIN` (v3: `X4CT` magic, u16 book count, 92-byte
+snapshot at `/XTEINK/CATALOG.BIN` (v4: `X4CT` magic, u16 book count, 92-byte
 records). Firmware streams it `LIBRARY_WINDOW` (16) entries at a time instead
 of holding the whole list in RAM, so library size is bounded by the card, and
 only window crossings re-read it. The currently open book sits in a separate
@@ -378,10 +403,12 @@ only window crossings re-read it. The currently open book sits in a separate
 scrolled. On boot/refresh, firmware first loads a window from the cached
 snapshot, then refreshes `/BOOKS` and card-root discovery in a storage
 command, streaming the fresh catalog out in batches without ever holding it
-whole. Entries are labeled with the book's real title from its cached
-`BOOK.BIN`, falling back to the stored original-filename label for uploaded
-8.3-named books, then to the prettified file stem. Each fresh catalog write
-also sweeps `CACHE2` and reclaims caches whose stored source identity no
+whole. Entries are labeled with the book's real title from its cached index,
+falling back to the stored original-filename label for uploaded 8.3-named books,
+then to the prettified file stem. This advisory title lookup tries a
+source-matching legacy `BOOK.BIN` first to avoid probing absent generation files
+for every old catalog entry. Page totals and section loading retain generation
+selection. Each fresh catalog write also sweeps `CACHE2` and reclaims caches whose stored source identity no
 longer matches any catalogued book, deleting the data files and the emptied
 directories while leaving `STATE.BIN` intact. Files renders the current
 snapshot immediately. It may show “Library unavailable” before any successful
@@ -389,7 +416,9 @@ cache/scan, and “No books found” only after a completed scan proves the card
 has no EPUBs.
 
 ```text
-/XTEINK/CACHE2/E<hash>/BOOK.BIN
+/XTEINK/CACHE2/E<hash>/BOOKA.BIN
+/XTEINK/CACHE2/E<hash>/BOOKB.BIN
+/XTEINK/CACHE2/E<hash>/BOOK.BIN       (legacy fallback)
 /XTEINK/CACHE2/E<hash>/TOC.BIN
 /XTEINK/CACHE2/E<hash>/COVER.BIN
 /XTEINK/CACHE2/E<hash>/SECTIONS/S000.BIN
@@ -399,14 +428,27 @@ has no EPUBs.
 /XTEINK/STATE.BIN
 ```
 
-`BOOK.BIN` holds a `BookV2Header`, one `BookV2SectionRecord` per section (spine,
-start page, page count, partial), TOC records, and a string blob for title,
-author, and TOC titles. Section files hold a `SectionV2Header`, page records,
-block records, per-block paragraph flags, and the UTF-8 text blob of that
-section's pre-wrapped lines. `TOC.BIN` is a per-book chapter-list sidecar for
-the Chapters overview, distinct from the TOC records inside `BOOK.BIN`.
-The active firmware state keeps only loaded book
-metadata, the full section index, the active section's page/block records and
+Each book index holds a `BookV2Header`, one `BookV2SectionRecord` per section
+(spine, start page, page count, partial), TOC records, and title/author/TOC text.
+The header also records the optional next-spine cursor and whether the TOC was
+generated from content. `BOOKA.BIN` and `BOOKB.BIN` add a generation/checksum
+footer written last. Loading verifies the newest committed body and can fall
+back to the older valid generation or legacy index.
+
+Section IDs use two banks, 0–319 and 320–639. A fresh build or spacing reflow
+uses the opposite bank; before overwriting it, firmware retires older indexes
+that reference that bank, preserving the active generation. Continuation steps
+append unused IDs in the current bank. Thus an interrupted replacement cannot
+make a fallback index point into partially overwritten sections. The two banks
+provide recovery space, not a doubled active-section limit.
+
+Section files hold a `SectionV2Header`, page records, block records, per-block
+paragraph flags, and the UTF-8 text blob of pre-wrapped lines. `TOC.BIN` is a
+per-book chapter-list sidecar for the Chapters overview, distinct from the
+records inside the book index. Generated TOC metadata is carried across prefix
+commits; a missing or stale sidecar can be repaired from the committed index.
+
+The active firmware state keeps only loaded book metadata, the full section index, the active section's page/block records and
 text bytes, and small ZIP/XML scratch buffers. Spine XHTML members of any size
 stream completely through the resumable block parser in bounded inflate
 windows, so chapter content is never truncated by scratch-buffer limits. `STATE.BIN`
@@ -457,8 +499,11 @@ remain hardware-validation concerns.
 `tools/bench/bench.py` is the hardware-facing counterpart to the emulator. It
 captures serial output with the same DTR/RTS behavior as `tools/serial_capture.py`,
 parses structured `bench:` telemetry, writes JSONL logs under `target/bench/`,
-and reports timing/storage/sleep summaries. Current hardware suites are guided
-workflows; the firmware still has no interactive serial command channel.
+and reports timing/storage/sleep summaries. Guided suites use the ordinary
+firmware. The default-off `bench-serial` feature additionally exposes button
+injection through `tools/bench/send.py`, a two-second deep-sleep timer wake, and
+a temporary SD font fixture for repeatable cache measurements. These bench
+behaviors are excluded from release builds; see `docs/agents/bench.md`.
 
 Use it in tiers:
 

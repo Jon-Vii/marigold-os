@@ -16,7 +16,7 @@ Rendering and task coordination should prefer ReaderStore query methods such as 
 
 ### Reader cache files
 
-The firmware module that owns the FAT paths and binary records for `/XTEINK/CATALOG.BIN`, `/XTEINK/CACHE/E<hash>/BOOK.BIN`, section files, cover sidecars, and `/XTEINK/STATE.BIN`.
+The firmware module that owns the FAT paths and binary records for `/XTEINK/CATALOG.BIN`, `/XTEINK/CACHE2/E<hash>/BOOKA.BIN` and `BOOKB.BIN` (with legacy `BOOK.BIN` fallback), section files, cover sidecars, and persisted state generations.
 
 Use this term for cache file I/O. Keep EPUB parsing, XHTML decoding, and pagination language separate from cache file persistence.
 
@@ -25,6 +25,18 @@ Use this term for cache file I/O. Keep EPUB parsing, XHTML decoding, and paginat
 The shared cache contract behind catalog snapshots, book records, section records, cover sidecars, cache keys, file names, version bytes, and fixed binary layouts.
 
 Use this term when discussing the portable cache format shared by firmware and host tools. Keep adapter-specific details, such as FAT directory handles or host filesystem paths, outside the artifact language.
+
+### Committed reader prefix
+
+The durable, readable part of a book cache whose index still holds a next-spine cursor. Its page count describes available pages; the final book total remains unknown. Reading extends it only when a requested page or chapter is not yet available, with no idle prefetch.
+
+Use this term for resumable progress. A terminal `partial` cache has reached a capacity or parsing limit and has no continuation cursor; the active index still holds at most 320 sections. Do not treat the two states as interchangeable.
+
+### Reader cache generation
+
+A committed book index plus the section files it references. Alternating `BOOKA.BIN` and `BOOKB.BIN` records carry generation/checksum footers; loading verifies the newest valid record. Fresh builds and full-book spacing reflows use the other section bank while preserving the current generation. Prefix continuation appends unused section IDs in the current bank.
+
+Use this term for recovery and replacement. The two 320-section banks provide room for interrupted replacement, not a larger active book index. A storage step processes at most one eligible source spine, then closes its handles and yields before continuing. This is a cancellation boundary, not a wall-clock latency guarantee for a large spine.
 
 ### Reader page plan
 
