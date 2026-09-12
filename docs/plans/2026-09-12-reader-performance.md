@@ -5,6 +5,52 @@ The progressive-opening measurements below describe the withdrawn release;
 its demand-driven preparation policy is superseded. Durable cache generations,
 resumable preparation, and the other performance changes remain in use.
 
+## Replacement v0.5.0: uninterrupted forward reading
+
+The reported recurring page-turn pauses exposed two problems. Demand-driven
+opening left later EPUB spines to be parsed during reading. Separately, crossing
+an already-prepared section painted a loading plate from the input render and
+again from storage, followed by the real page. The extra refresh time also let
+storage completion and queued input renders cause duplicate subsequent pages.
+
+`283f26b` keeps successful preparation steps Loading while a next-spine cursor
+exists and makes existing prefixes continue through the builder instead of
+returning a cache hit. Complete caches retain their fast path. X4 hardware
+resumed an existing 30-page prefix, cancelled at a spine boundary, and reopened
+from its durable progress to complete the 1,367-page, 102-spine book.
+
+`f96bb7c` defers page-turn rendering until the storage reply and skips loading
+plates for prepared sections outside the RAM window. On the same X4/book,
+the preparation-only build produced 71 reading renders for 50 forward inputs
+(destinations 1–50), with a maximum input-to-settled delay of 1,427 ms and no
+EPUB builds. With the section-turn fix, 50 inputs produced exactly 50 renders
+(destinations 8–57), median 487 ms and maximum 591 ms. Seven section-cache reads
+took 45–72 ms; no EPUB builds ran during those turns. The ranges overlap but
+are not identical because the TOC's first chapter begins after frontmatter.
+
+The reproducible check is
+`python3 tools/bench/check_forward_turns.py target/bench/section-turn-forward-50.jsonl --first-page 8`.
+It rejects duplicate/missing destination frames, preparation during reading,
+and input-to-settled latency above one second. The original trace
+`target/bench/preparation-forward-50.jsonl` fails this check. The previous
+alternating-page test stayed inside one RAM section and could not detect this
+path; consecutive forward coverage is now documented in the bench workflow.
+
+Regression tests exercise firmware ReaderStore readiness and prepared-page
+queries. The hardware trace is the integration check for the Embassy task
+ordering, which the host channel model does not execute. Host app-core/proto/ui
+tests pass (199 tests, one pre-existing ignored case), as do X3 UI tests and
+both sets of 25 emulator golden frames. Both production image builds pass the
+app-image validator with development serial controls disabled.
+
+A final preparation check on the 32-spine Frankenstein book captured 24
+committed steps with zero panel writes between the first and last step. The
+loading-plate guard retains the already-painted plate rather than adding a
+refresh to every continuation. Five sleep/wake cycles restored the original
+book (index 34, chapter 11, page 324); the test book's frontmatter position was
+also restored. Raw captures are under `target/bench/loading-plate-*.jsonl` and
+`target/bench/section-turn-*.jsonl`.
+
 ## Initial pass
 
 ### Incremental section pagination (`98b474d`)
