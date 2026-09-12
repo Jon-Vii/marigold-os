@@ -61,6 +61,23 @@ fn section(id: u16, spine: u16, start: u32, pages: u16) -> BookV2SectionRecord {
 }
 
 #[test]
+fn prepared_sections_do_not_need_a_loading_plate_when_the_ram_window_changes() {
+    let mut store = ReaderStore::new();
+    store.set_book_index(12, false, &[section(0, 0, 0, 7), section(1, 1, 7, 5)]);
+    store.set_current_section_range(0, 7);
+    store.page_count = 7;
+    store.finish_book_load(0, 0, BookLoadStatus::Ready);
+    assert!(store.covers_global_page(0, 6));
+    assert!(!store.covers_global_page(0, 7));
+    assert!(store.has_prepared_page(0, 7));
+    assert!(!store.has_prepared_page(1, 7));
+    assert!(!store.has_prepared_page(0, 12));
+    store.set_book_next_spine(Some(2));
+    store.finish_book_load(0, 0, BookLoadStatus::Ready);
+    assert!(!store.has_prepared_page(0, 7));
+}
+
+#[test]
 fn pending_prefix_targets_are_not_clamped_to_cached_tail() {
     let mut store = ReaderStore::new();
     let prefix = [section(320, 3, 0, 4), section(321, 3, 4, 2)];

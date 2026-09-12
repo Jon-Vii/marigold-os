@@ -150,13 +150,13 @@ pub async fn run() {
                     // so any dispatched command syncs the reader store.
                     reader_relayout_pending = false;
                 }
-                // The chapter overview can't paint its rows until the on-disk
-                // list lands; hold the current frame and let the Loaded event
-                // render once, rather than flashing a partial first frame and
-                // spending an extra panel refresh. Only when the command is
-                // truly in flight -- a queued command relies on the render's
-                // Settled to be drained, so it must still render.
-                let mut awaiting_chapter_list = false;
+                // Keep the current page while its replacement is loaded, then
+                // render once from the completion event. Rendering immediately
+                // on section boundaries paints a loading plate before the short
+                // cache read and adds redundant refreshes to subsequent turns.
+                // Only defer when storage accepted the command: a full queue
+                // still needs a render's Settled event to drain pending_storage.
+                let mut awaiting_reader_data = false;
                 if let Some(command) = storage_command {
                     if let Some(book_id) = provisional_position_book_id(command) {
                         unresolved_position = Some(book_id);
@@ -170,8 +170,11 @@ pub async fn run() {
                         if STORAGE_COMMANDS.try_send(command).is_err() {
                             log_storage_command("queue", command);
                             pending_storage = Some(command);
-                        } else if matches!(command, StorageCommand::LoadChapters { .. }) {
-                            awaiting_chapter_list = true;
+                        } else if matches!(
+                            command,
+                            StorageCommand::LoadChapters { .. } | StorageCommand::ExtendSection { .. }
+                        ) {
+                            awaiting_reader_data = true;
                         }
                     } else {
                         log_storage_command("queue", command);
@@ -209,9 +212,10 @@ pub async fn run() {
                 // on the previous screen. Let the render through immediately:
                 // the Reading view draws "OPENING EPUB" while sd_library's
                 // loaded_index doesn't match the requested book. The chapter
-                // overview is the exception: its list arrives in a beat, so it
-                // waits for that Loaded rather than painting a partial frame.
-                if awaiting_chapter_list {
+                // overview and page turns are exceptions: their cache reads
+                // are short, so they wait for Loaded rather than painting a
+                // partial frame. Storage paints a plate if preparation is needed.
+                if awaiting_reader_data {
                     render_pending = false;
                 } else if rendering {
                     render_pending = true;

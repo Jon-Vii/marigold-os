@@ -524,8 +524,9 @@ fn render_custom_reader(
 }
 
 /// The reader-view render to paint as a loading plate before an open/extend
-/// that cannot be answered from the already loaded RAM section. The app sends
-/// a normal Reading render around the same time, but the storage receiver can
+/// that needs book preparation. Prepared sections skip it even outside RAM.
+/// The app sends a normal Reading render around the same time as a book open,
+/// but the storage receiver can
 /// win that race; painting here keeps a first cache build from looking frozen
 /// on the previous screen.
 fn open_loading_plate_request(
@@ -559,7 +560,7 @@ fn open_loading_plate_request(
     }
     if sd_library.type_settings() == type_settings
         && sd_library.portrait() == portrait
-        && sd_library.covers_global_page(index as usize, target_pages as u32)
+        && sd_library.has_prepared_page(index as usize, target_pages as u32)
     {
         return None;
     }

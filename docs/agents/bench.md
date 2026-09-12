@@ -51,6 +51,14 @@ acknowledgement was lost. The command exits unsuccessfully if any sequence
 item lacks a queued acknowledgement. Acknowledgement proves input was queued;
 use the render/storage/sleep telemetry to verify the resulting behavior.
 
+For page-turn regressions, start at page zero of a prepared book and send 50
+consecutive `n` commands with `send.py` (one-second interval, 55-second capture).
+Check the capture with `python3 tools/bench/check_forward_turns.py <capture>`.
+It requires one settled render per destination page, no EPUB preparation, and
+at most one second from each input to its settled page. Use `--first-page` for
+another starting position and `--max-latency-ms` for a different panel budget.
+Alternating `np` inside one RAM section does not validate section boundaries.
+
 The same feature adds a two-second timer wake alongside the Power wake source,
 allowing unattended deep-sleep cycles. It also runs an isolated custom-font
 cache/read benchmark at boot using a temporary root-level `FNTBENCH.BIN`.

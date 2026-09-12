@@ -199,10 +199,13 @@ queuing stale framebuffer renders. When `DisplayEvent::Settled` arrives, the app
 renders the latest state once.
 
 Storage is also explicit. Files/Home/Reading transitions enqueue
-`StorageCommand`s after the visible render settles; render commands never scan
+`StorageCommand`s; render commands never scan
 FAT, open EPUBs, build caches, or write progress. Open/extend requests whose
 page already sits inside the loaded section window are answered from RAM
-without an SD session, and reading-progress writes are coalesced (at most one
+without an SD session. Page turns keep the current panel image until the
+storage reply, then render the requested page once. A section already present
+in the completed book index needs only a cache read and never a loading plate.
+Reading-progress writes are coalesced (at most one
 alternating STATEA/STATEB generation per 15 s, flushed before display sleep).
 The board I/O task is still
 the single SPI owner, so display refresh and SD transactions cannot overlap, but

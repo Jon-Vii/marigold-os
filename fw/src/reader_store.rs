@@ -938,6 +938,16 @@ impl ReaderStore {
                     .saturating_add(self.current_section_page_count as u32)
     }
 
+    /// Whether a short section-cache read can satisfy the page, without EPUB
+    /// preparation or its loading plate. The section need not be resident.
+    pub(crate) fn has_prepared_page(&self, index: usize, global_page: u32) -> bool {
+        self.loaded_index == Some(index)
+            && self.reader_status == BookLoadStatus::Ready
+            && self.book_next_spine.is_none()
+            && global_page < self.book_total_pages
+            && self.section_for_global_page(global_page).is_some()
+    }
+
     pub(crate) fn local_page_for_global(&self, global_page: u32) -> usize {
         global_page
             .saturating_sub(self.current_section_start_page)
