@@ -35,10 +35,12 @@ jobs:
           mkdir -p target/public-release
           cp target/release-images/firmware.bin target/public-release/firmware-x4.bin
           cp target/release-images/firmware-x3.bin target/public-release/firmware-x3.bin
-          cp target/release-images/update.bin target/public-release/update.bin
-          cp target/release-images/update-x3.bin target/public-release/update-x3.bin
-          cp target/release-images/update.bin target/public-release/FWUPDATE.BIN
-          cp target/release-images/FWUPDX3.BIN target/public-release/FWUPDX3.BIN
+
+      - name: Verify release images and write checksums
+        run: |
+          python3 tools/verify_release_images.py target/public-release
+          cd target/public-release
+          sha256sum firmware-x4.bin firmware-x3.bin > SHA256SUMS
 
       - name: Create GitHub Release
         env:
@@ -47,12 +49,10 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" \
             target/public-release/firmware-x4.bin \
             target/public-release/firmware-x3.bin \
-            target/public-release/update.bin \
-            target/public-release/update-x3.bin \
-            target/public-release/FWUPDATE.BIN \
-            target/public-release/FWUPDX3.BIN \
+            target/public-release/SHA256SUMS \
+            --verify-tag --latest \
             --title "${GITHUB_REF_NAME}" \
-            --notes "MarigoldOS ${GITHUB_REF_NAME} firmware images for Xteink X4 and X3."
+            --notes-file "docs/releases/${GITHUB_REF_NAME}.md"
 
       - name: Publish release firmware to Pages
         env:

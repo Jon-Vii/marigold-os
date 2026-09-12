@@ -25,6 +25,17 @@ for manifest_path in sorted(site.glob("manifest-x*.json")):
                 f"{manifest_path}: app-only parts must all target 0x10000"
             )
 
+index = (site / "index.html").read_text()
+for expected in (
+    'href="firmware-x4.bin" download="FWUPDATE.BIN"',
+    'href="firmware-x3.bin" download="FWUPDX3.BIN"',
+    'sd.download="update.bin"',
+):
+    if expected not in index:
+        raise SystemExit(
+            f"{site / 'index.html'}: missing updater download contract {expected!r}"
+        )
+
 dialog_path = site / "vendor/esp-web-tools/web/install-dialog-C5LjR_e6.js"
 dialog = dialog_path.read_text()
 try:

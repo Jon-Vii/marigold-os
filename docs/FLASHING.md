@@ -83,11 +83,22 @@ Produces local images in `target/release-images/`:
 - **`full-flash*.bin`** — merged 16 MB images (bootloader + partition table +
   app) for local bench recovery on unlocked units only.
 
-Tagged GitHub releases publish only the public app/SD assets:
-`firmware-x4.bin`, `firmware-x3.bin`, `update.bin`, `update-x3.bin`,
-`FWUPDATE.BIN`, and `FWUPDX3.BIN`. `firmware-x4.bin` is the release-time name
-for the default X4 `target/release-images/firmware.bin`; `FWUPDATE.BIN` is the
-same X4 app image under Marigold's in-app updater trigger name.
+Tagged GitHub releases publish one canonical app image per hardware target:
+`firmware-x4.bin` and `firmware-x3.bin`. The release does not repeat those
+bytes under updater-specific aliases. Rename the selected device image according
+to the installation path:
+
+| Installation path | X4 card filename | X3 card filename |
+| --- | --- | --- |
+| Stock/OEM SD updater | `update.bin` | `update.bin` |
+| Marigold automatic boot-time update | `FWUPDATE.BIN` | `FWUPDX3.BIN` |
+| USB, web flasher, or Settings firmware picker | no rename required | no rename required |
+
+The project website supplies the same canonical image with the appropriate
+download filename for each SD workflow, so website users do not need to rename
+it manually. Direct GitHub release downloads retain their canonical filename.
+The additional aliases produced by `tools/build-release.sh` are local
+development conveniences, not separate release payloads.
 
 > [!CAUTION]
 > Never put `full-flash*.bin` on an SD card and never write it to `0x10000`. The
@@ -118,9 +129,9 @@ Produces, in `target/release-images/`: **`firmware-x3.bin`** (flash to
 `0x10000`), **`update-x3.bin`** (rename to `update.bin` for the stock X3 OEM
 updater), **`FWUPDX3.BIN`** (Marigold's X3 one-shot trigger), and
 **`full-flash-x3.bin`** (local whole-flash image for unlocked bench units only).
-Some X3 stock variants also recognize `FWUPDX3.BIN`; publishing both app-image
-aliases covers both bootloader conventions without ever mixing in the X4
-image. The app-only flash paths are otherwise the same as the X4 below.
+Some X3 stock variants also recognize `FWUPDX3.BIN`; the website offers the
+canonical X3 image under either required card filename without ever mixing in
+the X4 image. The app-only flash paths are otherwise the same as the X4 below.
 
 > [!NOTE]
 > The X3 charges and flashes through a **4-pin magnetic pogo connector**, not
@@ -237,10 +248,12 @@ Implemented and verified on host tooling:
       installations.
 - [x] App descriptor with the open eFuse range at offset `0x20` (bootloader-gate
       workaround), verified present in the built image.
-- [x] Reproducible app/SD images (`firmware.bin`, `firmware-x3.bin`,
-      `update.bin`, `update-x3.bin`, `FWUPDATE.BIN`, `FWUPDX3.BIN`) plus
-      local-only `full-flash*.bin` bench images (`tools/build-release.sh`). The
-      SD images are app images written to `0x10000`, matching the OEM updater.
+- [x] Reproducible canonical app images (`firmware.bin`, `firmware-x3.bin`),
+      local updater-name aliases (`update.bin`, `update-x3.bin`,
+      `FWUPDATE.BIN`, `FWUPDX3.BIN`), and local-only `full-flash*.bin` bench
+      images (`tools/build-release.sh`). Tagged releases publish only the two
+      canonical device images. Every SD alias remains an app image written to
+      `0x10000`, matching the OEM updater.
 - [x] `cargo run` flashes the stock-compatible layout.
 - [x] **Image validator** (`proto::ota::validate_image`) — the integrity gate
       (magic / segment walk / XOR checksum / SHA-256 trailer) that must pass

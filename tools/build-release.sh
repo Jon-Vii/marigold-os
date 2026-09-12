@@ -19,9 +19,9 @@
 #                   NEVER write it to 0x10000 — it would land a bootloader in the
 #                   app slot and brick the device.
 #
-# GitHub releases publish only app/SD images: firmware-x4.bin, firmware-x3.bin,
-# update.bin, update-x3.bin, FWUPDATE.BIN, and FWUPDX3.BIN. full-flash*.bin
-# remains local-only.
+# GitHub releases publish only the two canonical app images:
+# firmware-x4.bin and firmware-x3.bin. The updater-specific aliases and
+# full-flash*.bin remain local-only.
 #
 # The app images carry our app descriptor (magic 0xABCD5432 at image offset
 # 0x20) with the wide-open eFuse-revision range, which is what lets the stock

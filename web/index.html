@@ -484,7 +484,7 @@
       <li><span class="n">3</span> Power on holding <b>Power + Up</b> to flash.</li>
     </ul>
     <a class="dl2" href="#" id="sd">Download SD image &#8595;</a>
-    <p class="txt">Already running Marigold? Use <a href="https://github.com/Jon-Vii/marigold-os/releases/latest/download/FWUPDATE.BIN">FWUPDATE.BIN</a> on X4 or <a href="https://github.com/Jon-Vii/marigold-os/releases/latest/download/FWUPDX3.BIN">FWUPDX3.BIN</a> on X3 and reboot normally.</p>
+    <p class="txt">Already running Marigold? Download <a href="firmware-x4.bin" download="FWUPDATE.BIN">FWUPDATE.BIN</a> for X4 or <a href="firmware-x3.bin" download="FWUPDX3.BIN">FWUPDX3.BIN</a> for X3 and reboot normally.</p>
   </div>
 </section>
 
@@ -729,11 +729,10 @@
   // ESP Web Tools fetch fail even though opening the release URL works.
   const R="";
   const FW={x4:R+"firmware-x4.bin", x3:R+"firmware-x3.bin"};
-  const SD={x4:R+"update.bin", x3:R+"update-x3.bin"};
   const IMG={x4:"firmware-x4.bin", x3:"firmware-x3.bin"};
   const btns=document.querySelectorAll(".dev");
   const img=document.getElementById("img"), dl=document.getElementById("dl"), sd=document.getElementById("sd");
-  function set(dev){ const fl=document.getElementById("flasher"); if(fl) fl.manifest=dev==="x3"?"manifest-x3.json":"manifest-x4.json"; if(img)img.textContent=IMG[dev]; if(dl)dl.href=FW[dev]; if(sd)sd.href=SD[dev]; }
+  function set(dev){ const fl=document.getElementById("flasher"); if(fl) fl.manifest=dev==="x3"?"manifest-x3.json":"manifest-x4.json"; if(img)img.textContent=IMG[dev]; if(dl)dl.href=FW[dev]; if(sd){sd.href=FW[dev]; sd.download="update.bin";} }
   btns.forEach(b=>b.addEventListener("click",()=>{
     btns.forEach(x=>x.classList.remove("on")); b.classList.add("on"); set(b.dataset.dev);
   }));
