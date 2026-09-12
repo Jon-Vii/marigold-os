@@ -7,10 +7,10 @@
 use crate::reader_store::ReaderStore;
 pub(crate) use display::font::{style_marker_code, STYLE_MARKER};
 use proto::cache::PageRecord;
-use ui::reading::{block_height, page_record_at, paginate_block_pages, ReadingBlocks};
 pub(crate) use ui::reading::{
     first_styled_line_style, paragraph_indent, reader_layout_config, READER_WRAP_SAFETY,
 };
+use ui::reading::{page_record_at, paginate_block_pages, PageCursor};
 
 pub(crate) struct ReaderPagePlan {
     page_count: u32,
@@ -53,35 +53,16 @@ pub(crate) fn reader_page_at(sd_library: &ReaderStore, page_index: usize) -> Pag
 
 pub(crate) fn rebuild_page_index(library: &mut ReaderStore) {
     library.page_count = 0;
-    if library.block_count == 0 {
-        return;
+    let mut cursor = PageCursor::new();
+    while library.page_count < library.pages.len() {
+        let Some(page) = cursor.next_page(library) else {
+            break;
+        };
+        let index = library.page_count;
+        library.pages[index] = page;
+        library.page_spine[index] = library.block_spine[usize::from(page.first_block)];
+        library.page_count += 1;
     }
-
-    let ui::reading::PageBox {
-        top: page_top,
-        bottom: page_bottom,
-        ..
-    } = library.page_box();
-    let mut first_block = 0usize;
-    let mut block_count = 0usize;
-    let mut y = page_top;
-
-    for index in 0..library.block_count {
-        let height = block_height(library, index);
-        let new_page = (y + height > page_bottom
-            || ReadingBlocks::page_break_before(library, index))
-            && y > page_top;
-        if new_page {
-            push_sd_page_record(library, first_block, block_count);
-            first_block = index;
-            block_count = 0;
-            y = page_top;
-        }
-        block_count += 1;
-        y += height;
-    }
-
-    push_sd_page_record(library, first_block, block_count);
 }
 
 pub(crate) fn rebuild_toc_page_targets(library: &mut ReaderStore) {
@@ -108,17 +89,4 @@ pub(crate) fn rebuild_toc_page_targets(library: &mut ReaderStore) {
             .unwrap_or(0);
         library.toc_page[toc_index] = page.min(u16::MAX as usize) as u16;
     }
-}
-
-fn push_sd_page_record(library: &mut ReaderStore, first_block: usize, block_count: usize) {
-    if block_count == 0 || library.page_count >= library.pages.len() {
-        return;
-    }
-    let page_index = library.page_count;
-    library.pages[library.page_count] = PageRecord {
-        first_block: first_block as u16,
-        block_count: block_count as u16,
-    };
-    library.page_spine[page_index] = library.block_spine.get(first_block).copied().unwrap_or(0);
-    library.page_count += 1;
 }

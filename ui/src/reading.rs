@@ -155,71 +155,72 @@ pub fn paragraph_gap_after(source: &impl ReadingBlocks, index: usize) -> i16 {
     }
 }
 
-/// Count the pages the loaded blocks paginate into, using the same height
-/// math as rendering.
-pub fn paginate_block_pages(source: &impl ReadingBlocks) -> usize {
-    let PageBox {
-        top: page_top,
-        bottom: page_bottom,
-        ..
-    } = source.page_box();
-    let mut pages = 1u32;
-    let mut y = page_top;
-
-    for index in 0..source.block_count() {
-        if source.page_break_before(index) && y > page_top {
-            pages = pages.saturating_add(1);
-            y = page_top;
-        }
-        let height = block_height(source, index);
-
-        if y + block_ink_height(source, index) > page_bottom && y > page_top {
-            pages = pages.saturating_add(1);
-            y = page_top;
-        }
-        y += height;
-    }
-
-    pages.max(1) as usize
+/// Allocation-free cursor over complete page records. It does not borrow the
+/// source between calls, so a bounded ReaderStore can write each result into
+/// its page index without copying its blocks or allocating another page array.
+/// Keep the source's blocks and layout unchanged until the walk finishes.
+#[derive(Default)]
+pub struct PageCursor {
+    next_block: usize,
 }
 
-/// Walk the blocks until `page_index` and return its page record.
-pub fn page_record_at(source: &impl ReadingBlocks, page_index: usize) -> PageRecord {
-    let PageBox {
-        top: page_top,
-        bottom: page_bottom,
-        ..
-    } = source.page_box();
-    let mut current = 0usize;
-    let mut first_block = 0usize;
-    let mut block_count = 0usize;
-    let mut y = page_top;
+impl PageCursor {
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-    for index in 0..source.block_count() {
-        let height = block_height(source, index);
-        let new_page = (y + block_ink_height(source, index) > page_bottom
-            || source.page_break_before(index))
-            && y > page_top;
-        if new_page {
-            if current == page_index {
-                return PageRecord {
-                    first_block: first_block as u16,
-                    block_count: block_count as u16,
-                };
-            }
-            current += 1;
-            first_block = index;
-            block_count = 0;
-            y = page_top;
+    pub fn next_page(&mut self, source: &impl ReadingBlocks) -> Option<PageRecord> {
+        let first_block = self.next_block;
+        if first_block >= source.block_count() {
+            return None;
         }
-        block_count += 1;
-        y += height;
+        let bounds = source.page_box();
+        let mut y = i32::from(bounds.top);
+        while self.next_block < source.block_count() {
+            let index = self.next_block;
+            // Measure once: block_ink_height would wrap the same text again.
+            let height = i32::from(block_height(source, index));
+            let ink_height = height - i32::from(paragraph_gap_after(source, index));
+            if (y + ink_height > i32::from(bounds.bottom) || source.page_break_before(index))
+                && y > i32::from(bounds.top)
+            {
+                break;
+            }
+            self.next_block += 1;
+            y += height;
+        }
+        Some(PageRecord {
+            first_block: first_block as u16,
+            block_count: (self.next_block - first_block) as u16,
+        })
     }
+}
 
-    PageRecord {
-        first_block: first_block as u16,
-        block_count: block_count as u16,
+/// Count pages with the same walk used to build the firmware's bounded index.
+/// An empty source still advertises one blank reading page.
+pub fn paginate_block_pages(source: &impl ReadingBlocks) -> usize {
+    let mut cursor = PageCursor::new();
+    let mut pages = 0;
+    while cursor.next_page(source).is_some() {
+        pages += 1;
     }
+    pages.max(1)
+}
+
+/// Resolve a page with the index-building walk, clamping to the last page.
+pub fn page_record_at(source: &impl ReadingBlocks, page_index: usize) -> PageRecord {
+    let mut cursor = PageCursor::new();
+    let mut last = PageRecord {
+        first_block: 0,
+        block_count: 0,
+    };
+    for _ in 0..=page_index {
+        let Some(page) = cursor.next_page(source) else {
+            break;
+        };
+        last = page;
+    }
+    last
 }
 
 pub fn for_each_drawable_block(
@@ -410,8 +411,10 @@ pub const READER_WRAP_SAFETY: i16 = 4;
 /// family widened from one bit to two bits so the Custom slot cannot collide
 /// with the version field. v18: the page box joins the layout config as a
 /// portrait bit — the upright frame wraps at the short axis, so portrait
-/// and landscape pagination cache separately.
-const READER_LAYOUT_VERSION: u16 = 18;
+/// and landscape pagination cache separately. v19: the shared page walk fits
+/// ink rather than trailing paragraph spacing at the page edge. Retire indexes
+/// built by the old firmware walk, including their whole-book page totals.
+const READER_LAYOUT_VERSION: u16 = 19;
 
 /// Panel-geometry salt folded into the version bits: wrap points and page
 /// heights depend on the page box, so pagination cached on one panel must

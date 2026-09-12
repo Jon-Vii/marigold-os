@@ -486,7 +486,7 @@ tools/bench/bench.py report target/bench/latest.jsonl
 Typical development loop:
 
 ```sh
-cargo test -p app-core -p proto --target aarch64-apple-darwin
+cargo test -p app-core -p proto -p ui --target aarch64-apple-darwin
 cargo test --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --no-default-features
 cargo test --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --no-default-features --features device-x3
 cargo run --manifest-path tools/emulator/Cargo.toml --target aarch64-apple-darwin --no-default-features -- --scenario fixtures/scenarios --check fixtures/golden
@@ -588,7 +588,8 @@ fw::library_sd          FAT scan, SD chip-select handling, and file discovery
 fw::sd_session          SD session open/close and the upload write pump
 fw::reader_cache        EPUB-to-cache loading into bounded proto::cache records
 fw::reader_cache_files  cache/state/credential/label file records on the card
-fw::reader_layout       page indexing, line wrapping, style markers, measurements
+ui::reading             Reader page plan: one page walk, wrapping, measurements, drawing
+fw::reader_layout       bounded page-index and TOC adapters over the shared page walk
 fw::reader_store        bounded loaded-book/library state shared by cache and views
 fw::catalog             the built-in fallback book's static content
 fw::sync_mem            the one-way memory loan for the Wi-Fi session

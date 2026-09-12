@@ -7,8 +7,7 @@ use display::font::{FontStyle, TypeSettings};
 use proto::cache::{BlockRecord, PageRecord};
 use proto::text::{TextAlign, TextRole};
 use ui::reading::{
-    block_first_line_indent, block_height, block_ink_height, body_font, wrapped_line_count,
-    PageBox, ReadingBlocks,
+    block_first_line_indent, body_font, wrapped_line_count, PageBox, PageCursor, ReadingBlocks,
 };
 
 pub struct BookSource {
@@ -206,45 +205,20 @@ impl BookStore {
         }
     }
 
-    /// The firmware's page walk (`reader_layout::rebuild_page_index`):
-    /// ink-height fit against the page bottom, forced breaks honored, and
-    /// the chapter list resolved to the page its heading lands on.
+    /// Build page records through the shared Reader page plan, then resolve
+    /// each chapter to the page containing its opening block.
     fn paginate(&mut self, chapter_blocks: &[usize]) {
         self.pages.clear();
-        if self.blocks.is_empty() {
-            return;
-        }
-        let page_box = PageBox::for_portrait(self.portrait);
-        let mut first_block = 0usize;
-        let mut block_count = 0usize;
-        let mut y = page_box.top;
+        let mut cursor = PageCursor::new();
         let mut chapter_cursor = 0usize;
-
-        for index in 0..self.blocks.len() {
-            let height = block_height(self, index);
-            let new_page = (y + block_ink_height(self, index) > page_box.bottom
-                || self.blocks[index].page_break_before)
-                && y > page_box.top;
-            if new_page {
-                self.pages.push(PageRecord {
-                    first_block: first_block as u16,
-                    block_count: block_count as u16,
-                });
-                first_block = index;
-                block_count = 0;
-                y = page_box.top;
-            }
-            if chapter_cursor < chapter_blocks.len() && chapter_blocks[chapter_cursor] == index {
+        while let Some(page) = cursor.next_page(self) {
+            let end = usize::from(page.first_block) + usize::from(page.block_count);
+            while chapter_cursor < chapter_blocks.len() && chapter_blocks[chapter_cursor] < end {
                 self.chapters[chapter_cursor].start_page = self.pages.len() as u16;
                 chapter_cursor += 1;
             }
-            block_count += 1;
-            y += height;
+            self.pages.push(page);
         }
-        self.pages.push(PageRecord {
-            first_block: first_block as u16,
-            block_count: block_count as u16,
-        });
     }
 }
 
@@ -353,4 +327,32 @@ fn parse(text: &str, store: &mut BookStore, chapter_blocks: &mut Vec<usize>) {
     }
     flush_paragraph(store, &mut paragraph);
     flush_verse(store, &mut verse_run);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chapter_targets_follow_shared_page_records_after_relayout() {
+        let source = BookSource {
+            title: "Pagination fixture",
+            author: "",
+            text: "# First\n\nBody text.\n\n> A quoted paragraph.\n\n# Second\n\nMore text.\n\n# Third\n\nEnd.",
+        };
+        for portrait in [false, true] {
+            let store = BookStore::build(&source, TypeSettings::DEFAULT, portrait);
+            assert_eq!(store.chapters.len(), 3);
+            assert_eq!(store.pages.len(), 3);
+            for (index, chapter) in store.chapters.iter().enumerate() {
+                assert_eq!(usize::from(chapter.start_page), index);
+                let page = store.pages[index];
+                assert_eq!(
+                    store.block_text(usize::from(page.first_block)),
+                    chapter.title
+                );
+                assert_eq!(page, ui::reading::page_record_at(&store, index));
+            }
+        }
+    }
 }
