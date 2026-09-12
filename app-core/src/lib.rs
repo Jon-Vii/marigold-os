@@ -909,6 +909,9 @@ impl ReaderState {
                     if !self.sd_complete && target == u16::MAX {
                         // This chapter has no page in the readable prefix yet.
                         // Keep the displayed position until the jump resolves.
+                        // Selection carries the requested chapter to storage;
+                        // chapter/page remain safe for Back, sleep, and progress.
+                        next.chapter = self.chapter;
                         self.page
                     } else {
                         u32::from(target)
@@ -919,6 +922,7 @@ impl ReaderState {
                 next.view = AppView::Reading;
             }
             (AppView::Chapters, Some(Button::Back)) => {
+                next.selection = self.chapter;
                 next.view = AppView::Reading;
             }
             (AppView::Wireless, Some(Button::Confirm)) => match self.sync_status {
@@ -2039,9 +2043,30 @@ mod tests {
         let chapters = press(press(state, Button::Confirm), Button::Next);
         let jumping = press(chapters, Button::Confirm);
         assert_eq!(jumping.view, AppView::Reading);
-        assert_eq!(jumping.chapter, 1);
+        assert_eq!(jumping.chapter, 0);
+        assert_eq!(
+            jumping.selection, 1,
+            "selection carries the unresolved jump target"
+        );
         assert_eq!(jumping.page, 3);
         assert_eq!(jumping.persisted().screen, 3);
+        assert_eq!(jumping.persisted().chapter, 0);
+        let cancelled = press(jumping, Button::Back);
+        assert_eq!(
+            (cancelled.view, cancelled.chapter, cancelled.page),
+            (AppView::Home, 0, 3)
+        );
+        assert_eq!(cancelled.persisted().chapter, 0);
+        let sleeping = press(jumping, Button::Power);
+        assert_eq!(
+            (sleeping.persisted().chapter, sleeping.persisted().screen),
+            (0, 3)
+        );
+        let backed_out = press(chapters, Button::Back);
+        assert_eq!(
+            (backed_out.chapter, backed_out.selection, backed_out.page),
+            (0, 0, 3)
+        );
         let resolved = jumping.apply_library_event(
             CTX,
             LibraryEvent::PrefixLoaded {

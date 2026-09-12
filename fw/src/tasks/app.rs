@@ -33,8 +33,8 @@ pub async fn run() {
     // send an extend even though page and chapter are unchanged.
     let mut reader_relayout_pending = false;
     let mut opening_book: Option<u32> = None;
-    // A fresh selection's page zero is provisional until the per-book resume
-    // resolves. Retain this marker across cancellation/failure so Settings or
+    // Opening a book or jumping to a chapter has a provisional position until
+    // storage resolves it. Retain this marker across cancellation/failure so
     // another Home action cannot overwrite the unread saved position either.
     let mut unresolved_position: Option<u32> = None;
     let mut suppress_input_until_open_settled = false;
@@ -158,7 +158,7 @@ pub async fn run() {
                 // Settled to be drained, so it must still render.
                 let mut awaiting_chapter_list = false;
                 if let Some(command) = storage_command {
-                    if let Some(book_id) = open_book_id(command) {
+                    if let Some(book_id) = provisional_position_book_id(command) {
                         unresolved_position = Some(book_id);
                     }
                     if should_send_storage_immediately(command) {
@@ -235,8 +235,10 @@ pub async fn run() {
                     }
                     if let Some(command) = pending_storage.take() {
                         log_storage_command("send", command);
-                        if let Some(book_id) = open_book_id(command) {
+                        if let Some(book_id) = provisional_position_book_id(command) {
                             unresolved_position = Some(book_id);
+                        }
+                        if let Some(book_id) = open_book_id(command) {
                             opening_book = Some(book_id);
                             suppress_input_until_open_settled = true;
                         }
@@ -467,6 +469,15 @@ fn should_send_storage_immediately(command: StorageCommand) -> bool {
     )
 }
 
+fn provisional_position_book_id(command: StorageCommand) -> Option<u32> {
+    match command {
+        StorageCommand::OpenBook { book_id, .. } | StorageCommand::JumpChapter { book_id, .. } => {
+            Some(book_id)
+        }
+        _ => None,
+    }
+}
+
 fn open_book_id(command: StorageCommand) -> Option<u32> {
     match command {
         StorageCommand::OpenBook { book_id, .. } => Some(book_id),
@@ -654,7 +665,7 @@ fn storage_command_for_transition(
             // The buffer held the TOC, so the section always reloads. A new
             // chapter selection resolves its page from the on-disk TOC; a
             // plain back-out just reloads the page we left.
-            return if next.chapter != previous.chapter {
+            return if next.selection != previous.chapter {
                 Some(jump_chapter_command(next, index))
             } else {
                 Some(extend_section_command(next, index))
@@ -720,7 +731,7 @@ fn jump_chapter_command(state: &ReaderState, index: u16) -> StorageCommand {
         request_id: next_reader_request_id(),
         book_id: state.book_id,
         index,
-        chapter: state.chapter,
+        chapter: state.selection,
         type_settings: state.type_settings(),
         portrait: app_core::is_portrait(state.orientation),
     }
