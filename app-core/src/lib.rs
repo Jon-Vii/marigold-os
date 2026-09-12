@@ -506,6 +506,23 @@ pub enum LibraryEvent {
         current_chapter: u16,
         chapter_pages: [u16; MAX_SD_CHAPTERS],
     },
+    /// A readable prefix has grown; only `complete` makes `pages` a book total.
+    PrefixLoaded {
+        request_id: u32,
+        book_id: u32,
+        pages: u32,
+        chapters: u16,
+        current_chapter: u16,
+        chapter_pages: [u16; MAX_SD_CHAPTERS],
+        complete: bool,
+        /// The resolved requested page, or None for progress without a page change.
+        page: Option<u32>,
+    },
+    /// Loading failed without establishing EOF; the readable prefix remains valid.
+    ReaderLoadFailed {
+        request_id: u32,
+        book_id: u32,
+    },
     ChapterPage {
         book_id: u32,
         chapter: u16,
@@ -542,6 +559,18 @@ pub enum LibraryEvent {
         font_family: u8,
         front_buttons: u8,
     },
+}
+
+impl LibraryEvent {
+    /// Firmware rejects obsolete reader replies before applying their state changes.
+    pub const fn reader_request_id(&self) -> Option<u32> {
+        match *self {
+            Self::PrefixLoaded { request_id, .. } | Self::ReaderLoadFailed { request_id, .. } => {
+                Some(request_id)
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Wi-Fi session lifecycle as shown on the Wireless screen. The wifi task
@@ -683,6 +712,9 @@ pub struct ReaderState {
     pub firmware_count: u16,
     pub firmware_status: FirmwareUpdateStatus,
     pub sd_page_count: u32,
+    pub sd_complete: bool,
+    /// A forward turn waiting for the readable prefix to reach this page.
+    pub pending_page: Option<u32>,
     pub sd_chapter_count: u16,
     pub sd_chapter_pages: [u16; MAX_SD_CHAPTERS],
     pub read_request_pending: bool,
@@ -721,6 +753,8 @@ impl ReaderState {
             firmware_count: 0,
             firmware_status: FirmwareUpdateStatus::Scanning,
             sd_page_count: 1,
+            sd_complete: true,
+            pending_page: None,
             sd_chapter_count: 1,
             sd_chapter_pages: [0; MAX_SD_CHAPTERS],
             read_request_pending: false,
@@ -794,6 +828,8 @@ impl ReaderState {
                     next.selection = 0;
                     next.page = 0;
                     next.sd_page_count = 1;
+                    next.sd_complete = false;
+                    next.pending_page = None;
                     next.sd_chapter_count = 1;
                     next.sd_chapter_pages = [0; MAX_SD_CHAPTERS];
                     next.read_request_pending = false;
@@ -806,8 +842,12 @@ impl ReaderState {
             }
             (AppView::Reading, Some(Button::Next | Button::PageNext)) => {
                 if ReaderSource::from_book_id(self.book_id).is_sd() {
-                    if self.page + 1 < self.sd_page_count {
-                        next.page = self.page + 1;
+                    if self.pending_page.is_some() {
+                        // Coalesce repeated turns while the same page is loading.
+                    } else if self.page.saturating_add(1) < self.sd_page_count {
+                        next.page = self.page.saturating_add(1);
+                    } else if !self.sd_complete {
+                        next.pending_page = Some(self.page.saturating_add(1));
                     } else {
                         next.page = self.sd_page_count.saturating_sub(1);
                     }
@@ -823,6 +863,7 @@ impl ReaderState {
                 }
             }
             (AppView::Reading, Some(Button::Previous | Button::PagePrevious)) => {
+                next.pending_page = None;
                 if ReaderSource::from_book_id(self.book_id).is_sd() {
                     if self.page > 0 {
                         next.page = self.page - 1;
@@ -839,6 +880,7 @@ impl ReaderState {
                 }
             }
             (AppView::Reading, Some(Button::Confirm)) => {
+                next.pending_page = None;
                 next.view = AppView::Chapters;
                 // `chapter` already tracks the reading position (kept current
                 // by the firmware's Loaded event, un-capped); opening the list
@@ -846,6 +888,7 @@ impl ReaderState {
                 next.selection = self.chapter as u16;
             }
             (AppView::Reading, Some(Button::Back)) => {
+                next.pending_page = None;
                 next.view = AppView::Home;
                 next.selection = 0;
             }
@@ -858,12 +901,18 @@ impl ReaderState {
             (AppView::Chapters, Some(Button::Confirm)) => {
                 next.chapter = self.selection;
                 next.page = if ReaderSource::from_book_id(self.book_id).is_sd() {
-                    u32::from(
-                        self.sd_chapter_pages
-                            .get(self.selection as usize)
-                            .copied()
-                            .unwrap_or(0),
-                    )
+                    let target = self
+                        .sd_chapter_pages
+                        .get(self.selection as usize)
+                        .copied()
+                        .unwrap_or(if self.sd_complete { 0 } else { u16::MAX });
+                    if !self.sd_complete && target == u16::MAX {
+                        // This chapter has no page in the readable prefix yet.
+                        // Keep the displayed position until the jump resolves.
+                        self.page
+                    } else {
+                        u32::from(target)
+                    }
                 } else {
                     0
                 };
@@ -1013,6 +1062,8 @@ impl ReaderState {
             } => {
                 if self.book_id == book_id {
                     self.sd_page_count = pages.max(1);
+                    self.sd_complete = true;
+                    self.pending_page = None;
                     self.sd_chapter_count = chapters.max(1);
                     self.sd_chapter_pages = chapter_pages;
                     self.page = self.page.min(self.sd_page_count.saturating_sub(1));
@@ -1020,6 +1071,54 @@ impl ReaderState {
                     // book; adopt it so the cursor tracks past the cap that the
                     // page-turn recompute (sd_chapter_for_page) saturates at.
                     self.chapter = current_chapter;
+                    self.dirty = Rect::FULL;
+                }
+            }
+            LibraryEvent::PrefixLoaded {
+                request_id: _,
+                book_id,
+                pages,
+                chapters,
+                current_chapter,
+                chapter_pages,
+                complete,
+                page,
+            } => {
+                if self.book_id == book_id {
+                    self.sd_page_count = pages.max(1);
+                    self.sd_complete = complete;
+                    self.sd_chapter_count = chapters.max(1);
+                    self.sd_chapter_pages = chapter_pages;
+                    let last_page = self.sd_page_count.saturating_sub(1);
+                    if self.view == AppView::Reading {
+                        let resolved = page.filter(|resolved| {
+                            self.pending_page.map_or(true, |pending| {
+                                *resolved == pending
+                                    || (complete && *resolved == pending.min(last_page))
+                            })
+                        });
+                        if let Some(resolved) = resolved {
+                            self.page = resolved;
+                            self.pending_page = None;
+                            self.chapter = current_chapter;
+                            self.selection = current_chapter;
+                        } else if complete {
+                            // EOF can arrive before a pending forward target exists.
+                            self.page = self.pending_page.unwrap_or(self.page).min(last_page);
+                            self.pending_page = None;
+                            self.chapter = self.sd_chapter_for_page(self.page);
+                            self.selection = self.chapter;
+                        }
+                    }
+                    if complete {
+                        self.page = self.page.min(last_page);
+                    }
+                    self.dirty = Rect::FULL;
+                }
+            }
+            LibraryEvent::ReaderLoadFailed { book_id, .. } => {
+                if self.book_id == book_id {
+                    self.pending_page = None;
                     self.dirty = Rect::FULL;
                 }
             }
@@ -1084,6 +1183,8 @@ impl ReaderState {
                 self.book_id = book_id;
                 self.chapter = chapter;
                 self.page = page;
+                self.pending_page = None;
+                self.sd_complete = page_count > 0;
                 // Give the Home progress bar a real denominator on wake, before
                 // the book opens; the Loaded event refreshes it once read.
                 if page_count > 0 {
@@ -1182,7 +1283,11 @@ impl ReaderState {
             kind,
             view: self.view,
             page: self.page,
-            page_count: self.sd_page_count,
+            page_count: if self.sd_complete {
+                self.sd_page_count
+            } else {
+                0
+            },
             chapter: self.chapter,
             selection: self.selection,
             book_id: self.book_id,
@@ -1250,11 +1355,17 @@ impl ReaderState {
 
     pub fn sd_chapter_for_page(self, page: u32) -> u16 {
         let mut selected = 0u16;
+        let mut best_page = None;
         for index in 0..self.sd_chapter_count.min(MAX_SD_CHAPTERS as u16) {
-            if u32::from(self.sd_chapter_pages[index as usize]) <= page {
+            let start = self.sd_chapter_pages[index as usize];
+            // Prefix TOCs can have unresolved entries before known chapters;
+            // shared spines and unresolved links also make targets non-monotonic.
+            if (!self.sd_complete && start == u16::MAX) || u32::from(start) > page {
+                continue;
+            }
+            if best_page.is_none_or(|best| start > best) {
+                best_page = Some(start);
                 selected = index;
-            } else {
-                break;
             }
         }
         selected
@@ -1329,10 +1440,12 @@ fn home_action_for_button(button: Button) -> HomeAction {
 fn apply_home_action(mut state: ReaderState, action: HomeAction) -> ReaderState {
     state.selection = 0;
     state.read_request_pending = false;
+    state.pending_page = None;
     match action {
         HomeAction::Read => {
             if ReaderSource::from_book_id(state.book_id).is_sd() {
                 state.view = AppView::Reading;
+                state.sd_complete = false;
                 state.selection = state.chapter as u16;
             } else if state.library_count > 0 {
                 state.view = AppView::Library;
@@ -1663,6 +1776,234 @@ mod tests {
     }
 
     #[test]
+    fn progressive_reader_events_carry_the_request_generation() {
+        let ready = LibraryEvent::PrefixLoaded {
+            request_id: 17,
+            book_id: ReaderSource::sd(0).book_id(),
+            pages: 4,
+            chapters: 1,
+            current_chapter: 0,
+            chapter_pages: [0; MAX_SD_CHAPTERS],
+            complete: false,
+            page: Some(3),
+        };
+        assert_eq!(ready.reader_request_id(), Some(17));
+        let failed = LibraryEvent::ReaderLoadFailed {
+            request_id: 18,
+            book_id: ReaderSource::sd(0).book_id(),
+        };
+        assert_eq!(failed.reader_request_id(), Some(18));
+        assert_eq!(LibraryEvent::Scanned { count: 2 }.reader_request_id(), None);
+        assert_eq!(
+            LibraryEvent::Loaded {
+                book_id: ReaderSource::sd(0).book_id(),
+                pages: 4,
+                chapters: 1,
+                current_chapter: 0,
+                chapter_pages: [0; MAX_SD_CHAPTERS],
+            }
+            .reader_request_id(),
+            None
+        );
+    }
+
+    #[test]
+    fn prefix_end_queues_one_turn_without_changing_displayed_page() {
+        let mut state = ReaderState::boot();
+        state.view = AppView::Reading;
+        state.book_id = ReaderSource::sd(0).book_id();
+        state.page = 3;
+        state.sd_page_count = 4;
+        state.sd_complete = false;
+        let waiting = press(state, Button::Next);
+        assert_eq!(waiting.page, 3);
+        assert_eq!(waiting.pending_page, Some(4));
+        let waiting = press(waiting, Button::PageNext);
+        assert_eq!(waiting.page, 3);
+        assert_eq!(waiting.pending_page, Some(4));
+        assert_eq!(waiting.render_request(RenderKind::Page).page_count, 0);
+
+        let progress = prefix_event(waiting, 8, false, None);
+        assert_eq!(progress.page, 3);
+        assert_eq!(progress.pending_page, Some(4));
+        assert_eq!(press(progress, Button::Next).page, 3);
+        let ready = prefix_event(progress, 8, false, Some(4));
+        assert_eq!(ready.page, 4);
+        assert_eq!(ready.pending_page, None);
+        assert_eq!(press(ready, Button::Next).page, 5);
+    }
+
+    fn prefix_event(
+        state: ReaderState,
+        pages: u32,
+        complete: bool,
+        page: Option<u32>,
+    ) -> ReaderState {
+        state.apply_library_event(
+            CTX,
+            LibraryEvent::PrefixLoaded {
+                request_id: 1,
+                book_id: state.book_id,
+                pages,
+                chapters: 1,
+                current_chapter: 0,
+                chapter_pages: [0; MAX_SD_CHAPTERS],
+                complete,
+                page,
+            },
+        )
+    }
+
+    #[test]
+    fn incomplete_prefix_preserves_a_distant_resume_target() {
+        let mut state = ReaderState::boot();
+        state.view = AppView::Reading;
+        state.book_id = ReaderSource::sd(0).book_id();
+        state.page = 250;
+        let state = prefix_event(state, 12, false, None);
+        assert_eq!(state.page, 250);
+        assert_eq!(state.sd_page_count, 12);
+        assert!(!state.sd_complete);
+        let state = prefix_event(state, 300, false, Some(250));
+        assert_eq!(state.page, 250);
+    }
+
+    #[test]
+    fn prefix_eof_resolves_pending_turn_and_exposes_book_total() {
+        let mut state = ReaderState::boot();
+        state.view = AppView::Reading;
+        state.book_id = ReaderSource::sd(0).book_id();
+        state.page = 3;
+        state.pending_page = Some(4);
+        state.sd_complete = false;
+        for resolved_page in [None, Some(3)] {
+            let complete = prefix_event(state, 4, true, resolved_page);
+            assert_eq!(complete.page, 3);
+            assert_eq!(complete.pending_page, None);
+            assert!(complete.sd_complete);
+            assert_eq!(complete.render_request(RenderKind::Page).page_count, 4);
+            assert_eq!(press(complete, Button::Next).page, 3);
+        }
+        state.page = 250;
+        state.pending_page = None;
+        assert_eq!(prefix_event(state, 4, true, Some(3)).page, 3);
+    }
+
+    #[test]
+    fn unrelated_prefix_page_does_not_consume_pending_turn() {
+        let mut state = ReaderState::boot();
+        state.view = AppView::Reading;
+        state.book_id = ReaderSource::sd(0).book_id();
+        state.page = 3;
+        state.pending_page = Some(4);
+        let state = prefix_event(state, 8, false, Some(2));
+        assert_eq!(state.page, 3);
+        assert_eq!(state.pending_page, Some(4));
+        let other_book = state.apply_library_event(
+            CTX,
+            LibraryEvent::PrefixLoaded {
+                request_id: 1,
+                book_id: ReaderSource::sd(1).book_id(),
+                pages: 100,
+                chapters: 1,
+                current_chapter: 0,
+                chapter_pages: [0; MAX_SD_CHAPTERS],
+                complete: true,
+                page: Some(20),
+            },
+        );
+        assert_eq!(other_book.page, 3);
+        assert_eq!(other_book.sd_page_count, 8);
+        assert_eq!(other_book.pending_page, Some(4));
+    }
+
+    #[test]
+    fn previous_back_and_chapter_overview_cancel_pending_turn() {
+        let mut state = ReaderState::boot();
+        state.view = AppView::Reading;
+        state.book_id = ReaderSource::sd(0).book_id();
+        state.page = 3;
+        state.pending_page = Some(4);
+        let previous = press(state, Button::Previous);
+        assert_eq!(previous.page, 2);
+        assert_eq!(previous.pending_page, None);
+        let home = press(state, Button::Back);
+        assert_eq!(home.view, AppView::Home);
+        assert_eq!(home.pending_page, None);
+        assert_eq!(prefix_event(home, 8, false, Some(4)).page, 3);
+        let chapters = press(state, Button::Confirm);
+        assert_eq!(chapters.view, AppView::Chapters);
+        assert_eq!(chapters.pending_page, None);
+    }
+
+    #[test]
+    fn selecting_book_starts_with_unknown_total_and_no_pending_turn() {
+        let mut state = ReaderState::boot();
+        state.view = AppView::Library;
+        state.library_count = 2;
+        state.selection = 1;
+        state.pending_page = Some(20);
+        let state = press(state, Button::Confirm);
+        assert_eq!(state.book_id, ReaderSource::sd(1).book_id());
+        assert_eq!(state.page, 0);
+        assert!(!state.sd_complete);
+        assert_eq!(state.pending_page, None);
+    }
+
+    #[test]
+    fn legacy_loaded_keeps_complete_book_semantics() {
+        let mut state = ReaderState::boot();
+        state.page = 30;
+        state.pending_page = Some(31);
+        state.sd_complete = false;
+        let state = state.apply_library_event(
+            CTX,
+            LibraryEvent::Loaded {
+                book_id: state.book_id,
+                pages: 10,
+                chapters: 1,
+                current_chapter: 0,
+                chapter_pages: [0; MAX_SD_CHAPTERS],
+            },
+        );
+        assert!(state.sd_complete);
+        assert_eq!(state.pending_page, None);
+        assert_eq!(state.page, 9);
+    }
+
+    #[test]
+    fn failed_prefix_extension_preserves_position_and_allows_retry() {
+        let mut state = ReaderState::boot();
+        state.view = AppView::Reading;
+        state.book_id = ReaderSource::sd(0).book_id();
+        state.page = 3;
+        state.sd_page_count = 4;
+        state.sd_complete = false;
+        let pending = press(state, Button::Next);
+        assert_eq!(pending.pending_page, Some(4));
+        let unrelated = pending.apply_library_event(
+            CTX,
+            LibraryEvent::ReaderLoadFailed {
+                request_id: 1,
+                book_id: ReaderSource::sd(1).book_id(),
+            },
+        );
+        assert_eq!(unrelated.pending_page, Some(4));
+        let failed = pending.apply_library_event(
+            CTX,
+            LibraryEvent::ReaderLoadFailed {
+                request_id: 1,
+                book_id: state.book_id,
+            },
+        );
+        assert_eq!(failed.pending_page, None);
+        assert_eq!(failed.page, 3);
+        assert_eq!(failed.sd_page_count, 4);
+        assert!(!failed.sd_complete);
+        assert_eq!(press(failed, Button::Next).pending_page, Some(4));
+    }
+
+    #[test]
     fn reading_next_previous_bounds_sd_pages() {
         let mut state = ReaderState::boot();
         state.view = AppView::Reading;
@@ -1683,6 +2024,57 @@ mod tests {
         let state = press(press(state, Button::Next), Button::Confirm);
         assert_eq!(state.view, AppView::Reading);
         assert_eq!(state.chapter, 1);
+    }
+
+    #[test]
+    fn unknown_chapter_jump_keeps_page_until_the_prefix_resolves_it() {
+        let mut state = ReaderState::boot();
+        state.view = AppView::Reading;
+        state.book_id = ReaderSource::sd(0).book_id();
+        state.page = 3;
+        state.sd_page_count = 4;
+        state.sd_complete = false;
+        state.sd_chapter_count = 2;
+        state.sd_chapter_pages[1] = u16::MAX;
+        let chapters = press(press(state, Button::Confirm), Button::Next);
+        let jumping = press(chapters, Button::Confirm);
+        assert_eq!(jumping.view, AppView::Reading);
+        assert_eq!(jumping.chapter, 1);
+        assert_eq!(jumping.page, 3);
+        assert_eq!(jumping.persisted().screen, 3);
+        let resolved = jumping.apply_library_event(
+            CTX,
+            LibraryEvent::PrefixLoaded {
+                request_id: 1,
+                book_id: state.book_id,
+                pages: 31,
+                chapters: 2,
+                current_chapter: 1,
+                chapter_pages: [0; MAX_SD_CHAPTERS],
+                complete: false,
+                page: Some(30),
+            },
+        );
+        assert_eq!(resolved.page, 30);
+        assert_eq!(resolved.chapter, 1);
+    }
+
+    #[test]
+    fn prefix_chapter_cursor_skips_unresolved_entries_and_shared_spines() {
+        let mut state = ReaderState::boot();
+        state.view = AppView::Reading;
+        state.book_id = ReaderSource::sd(0).book_id();
+        state.sd_complete = false;
+        state.sd_page_count = 407;
+        state.sd_chapter_count = 6;
+        state.sd_chapter_pages[..6].copy_from_slice(&[u16::MAX, 0, 280, 280, 0, u16::MAX]);
+        state.page = 302;
+        state.chapter = 2;
+        let next = press(state, Button::Next);
+        assert_eq!((next.page, next.chapter), (303, 2));
+        let previous = press(next, Button::Previous);
+        assert_eq!((previous.page, previous.chapter), (302, 2));
+        assert_eq!(state.sd_chapter_for_page(u32::MAX), 2);
     }
 
     #[test]

@@ -1826,6 +1826,7 @@ version = "0.1.0"
 dependencies = [
  "app-core",
  "display",
+ "embedded-sdmmc",
  "heapless 0.9.3",
  "proto",
 ]

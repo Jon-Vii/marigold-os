@@ -138,6 +138,9 @@ pub struct SectionV2Header {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BookV2Header {
+    /// Next raw OPF spine ordinal to append; None is a terminal cache.
+    pub next_spine: Option<u16>,
+    pub generated_toc: bool,
     pub source_hash: u32,
     pub source_size: u32,
     pub total_pages: u32,
@@ -480,14 +483,14 @@ pub fn encode_book_v2_header(header: BookV2Header, out: &mut [u8]) -> Result<usi
     write_u32(out, 0, CACHE_MAGIC);
     write_u16(out, 4, CACHE_V2_VERSION);
     out[6] = header.partial as u8;
-    out[7] = 0;
+    out[7] = u8::from(header.next_spine.is_some()) | (u8::from(header.generated_toc) << 1);
     write_u32(out, 8, header.source_hash);
     write_u32(out, 12, header.source_size);
     write_u32(out, 16, header.total_pages);
     write_u16(out, 20, header.section_count);
     write_u16(out, 22, header.spine_count);
     write_u16(out, 24, header.toc_count);
-    write_u16(out, 26, 0);
+    write_u16(out, 26, header.next_spine.unwrap_or(0));
     write_u16(out, 28, header.viewport_width);
     write_u16(out, 30, header.viewport_height);
     write_u16(out, 32, header.font_config);
@@ -508,6 +511,12 @@ pub fn decode_book_v2_header(input: &[u8]) -> Result<BookV2Header, CacheError> {
         return Err(CacheError::BadVersion);
     }
     Ok(BookV2Header {
+        next_spine: if input[7] & 1 != 0 {
+            Some(read_u16(input, 26)?)
+        } else {
+            None
+        },
+        generated_toc: input[7] & 2 != 0,
         partial: input[6] != 0,
         source_hash: read_u32(input, 8)?,
         source_size: read_u32(input, 12)?,
@@ -1140,6 +1149,8 @@ mod tests {
     #[test]
     fn book_v2_cache_records_round_trip() {
         let header = BookV2Header {
+            next_spine: Some(17),
+            generated_toc: true,
             source_hash: 0x1234_5678,
             source_size: 98_765,
             total_pages: 123,
@@ -1169,6 +1180,16 @@ mod tests {
         encode_book_v2_section(section, &mut section_bytes).expect("book v2 section encodes");
 
         assert_eq!(decode_book_v2_header(&header_bytes).unwrap(), header);
+        // Older complete records reserved these bytes as zero. Progress and
+        // generated-heading state must not be inferred from the partial flag.
+        let mut legacy = header_bytes;
+        legacy[7] = 0;
+        legacy[26..28].fill(0);
+        let old = decode_book_v2_header(&legacy).unwrap();
+        assert_eq!(old.next_spine, None);
+        assert!(!old.generated_toc);
+        assert!(old.partial);
+        assert_eq!(old.total_pages, header.total_pages);
         assert_eq!(decode_book_v2_section(&section_bytes).unwrap(), section);
         assert_eq!(
             book_v2_cache_size(header),

@@ -121,9 +121,34 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
         esp_hal::system::software_reset();
     }
 
+
+
+    // A continuation is tiny Copy data, never a retained ZIP/FAT/parser borrow.
+    // Give queued display/storage commands and the other executor tasks a turn
+    // before appending the next spine for a distant page/chapter request.
+    let mut pending_reader: Option<StorageCommand> = None;
+    // A loading plate can have the same request as its eventual page. Keep
+    // this bit separate so a RAM reply only skips a proven body-page redraw.
+    let mut last_reader_render_ready = false;
     loop {
-        match select(DISPLAY_COMMANDS.receive(), STORAGE_COMMANDS.receive()).await {
+        let incoming = if pending_reader.is_some() {
+            match select(
+                select(DISPLAY_COMMANDS.receive(), STORAGE_COMMANDS.receive()),
+                embassy_time::Timer::after_millis(1),
+            )
+            .await
+            {
+                Either::First(command) => command,
+                Either::Second(()) => Either::Second(pending_reader.take().unwrap()),
+            }
+        } else {
+            select(DISPLAY_COMMANDS.receive(), STORAGE_COMMANDS.receive()).await
+        };
+        match incoming {
             Either::First(DisplayCommand::Render(request)) => {
+                if pending_reader.is_some_and(|command| !pending_reader_matches(command, request)) {
+                    pending_reader = None;
+                }
                 let content_context_changed = refresh_planner
                     .last_request()
                     .map(|last| (last.view, last.book_id))
@@ -213,6 +238,20 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                 {
                     let flush_ms = flush_start.elapsed().as_millis();
                     refresh_planner.record_render(request, mode);
+                    last_reader_render_ready = request.view == AppView::Reading
+                        && ReaderSource::from_book_id(request.book_id)
+                            .sd_index()
+                            .is_some_and(|index| {
+                                sd_library.covers_global_page(index as usize, request.page)
+                            })
+                        && sd_library.type_settings()
+                            == display::font::TypeSettings {
+                                size: request.font_size,
+                                spacing: request.line_spacing,
+                                weight: request.font_weight,
+                                family: request.font_family,
+                            }
+                        && sd_library.portrait() == app_core::is_portrait(request.orientation);
                     prev_fb.copy_from(fb);
                     let prestage_start = Instant::now();
                     prev_prestaged = display_flush::prestage_previous(&mut epd, fb, tx_band)
@@ -258,6 +297,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                 }
             }
             Either::First(DisplayCommand::Sleep) => {
+                pending_reader = None;
                 let sleep_start = Instant::now();
                 esp_println::println!(
                     "bench: sleep phase=requested screen_on={} t_ms={}",
@@ -344,6 +384,20 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                 esp_println::println!("storage: upload refused outside sync");
             }
             Either::Second(command) => {
+                // Cancellation must win before even the loading plate: a stale
+                // request must not repaint Reading over a newer Home frame.
+                let stale = match command {
+                    StorageCommand::OpenBook { request_id, .. }
+                    | StorageCommand::ExtendSection { request_id, .. }
+                    | StorageCommand::JumpChapter { request_id, .. }
+                    | StorageCommand::LoadChapters { request_id, .. } => {
+                        request_id != LATEST_READER_REQUEST_ID.load(Ordering::Relaxed)
+                    }
+                    _ => false,
+                };
+                if stale {
+                    continue;
+                }
                 // A layout change re-paginates the book, which blocks this
                 // task for the whole rebuild. Paint the title/author plate
                 // first so the wait reads as loading, not frozen: the store
@@ -372,13 +426,22 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                         .is_ok()
                         {
                             refresh_planner.record_render(loading_request, mode);
+                            last_reader_render_ready = false;
                             prev_fb.copy_from(fb);
                             prev_prestaged = false;
                         }
                     }
                 }
+                let reader_page_already_rendered = last_reader_render_ready
+                    && refresh_planner.screen_on()
+                    && refresh_planner.last_request().is_some_and(|request| {
+                        matches!(command, StorageCommand::ExtendSection { target_pages, .. }
+                            if u32::from(target_pages) == request.page)
+                            && pending_reader_matches(command, request)
+                    });
                 handle_storage_command(
                     command,
+                    reader_page_already_rendered,
                     &mut epd,
                     &mut sd_cs,
                     sd_library,
@@ -388,14 +451,45 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                     &mut pending_progress,
                     &mut last_progress_write,
                     &mut state_restored,
-                    refresh_planner.last_request(),
+                    &mut pending_reader,
                 );
             }
         }
     }
 }
 
-pub(crate) fn send_library_event(event: &LibraryEvent) {
+pub(crate) fn pending_reader_matches(command: StorageCommand, request: RenderRequest) -> bool {
+    let (book_id, type_settings, portrait) = match command {
+        StorageCommand::OpenBook {
+            book_id,
+            type_settings,
+            portrait,
+            ..
+        }
+        | StorageCommand::ExtendSection {
+            book_id,
+            type_settings,
+            portrait,
+            ..
+        }
+        | StorageCommand::JumpChapter {
+            book_id,
+            type_settings,
+            portrait,
+            ..
+        } => (book_id, type_settings, portrait),
+        _ => return false,
+    };
+    request.view == AppView::Reading
+        && request.book_id == book_id
+        && request.font_size == type_settings.size
+        && request.line_spacing == type_settings.spacing
+        && request.font_family == type_settings.family
+        && request.font_weight == type_settings.weight
+        && app_core::is_portrait(request.orientation) == portrait
+}
+
+fn send_library_event(event: &LibraryEvent) {
     if LIBRARY_EVENTS.try_send(*event).is_err() {
         esp_println::println!("display: library event queue full");
     }
@@ -480,6 +574,7 @@ fn open_loading_plate_request(
 #[allow(clippy::too_many_arguments)]
 fn handle_storage_command(
     command: StorageCommand,
+    reader_page_already_rendered: bool,
     epd: &mut Epd,
     sd_cs: &mut Output<'static>,
     sd_library: &mut ReaderStore,
@@ -489,7 +584,7 @@ fn handle_storage_command(
     pending_progress: &mut Option<AppStateRecord>,
     last_progress_write: &mut Option<Instant>,
     state_restored: &mut bool,
-    last_request: Option<RenderRequest>,
+    pending_reader: &mut Option<StorageCommand>,
 ) {
     let is_open_book = matches!(command, StorageCommand::OpenBook { .. });
     // The session decides what may run: progress writes stay alive during a
@@ -501,6 +596,7 @@ fn handle_storage_command(
     }
     match command {
         StorageCommand::LoanSyncMemory => {
+            *pending_reader = None;
             // The session only ends in a reset, so any coalesced position
             // must reach the card before the scratch is dismantled.
             if !flush_pending_progress(
@@ -592,6 +688,7 @@ fn handle_storage_command(
             type_settings,
             portrait,
         } => {
+            *pending_reader = None;
             let storage_start = Instant::now();
             if request_id != LATEST_READER_REQUEST_ID.load(Ordering::Relaxed) {
                 esp_println::println!(
@@ -617,7 +714,6 @@ fn handle_storage_command(
             // through untouched. Extends never resume.
             let mut chapter = chapter;
             let mut target_pages = target_pages;
-            let mut resumed = false;
             if is_open_book && chapter == 0 && target_pages == 0 {
                 if let Some((saved_chapter, saved_screen)) =
                     reader_cache::load_position(epd, sd_cs, sd_library, index as usize)
@@ -625,7 +721,6 @@ fn handle_storage_command(
                     if saved_chapter > 0 || saved_screen > 0 {
                         chapter = saved_chapter;
                         target_pages = saved_screen.min(u16::MAX as u32) as u16;
-                        resumed = true;
                         esp_println::println!(
                             "storage: resume book {} at chapter {} screen {}",
                             book_id,
@@ -654,16 +749,26 @@ fn handle_storage_command(
                     sd_library.advertised_page_count(),
                     sd_library.chapter_count_for_ui(),
                 );
-                send_loaded_library_event(&LibraryEvent::Loaded {
+                if reader_page_already_rendered {
+                    // The input render already showed this RAM page. Keep the
+                    // uncapped chapter cursor in sync without a second refresh.
+                    send_loaded_library_event(&LibraryEvent::ChapterCursor {
+                        book_id,
+                        current_chapter: sd_library.current_chapter(),
+                    });
+                    return;
+                }
+                send_loaded_library_event(&LibraryEvent::PrefixLoaded {
+                    request_id,
                     book_id,
                     pages: sd_library.advertised_page_count(),
                     chapters: sd_library.chapter_count_for_ui(),
                     current_chapter: sd_library.current_chapter(),
                     chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
+                    complete: sd_library.book_next_spine().is_none(),
+                    page: Some(target_pages as u32),
                 });
-                if resumed {
-                    send_resumed_position(book_id, chapter, target_pages, last_request);
-                }
+
                 return;
             }
             esp_println::println!(
@@ -683,19 +788,42 @@ fn handle_storage_command(
                 index as usize,
                 chapter,
                 target_pages as usize,
+                None,
                 scratch,
                 font_metrics,
             );
-            send_loaded_library_event(&LibraryEvent::Loaded {
+            if request_id != LATEST_READER_REQUEST_ID.load(Ordering::Relaxed) {
+                return;
+            }
+            if sd_library.reader_status() == BookLoadStatus::Loading {
+                *pending_reader = Some(StorageCommand::ExtendSection {
+                    request_id,
+                    book_id,
+                    index,
+                    chapter,
+                    target_pages,
+                    type_settings,
+                    portrait,
+                });
+                return;
+            }
+            if sd_library.reader_status() == BookLoadStatus::Error {
+                send_loaded_library_event(&LibraryEvent::ReaderLoadFailed {
+                    request_id,
+                    book_id,
+                });
+                return;
+            }
+            send_loaded_library_event(&LibraryEvent::PrefixLoaded {
+                request_id,
                 book_id,
                 pages: sd_library.advertised_page_count(),
                 chapters: sd_library.chapter_count_for_ui(),
                 current_chapter: sd_library.current_chapter(),
                 chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
+                complete: sd_library.book_next_spine().is_none(),
+                page: sd_library.requested_page(target_pages as u32, None),
             });
-            if resumed {
-                send_resumed_position(book_id, chapter, target_pages, last_request);
-            }
             esp_println::println!(
                 "storage: open complete status={:?} pages={} chapters={}",
                 sd_library.reader_status(),
@@ -739,12 +867,15 @@ fn handle_storage_command(
             );
             // Re-render the overview with the full list resident, syncing the
             // selection range to the full chapter count.
-            send_loaded_library_event(&LibraryEvent::Loaded {
+            send_loaded_library_event(&LibraryEvent::PrefixLoaded {
+                request_id,
                 book_id,
                 pages: sd_library.advertised_page_count(),
                 chapters: sd_library.chapter_count_for_ui(),
                 current_chapter: sd_library.current_chapter(),
                 chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
+                complete: sd_library.book_next_spine().is_none(),
+                page: None,
             });
         }
         StorageCommand::JumpChapter {
@@ -755,6 +886,7 @@ fn handle_storage_command(
             type_settings,
             portrait,
         } => {
+            *pending_reader = None;
             if request_id != LATEST_READER_REQUEST_ID.load(Ordering::Relaxed) {
                 return;
             }
@@ -771,7 +903,11 @@ fn handle_storage_command(
                 chapter as usize,
                 portrait,
             );
-            let target_page = sd_library.overview_page_at(chapter as usize);
+            let requested_spine =
+                u16::try_from(sd_library.overview_spine_at(chapter as usize)).ok();
+            let target_page = requested_spine
+                .and_then(|spine| sd_library.known_page_for_spine(spine))
+                .unwrap_or(0);
             let scratch = ensure_epub_scratch(epub_scratch);
             reader_cache::build_or_load_book_cache(
                 epd,
@@ -780,17 +916,34 @@ fn handle_storage_command(
                 index as usize,
                 chapter,
                 target_page as usize,
+                requested_spine,
                 scratch,
                 font_metrics,
             );
-            send_loaded_library_event(&LibraryEvent::Loaded {
+            if request_id != LATEST_READER_REQUEST_ID.load(Ordering::Relaxed) {
+                return;
+            }
+            if sd_library.reader_status() == BookLoadStatus::Loading {
+                *pending_reader = Some(command);
+                return;
+            }
+            if sd_library.reader_status() == BookLoadStatus::Error {
+                send_loaded_library_event(&LibraryEvent::ReaderLoadFailed {
+                    request_id,
+                    book_id,
+                });
+                return;
+            }
+            send_loaded_library_event(&LibraryEvent::PrefixLoaded {
+                request_id,
                 book_id,
                 pages: sd_library.advertised_page_count(),
                 chapters: sd_library.chapter_count_for_ui(),
                 current_chapter: sd_library.current_chapter(),
                 chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
+                complete: sd_library.book_next_spine().is_none(),
+                page: sd_library.requested_page(target_page, requested_spine),
             });
-            send_resumed_position(book_id, chapter, target_page, last_request);
         }
         StorageCommand::ReceiveUpload => {
             // Handled in the task loop before dispatch; reaching here means
@@ -976,33 +1129,6 @@ fn send_required_display_event(event: &DisplayEvent) {
     if DISPLAY_EVENTS.try_send(*event).is_err() {
         esp_println::println!("display: required display event queue full");
     }
-}
-
-/// Announces a per-book resume to the app as a Restored event, carrying
-/// the current display settings unchanged.
-fn send_resumed_position(
-    book_id: u32,
-    chapter: u16,
-    target_pages: u16,
-    last_request: Option<RenderRequest>,
-) {
-    let Some(request) = last_request else {
-        return;
-    };
-    send_required_library_event(&LibraryEvent::Restored {
-        book_id,
-        chapter,
-        page: target_pages as u32,
-        // The book is loaded here, so carry its known total page count.
-        page_count: request.page_count,
-        reading_orientation: request.orientation as u8,
-        refresh_policy: request.refresh_policy as u8,
-        font_size: request.font_size as u8,
-        line_spacing: request.line_spacing as u8,
-        font_weight: request.font_weight as u8,
-        font_family: request.font_family as u8,
-        front_buttons: request.front_buttons as u8,
-    });
 }
 
 /// Kept out of line: first-call initialization moves a multi-KB scratch

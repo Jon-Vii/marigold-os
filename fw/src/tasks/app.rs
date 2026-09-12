@@ -33,6 +33,10 @@ pub async fn run() {
     // send an extend even though page and chapter are unchanged.
     let mut reader_relayout_pending = false;
     let mut opening_book: Option<u32> = None;
+    // A fresh selection's page zero is provisional until the per-book resume
+    // resolves. Retain this marker across cancellation/failure so Settings or
+    // another Home action cannot overwrite the unread saved position either.
+    let mut unresolved_position: Option<u32> = None;
     let mut suppress_input_until_open_settled = false;
     let mut block_confirm_until: Option<Instant> = None;
     // Defer the first paint. ReaderState::boot() defaults to the built-in guide
@@ -85,6 +89,12 @@ pub async fn run() {
                     // (deep sleep is terminal), so there is no in-app "asleep"
                     // state to toggle back out of here.
                     esp_println::println!("app: sleep requested");
+                    next_reader_request_id();
+                    state.pending_page = None;
+                    pending_storage = pending_storage
+                        .filter(|command| !should_send_storage_immediately(*command));
+                    opening_book = None;
+                    suppress_input_until_open_settled = false;
                     let _ = POWER_EVENTS.send(PowerEvent::SleepNow).await;
                     continue;
                 }
@@ -97,14 +107,28 @@ pub async fn run() {
                 }
 
                 if opening_book.is_some() || suppress_input_until_open_settled {
-                    esp_println::println!("app: input ignored while book open pending");
-                    continue;
+                    // Respect the oriented Back key even while a cold open is
+                    // parsing. The request generation cancels its storage work.
+                    if state.view != AppView::Reading
+                        || state.apply_input(ctx, event).view != AppView::Home
+                    {
+                        esp_println::println!("app: input ignored while book open pending");
+                        continue;
+                    }
                 }
 
                 let _ = POWER_EVENTS.try_send(PowerEvent::Activity);
                 let previous = state;
                 let previous_persisted = state.persisted();
                 state = state.apply_input(ctx, event);
+                if previous.view == AppView::Reading && state.view != AppView::Reading {
+                    next_reader_request_id();
+                    pending_storage = pending_storage
+                        .filter(|command| !should_send_storage_immediately(*command));
+                    opening_book = None;
+                    suppress_input_until_open_settled = false;
+                    block_confirm_until = None;
+                }
                 let next_persisted = state.persisted();
                 if previous.type_settings() != state.type_settings()
                     || app_core::is_portrait(previous.orientation)
@@ -134,6 +158,9 @@ pub async fn run() {
                 // Settled to be drained, so it must still render.
                 let mut awaiting_chapter_list = false;
                 if let Some(command) = storage_command {
+                    if let Some(book_id) = open_book_id(command) {
+                        unresolved_position = Some(book_id);
+                    }
                     if should_send_storage_immediately(command) {
                         log_storage_command("send", command);
                         if let Some(book_id) = open_book_id(command) {
@@ -155,7 +182,9 @@ pub async fn run() {
                         pending_storage = Some(command);
                     }
                 }
-                if previous_persisted != next_persisted {
+                if previous_persisted != next_persisted
+                    && unresolved_position != Some(state.book_id)
+                {
                     let command = StorageCommand::StoreProgress(next_persisted);
                     if STORAGE_COMMANDS.try_send(command).is_err() && pending_storage.is_none() {
                         pending_storage = Some(command);
@@ -207,6 +236,7 @@ pub async fn run() {
                     if let Some(command) = pending_storage.take() {
                         log_storage_command("send", command);
                         if let Some(book_id) = open_book_id(command) {
+                            unresolved_position = Some(book_id);
                             opening_book = Some(book_id);
                             suppress_input_until_open_settled = true;
                         }
@@ -237,6 +267,9 @@ pub async fn run() {
                     render_pending = false;
                 }
                 DisplayEvent::Library(event) => {
+                    if !library_event_is_current(&event) {
+                        continue;
+                    }
                     if let Some(book_id) = loaded_book_id(&event) {
                         if opening_book == Some(book_id) {
                             opening_book = None;
@@ -247,7 +280,20 @@ pub async fn run() {
                     } else {
                         library_event_affects_view(&state, &event)
                     };
+                    let previous_persisted = state.persisted();
                     state = state.apply_library_event(ctx, event);
+                    let resolved_position =
+                        resolve_open_position(&event, &state, &mut unresolved_position);
+                    if matches!(event, crate::LibraryEvent::PrefixLoaded { .. })
+                        && unresolved_position != Some(state.book_id)
+                        && (resolved_position || previous_persisted != state.persisted())
+                    {
+                        let command = StorageCommand::StoreProgress(state.persisted());
+                        if STORAGE_COMMANDS.try_send(command).is_err() && pending_storage.is_none()
+                        {
+                            pending_storage = Some(command);
+                        }
+                    }
                     if !should_render {
                         continue;
                     }
@@ -261,6 +307,9 @@ pub async fn run() {
                 }
             },
             Either4::Third(event) => {
+                if !library_event_is_current(&event) {
+                    continue;
+                }
                 if let Some(book_id) = loaded_book_id(&event) {
                     if opening_book == Some(book_id) {
                         opening_book = None;
@@ -271,7 +320,19 @@ pub async fn run() {
                 } else {
                     library_event_affects_view(&state, &event)
                 };
+                let previous_persisted = state.persisted();
                 state = state.apply_library_event(ctx, event);
+                let resolved_position =
+                    resolve_open_position(&event, &state, &mut unresolved_position);
+                if matches!(event, crate::LibraryEvent::PrefixLoaded { .. })
+                    && unresolved_position != Some(state.book_id)
+                    && (resolved_position || previous_persisted != state.persisted())
+                {
+                    let command = StorageCommand::StoreProgress(state.persisted());
+                    if STORAGE_COMMANDS.try_send(command).is_err() && pending_storage.is_none() {
+                        pending_storage = Some(command);
+                    }
+                }
                 if !should_render {
                     continue;
                 }
@@ -311,6 +372,35 @@ fn first_render_kind(boot_render_pending: &mut bool) -> RenderKind {
     }
 }
 
+fn library_event_is_current(event: &crate::LibraryEvent) -> bool {
+    event.reader_request_id().map_or(true, |request_id| {
+        request_id == LATEST_READER_REQUEST_ID.load(Ordering::Relaxed)
+    })
+}
+
+fn resolve_open_position(
+    event: &crate::LibraryEvent,
+    state: &ReaderState,
+    unresolved: &mut Option<u32>,
+) -> bool {
+    if let crate::LibraryEvent::PrefixLoaded {
+        book_id,
+        page: Some(page),
+        ..
+    } = *event
+    {
+        if *unresolved == Some(book_id)
+            && state.book_id == book_id
+            && state.view == AppView::Reading
+            && state.page == page
+        {
+            *unresolved = None;
+            return true;
+        }
+    }
+    false
+}
+
 fn library_event_affects_view(state: &ReaderState, event: &crate::LibraryEvent) -> bool {
     match *event {
         crate::LibraryEvent::Scanned { count } => {
@@ -323,6 +413,20 @@ fn library_event_affects_view(state: &ReaderState, event: &crate::LibraryEvent) 
             current_chapter: _,
             chapter_pages: _,
         } => state.book_id == book_id,
+        crate::LibraryEvent::PrefixLoaded {
+            book_id,
+            page,
+            complete,
+            ..
+        } => {
+            state.book_id == book_id
+                && (complete
+                    || state.view == AppView::Chapters
+                    || (state.view == AppView::Reading && page.is_some()))
+        }
+        crate::LibraryEvent::ReaderLoadFailed { book_id, .. } => {
+            state.book_id == book_id && state.view == AppView::Reading
+        }
         crate::LibraryEvent::ChapterPage {
             book_id,
             chapter,
@@ -373,6 +477,12 @@ fn open_book_id(command: StorageCommand) -> Option<u32> {
 fn loaded_book_id(event: &crate::LibraryEvent) -> Option<u32> {
     match *event {
         crate::LibraryEvent::Loaded { book_id, .. } => Some(book_id),
+        crate::LibraryEvent::ReaderLoadFailed { book_id, .. } => Some(book_id),
+        crate::LibraryEvent::PrefixLoaded {
+            book_id,
+            page: Some(_),
+            ..
+        } => Some(book_id),
         _ => None,
     }
 }
@@ -558,7 +668,10 @@ fn storage_command_for_transition(
         return Some(open_book_command(next, index));
     }
 
-    if previous.page != next.page || previous.chapter != next.chapter {
+    if previous.page != next.page
+        || previous.chapter != next.chapter
+        || previous.pending_page != next.pending_page
+    {
         return Some(extend_section_command(next, index));
     }
 
@@ -585,7 +698,10 @@ fn extend_section_command(state: &ReaderState, index: u16) -> StorageCommand {
         book_id: state.book_id,
         index,
         chapter: state.chapter,
-        target_pages: state.page.min(u16::MAX as u32) as u16,
+        target_pages: state
+            .pending_page
+            .unwrap_or(state.page)
+            .min(u16::MAX as u32) as u16,
         type_settings: state.type_settings(),
         portrait: app_core::is_portrait(state.orientation),
     }

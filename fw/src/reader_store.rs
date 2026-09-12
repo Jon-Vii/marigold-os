@@ -179,6 +179,8 @@ pub(crate) struct ReaderStore {
     pub(crate) current_section_page_count: u16,
     pub(crate) book_cache_ready: bool,
     pub(crate) book_cache_partial: bool,
+    book_next_spine: Option<u16>,
+    book_generated_toc: bool,
     pub(crate) book_section_count: usize,
     pub(crate) book_sections: [BookV2SectionRecord; MAX_BOOK_SECTIONS],
     pub(crate) toc_text: [u8; MAX_SD_TOC_TEXT_BYTES],
@@ -278,6 +280,8 @@ impl ReaderStore {
             current_section_page_count: 0,
             book_cache_ready: false,
             book_cache_partial: false,
+            book_next_spine: None,
+            book_generated_toc: false,
             book_section_count: 0,
             book_sections: [EMPTY_BOOK_SECTION_RECORD; MAX_BOOK_SECTIONS],
             toc_text: [0; MAX_SD_TOC_TEXT_BYTES],
@@ -421,6 +425,7 @@ impl ReaderStore {
         self.portrait = portrait;
         self.page_count = 0;
         self.current_section_page_count = 0;
+        self.book_next_spine = None;
     }
 
     pub(crate) fn clear_catalog(&mut self) {
@@ -664,6 +669,8 @@ impl ReaderStore {
     }
 
     pub(crate) fn clear_book_index(&mut self) {
+        self.book_next_spine = None;
+        self.book_generated_toc = false;
         self.book_total_pages = 0;
         self.current_section_start_page = 0;
         self.current_section_page_count = 0;
@@ -845,6 +852,7 @@ impl ReaderStore {
         partial: bool,
         sections: &[BookV2SectionRecord],
     ) {
+        self.book_next_spine = None;
         self.book_total_pages = total_pages.max(1);
         self.book_cache_ready = true;
         self.book_cache_partial = partial;
@@ -854,6 +862,50 @@ impl ReaderStore {
         }
         for index in self.book_section_count..self.book_sections.len() {
             self.book_sections[index] = EMPTY_BOOK_SECTION_RECORD;
+        }
+    }
+
+    pub(crate) fn book_generated_toc(&self) -> bool {
+        self.book_generated_toc
+    }
+
+    pub(crate) fn set_book_generated_toc(&mut self, generated: bool) {
+        self.book_generated_toc = generated;
+    }
+
+    pub(crate) fn book_next_spine(&self) -> Option<u16> {
+        self.book_next_spine
+    }
+
+    pub(crate) fn set_book_next_spine(&mut self, next: Option<u16>) {
+        if self.book_next_spine != next {
+            self.chapter_page_count = 0;
+        }
+        self.book_next_spine = next;
+    }
+
+    pub(crate) fn known_page_for_spine(&self, spine: u16) -> Option<u32> {
+        self.book_sections[..self.book_section_count]
+            .iter()
+            .find(|section| section.spine == spine)
+            .map(|section| section.start_page)
+    }
+
+    pub(crate) fn requested_page(&self, page: u32, spine: Option<u16>) -> Option<u32> {
+        if let Some(spine) = spine {
+            if let Some(page) = self.known_page_for_spine(spine) {
+                return Some(page);
+            }
+            if self.book_next_spine.is_some_and(|next| spine >= next) {
+                return None;
+            }
+        }
+        if page < self.book_total_pages {
+            Some(page)
+        } else if self.book_next_spine.is_none() && self.book_total_pages > 0 {
+            Some(self.book_total_pages - 1)
+        } else {
+            None
         }
     }
 
@@ -896,6 +948,9 @@ impl ReaderStore {
                 global_page >= start && global_page < end
             })
             .or_else(|| {
+                if self.book_next_spine.is_some() {
+                    return None;
+                }
                 self.book_sections
                     .iter()
                     .take(self.book_section_count)
@@ -1095,7 +1150,13 @@ impl ReaderStore {
             .take(self.book_section_count)
             .find(|section| section.spine == spine)
             .map(|section| section.start_page)
-            .unwrap_or(0)
+            .unwrap_or_else(|| {
+                if self.book_next_spine.is_some() {
+                    u32::MAX
+                } else {
+                    0
+                }
+            })
     }
 
     pub(crate) fn overview_page_at(&self, index: usize) -> u16 {

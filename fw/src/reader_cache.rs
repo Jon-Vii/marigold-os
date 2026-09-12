@@ -184,6 +184,7 @@ pub(crate) fn build_or_load_book_cache(
     index: usize,
     requested_chapter: u16,
     target_pages: usize,
+    requested_spine: Option<u16>,
     scratch: &mut ReaderCacheScratch<'_>,
     font_metrics: &mut crate::custom_font::MetricCache,
 ) {
@@ -193,7 +194,19 @@ pub(crate) fn build_or_load_book_cache(
         requested_chapter,
         target_pages
     );
+    // Before the first nonempty spine there is no durable index yet. Retain
+    // only that tiny same-book cursor across task turns; all durable prefixes
+    // are reloaded and validated from their index.
+    let empty_next = if library.loaded_index == Some(index)
+        && library.reader_status() == BookLoadStatus::Loading
+        && library.book_section_count == 0
+    {
+        library.book_next_spine()
+    } else {
+        None
+    };
     library.begin_book_load();
+    library.set_book_next_spine(empty_next);
 
     if library.catalog_entry(index).is_none() {
         set_preview_error(library, "BAD INDEX");
@@ -208,6 +221,7 @@ pub(crate) fn build_or_load_book_cache(
             index,
             requested_chapter,
             target_pages,
+            requested_spine,
             scratch,
             font_metrics,
         )
@@ -218,7 +232,18 @@ pub(crate) fn build_or_load_book_cache(
         BookLoadStatus::Error
     });
 
+    let status = if status == BookLoadStatus::Ready
+        && library
+            .requested_page(target_pages as u32, requested_spine)
+            .is_none()
+        && library.book_next_spine().is_some()
+    {
+        BookLoadStatus::Loading
+    } else {
+        status
+    };
     library.finish_book_load(index, requested_chapter, status);
+    library.loaded_index = Some(index);
 }
 
 #[inline(never)]
@@ -234,6 +259,7 @@ pub(crate) fn build_or_load_book_cache_from_root<
     index: usize,
     requested_chapter: u16,
     target_pages: usize,
+    requested_spine: Option<u16>,
     scratch: &mut ReaderCacheScratch<'_>,
     font_metrics: &mut crate::custom_font::MetricCache,
 ) -> BookLoadStatus
@@ -270,9 +296,11 @@ where
         cache_key.as_str(),
         source_identity,
         target_pages as u32,
+        requested_spine,
         library,
         Instant::now(),
         "fast",
+        scratch.xhtml,
     ) {
         return BookLoadStatus::Ready;
     }
@@ -286,6 +314,7 @@ where
                     &display_name,
                     requested_chapter,
                     target_pages,
+                    requested_spine,
                     library,
                     scratch,
                     font_metrics,
@@ -311,6 +340,7 @@ where
                 &display_name,
                 requested_chapter,
                 target_pages,
+                requested_spine,
                 library,
                 scratch,
                 font_metrics,
@@ -609,16 +639,37 @@ fn try_load_v2_book_cache<
     cache_key: &str,
     source_identity: (u32, u32),
     requested_global_page: u32,
+    requested_spine: Option<u16>,
     library: &mut ReaderStore,
     started: Instant,
     label: &str,
+    reflow_scratch: &mut [u8],
 ) -> bool
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    match reader_cache_files::load_v2_book_index(root, cache_key, source_identity, library) {
+    let result =
+        reader_cache_files::load_v2_book_index(root, cache_key, source_identity, library);
+    if result == BookIndexLoadResult::SpacingMismatch {
+        library.clear_book_index();
+        return false;
+    }
+    match result {
         BookIndexLoadResult::Hit => {
+            // BOOK is the commit record. Reconstruct a generated TOC sidecar
+            // after interrupted publication, rather than trusting an older file.
+            if library.book_generated_toc()
+                && !generated_toc_is_current(root, cache_key, source_identity, library)
+                && !write_generated_toc(root, cache_key, source_identity, library, reflow_scratch)
+            {
+                return false;
+            }
+            let Some(requested_global_page) =
+                library.requested_page(requested_global_page, requested_spine)
+            else {
+                return false;
+            };
             match reader_cache_files::load_v2_section_by_global_page(
                 root,
                 cache_key,
@@ -648,11 +699,14 @@ where
                 }
                 other => {
                     esp_println::println!("epub: {label} book index section load {:?}", other);
+                    // A missing/corrupt page within the known prefix needs a
+                    // replacement, not another append to that damaged prefix.
+                    library.clear_book_index();
                     false
                 }
             }
         }
-        BookIndexLoadResult::Invalid => {
+        BookIndexLoadResult::Invalid | BookIndexLoadResult::SpacingMismatch => {
             esp_println::println!("epub: v2 {label} book index invalid");
             false
         }
@@ -661,6 +715,68 @@ where
             false
         }
     }
+}
+
+fn generated_toc_is_current<D, T, const ND: usize, const NF: usize, const NV: usize>(
+    root: &Directory<'_, D, T, ND, NF, NV>,
+    key: &str,
+    source: (u32, u32),
+    library: &mut ReaderStore,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if !reader_cache_files::load_v2_toc_into_text(root, key, source, library, 0)
+        || library.overview_chapter_count() != library.toc_count()
+    {
+        return false;
+    }
+    for index in 0..library.toc_count() {
+        let toc = library.toc[index];
+        let expected =
+            proto::cache::toc_chapter_record(library.toc_title(index), toc.level, toc.spine_index);
+        if library.overview_title_at(index) != expected.title_str()
+            || library.overview_spine_at(index) != expected.spine_index
+            || library.overview_level_at(index) != expected.level
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn write_generated_toc<D, T, const ND: usize, const NF: usize, const NV: usize>(
+    root: &Directory<'_, D, T, ND, NF, NV>,
+    key: &str,
+    source: (u32, u32),
+    library: &ReaderStore,
+    scratch: &mut [u8],
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let count = library.toc_count();
+    let len = count * proto::cache::TOC_CHAPTER_RECORD_BYTES;
+    if len > scratch.len() {
+        return false;
+    }
+    for index in 0..count {
+        let toc = library.toc[index];
+        let record =
+            proto::cache::toc_chapter_record(library.toc_title(index), toc.level, toc.spine_index);
+        let offset = index * proto::cache::TOC_CHAPTER_RECORD_BYTES;
+        if proto::cache::encode_toc_chapter(
+            &record,
+            &mut scratch[offset..offset + proto::cache::TOC_CHAPTER_RECORD_BYTES],
+        )
+        .is_err()
+        {
+            return false;
+        }
+    }
+    reader_cache_files::write_v2_toc_file(root, key, source, count, &scratch[..len])
 }
 
 /// Keep the resident current-chapter index and title pointed at the page just
@@ -763,6 +879,8 @@ fn set_preview_error_from_error(library: &mut ReaderStore, error: ReaderCacheErr
         ReaderCacheError::MissingOpfPath => "NO OPF",
         ReaderCacheError::MissingSpine => "NO SPINE",
         ReaderCacheError::NoBodyText => "NO BODY TEXT",
+        ReaderCacheError::CacheWrite => "CACHE WRITE",
+        ReaderCacheError::CacheRead => "CACHE READ",
         ReaderCacheError::EntryNameTooLong => "PATH LONG",
     };
     set_preview_error(library, message);
@@ -777,6 +895,8 @@ enum ReaderCacheError {
     MissingOpfPath,
     MissingSpine,
     NoBodyText,
+    CacheWrite,
+    CacheRead,
     EntryNameTooLong,
 }
 
@@ -812,6 +932,7 @@ fn build_or_load_epub_cache_from_file<
     source_path: &str,
     _requested_chapter: u16,
     target_pages: usize,
+    requested_spine: Option<u16>,
     library: &mut ReaderStore,
     scratch: &mut ReaderCacheScratch<'_>,
     font_metrics: &mut crate::custom_font::MetricCache,
@@ -849,6 +970,7 @@ where
         source_identity,
         cache_key.as_str(),
         requested_global_page,
+        requested_spine,
         open_started,
         library,
         font_metrics,
@@ -892,6 +1014,7 @@ fn build_or_load_epub_cache_from_zip<
     source_identity: (u32, u32),
     cache_key: &str,
     requested_global_page: u32,
+    requested_spine: Option<u16>,
     open_started: Instant,
     library: &mut ReaderStore,
     font_metrics: &mut crate::custom_font::MetricCache,
@@ -902,6 +1025,18 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    let resume_next = library.book_next_spine();
+    let resumed_sections = if resume_next.is_some() {
+        library.book_section_count
+    } else {
+        0
+    };
+    let section_base = if resumed_sections > 0 {
+        (library.book_sections[0].section / MAX_BOOK_SECTIONS as u16) * MAX_BOOK_SECTIONS as u16
+    } else {
+        reader_cache_files::prepare_book_replacement(root, cache_key)
+            .ok_or(ReaderCacheError::CacheWrite)?
+    };
     let io_start = crate::sd_session::sd_stats::snapshot();
     let mut section_write_micros: u64 = 0;
     esp_println::println!("epub: stage ParseContainerAndOpf");
@@ -947,7 +1082,9 @@ where
 
     library.set_book_labels(package.meta.title, package.meta.author);
     library.clear_cover();
-    if zip.is_forward_only() {
+    if resumed_sections > 0 {
+        // The prefix index and existing TOC sidecar remain authoritative.
+    } else if zip.is_forward_only() {
         library.clear_toc();
     } else {
         // Stream the whole chapter list into the (currently idle) xhtml
@@ -994,14 +1131,25 @@ where
     let mut xhtml_path = String::<MAX_ENTRY_NAME_BYTES>::new();
     scratch.book_sections.fill(EMPTY_BOOK_SECTION_RECORD);
     let sections = &mut *scratch.book_sections;
-    let mut section_count = 0usize;
-    let mut total_pages = 0u32;
+    sections[..resumed_sections].copy_from_slice(&library.book_sections[..resumed_sections]);
+    let mut section_count = resumed_sections;
+    let mut total_pages = if resumed_sections > 0 {
+        library.book_total_pages
+    } else {
+        0
+    };
     let mut saw_spine = false;
     // A spine clipped at MAX_SPINE_ITEMS means the tail chapters were dropped at
     // parse, so the book is partial even if every kept section caches cleanly.
-    let mut book_partial = package.spine_truncated;
+    let mut book_partial =
+        package.spine_truncated || (resumed_sections > 0 && library.book_cache_partial);
     let visible_page_capacity = library.page_capacity().max(1);
-    let generate_toc_from_headings = library.toc_count() == 0;
+    let generate_toc_from_headings = if resumed_sections > 0 {
+        library.book_generated_toc()
+    } else {
+        library.toc_count() == 0
+    };
+    library.set_book_generated_toc(generate_toc_from_headings);
     let start_spine_index = package
         .text_reference_href
         .and_then(|href| {
@@ -1012,6 +1160,11 @@ where
         })
         .unwrap_or_else(|| inferred_start_spine_index(&package));
 
+    let start_spine_index = resume_next.map(usize::from).unwrap_or(start_spine_index);
+    let mut next_spine = None;
+    let mut processed_spine = false;
+    // Each call processes at most one spine. No ZIP/parser/FAT borrow survives
+    // the return to the display task, which handles input/render/sleep first.
     // The SECTIONS directory stays open for the whole spine walk; every
     // section flush is one file open instead of a four-level dir walk.
     reader_cache_files::with_v2_sections_dir(root, cache_key, |sections_dir| {
@@ -1020,6 +1173,11 @@ where
                 && !item.href.is_empty()
                 && !spine_item_is_navigation(item, &package)
         }) {
+            if processed_spine {
+                next_spine = Some(spine_index as u16);
+                break;
+            }
+            processed_spine = true;
             if section_count >= sections.len() {
                 book_partial = true;
                 break;
@@ -1043,6 +1201,7 @@ where
                 root,
                 sections_dir,
                 source_identity,
+                section_base,
                 font_metrics: &mut *font_metrics,
                 sections: &mut *sections,
                 section_count: &mut section_count,
@@ -1062,6 +1221,7 @@ where
                 generate_toc_from_headings,
                 generated_toc_for_spine: false,
                 pages_dirty: true,
+                write_failed: false,
             };
             // Stream the whole member through the resumable block parser in
             // bounded windows: spine XHTML of any size decodes completely, with
@@ -1116,10 +1276,18 @@ where
                 Err(err) => return Err(err.into()),
             }
             sink.finish_spine(false);
+            if sink.write_failed {
+                return Err(ReaderCacheError::CacheWrite);
+            }
         }
         Ok::<(), ReaderCacheError>(())
     })?;
 
+    if section_count >= sections.len() && next_spine.is_some() {
+        book_partial = true;
+        next_spine = None;
+    }
+    library.set_book_next_spine(next_spine);
     if section_count > 0 && total_pages > 0 {
         let sections_slice = &sections[..section_count];
         let wrote_index = reader_cache_files::write_v2_book_index(
@@ -1131,42 +1299,48 @@ where
             library,
             book_partial,
         );
-        library.set_book_index(total_pages, book_partial || !wrote_index, sections_slice);
+        if !wrote_index {
+            return Err(ReaderCacheError::CacheWrite);
+        }
+        if generate_toc_from_headings
+            && !write_generated_toc(root, cache_key, source_identity, library, scratch.xhtml)
+        {
+            return Err(ReaderCacheError::CacheWrite);
+        }
+
+        library.set_book_index(total_pages, book_partial, sections_slice);
+        library.set_book_next_spine(next_spine);
+        let resolved_page = library.requested_page(requested_global_page, requested_spine);
+        // During a distant-page/chapter request, leave a real committed prefix
+        // resident while the task schedules the next independent spine step.
+        let loaded_page = resolved_page.unwrap_or(0);
         match reader_cache_files::load_v2_section_by_global_page(
             root,
             cache_key,
             source_identity,
-            requested_global_page.min(total_pages.saturating_sub(1)),
+            loaded_page,
             library,
         ) {
             CacheLoadResult::Hit { .. } => {}
-            _ => {
-                let first = sections_slice[0];
-                library.set_current_section_range(first.start_page, first.page_count as usize);
-            }
+            _ => return Err(ReaderCacheError::CacheRead),
         }
         reader_layout::rebuild_toc_page_targets(library);
-        refresh_chapter_tracking(
-            root,
-            cache_key,
-            source_identity,
-            requested_global_page.min(total_pages.saturating_sub(1)),
-            library,
-        );
+        refresh_chapter_tracking(root, cache_key, source_identity, loaded_page, library);
         let cover = reader_cache_files::load_v2_cover_cache(root, cache_key, library);
         esp_println::println!("epub: stage PublishLoaded");
         esp_println::println!(
-            "epub: full book cache ready after {} ms (total={} sections={} partial={} cover={:?} key {})",
+            "epub: book cache step ready after {} ms (pages={} sections={} partial={} cover={:?} key {} next_spine={:?})",
             open_started.elapsed().as_millis(),
             total_pages,
             section_count,
             book_partial,
             cover,
-            cache_key
+            cache_key,
+            next_spine
         );
         let io = crate::sd_session::sd_stats::snapshot().since(io_start);
         esp_println::println!(
-            "bench: storage_build elapsed_ms={} spine_ms={} write_ms={} sections={} pages={} rd_calls={} rd_blocks={} wr_calls={} wr_blocks={} key={}",
+            "bench: storage_build elapsed_ms={} spine_ms={} write_ms={} sections={} pages={} rd_calls={} rd_blocks={} wr_calls={} wr_blocks={} key={} complete={}",
             open_started.elapsed().as_millis(),
             spine_started.elapsed().as_millis(),
             section_write_micros / 1000,
@@ -1176,8 +1350,11 @@ where
             io.read_blocks,
             io.write_calls,
             io.write_blocks,
-            cache_key
+            cache_key,
+            next_spine.is_none()
         );
+        Ok(())
+    } else if next_spine.is_some() {
         Ok(())
     } else if saw_spine {
         Err(ReaderCacheError::NoBodyText)
@@ -1471,6 +1648,7 @@ struct LibraryBlockSink<
     /// writes then fail per section and the book publishes as partial.
     sections_dir: Option<&'r Directory<'r, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>,
     source_identity: (u32, u32),
+    section_base: u16,
     font_metrics: &'a mut crate::custom_font::MetricCache,
     sections: &'a mut [BookV2SectionRecord; MAX_BOOK_SECTIONS],
     section_count: &'a mut usize,
@@ -1497,6 +1675,7 @@ struct LibraryBlockSink<
     /// Only appends and final paragraph-end marks occur between updates.
     /// Completed pages stay valid; the dirty trailing page is repaginated.
     pages_dirty: bool,
+    write_failed: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1629,66 +1808,39 @@ where
             *self.book_partial = true;
         }
 
-        // Intermediate sections end on a whole page: the half-finished final
-        // page carries into the next section rather than being written as a
-        // short, half-empty page the reader would stop on mid-chapter. The
-        // last section of a chapter (finish_spine) keeps its trailing page —
-        // that is the genuine end of the text.
-        let full_blocks = self.library.block_count();
-        let full_text = self.library.text_len;
-        let full_pages = self.library.page_count;
-        let carry_first = if carry_incomplete && full_pages > 1 {
-            let cut = self.library.pages[full_pages - 1].first_block as usize;
-            (cut > 0 && cut < full_blocks).then_some(cut)
-        } else {
-            None
-        };
-        if let Some(cut) = carry_first {
-            self.library.block_count = cut;
-            self.library.page_count = full_pages - 1;
-            self.library.text_len = self.library.blocks[cut].text_offset as usize;
-        }
-
         self.library.set_cached_spine(self.spine_index);
         self.library.set_section_partial(partial);
-        let section_id = (*self.section_count).min(u16::MAX as usize) as u16;
+        let section_id = self.section_base + (*self.section_count) as u16;
         let write_started = Instant::now();
-        let wrote = match self.sections_dir {
-            Some(sections) => reader_cache_files::write_v2_section_cache_in(
-                sections,
-                self.source_identity,
-                section_id,
-                self.library,
-            ),
-            None => false,
-        };
+        let mut written_pages = 0;
+        let wrote = reader_layout::flush_page_window(self.library, carry_incomplete, |window| {
+            written_pages = window.page_count;
+            match self.sections_dir {
+                Some(sections) => reader_cache_files::write_v2_section_cache_in(
+                    sections,
+                    self.source_identity,
+                    section_id,
+                    window,
+                ),
+                None => false,
+            }
+        });
         *self.write_micros += write_started.elapsed().as_micros();
         if !wrote {
-            *self.book_partial = true;
+            self.write_failed = true;
+            self.stopped = true;
+            return false;
         }
         self.sections[*self.section_count] = BookV2SectionRecord {
             section: section_id,
             spine: self.spine_index,
             start_page: *self.total_pages,
-            page_count: self.library.page_count.min(u16::MAX as usize) as u16,
+            page_count: written_pages.min(u16::MAX as usize) as u16,
             partial,
         };
-        *self.total_pages = (*self.total_pages).saturating_add(self.library.page_count as u32);
+        *self.total_pages = (*self.total_pages).saturating_add(written_pages as u32);
         *self.section_count += 1;
-
-        match carry_first {
-            Some(cut) => {
-                self.library.block_count = full_blocks;
-                self.library.text_len = full_text;
-                self.library.carry_last_page(cut);
-                reader_layout::rebuild_page_index(self.library);
-                self.pages_dirty = false;
-            }
-            None => {
-                self.library.clear_lines();
-                self.pages_dirty = true;
-            }
-        }
+        self.pages_dirty = false;
         true
     }
 

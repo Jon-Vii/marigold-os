@@ -79,6 +79,43 @@ pub(crate) fn extend_page_index(library: &mut ReaderStore) {
     }
 }
 
+/// Write a section ending on a complete page, then retain its unfinished tail.
+/// Both XHTML construction and cached-line reflow use the same cut/carry rule.
+/// On write failure the original window remains intact for error handling.
+pub(crate) fn flush_page_window(
+    library: &mut ReaderStore,
+    carry_incomplete: bool,
+    write: impl FnOnce(&ReaderStore) -> bool,
+) -> bool {
+    let blocks = library.block_count;
+    let text = library.text_len;
+    let pages = library.page_count;
+    let cut = if carry_incomplete && pages > 1 {
+        let first = usize::from(library.pages[pages - 1].first_block);
+        (first > 0 && first < blocks).then_some(first)
+    } else {
+        None
+    };
+    if let Some(first) = cut {
+        library.block_count = first;
+        library.page_count = pages - 1;
+        library.text_len = library.blocks[first].text_offset as usize;
+    }
+    let ok = write(library);
+    library.block_count = blocks;
+    library.text_len = text;
+    library.page_count = pages;
+    if ok {
+        if let Some(first) = cut {
+            library.carry_last_page(first);
+            rebuild_page_index(library);
+        } else {
+            library.clear_lines();
+        }
+    }
+    ok
+}
+
 pub(crate) fn rebuild_toc_page_targets(library: &mut ReaderStore) {
     for toc_index in 0..library.toc_count {
         let spine_index = library.toc[toc_index].spine_index;
@@ -100,7 +137,13 @@ pub(crate) fn rebuild_toc_page_targets(library: &mut ReaderStore) {
                     .take(library.page_count)
                     .position(|page_spine| *page_spine == spine)
             })
-            .unwrap_or(0);
+            .unwrap_or_else(|| {
+                if library.book_next_spine().is_some() {
+                    u16::MAX as usize
+                } else {
+                    0
+                }
+            });
         library.toc_page[toc_index] = page.min(u16::MAX as usize) as u16;
     }
 }

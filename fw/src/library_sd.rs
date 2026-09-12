@@ -600,8 +600,10 @@ fn sweep_orphan_caches<
     let mut swept = 0u32;
     for key in &keys {
         let header = crate::reader_cache_files::read_cache_header(root, key.as_str());
-        // A readable cache that still maps to a catalog book stays. Anything
-        // else -- no book, or an unreadable BOOK.BIN -- is reclaimed.
+        // An unreadable index may be a transient card error or an interrupted
+        // generation. Reclaim only after verifying an orphan's identity.
+        if header.is_none() { continue; }
+        // A verified cache that still maps to a catalog book stays.
         let live = header
             .as_ref()
             .map(|h| find_in_catalog(root, h.source_hash, h.source_size, None).is_some())

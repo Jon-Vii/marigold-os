@@ -1,3 +1,5 @@
+#[path = "reader_cache_files/book_generation.rs"]
+mod book_generation;
 use crate::reader_layout;
 use crate::reader_store::{
     ReaderStore, EMPTY_BOOK_SECTION_RECORD, EMPTY_TOC_RECORD, MAX_BOOK_SECTIONS,
@@ -184,6 +186,7 @@ pub(crate) enum CacheLoadResult {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BookIndexLoadResult {
     Hit,
+    SpacingMismatch,
     Miss,
     Invalid,
 }
@@ -236,8 +239,7 @@ const POSITION_GEOMETRY_SALT: u32 = (display::WIDTH as u32 ^ display::HEIGHT as 
 
 // The salt must vanish on the X4 or an upgrade would reject every existing
 // POS.BIN; guard the backward-compat guarantee at compile time.
-#[cfg(not(feature = "device-x3"))]
-const _: () = assert!(POSITION_GEOMETRY_SALT == 0);
+const _: () = assert!(display::WIDTH != 800 || POSITION_GEOMETRY_SALT == 0);
 
 fn encode_position(chapter: u16, screen: u32) -> [u8; POSITION_BYTES] {
     let mut out = [0u8; POSITION_BYTES];
@@ -587,7 +589,8 @@ where
         let Ok(header) = decode_book_v2_header(&header_bytes) else {
             return 0;
         };
-        if header.source_hash != source_identity.0
+        if header.next_spine.is_some()
+            || header.source_hash != source_identity.0
             || header.source_size != source_identity.1
             || header.custom_font_identity != library.custom_font_identity()
         {
@@ -614,7 +617,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    with_v2_book_file(root, key, Mode::ReadOnly, |file| {
+    with_verified_v2_book_file(root, key, |file| {
         let mut header_bytes = [0u8; BOOK_V2_HEADER_BYTES];
         if read_exact_file(file, &mut header_bytes).is_err() {
             return BookIndexLoadResult::Invalid;
@@ -622,10 +625,13 @@ where
         let Ok(header) = decode_book_v2_header(&header_bytes) else {
             return BookIndexLoadResult::Invalid;
         };
+        let expected_config =
+            reader_layout::reader_layout_config(library.type_settings(), library.portrait());
+        let spacing_changed = header.font_config != expected_config;
         if header.source_hash != source_identity.0
             || header.source_size != source_identity.1
-            || header.font_config
-                != reader_layout::reader_layout_config(library.type_settings(), library.portrait())
+            || header.font_config & !0b11 != expected_config & !0b11
+            || (spacing_changed && header.next_spine.is_some())
             || header.custom_font_identity != library.custom_font_identity()
             || header.section_count as usize > MAX_BOOK_SECTIONS
             || header.toc_count as usize > MAX_SD_TOC_ITEMS
@@ -645,7 +651,28 @@ where
                 let Ok(record) = decode_book_v2_section(bytes) else {
                     return false;
                 };
-                if record.page_count == 0 {
+                let expected_start = if index == 0 {
+                    0
+                } else {
+                    let previous = sections[index - 1];
+                    if record.spine < previous.spine
+                        || usize::from(record.section) / MAX_BOOK_SECTIONS
+                            != usize::from(previous.section) / MAX_BOOK_SECTIONS
+                        || record.section != previous.section + 1
+                    {
+                        return false;
+                    }
+                    previous.start_page + u32::from(previous.page_count)
+                };
+                if record.page_count == 0
+                    || usize::from(record.section) >= 2 * MAX_BOOK_SECTIONS
+                    || record.start_page != expected_start
+                    || record.start_page.checked_add(u32::from(record.page_count))
+                        .is_none_or(|end| end > header.total_pages)
+                    || header.next_spine.is_some_and(|next| record.spine >= next)
+                    || (index + 1 == usize::from(header.section_count)
+                        && record.start_page + u32::from(record.page_count) != header.total_pages)
+                {
                     return false;
                 }
                 sections[index] = record;
@@ -722,7 +749,13 @@ where
             header.partial,
             &sections[..header.section_count as usize],
         );
-        BookIndexLoadResult::Hit
+        library.set_book_next_spine(header.next_spine);
+        library.set_book_generated_toc(header.generated_toc);
+        if spacing_changed {
+            BookIndexLoadResult::SpacingMismatch
+        } else {
+            BookIndexLoadResult::Hit
+        }
     })
     .unwrap_or(BookIndexLoadResult::Miss)
 }
@@ -749,44 +782,72 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    with_v2_book_file(root, key, Mode::ReadOnly, |file| {
-        let mut header_bytes = [0u8; BOOK_V2_HEADER_BYTES];
-        if read_exact_file(file, &mut header_bytes).is_err() {
-            return false;
+    (|| {
+        let xteink = root.open_dir(CACHE_ROOT_DIR).ok()?;
+        let cache = xteink.open_dir(CACHE_V2_DIR).ok()?;
+        let book_dir = cache.open_dir(key).ok()?;
+        // Labels are advisory EPUB metadata, independent of pagination. Most
+        // catalog entries still have a legacy index: avoid probing both absent
+        // generation files for every book at boot. Never use this ordering for
+        // page totals, section loading, or bank retirement.
+        if let Ok(file) = book_dir.open_file_in_dir(CACHE_BOOK_FILE, Mode::ReadOnly) {
+            if read_book_title(&file, source_identity, out) {
+                return Some(true);
+            }
         }
-        let Ok(header) = decode_book_v2_header(&header_bytes) else {
-            return false;
-        };
-        if header.source_hash != source_identity.0
-            || header.source_size != source_identity.1
-            || header.title_text_bytes == 0
-            || header.title_text_bytes as usize > 64
-        {
-            return false;
-        }
-        // The title text sits after the header, the section records, and the
-        // TOC block (records + text) -- the same body order write_v2_book_index
-        // lays down and load_v2_book_index reads through.
-        let title_offset = BOOK_V2_HEADER_BYTES as u32
-            + header.section_count as u32 * BOOK_V2_SECTION_RECORD_BYTES as u32
-            + header.toc_count as u32 * TOC_RECORD_BYTES as u32
-            + header.toc_text_bytes;
-        if file.seek_from_start(title_offset).is_err() {
-            return false;
-        }
-        let title_len = header.title_text_bytes as usize;
-        let mut title = [0u8; 64];
-        if read_exact_file(file, &mut title[..title_len]).is_err() {
-            return false;
-        }
-        let Ok(title_str) = core::str::from_utf8(&title[..title_len]) else {
-            return false;
-        };
-        out.clear();
-        let _ = out.push_str(title_str);
-        true
-    })
+        let (slot, _) = book_generation::selected(&book_dir, false)?;
+        let file = book_dir
+            .open_file_in_dir(book_generation::NAMES[slot], Mode::ReadOnly)
+            .ok()?;
+        Some(read_book_title(&file, source_identity, out))
+    })()
     .unwrap_or(false)
+}
+
+fn read_book_title<D, T, const ND: usize, const NF: usize, const NV: usize>(
+    file: &File<'_, D, T, ND, NF, NV>,
+    source_identity: (u32, u32),
+    out: &mut String<64>,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut header_bytes = [0u8; BOOK_V2_HEADER_BYTES];
+    if read_exact_file(file, &mut header_bytes).is_err() {
+        return false;
+    }
+    let Ok(header) = decode_book_v2_header(&header_bytes) else {
+        return false;
+    };
+    if header.source_hash != source_identity.0
+        || header.source_size != source_identity.1
+        || header.title_text_bytes == 0
+        || header.title_text_bytes as usize > 64
+    {
+        return false;
+    }
+    // The title text sits after the header, the section records, and the
+    // TOC block (records + text) -- the same body order write_v2_book_index
+    // lays down and load_v2_book_index reads through.
+    let title_offset = BOOK_V2_HEADER_BYTES as u32
+        + header.section_count as u32 * BOOK_V2_SECTION_RECORD_BYTES as u32
+        + header.toc_count as u32 * TOC_RECORD_BYTES as u32
+        + header.toc_text_bytes;
+    if file.seek_from_start(title_offset).is_err() {
+        return false;
+    }
+    let title_len = header.title_text_bytes as usize;
+    let mut title = [0u8; 64];
+    if read_exact_file(file, &mut title[..title_len]).is_err() {
+        return false;
+    }
+    let Ok(title_str) = core::str::from_utf8(&title[..title_len]) else {
+        return false;
+    };
+    out.clear();
+    let _ = out.push_str(title_str);
+    true
 }
 
 /// Legacy subdir under XTEINK holding one `<8.3-stem>.TXT` label for books
@@ -886,7 +947,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    with_v2_book_file(root, key, Mode::ReadOnly, |file| {
+    with_verified_v2_book_file(root, key, |file| {
         let mut header_bytes = [0u8; BOOK_V2_HEADER_BYTES];
         read_exact_file(file, &mut header_bytes).ok()?;
         decode_book_v2_header(&header_bytes).ok()
@@ -908,7 +969,7 @@ pub(crate) fn empty_cache_dir<
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     key: &str,
-    section_count: u16,
+    _section_count: u16,
 ) where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
@@ -925,7 +986,7 @@ pub(crate) fn empty_cache_dir<
         };
         if let Ok(sections) = book.open_dir(CACHE_SECTIONS_DIR) {
             let mut name = String::<CACHE_SECTION_FILE_BYTES>::new();
-            for spine in 0..section_count {
+            for spine in 0..(MAX_BOOK_SECTIONS * 2) as u16 {
                 name.clear();
                 section_file_name(spine, &mut name);
                 let _ =
@@ -935,6 +996,9 @@ pub(crate) fn empty_cache_dir<
         // The SECTIONS handle has dropped; the empty directory can go now.
         let _ = book.delete_file_in_dir(CACHE_SECTIONS_DIR);
         let _ = crate::sd_session::remove_file_reclaiming_clusters(&book, CACHE_BOOK_FILE);
+        for name in book_generation::NAMES {
+            let _ = crate::sd_session::remove_file_reclaiming_clusters(&book, name);
+        }
         let _ = crate::sd_session::remove_file_reclaiming_clusters(&book, CACHE_TOC_FILE);
         let _ = crate::sd_session::remove_file_reclaiming_clusters(&book, CACHE_COVER_FILE);
     }
@@ -967,7 +1031,7 @@ where
     if ensure_v2_cache_dirs(root, key).is_err() {
         return false;
     }
-    with_v2_book_file(root, key, Mode::ReadWriteCreateOrTruncate, |file| {
+    with_v2_book_writer(root, key, |file| {
         let toc_count = library
             .toc_count
             .min(MAX_SD_TOC_ITEMS)
@@ -975,6 +1039,8 @@ where
         let title_text_bytes = library.title.len().min(64) as u32;
         let author_text_bytes = library.author.len().min(64) as u32;
         let header = BookV2Header {
+            next_spine: library.book_next_spine(),
+            generated_toc: library.book_generated_toc(),
             source_hash: source_identity.0,
             source_size: source_identity.1,
             total_pages,
@@ -1003,51 +1069,52 @@ where
         };
         let mut bytes = [0u8; BOOK_V2_HEADER_BYTES];
         if encode_book_v2_header(header, &mut bytes).is_err() {
-            return false;
+            return None;
         }
-        let mut stage = WriteStage::new(file);
+        let mut stage = WriteStage::checksummed(file);
         if stage.push(&bytes).is_err() {
-            return false;
+            return None;
         }
         let mut record_bytes = [0u8; BOOK_V2_SECTION_RECORD_BYTES];
         for section in sections {
             if encode_book_v2_section(*section, &mut record_bytes).is_err()
                 || stage.push(&record_bytes).is_err()
             {
-                return false;
+                return None;
             }
         }
         let mut toc_bytes = [0u8; TOC_RECORD_BYTES];
         for record in library.toc.iter().take(toc_count).copied() {
             if encode_toc(record, &mut toc_bytes).is_err() || stage.push(&toc_bytes).is_err() {
-                return false;
+                return None;
             }
         }
         if stage.flush().is_err() {
-            return false;
+            return None;
         }
         if header.toc_text_bytes > 0
-            && file
-                .write(&library.toc_text[..header.toc_text_bytes as usize])
+            && stage
+                .push(&library.toc_text[..header.toc_text_bytes as usize])
                 .is_err()
         {
-            return false;
+            return None;
         }
         if header.title_text_bytes > 0
-            && file
-                .write(&library.title.as_bytes()[..header.title_text_bytes as usize])
+            && stage
+                .push(&library.title.as_bytes()[..header.title_text_bytes as usize])
                 .is_err()
         {
-            return false;
+            return None;
         }
         if header.author_text_bytes > 0
-            && file
-                .write(&library.author.as_bytes()[..header.author_text_bytes as usize])
+            && stage
+                .push(&library.author.as_bytes()[..header.author_text_bytes as usize])
                 .is_err()
         {
-            return false;
+            return None;
         }
-        true
+        stage.flush().ok()?;
+        stage.checksum
     })
     .unwrap_or(false)
 }
@@ -1346,7 +1413,10 @@ where
     let xteink = root.open_dir(CACHE_ROOT_DIR).ok()?;
     let cache = xteink.open_dir(CACHE_V2_DIR).ok()?;
     let book_dir = cache.open_dir(key).ok()?;
-    let file = book_dir.open_file_in_dir(CACHE_BOOK_FILE, mode).ok()?;
+    let name = book_generation::selected(&book_dir, false)
+        .map(|(slot, _)| book_generation::NAMES[slot])
+        .unwrap_or(CACHE_BOOK_FILE);
+    let file = book_dir.open_file_in_dir(name, mode).ok()?;
     Some(f(&file))
 }
 
@@ -1790,6 +1860,7 @@ struct WriteStage<
     file: &'f File<'v, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     buf: [u8; RECORD_STAGE_BYTES],
     len: usize,
+    checksum: Option<u32>,
 }
 
 impl<'f, 'v, D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>
@@ -1803,10 +1874,22 @@ where
             file,
             buf: [0u8; RECORD_STAGE_BYTES],
             len: 0,
+            checksum: None,
         }
     }
 
+    fn checksummed(file: &'f File<'v, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>) -> Self {
+        let mut stage = Self::new(file);
+        stage.checksum = Some(0x811c_9dc5);
+        stage
+    }
+
     fn push(&mut self, bytes: &[u8]) -> Result<(), ()> {
+        if let Some(hash) = self.checksum.as_mut() {
+            *hash = bytes
+                .iter()
+                .fold(*hash, |h, b| (h ^ u32::from(*b)).wrapping_mul(0x0100_0193));
+        }
         if bytes.len() > self.buf.len() - self.len {
             self.flush()?;
         }
@@ -1895,3 +1978,116 @@ fn display_style_for_proto_style(style: proto::text::FontStyle) -> FontStyle {
         proto::text::FontStyle::Regular => FontStyle::Regular,
     }
 }
+
+fn with_verified_v2_book_file<R, D, T, const ND: usize, const NF: usize, const NV: usize>(
+    root: &Directory<'_, D, T, ND, NF, NV>,
+    key: &str,
+    f: impl FnOnce(&File<'_, D, T, ND, NF, NV>) -> R,
+) -> Option<R>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let xteink = root.open_dir(CACHE_ROOT_DIR).ok()?;
+    let cache = xteink.open_dir(CACHE_V2_DIR).ok()?;
+    let dir = cache.open_dir(key).ok()?;
+    let name = book_generation::selected_checked(&dir, true)
+        .ok()?
+        .map(|(slot, _)| book_generation::NAMES[slot])
+        .unwrap_or(CACHE_BOOK_FILE);
+    let file = dir.open_file_in_dir(name, Mode::ReadOnly).ok()?;
+    Some(f(&file))
+}
+
+fn with_v2_book_writer<D, T, const ND: usize, const NF: usize, const NV: usize>(
+    root: &Directory<'_, D, T, ND, NF, NV>,
+    key: &str,
+    f: impl FnOnce(&File<'_, D, T, ND, NF, NV>) -> Option<u32>,
+) -> Option<bool>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let xteink = root.open_dir(CACHE_ROOT_DIR).ok()?;
+    let cache = xteink.open_dir(CACHE_V2_DIR).ok()?;
+    let dir = cache.open_dir(key).ok()?;
+    Some(book_generation::write(&dir, f))
+}
+
+/// Select the inactive section bank and retire any index that still references
+/// it BEFORE its files are overwritten. The active generation stays readable
+/// until the replacement's complete, checksummed index has been published.
+pub(crate) fn prepare_book_replacement<D, T, const ND: usize, const NF: usize, const NV: usize>(
+    root: &Directory<'_, D, T, ND, NF, NV>,
+    key: &str,
+) -> Option<u16>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    ensure_v2_cache_dirs(root, key).ok()?;
+    let xteink = root.open_dir(CACHE_ROOT_DIR).ok()?;
+    let cache = xteink.open_dir(CACHE_V2_DIR).ok()?;
+    let dir = cache.open_dir(key).ok()?;
+    let selected = book_generation::selected_checked(&dir, true)
+        .ok()?
+        .map(|(slot, _)| book_generation::NAMES[slot])
+        .unwrap_or(CACHE_BOOK_FILE);
+    let active = index_section_bank(&dir, selected).ok()?;
+    let target = if active == Some(0) {
+        MAX_BOOK_SECTIONS as u16
+    } else {
+        0
+    };
+    for name in [
+        CACHE_BOOK_FILE,
+        book_generation::NAMES[0],
+        book_generation::NAMES[1],
+    ] {
+        if active.is_some() && name == selected {
+            continue;
+        }
+        match dir.find_directory_entry(name) {
+            Ok(_) => {
+                if !crate::sd_session::remove_file_reclaiming_clusters(&dir, name) {
+                    return None;
+                }
+            }
+            Err(embedded_sdmmc::Error::NotFound) => {}
+            Err(_) => return None,
+        }
+    }
+    Some(target)
+}
+
+fn index_section_bank<D, T, const ND: usize, const NF: usize, const NV: usize>(
+    dir: &Directory<'_, D, T, ND, NF, NV>,
+    name: &str,
+) -> Result<Option<u16>, ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let file = match dir.open_file_in_dir(name, Mode::ReadOnly) {
+        Ok(file) => file,
+        Err(embedded_sdmmc::Error::NotFound) => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    let mut bytes = [0; BOOK_V2_HEADER_BYTES];
+    read_exact_file(&file, &mut bytes).map_err(|_| ())?;
+    let Ok(header) = decode_book_v2_header(&bytes) else {
+        return Ok(None);
+    };
+    if header.section_count == 0 {
+        return Ok(None);
+    }
+    let mut record = [0; BOOK_V2_SECTION_RECORD_BYTES];
+    read_exact_file(&file, &mut record).map_err(|_| ())?;
+    let Ok(record) = decode_book_v2_section(&record) else {
+        return Ok(None);
+    };
+    let first = usize::from(record.section);
+    Ok((first < MAX_BOOK_SECTIONS * 2)
+        .then_some((first / MAX_BOOK_SECTIONS * MAX_BOOK_SECTIONS) as u16))
+}
+
