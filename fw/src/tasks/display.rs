@@ -121,7 +121,13 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
         esp_hal::system::software_reset();
     }
 
-
+    #[cfg(feature = "bench-serial")]
+    {
+        let result = crate::sd_session::with_root(&mut epd, &mut sd_cs, |root| {
+            crate::custom_font::bench::run(root, fb, sd_library, font_metrics)
+        });
+        esp_println::println!("bench: font_selftest ok={}", matches!(result, Ok(true)));
+    }
 
     // A continuation is tiny Copy data, never a retained ZIP/FAT/parser borrow.
     // Give queued display/storage commands and the other executor tasks a turn

@@ -249,6 +249,8 @@ fn main() -> ! {
         let input_executor =
             INPUT_EXECUTOR.init(InterruptExecutor::new(sw_ints.software_interrupt1));
         let input_spawner = input_executor.start(Priority::Priority1);
+        #[cfg(feature = "bench-serial")]
+        input_spawner.spawn(tasks::bench_serial::run(peripherals.USB_DEVICE).unwrap());
         esp_println::println!("main: spawn input");
         input_spawner.spawn(
             tasks::input::run(

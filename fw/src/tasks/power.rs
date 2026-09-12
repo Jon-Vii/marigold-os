@@ -56,6 +56,18 @@ async fn enter_sleep(rtc: &mut Rtc<'_>) {
             PowerEvent::DisplayAsleep => {
                 esp_println::println!("power: deep sleep");
                 let mut button = steal_wake_button();
+                #[cfg(feature = "bench-serial")]
+                {
+                    use esp_hal::gpio::RtcPinWithResistors;
+                    use esp_hal::rtc_cntl::sleep::{RtcioWakeupSource, TimerWakeupSource, WakeupLevel};
+                    let mut pins: [(&mut dyn RtcPinWithResistors, WakeupLevel); 1] =
+                        [(&mut button, WakeupLevel::Low)];
+                    let gpio = RtcioWakeupSource::new(&mut pins);
+                    let timer = TimerWakeupSource::new(core::time::Duration::from_secs(2));
+                    esp_println::println!("bench: serial_sleep timer_wake_ms=2000 gpio=3");
+                    rtc.sleep_deep(&[&gpio, &timer]);
+                }
+                #[cfg(not(feature = "bench-serial"))]
                 hal_ext::rtc::enter_deep_sleep_button(rtc, &mut button);
             }
             PowerEvent::DisplayFailed => {

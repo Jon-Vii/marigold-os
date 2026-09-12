@@ -1,3 +1,6 @@
+#[cfg(feature = "bench-serial")]
+pub(crate) mod bench;
+
 use crate::reader_store::ReaderStore;
 use display::fb::Framebuffer;
 use display::font::{
