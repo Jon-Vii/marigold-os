@@ -9,7 +9,46 @@ mod reader_store;
 
 use display::font::{LineSpacing, TypeSettings};
 use proto::cache::BookV2SectionRecord;
-use reader_store::ReaderStore;
+use reader_store::{BookLoadStatus, ReaderStore};
+
+#[test]
+fn book_open_waits_for_all_spines_even_when_the_requested_page_is_cached() {
+    let mut store = ReaderStore::new();
+    let sections = [section(0, 0, 0, 7), section(1, 1, 7, 5)];
+    store.set_book_index(7, false, &sections[..1]);
+    store.set_book_next_spine(Some(1));
+    store.set_current_section_range(0, 7);
+    store.page_count = 7;
+    // The requested page is available after the first spine, but publishing
+    // it now defers the next spine's preparation until a forward page turn.
+    assert_eq!(store.requested_page(0, None), Some(0));
+    store.finish_book_load(0, 0, BookLoadStatus::Ready);
+    assert_eq!(store.reader_status(), BookLoadStatus::Loading);
+    assert!(!store.covers_global_page(0, 0));
+
+    store.set_book_index(12, false, &sections);
+    store.set_book_next_spine(None);
+    store.finish_book_load(0, 0, BookLoadStatus::Ready);
+    assert_eq!(store.reader_status(), BookLoadStatus::Ready);
+    assert!(store.covers_global_page(0, 0));
+    // Reading through the later section now requires cache reads, not parsing.
+    for page in 0..12 {
+        assert!(store.section_for_global_page(page).is_some());
+    }
+}
+
+#[test]
+fn interrupted_preparation_does_not_hide_errors_or_block_terminal_partial_books() {
+    let mut store = ReaderStore::new();
+    store.set_book_index(7, false, &[section(0, 0, 0, 7)]);
+    store.set_book_next_spine(Some(1));
+    store.finish_book_load(0, 0, BookLoadStatus::Error);
+    assert_eq!(store.reader_status(), BookLoadStatus::Error);
+    store.set_book_index(7, true, &[section(0, 0, 0, 7)]);
+    store.set_book_next_spine(None);
+    store.finish_book_load(0, 0, BookLoadStatus::Ready);
+    assert_eq!(store.reader_status(), BookLoadStatus::Ready);
+}
 
 fn section(id: u16, spine: u16, start: u32, pages: u16) -> BookV2SectionRecord {
     BookV2SectionRecord {

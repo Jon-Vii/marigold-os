@@ -345,13 +345,13 @@ board-I/O owner.
 
 ## SD-backed reader cache
 
-The SD reader uses a V2 cache that grows on demand. A cold open parses the
+The SD reader prepares its complete V2 cache before displaying a book. A cold open parses the
 package metadata and processes at most one eligible spine item per storage
-step, then commits its section files and updated book index. If that prefix
-covers the requested page, reading starts immediately. A distant saved page,
-chapter jump, or Next at the prefix boundary requests further steps until the
-target is covered or the cache reaches its terminal end. There is no idle
-prefetch: opening an early page does not continue building the rest of the book.
+step, then commits its section files and updated book index. The loading plate
+stays visible until the cache reaches its terminal end, even if the requested
+page is already available. This keeps EPUB preparation out of subsequent page
+turns. Completed caches retain the fast open path; interrupted caches and
+prefixes from the original v0.5.0 resume preparation before reading starts.
 
 Each continuation closes its ZIP/FAT handles, retains only the request and a
 durable next-spine cursor, and reopens the package on the next step. The board
@@ -362,12 +362,11 @@ interval: a large XHTML spine can still block the shared I/O owner until its
 stream finishes. Cancellation does not interrupt that stream mid-spine.
 
 While a next-spine cursor exists, the cached page count is a known prefix, not
-the book's total. Reading publishes an unknown total and holds the displayed
-page while a future page is pending; repeated Next presses coalesce that target.
-An unresolved chapter target stays unresolved rather than aliasing page zero or
-the last cached section. Appending complete spines preserves earlier page
-numbers and chapter boundaries. Reopening can reuse the committed prefix after
-sleep or an interrupted later step.
+the book's total, and the reader store remains Loading. An unresolved chapter
+target stays unresolved rather than aliasing page zero or the last cached
+section. Appending complete spines preserves earlier page numbers and chapter
+boundaries. Reopening can reuse the committed prefix after sleep or an
+interrupted later step.
 
 A source spine item can paginate into several sections, and several TOC
 chapters can refer to the same spine. The builder closes the current section and opens the next when its in-RAM arena

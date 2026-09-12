@@ -28,7 +28,7 @@ Use this term when discussing the portable cache format shared by firmware and h
 
 ### Committed reader prefix
 
-The durable, readable part of a book cache whose index still holds a next-spine cursor. Its page count describes available pages; the final book total remains unknown. Reading extends it only when a requested page or chapter is not yet available, with no idle prefetch.
+The durable part of a book cache whose index still holds a next-spine cursor. Its page count describes prepared pages; the final book total remains unknown. Opening resumes preparation to the terminal end before displaying a reading page, so later page turns do not trigger EPUB builds.
 
 Use this term for resumable progress. A terminal `partial` cache has reached a capacity or parsing limit and has no continuation cursor; the active index still holds at most 320 sections. Do not treat the two states as interchangeable.
 

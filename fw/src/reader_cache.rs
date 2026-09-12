@@ -232,16 +232,6 @@ pub(crate) fn build_or_load_book_cache(
         BookLoadStatus::Error
     });
 
-    let status = if status == BookLoadStatus::Ready
-        && library
-            .requested_page(target_pages as u32, requested_spine)
-            .is_none()
-        && library.book_next_spine().is_some()
-    {
-        BookLoadStatus::Loading
-    } else {
-        status
-    };
     library.finish_book_load(index, requested_chapter, status);
     library.loaded_index = Some(index);
 }
@@ -673,6 +663,12 @@ where
     }
     match result {
         BookIndexLoadResult::Hit => {
+            // A durable prefix is a resume point for preparation, not a ready
+            // book. Returning a cache hit here would keep replaying that prefix
+            // without ever appending its remaining spines.
+            if library.book_next_spine().is_some() {
+                return false;
+            }
             // BOOK is the commit record. Reconstruct a generated TOC sidecar
             // after interrupted publication, rather than trusting an older file.
             if library.book_generated_toc()

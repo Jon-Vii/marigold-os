@@ -1,5 +1,10 @@
 # Reader performance work — September 12, 2026
 
+The replacement v0.5.0 restores complete-book preparation before reading.
+The progressive-opening measurements below describe the withdrawn release;
+its demand-driven preparation policy is superseded. Durable cache generations,
+resumable preparation, and the other performance changes remain in use.
+
 ## Initial pass
 
 ### Incremental section pagination (`98b474d`)

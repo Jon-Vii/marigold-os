@@ -131,7 +131,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
 
     // A continuation is tiny Copy data, never a retained ZIP/FAT/parser borrow.
     // Give queued display/storage commands and the other executor tasks a turn
-    // before appending the next spine for a distant page/chapter request.
+    // before appending the next spine during book preparation.
     let mut pending_reader: Option<StorageCommand> = None;
     // A loading plate can have the same request as its eventual page. Keep
     // this bit separate so a RAM reply only skips a proven body-page redraw.

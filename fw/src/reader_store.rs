@@ -694,6 +694,13 @@ impl ReaderStore {
     }
 
     pub(crate) fn finish_book_load(&mut self, index: usize, chapter: u16, status: BookLoadStatus) {
+        // Commit progress between spines, but finish preparation before exposing
+        // any page. Otherwise ordinary forward turns pay for later EPUB builds.
+        let status = if status == BookLoadStatus::Ready && self.book_next_spine.is_some() {
+            BookLoadStatus::Loading
+        } else {
+            status
+        };
         if matches!(status, BookLoadStatus::Ready) {
             self.set_current_index(index);
         }
