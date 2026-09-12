@@ -281,7 +281,11 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    with_catalog_file(root, |file, count| {
+    #[cfg(feature = "bench-serial")]
+    let window_start = (Instant::now(), crate::sd_session::sd_stats::snapshot());
+    #[cfg(feature = "bench-serial")]
+    let (mut record_us, mut label_us) = (0u64, 0u64);
+    let result = with_catalog_file(root, |file, count| {
         library.set_catalog_total(count);
         library.begin_window(start);
         if start >= count as usize {
@@ -291,13 +295,33 @@ where
         let take = LIBRARY_WINDOW.min(count as usize - start);
         let mut record = [0u8; CATALOG_RECORD_BYTES];
         for _ in 0..take {
+            #[cfg(feature = "bench-serial")]
+            let record_start = Instant::now();
             read_exact_file(file, &mut record)?;
+            #[cfg(feature = "bench-serial")]
+            { record_us += record_start.elapsed().as_micros(); }
             let decoded = decode_record(&record);
             // Prefer the title saved when the book was last opened over the
             // file-stem label, so uploaded books (8.3 names) read as their
             // real titles. A miss (never opened) falls back to the stem.
             let mut title = String::<64>::new();
+            #[cfg(feature = "bench-serial")]
+            let title_start = (Instant::now(), crate::sd_session::sd_stats::snapshot());
             let label = cached_title_label(root, &decoded, &mut title);
+            #[cfg(feature = "bench-serial")]
+            {
+                let elapsed_us = title_start.0.elapsed().as_micros();
+                label_us += elapsed_us;
+                let reads = crate::sd_session::sd_stats::snapshot().since(title_start.1);
+                esp_println::println!(
+                    "bench: catalog_label source_hash={} hit={} elapsed_us={} rd_calls={} rd_blocks={}",
+                    decoded.source_hash,
+                    label.is_some(),
+                    elapsed_us,
+                    reads.read_calls,
+                    reads.read_blocks,
+                );
+            }
             library.push_window_entry(
                 decoded.display_name.as_str(),
                 decoded.open_name.as_str(),
@@ -308,7 +332,23 @@ where
             );
         }
         Ok(())
-    })
+    });
+    #[cfg(feature = "bench-serial")]
+    {
+        let elapsed_us = window_start.0.elapsed().as_micros();
+        let reads = crate::sd_session::sd_stats::snapshot().since(window_start.1);
+        esp_println::println!(
+            "bench: catalog_window start={} ok={} elapsed_us={} record_us={} label_us={} rd_calls={} rd_blocks={}",
+            start,
+            result.is_ok(),
+            elapsed_us,
+            record_us,
+            label_us,
+            reads.read_calls,
+            reads.read_blocks,
+        );
+    }
+    result
 }
 
 /// Read a single catalog record by absolute index.

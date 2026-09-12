@@ -795,11 +795,17 @@ where
                 return Some(true);
             }
         }
-        let (slot, _) = book_generation::selected(&book_dir, false)?;
-        let file = book_dir
-            .open_file_in_dir(book_generation::NAMES[slot], Mode::ReadOnly)
-            .ok()?;
-        Some(read_book_title(&file, source_identity, out))
+        // The same source has the same EPUB title regardless of pagination.
+        // Reading a label needs only its matching header and text: selecting a
+        // generation would seek to both footers and walk their FAT chains.
+        for name in book_generation::NAMES {
+            if let Ok(file) = book_dir.open_file_in_dir(name, Mode::ReadOnly) {
+                if read_book_title(&file, source_identity, out) {
+                    return Some(true);
+                }
+            }
+        }
+        Some(false)
     })()
     .unwrap_or(false)
 }
