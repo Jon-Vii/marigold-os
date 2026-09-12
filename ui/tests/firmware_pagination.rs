@@ -233,3 +233,43 @@ fn incremental_index_respects_capacity_and_clear() {
     reader_layout::extend_page_index(&mut store);
     assert_incremental_index(&store);
 }
+
+/// Run explicitly in release mode; timings are observations, never CI gates.
+#[test]
+#[ignore = "host timing probe; run in release mode with --ignored --nocapture"]
+fn benchmark_cache_pagination() {
+    use std::{hint::black_box, time::Instant};
+    const BLOCKS: usize = 320;
+    const ROUNDS: usize = 2000;
+    let mut store = ReaderStore::new();
+    for _ in 0..BLOCKS {
+        append_block(&mut store, TextRole::Body);
+    }
+    for batch in [1, 4, 16, BLOCKS] {
+        for incremental in [false, true] {
+            let mut samples = [0.0; 5];
+            for sample in &mut samples {
+                let start = Instant::now();
+                for _ in 0..ROUNDS {
+                    store.page_count = 0;
+                    for count in (batch..=BLOCKS).step_by(batch) {
+                        store.block_count = count;
+                        if incremental {
+                            reader_layout::extend_page_index(black_box(&mut store));
+                        } else {
+                            reader_layout::rebuild_page_index(black_box(&mut store));
+                        }
+                        black_box(&store.pages[..store.page_count]);
+                    }
+                }
+                *sample = start.elapsed().as_secs_f64() * 1_000_000.0 / ROUNDS as f64;
+            }
+            samples.sort_by(f64::total_cmp);
+            assert_incremental_index(&store);
+            println!(
+                "batch={batch} incremental={incremental} median_us_per_section={:.3}",
+                samples[2]
+            );
+        }
+    }
+}
