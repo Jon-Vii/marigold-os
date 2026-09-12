@@ -12,6 +12,9 @@ use proto::font_pack::{
 };
 use proto::text::TextAlign;
 
+mod bitmap_cache;
+use bitmap_cache::BitmapCache;
+
 const MAX_ROW_BYTES: usize = 32;
 const MAX_GLYPH_BYTES: usize = 512;
 
@@ -181,6 +184,8 @@ impl MetricCache {
     }
 }
 
+// Keep the temporary bitmap working set out of the deeper EPUB build stack.
+#[inline(never)]
 pub(crate) fn draw_reading_page_body<
     D,
     T,
@@ -214,6 +219,7 @@ where
         file: &file,
         source,
         cache,
+        bitmaps: BitmapCache::new(),
     };
     let settings = source.type_settings();
     let page_box = ui::reading::ReadingBlocks::page_box(source);
@@ -334,6 +340,7 @@ struct CustomFontFile<
     file: &'file File<'volume, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     source: &'file ReaderStore,
     cache: &'file mut MetricCache,
+    bitmaps: BitmapCache,
 }
 
 impl<
@@ -461,7 +468,7 @@ where
     }
 
     fn draw_glyph_bitmap(
-        &self,
+        &mut self,
         fb: &mut Framebuffer,
         face: FontPackFaceRecord,
         metric: GlyphMetric,
@@ -479,9 +486,16 @@ where
             return None;
         }
         let offset = face.bitmap_offset.checked_add(metric.offset as u32)?;
-        self.file.seek_from_start(offset).ok()?;
-        let mut bitmap = [0u8; MAX_GLYPH_BYTES];
-        read_full(&self.file, &mut bitmap[..glyph_len])?;
+        let file = self.file;
+        let bitmap = self.bitmaps.get_or_load(
+            self.source.custom_font_identity(),
+            offset,
+            glyph_len,
+            |bytes| {
+                file.seek_from_start(offset).ok()?;
+                read_full(file, bytes)
+            },
+        )?;
         for y in 0..metric.height as usize {
             let row = &bitmap[y * row_bytes..(y + 1) * row_bytes];
             for x_byte in 0..row_bytes {
