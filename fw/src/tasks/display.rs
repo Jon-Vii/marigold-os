@@ -416,6 +416,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                         &command,
                         sd_library,
                         refresh_planner.last_request(),
+                        last_reader_render_ready,
                     ) {
                         crate::views::render(fb, loading_request, sd_library);
                         let mode = refresh_planner.mode_for(loading_request);
@@ -533,6 +534,7 @@ fn open_loading_plate_request(
     command: &StorageCommand,
     sd_library: &ReaderStore,
     last_request: Option<RenderRequest>,
+    last_reader_render_ready: bool,
 ) -> Option<RenderRequest> {
     let (book_id, index, target_pages, type_settings, portrait) = match *command {
         StorageCommand::OpenBook {
@@ -572,6 +574,11 @@ fn open_loading_plate_request(
     request.line_spacing = type_settings.spacing;
     request.font_weight = type_settings.weight;
     request.font_family = type_settings.family;
+    // Continuation steps keep the same loading plate. Repainting it between
+    // spines adds a full panel refresh to every preparation step.
+    if !last_reader_render_ready && last_request == Some(request) {
+        return None;
+    }
     Some(request)
 }
 
