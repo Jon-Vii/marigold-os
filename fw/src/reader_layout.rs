@@ -53,7 +53,21 @@ pub(crate) fn reader_page_at(sd_library: &ReaderStore, page_index: usize) -> Pag
 
 pub(crate) fn rebuild_page_index(library: &mut ReaderStore) {
     library.page_count = 0;
-    let mut cursor = PageCursor::new();
+    extend_page_index(library);
+}
+
+/// Update after appending blocks or marking the final block's paragraph end.
+/// Completed pages cannot change under these mutations. Revisit the trailing
+/// page because its available space (including its final gap) can change.
+/// Layout changes, removals, and edits to earlier blocks require a full rebuild.
+pub(crate) fn extend_page_index(library: &mut ReaderStore) {
+    let first_block = if library.page_count > 0 {
+        library.page_count -= 1;
+        usize::from(library.pages[library.page_count].first_block)
+    } else {
+        0
+    };
+    let mut cursor = PageCursor::from_page_start(first_block);
     while library.page_count < library.pages.len() {
         let Some(page) = cursor.next_page(library) else {
             break;

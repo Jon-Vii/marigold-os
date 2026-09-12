@@ -170,6 +170,14 @@ impl PageCursor {
         Self::default()
     }
 
+    /// Resume at a known page boundary. Earlier blocks are not visited;
+    /// callers must retain the layout that established this boundary.
+    pub fn from_page_start(first_block: usize) -> Self {
+        Self {
+            next_block: first_block,
+        }
+    }
+
     pub fn next_page(&mut self, source: &impl ReadingBlocks) -> Option<PageRecord> {
         let first_block = self.next_block;
         if first_block >= source.block_count() {

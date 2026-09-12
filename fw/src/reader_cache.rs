@@ -1494,11 +1494,8 @@ struct LibraryBlockSink<
     target_pages: usize,
     generate_toc_from_headings: bool,
     generated_toc_for_spine: bool,
-    /// The section arena changed since the last `rebuild_page_index`. Every
-    /// pushed XHTML run used to trigger a full re-walk of the accumulated
-    /// blocks (twice, via `flush_if_full`) — O(blocks²) per section. The
-    /// flag limits the rebuild to arena mutations, including paragraph-end
-    /// marks, which change heights without changing counts.
+    /// Only appends and final paragraph-end marks occur between updates.
+    /// Completed pages stay valid; the dirty trailing page is repaginated.
     pages_dirty: bool,
 }
 
@@ -1606,7 +1603,7 @@ where
 
     fn rebuild_pages_if_dirty(&mut self) {
         if self.pages_dirty {
-            reader_layout::rebuild_page_index(self.library);
+            reader_layout::extend_page_index(self.library);
             self.pages_dirty = false;
         }
     }

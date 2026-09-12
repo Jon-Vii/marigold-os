@@ -152,3 +152,84 @@ fn firmware_index_is_bounded_and_empty_rebuild_clears_old_pages() {
     assert_eq!(paginate_block_pages(&store), 1);
     assert_eq!(page_record_at(&store, 0).block_count, 0);
 }
+
+#[test]
+fn incremental_index_matches_full_walk_during_append_and_section_carry() {
+    let mut store = ReaderStore::new();
+    for portrait in [false, true] {
+        for spacing in [
+            LineSpacing::Compact,
+            LineSpacing::Normal,
+            LineSpacing::Relaxed,
+        ] {
+            store.clear_lines();
+            store.set_layout(
+                TypeSettings {
+                    spacing,
+                    ..TypeSettings::DEFAULT
+                },
+                portrait,
+            );
+            for step in 0..700 {
+                let index = store.block_count;
+                append_block(
+                    &mut store,
+                    if step % 7 == 0 {
+                        TextRole::BlockQuote
+                    } else {
+                        TextRole::Body
+                    },
+                );
+                store.block_paragraph_end[index] = false;
+                store.block_spine[index] = (step / 23) as u16;
+                store.block_page_break_before[index] = step % 23 == 0;
+                reader_layout::extend_page_index(&mut store);
+                assert_incremental_index(&store);
+                // A later parser fragment can end a paragraph without adding
+                // a block. Its new gap must affect the next appended line.
+                if step % 3 == 0 {
+                    store.mark_last_block_paragraph_end();
+                    reader_layout::extend_page_index(&mut store);
+                    assert_incremental_index(&store);
+                }
+                if store.page_count >= 12 {
+                    let cut = usize::from(store.pages[store.page_count - 1].first_block);
+                    store.carry_last_page(cut);
+                    reader_layout::rebuild_page_index(&mut store);
+                    assert_incremental_index(&store);
+                }
+            }
+        }
+    }
+}
+
+fn assert_incremental_index(store: &ReaderStore) {
+    assert_eq!(
+        store.page_count,
+        paginate_block_pages(store).min(store.page_capacity())
+    );
+    for index in 0..store.page_count {
+        assert_eq!(store.pages[index], page_record_at(store, index));
+        assert_eq!(
+            store.page_spine[index],
+            store.block_spine[usize::from(store.pages[index].first_block)]
+        );
+    }
+}
+
+#[test]
+fn incremental_index_respects_capacity_and_clear() {
+    let mut store = ReaderStore::new();
+    for index in 0..store.block_capacity() {
+        append_block(&mut store, TextRole::Heading1);
+        store.block_page_break_before[index] = true;
+        reader_layout::extend_page_index(&mut store);
+        assert_incremental_index(&store);
+    }
+    store.clear_lines();
+    reader_layout::extend_page_index(&mut store);
+    assert_eq!(store.page_count, 0);
+    append_block(&mut store, TextRole::Body);
+    reader_layout::extend_page_index(&mut store);
+    assert_incremental_index(&store);
+}
