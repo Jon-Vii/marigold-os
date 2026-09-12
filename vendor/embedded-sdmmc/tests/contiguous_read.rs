@@ -314,3 +314,206 @@ fn empty_and_eof_reads_do_not_issue_device_transactions() {
     assert!(observer.0.borrow().reads.is_empty());
     assert_eq!(bytes, [0xAA; 1024]);
 }
+
+// Directory lookup regressions share the sparse disk adapter so they can
+// assert the exact physical reads, not only the eventual NotFound result.
+fn put_directory_entry(
+    block: &mut Block,
+    slot: usize,
+    name: &[u8; 11],
+    directory: bool,
+    cluster: u16,
+) {
+    let offset = slot * 32;
+    block[offset..offset + 11].copy_from_slice(name);
+    block[offset + 11] = if directory { 0x10 } else { 0x20 };
+    u16_at(&mut block.contents, offset + 26, cluster);
+}
+
+fn directory_fixture(fat32: bool, subdirectory: bool) -> (Disk, u32, u32, Option<u32>) {
+    let sectors = if fat32 { 8 } else { 4 };
+    let (disk, _) = fixture(fat32, sectors);
+    let mut state = disk.0.borrow_mut();
+    let root_start = if fat32 {
+        state.data_start
+    } else {
+        state.data_start - 32
+    };
+    let cluster = if subdirectory { 12 } else { 2 };
+    let directory_start = if subdirectory {
+        state.data_start + (cluster - 2) * u32::from(sectors)
+    } else {
+        root_start
+    };
+    let next_start = state.data_start + 15 * u32::from(sectors); // cluster 17
+    let mut root = Block::new();
+    if subdirectory {
+        put_directory_entry(&mut root, 0, b"SUBDIR     ", true, cluster as u16);
+    }
+    state.blocks.insert(root_start, root);
+    let directory_sectors = if !fat32 && !subdirectory {
+        32
+    } else {
+        u32::from(sectors)
+    };
+    for sector in 0..directory_sectors {
+        state.blocks.insert(directory_start + sector, Block::new());
+    }
+    let next = if fat32 || subdirectory {
+        let fat_start = if fat32 { 33 } else { 2 };
+        let fat = state.blocks.get_mut(&fat_start).unwrap();
+        if fat32 {
+            u32_at(&mut fat.contents, cluster as usize * 4, 17);
+            u32_at(&mut fat.contents, 17 * 4, 0x0FFFFFFF);
+        } else {
+            u16_at(&mut fat.contents, cluster as usize * 2, 17);
+            u16_at(&mut fat.contents, 17 * 2, 0xFFFF);
+        }
+        state.blocks.insert(next_start, Block::new());
+        Some(next_start)
+    } else {
+        None
+    };
+    drop(state);
+    (disk, directory_start, directory_sectors, next)
+}
+
+#[test]
+fn directory_end_marker_stops_lookup_before_unused_sectors_and_clusters() {
+    for (fat32, subdirectory) in [(false, false), (false, true), (true, false), (true, true)] {
+        for name in ["MISSING.DAT", "LATE.DAT"] {
+            let (disk, start, _, next) = directory_fixture(fat32, subdirectory);
+            {
+                let mut state = disk.0.borrow_mut();
+                // Entry zero is 0x00. Junk in this sector, the next sector,
+                // and an allocated following cluster must all stay invisible.
+                put_directory_entry(
+                    state.blocks.get_mut(&start).unwrap(),
+                    1,
+                    b"LATE    DAT",
+                    false,
+                    3,
+                );
+                put_directory_entry(
+                    state.blocks.get_mut(&(start + 1)).unwrap(),
+                    0,
+                    b"LATE    DAT",
+                    false,
+                    3,
+                );
+                if let Some(next) = next {
+                    put_directory_entry(
+                        state.blocks.get_mut(&next).unwrap(),
+                        0,
+                        b"LATE    DAT",
+                        false,
+                        3,
+                    );
+                }
+            }
+            let observer = disk.clone();
+            let manager = VolumeManager::new(disk, Clock);
+            let volume = manager.open_volume(VolumeIdx(0)).unwrap();
+            let root = volume.open_root_dir().unwrap();
+            let child = if subdirectory {
+                Some(root.open_dir("SUBDIR").unwrap())
+            } else {
+                None
+            };
+            let directory = child.as_ref().unwrap_or(&root);
+            observer.0.borrow_mut().reads.clear();
+            assert!(matches!(
+                directory.find_directory_entry(name),
+                Err(embedded_sdmmc::Error::NotFound)
+            ));
+            assert_eq!(
+                observer.0.borrow().reads.as_slice(),
+                &[(start, 1)],
+                "lookup must stop after one sector: FAT32={fat32} subdirectory={subdirectory}"
+            );
+        }
+    }
+}
+
+#[test]
+fn directory_deleted_entries_are_skipped_and_full_sectors_continue() {
+    for (fat32, subdirectory) in [(false, false), (false, true), (true, false), (true, true)] {
+        for full_first_sector in [false, true] {
+            let (disk, start, _, _) = directory_fixture(fat32, subdirectory);
+            let expected_sector = start + u32::from(full_first_sector);
+            {
+                let mut state = disk.0.borrow_mut();
+                let first = state.blocks.get_mut(&start).unwrap();
+                first[0] = 0xE5; // deleted is not the end marker
+                if full_first_sector {
+                    for slot in 1..16 {
+                        put_directory_entry(first, slot, b"OTHER   DAT", false, 3);
+                    }
+                }
+                let slot = if full_first_sector { 0 } else { 1 };
+                put_directory_entry(
+                    state.blocks.get_mut(&expected_sector).unwrap(),
+                    slot,
+                    b"LATE    DAT",
+                    false,
+                    3,
+                );
+            }
+            let observer = disk.clone();
+            let manager = VolumeManager::new(disk, Clock);
+            let volume = manager.open_volume(VolumeIdx(0)).unwrap();
+            let root = volume.open_root_dir().unwrap();
+            let child = if subdirectory {
+                Some(root.open_dir("SUBDIR").unwrap())
+            } else {
+                None
+            };
+            let directory = child.as_ref().unwrap_or(&root);
+            observer.0.borrow_mut().reads.clear();
+            assert!(directory.find_directory_entry("LATE.DAT").is_ok());
+            assert_eq!(
+                observer.0.borrow().reads.len(),
+                if full_first_sector { 2 } else { 1 }
+            );
+        }
+    }
+}
+
+#[test]
+fn full_directory_clusters_still_follow_the_fat_chain() {
+    for (fat32, subdirectory) in [(false, true), (true, false), (true, true)] {
+        let (disk, start, sectors, next) = directory_fixture(fat32, subdirectory);
+        let next = next.unwrap();
+        {
+            let mut state = disk.0.borrow_mut();
+            for sector in start..start + sectors {
+                let block = state.blocks.get_mut(&sector).unwrap();
+                for slot in 0..16 {
+                    put_directory_entry(block, slot, b"OTHER   DAT", false, 3);
+                }
+            }
+            put_directory_entry(
+                state.blocks.get_mut(&next).unwrap(),
+                0,
+                b"LATE    DAT",
+                false,
+                3,
+            );
+        }
+        let observer = disk.clone();
+        let manager = VolumeManager::new(disk, Clock);
+        let volume = manager.open_volume(VolumeIdx(0)).unwrap();
+        let root = volume.open_root_dir().unwrap();
+        let child = if subdirectory {
+            Some(root.open_dir("SUBDIR").unwrap())
+        } else {
+            None
+        };
+        let directory = child.as_ref().unwrap_or(&root);
+        observer.0.borrow_mut().reads.clear();
+        assert!(directory.find_directory_entry("LATE.DAT").is_ok());
+        let state = observer.0.borrow();
+        assert_eq!(state.reads.len(), sectors as usize + 2); // first cluster, FAT link, next cluster
+        assert_eq!(state.reads.last(), Some(&(next, 1)));
+    }
+}

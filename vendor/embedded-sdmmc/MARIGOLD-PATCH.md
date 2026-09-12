@@ -1,4 +1,4 @@
-# Marigold local FAT read experiment
+# Marigold local FAT patches
 
 Source: `https://github.com/Jon-Vii/embedded-sdmmc-rs.git`, commit
 `329b3a53a55fb527f62a7813557b420817e831d8` (version 0.9.0).
@@ -8,6 +8,21 @@ upstream driver upgrade is involved. The existing CMD18 path also gains a narrow
 error cleanup: always attempt CMD12 after a data transfer error, preserving the
 original error if stopping fails too. A scripted SPI test covers successful
 transfers, errors before/after a good block, and failed stop commands.
+
+The always-enabled directory lookup fix distinguishes a full-sector miss from
+FAT's `0x00` directory-end marker. Previously the inner search stopped at the
+marker but returned the same result as a full-sector miss; the outer search
+then scanned every remaining allocated sector (and sometimes another cluster).
+Both FAT16 and FAT32 now stop the complete lookup immediately at the marker and
+return `NotFound`. Deleted `0xE5` entries remain skippable, and full sectors or
+clusters still continue normally. This also prevents stale bytes after the end
+marker from being mistaken for live directory entries. Production code adds no
+buffer or heap allocation, and the SD initialization path is unchanged.
+
+Sparse-disk tests cover FAT16/FAT32 roots and subdirectories: missing names and
+junk after the marker read exactly the first directory sector, deleted entries
+are skipped, full sectors continue, and full clusters follow their FAT links.
+This lookup correction is independent of the experimental batching feature.
 
 The default-off `contiguous-file-read` feature changes only the FAT file read
 path. Full sectors within the current cluster reach `BlockDevice::read` in

@@ -1073,6 +1073,7 @@ impl FatVolume {
                             block,
                         ) {
                             Err(Error::NotFound) => continue,
+                            Err(Error::EndOfFile) => return Err(Error::NotFound),
                             x => return x,
                         }
                     }
@@ -1105,6 +1106,7 @@ impl FatVolume {
                             block,
                         ) {
                             Err(Error::NotFound) => continue,
+                            Err(Error::EndOfFile) => return Err(Error::NotFound),
                             x => return x,
                         }
                     }
@@ -1131,8 +1133,10 @@ impl FatVolume {
         for (i, dir_entry_bytes) in block.chunks_exact(OnDiskDirEntry::LEN).enumerate() {
             let dir_entry = OnDiskDirEntry::new(dir_entry_bytes);
             if dir_entry.is_end() {
-                // Can quit early
-                break;
+                // 0x00 ends the entire directory, not just this sector.
+                // Keep it distinct from a full-sector miss so callers do not
+                // scan unused allocated sectors or follow another FAT cluster.
+                return Err(Error::EndOfFile);
             } else if dir_entry.matches(match_name) {
                 // Found it
                 // Block::LEN always fits on a u32
