@@ -258,7 +258,134 @@ fn page_text(store: &ReaderStore) -> Vec<Vec<String>> {
         .collect()
 }
 
-
+#[test]
+fn spacing_reflow_matches_fresh_pagination_across_old_section_boundaries() {
+    use display::font::{LineSpacing, TypeSettings};
+    for portrait in [false, true] {
+        let disk = fat::Disk::new();
+        let manager: VolumeManager<_, _, 8, 8, 1> =
+            VolumeManager::new_with_limits(&disk, fat::Clock, 0);
+        let volume = manager.open_volume(VolumeIdx(0)).unwrap();
+        let root = volume.open_root_dir().unwrap();
+        let mut store = ReaderStore::new();
+        store.set_layout(
+            TypeSettings {
+                spacing: LineSpacing::Compact,
+                ..TypeSettings::DEFAULT
+            },
+            portrait,
+        );
+        let mut records = Vec::new();
+        let mut total = 0u32;
+        for spine in 0..3u16 {
+            store.clear_lines();
+            store.push_toc_record(&format!("Chapter {spine}"), 1, spine as i16);
+            for line in 0..200 {
+                append_fixture_line(&mut store, spine, line);
+                if store.page_count >= 3 || line == 199 {
+                    store.set_cached_spine(spine);
+                    assert!(reader_layout::flush_page_window(
+                        &mut store,
+                        line != 199,
+                        |window| {
+                            let section = records.len() as u16;
+                            if !reader_cache_files::write_v2_section_cache(
+                                &root, KEY, ID, section, window,
+                            ) {
+                                return false;
+                            }
+                            records.push(BookV2SectionRecord {
+                                section,
+                                spine,
+                                start_page: total,
+                                page_count: window.page_count as u16,
+                                partial: false,
+                            });
+                            total += window.page_count as u32;
+                            true
+                        }
+                    ));
+                }
+            }
+        }
+        assert!(
+            records.len() > 3,
+            "fixture spans multiple old sections per chapter"
+        );
+        assert!(reader_cache_files::write_v2_book_index(
+            &root, KEY, ID, total, &records, &store, false
+        ));
+        let mut scratch = vec![0u8; 24576];
+        for spacing in [
+            LineSpacing::Relaxed,
+            LineSpacing::Compact,
+            LineSpacing::Normal,
+            LineSpacing::Relaxed,
+            LineSpacing::Normal,
+            LineSpacing::Compact,
+        ] {
+            let settings = TypeSettings {
+                spacing,
+                ..TypeSettings::DEFAULT
+            };
+            store.set_layout(settings, portrait);
+            assert_eq!(
+                reader_cache_files::load_v2_book_index(&root, KEY, ID, &mut store),
+                BookIndexLoadResult::SpacingMismatch
+            );
+            assert!(reader_cache_files::reflow_book_spacing(
+                &root,
+                KEY,
+                ID,
+                &mut store,
+                &mut scratch
+            ));
+            assert_eq!(
+                reader_cache_files::load_v2_book_index(&root, KEY, ID, &mut store),
+                BookIndexLoadResult::Hit
+            );
+            let mut actual = Vec::new();
+            let mut expected = Vec::new();
+            let sections = store.book_sections[..store.book_section_count].to_vec();
+            for section in sections {
+                assert!(matches!(
+                    reader_cache_files::load_v2_section_cache(
+                        &root,
+                        KEY,
+                        ID,
+                        section.section,
+                        section.spine,
+                        section.page_count as usize,
+                        &mut store
+                    ),
+                    CacheLoadResult::Hit {
+                        repaginated: false,
+                        ..
+                    }
+                ));
+                actual.extend(page_text(&store));
+            }
+            for spine in 0..3u16 {
+                assert_eq!(store.page_for_spine(spine), expected.len() as u32);
+                let mut fresh = ReaderStore::new();
+                fresh.set_layout(settings, portrait);
+                for line in 0..200 {
+                    append_fixture_line(&mut fresh, spine, line);
+                }
+                expected.extend(page_text(&fresh));
+            }
+            assert_eq!(actual, expected, "spacing={spacing:?}, portrait={portrait}");
+            assert_eq!(store.book_total_pages as usize, expected.len());
+            reader_layout::rebuild_toc_page_targets(&mut store);
+            for spine in 0..3 {
+                assert_eq!(
+                    u32::from(store.toc_page[spine]),
+                    store.page_for_spine(spine as u16)
+                );
+            }
+        }
+    }
+}
 
 #[test]
 fn corrupted_new_generation_falls_back_for_loading_and_orphan_identity() {
@@ -484,4 +611,149 @@ fn advisory_legacy_titles_do_not_override_generation_page_state() {
     );
 }
 
-
+#[test]
+fn spacing_reflow_write_interruptions_preserve_a_readable_generation() {
+    use display::font::{LineSpacing, TypeSettings};
+    let seed = fat::Disk::new();
+    {
+        let manager: VolumeManager<_, _, 8, 8, 1> =
+            VolumeManager::new_with_limits(&seed, fat::Clock, 0);
+        let volume = manager.open_volume(VolumeIdx(0)).unwrap();
+        let root = volume.open_root_dir().unwrap();
+        let mut store = ReaderStore::new();
+        store.set_layout(
+            TypeSettings {
+                spacing: LineSpacing::Compact,
+                ..TypeSettings::DEFAULT
+            },
+            false,
+        );
+        for line in 0..80 {
+            append_fixture_line(&mut store, 0, line);
+        }
+        store.set_cached_spine(0);
+        assert!(reader_cache_files::write_v2_section_cache(
+            &root, KEY, ID, 0, &store
+        ));
+        let section = BookV2SectionRecord {
+            section: 0,
+            spine: 0,
+            start_page: 0,
+            page_count: store.page_count as u16,
+            partial: false,
+        };
+        assert!(reader_cache_files::write_v2_book_index(
+            &root,
+            KEY,
+            ID,
+            store.page_count as u32,
+            &[section],
+            &store,
+            false
+        ));
+    }
+    for cut in 0..100 {
+        let disk = fat::Disk::new();
+        disk.bytes
+            .borrow_mut()
+            .copy_from_slice(&seed.bytes.borrow());
+        {
+            let manager: VolumeManager<_, _, 8, 8, 1> =
+                VolumeManager::new_with_limits(&disk, fat::Clock, 0);
+            let volume = manager.open_volume(VolumeIdx(0)).unwrap();
+            let root = volume.open_root_dir().unwrap();
+            let mut store = ReaderStore::new();
+            store.set_layout(
+                TypeSettings {
+                    spacing: LineSpacing::Relaxed,
+                    ..TypeSettings::DEFAULT
+                },
+                false,
+            );
+            assert_eq!(
+                reader_cache_files::load_v2_book_index(&root, KEY, ID, &mut store),
+                BookIndexLoadResult::SpacingMismatch
+            );
+            disk.fail_after.set(Some(cut));
+            let _ = reader_cache_files::reflow_book_spacing(
+                &root,
+                KEY,
+                ID,
+                &mut store,
+                &mut [0; 24576],
+            );
+        }
+        disk.fail_after.set(None);
+        let manager: VolumeManager<_, _, 8, 8, 1> =
+            VolumeManager::new_with_limits(&disk, fat::Clock, 0);
+        let volume = manager.open_volume(VolumeIdx(0)).unwrap();
+        let root = volume.open_root_dir().unwrap();
+        let mut store = ReaderStore::new();
+        store.set_layout(
+            TypeSettings {
+                spacing: LineSpacing::Compact,
+                ..TypeSettings::DEFAULT
+            },
+            false,
+        );
+        let result = reader_cache_files::load_v2_book_index(&root, KEY, ID, &mut store);
+        assert!(
+            matches!(
+                result,
+                BookIndexLoadResult::Hit | BookIndexLoadResult::SpacingMismatch
+            ),
+            "cut={cut} result={result:?}"
+        );
+        let spacing = if result == BookIndexLoadResult::Hit {
+            LineSpacing::Compact
+        } else {
+            LineSpacing::Relaxed
+        };
+        store.set_layout(
+            TypeSettings {
+                spacing,
+                ..TypeSettings::DEFAULT
+            },
+            false,
+        );
+        assert_eq!(
+            reader_cache_files::load_v2_book_index(&root, KEY, ID, &mut store),
+            BookIndexLoadResult::Hit
+        );
+        let sections = store.book_sections[..store.book_section_count].to_vec();
+        let mut actual = Vec::new();
+        for section in sections {
+            assert!(
+                matches!(
+                    reader_cache_files::load_v2_section_cache(
+                        &root,
+                        KEY,
+                        ID,
+                        section.section,
+                        section.spine,
+                        section.page_count as usize,
+                        &mut store
+                    ),
+                    CacheLoadResult::Hit {
+                        repaginated: false,
+                        ..
+                    }
+                ),
+                "cut={cut}"
+            );
+            actual.extend(page_text(&store));
+        }
+        let mut fresh = ReaderStore::new();
+        fresh.set_layout(
+            TypeSettings {
+                spacing,
+                ..TypeSettings::DEFAULT
+            },
+            false,
+        );
+        for line in 0..80 {
+            append_fixture_line(&mut fresh, 0, line);
+        }
+        assert_eq!(actual, page_text(&fresh), "cut={cut}");
+    }
+}

@@ -2091,3 +2091,216 @@ where
         .then_some((first / MAX_BOOK_SECTIONS * MAX_BOOK_SECTIONS) as u16))
 }
 
+/// Reflow prewrapped lines through the same page plan, joining old section
+/// boundaries before choosing new ones. Scratch is the idle XHTML buffer, not
+/// additional stack/static storage. The verified old index remains recoverable
+/// until every replacement section and its new index have reached the card.
+#[inline(never)]
+pub(crate) fn reflow_book_spacing<D, T, const ND: usize, const NF: usize, const NV: usize>(
+    root: &Directory<'_, D, T, ND, NF, NV>,
+    key: &str,
+    identity: (u32, u32),
+    library: &mut ReaderStore,
+    scratch: &mut [u8],
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if library.book_next_spine().is_some()
+        || library.book_cache_partial
+        || library.book_section_count == 0
+    {
+        return false;
+    }
+    let original_sections = library.book_sections;
+    let original_count = library.book_section_count;
+    let Some(base) = prepare_book_replacement(root, key) else {
+        return false;
+    };
+    library.book_cache_ready = false;
+    library.clear_lines();
+    let mut count = 0usize;
+    let mut pages = 0u32;
+    let mut previous_spine = None;
+    let ok = with_v2_sections_dir(root, key, |dir| {
+        let Some(dir) = dir else {
+            return false;
+        };
+        for section in &original_sections[..original_count] {
+            if previous_spine.is_some_and(|spine| spine != section.spine)
+                && !flush_reflow_window(dir, identity, base, library, &mut count, &mut pages, false)
+            {
+                return false;
+            }
+            previous_spine = Some(section.spine);
+            let Some(header) = read_reflow_source(dir, section, identity, library, scratch) else {
+                return false;
+            };
+            let blocks_at =
+                SECTION_V2_HEADER_BYTES + usize::from(header.page_count) * PAGE_RECORD_BYTES;
+            let flags_at = blocks_at + usize::from(header.block_count) * BLOCK_RECORD_BYTES;
+            let text_at = flags_at + usize::from(header.block_count);
+            for index in 0..usize::from(header.block_count) {
+                let record_at = blocks_at + index * BLOCK_RECORD_BYTES;
+                let Ok(block) = decode_block(&scratch[record_at..record_at + BLOCK_RECORD_BYTES])
+                else {
+                    return false;
+                };
+                let start = block.text_offset as usize;
+                let Some(end) = start.checked_add(usize::from(block.text_len)) else {
+                    return false;
+                };
+                if block.line_count != 1
+                    || end > header.text_bytes as usize
+                    || block.text_len as usize > crate::reader_store::MAX_READER_BLOCK_TEXT
+                {
+                    return false;
+                }
+                let Ok(text) = core::str::from_utf8(&scratch[text_at + start..text_at + end])
+                else {
+                    return false;
+                };
+                if text.is_empty() || text.trim() != text {
+                    return false;
+                }
+                let flags = scratch[flags_at + index];
+                if flags & !0b11 != 0 {
+                    return false;
+                }
+                // Leave the same worst-case line headroom as the XHTML sink.
+                if (library.block_count() >= library.block_capacity().saturating_sub(4)
+                    || library.text_capacity_reached()
+                    || library.page_count >= library.page_capacity())
+                    && !flush_reflow_window(
+                        dir, identity, base, library, &mut count, &mut pages, true,
+                    )
+                {
+                    return false;
+                }
+                let next = library.block_count();
+                if !library.push_line_block(
+                    text,
+                    display_style_for_proto_style(block.style),
+                    block.role,
+                    block.align,
+                    flags & 1 != 0,
+                    section.spine,
+                ) || library.block_count() != next + 1
+                {
+                    return false;
+                }
+                // The old section may start in the middle of a paragraph.
+                library.block_paragraph_start[next] = flags & 2 != 0;
+                reader_layout::extend_page_index(library);
+            }
+        }
+        flush_reflow_window(dir, identity, base, library, &mut count, &mut pages, false)
+    });
+    if !ok || count == 0 {
+        return false;
+    }
+    library.book_section_count = count;
+    library.book_total_pages = pages;
+    reader_layout::rebuild_toc_page_targets(library);
+    library.chapter_page_count = 0;
+    if !write_v2_book_index(
+        root,
+        key,
+        identity,
+        pages,
+        &library.book_sections[..count],
+        library,
+        false,
+    ) {
+        return false;
+    }
+    library.book_section_count = count;
+    library.book_total_pages = pages;
+    library.book_cache_ready = true;
+    library.book_cache_partial = false;
+    true
+}
+
+fn read_reflow_source<D, T, const ND: usize, const NF: usize, const NV: usize>(
+    dir: &Directory<'_, D, T, ND, NF, NV>,
+    section: &BookV2SectionRecord,
+    identity: (u32, u32),
+    library: &ReaderStore,
+    scratch: &mut [u8],
+) -> Option<SectionV2Header>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut name = String::<CACHE_SECTION_FILE_BYTES>::new();
+    section_file_name(section.section, &mut name);
+    let file = dir.open_file_in_dir(name.as_str(), Mode::ReadOnly).ok()?;
+    let bytes = scratch.get_mut(..SECTION_V2_HEADER_BYTES)?;
+    read_exact_file(&file, bytes).ok()?;
+    let header = decode_section_v2_header(bytes).ok()?;
+    let config = reader_layout::reader_layout_config(library.type_settings(), library.portrait());
+    if (header.source_hash, header.source_size) != identity
+        || header.spine != section.spine
+        || header.custom_font_identity != library.custom_font_identity()
+        || header.font_config & !0b11 != config & !0b11
+        || header.page_count != section.page_count
+        || header.block_count == 0
+        || header.partial
+        || !library.can_hold_section(
+            header.page_count as usize,
+            header.block_count as usize,
+            header.text_bytes as usize,
+        )
+    {
+        return None;
+    }
+    let len = proto::cache::section_v2_cache_size(header);
+    if file.length() as usize != len {
+        return None;
+    }
+    read_exact_file(&file, scratch.get_mut(SECTION_V2_HEADER_BYTES..len)?).ok()?;
+    Some(header)
+}
+
+fn flush_reflow_window<D, T, const ND: usize, const NF: usize, const NV: usize>(
+    dir: &Directory<'_, D, T, ND, NF, NV>,
+    identity: (u32, u32),
+    base: u16,
+    library: &mut ReaderStore,
+    count: &mut usize,
+    total: &mut u32,
+    carry: bool,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if library.block_count() == 0 {
+        return true;
+    }
+    if *count >= MAX_BOOK_SECTIONS {
+        return false;
+    }
+    let id = base + *count as u16;
+    let spine = library.block_spine[0];
+    library.set_cached_spine(spine);
+    let mut written_pages = 0;
+    let ok = reader_layout::flush_page_window(library, carry, |window| {
+        written_pages = window.page_count;
+        write_v2_section_cache_in(dir, identity, id, window)
+    });
+    if !ok {
+        return false;
+    }
+    library.book_sections[*count] = BookV2SectionRecord {
+        section: id,
+        spine,
+        start_page: *total,
+        page_count: written_pages as u16,
+        partial: false,
+    };
+    *count += 1;
+    *total += written_pages as u32;
+    true
+}

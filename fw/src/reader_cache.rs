@@ -649,11 +649,27 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let result =
+    let mut result =
         reader_cache_files::load_v2_book_index(root, cache_key, source_identity, library);
     if result == BookIndexLoadResult::SpacingMismatch {
-        library.clear_book_index();
-        return false;
+        if !reader_cache_files::reflow_book_spacing(
+            root,
+            cache_key,
+            source_identity,
+            library,
+            reflow_scratch,
+        ) {
+            library.clear_book_index();
+            return false;
+        }
+        esp_println::println!(
+            "bench: storage_reflow elapsed_ms={} pages={} sections={} key={}",
+            started.elapsed().as_millis(),
+            library.book_total_pages,
+            library.book_section_count,
+            cache_key
+        );
+        result = BookIndexLoadResult::Hit;
     }
     match result {
         BookIndexLoadResult::Hit => {
