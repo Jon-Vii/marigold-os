@@ -9,6 +9,10 @@ members = [
 ]
 resolver = "2"
 
+# Exact proven SD driver revision, with the bounded FAT read patch kept locally.
+[patch."https://github.com/Jon-Vii/embedded-sdmmc-rs.git"]
+embedded-sdmmc = { path = "vendor/embedded-sdmmc" }
+
 [profile.release]
 opt-level = "s"          # Size over speed
 lto = "fat"
