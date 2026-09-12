@@ -378,23 +378,10 @@ fn draw_reader_footer(
 }
 
 fn draw_sd_reader_loading(fb: &mut Framebuffer, request: RenderRequest, sd_library: &ReaderStore) {
-    let title_font = literata(FontStyle::Bold);
-    let author_font = literata(FontStyle::Italic);
     let fallback = catalog::active_book(request.book_id);
     let (title, author) =
         sd_library.active_book_labels(request.book_id, fallback.title, fallback.author);
-
-    // Vertically center title + author block within the reader page region
-    // (frame-relative, so the X3's taller page and the portrait hold both
-    // carry the plate to their own middle).
-    let left = 8;
-    let right = fb.frame_width() as i16 - 8;
-    let title_y = fb.frame_height() as i16 / 2 - 8;
-    let author_y = title_y + 36;
-    draw_text_centered_truncated_local(fb, title_font, title, left, right, title_y);
-    if !author.is_empty() {
-        draw_text_centered_truncated_local(fb, author_font, author, left, right, author_y);
-    }
+    ui::reading::draw_reading_bookplate(fb, title, author);
 }
 
 fn draw_sd_reader_error(fb: &mut Framebuffer, request: RenderRequest, sd_library: &ReaderStore) {

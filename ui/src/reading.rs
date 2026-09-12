@@ -9,8 +9,9 @@
 
 use display::fb::{FbFrame, Framebuffer};
 use display::font::{
-    draw_text, family_weighted, fixed_ceil, fixed_round, measure_text, style_from_marker_code,
-    BitmapFont, FontSize, FontStyle, LineSpacing, TypeSettings, STYLE_MARKER,
+    draw_text, family_weighted, fixed_ceil, fixed_round, literata, measure_text,
+    style_from_marker_code, BitmapFont, FontSize, FontStyle, LineSpacing, TypeSettings,
+    STYLE_MARKER,
 };
 use proto::cache::{BlockRecord, PageRecord};
 use proto::text::{TextAlign, TextRole};
@@ -221,6 +222,36 @@ pub fn page_record_at(source: &impl ReadingBlocks, page_index: usize) -> PageRec
         last = page;
     }
     last
+}
+
+/// The loading bookplate shared by the firmware and host reading views.
+/// Coordinates follow the framebuffer's current drawing frame; long labels
+/// keep their leading text and an ellipsis inside the page margins.
+pub fn draw_reading_bookplate(fb: &mut Framebuffer, title: &str, author: &str) {
+    let max_width = fb.frame_width().saturating_sub(16) as u16;
+    let title_y = fb.frame_height() as i16 / 2 - 8;
+    for (style, text, y) in [
+        (FontStyle::Bold, title, title_y),
+        (FontStyle::Italic, author, title_y + 36),
+    ] {
+        if text.is_empty() {
+            continue;
+        }
+        let font = literata(style);
+        let truncated = measure_text(font, text) > max_width;
+        let dots_width = if truncated {
+            measure_text(font, "...")
+        } else {
+            0
+        };
+        let shown = crate::render::fit_text(font, text, max_width.saturating_sub(dots_width));
+        let shown_width = measure_text(font, shown);
+        let x = (fb.frame_width() as i16 - shown_width as i16 - dots_width as i16) / 2;
+        draw_text(fb, font, shown, x, y, false);
+        if truncated {
+            draw_text(fb, font, "...", x + shown_width as i16, y, false);
+        }
+    }
 }
 
 pub fn for_each_drawable_block(

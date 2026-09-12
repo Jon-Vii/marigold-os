@@ -13,7 +13,7 @@ use app_core::{
 use books::{BookStore, SHELF};
 use display::epd::RefreshMode;
 use display::fb::Framebuffer;
-use display::font::{draw_text, literata, measure_text, FontStyle, TypeSettings};
+use display::font::TypeSettings;
 use display::{HEIGHT, WIDTH};
 use ui::app_render::{render_request as render_shared, render_sleep as render_shared_sleep, UiRenderModel};
 use ui::reading::ReadingBlocks;
@@ -396,12 +396,9 @@ impl WebEmulator {
         let book_index = ReaderSource::from_book_id(request.book_id)
             .sd_index()
             .unwrap_or(0);
-        let ready = self.store_ready_for(book_index)
-            || (self.store_book == Some(book_index) && self.load_status == LoadStatus::Ready);
-        if !ready {
+        if !self.store_ready_for(book_index) {
             let source = &SHELF[book_index as usize % SHELF.len()];
-            draw_centered(&mut self.fb, literata(FontStyle::Bold), source.title, 232);
-            draw_centered(&mut self.fb, literata(FontStyle::Italic), source.author, 268);
+            ui::reading::draw_reading_bookplate(&mut self.fb, source.title, source.author);
             return;
         }
         let store = self.store.as_ref().unwrap();
@@ -435,11 +432,6 @@ impl WebEmulator {
 
 fn home_network() -> WifiSsid {
     WifiSsid::new("HOME-WIFI").unwrap()
-}
-
-fn draw_centered(fb: &mut Framebuffer, font: &'static display::font::BitmapFont, text: &str, y: i16) {
-    let width = measure_text(font, text) as i16;
-    draw_text(fb, font, text, (WIDTH as i16 - width) / 2, y, false);
 }
 
 /// The desktop emulator's transition-to-storage-command mapping, verbatim.
@@ -586,4 +578,62 @@ pub extern "C" fn x4_restore(
 #[allow(dead_code)]
 fn _settings_witness(settings: TypeSettings) -> TypeSettings {
     settings
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loading_bookplate_is_centered_in_every_drawing_frame() {
+        let mut emu = WebEmulator::boot();
+        emu.state.view = AppView::Reading;
+        emu.load_status = LoadStatus::Loading;
+        for orientation in [
+            DisplayOrientation::LandscapeButtonsBottom,
+            DisplayOrientation::LandscapeButtonsTop,
+            DisplayOrientation::PortraitButtonsLeft,
+            DisplayOrientation::PortraitButtonsRight,
+        ] {
+            emu.state.orientation = orientation;
+            emu.render(RenderKind::Page);
+            let (width, height) = (emu.fb.frame_width(), emu.fb.frame_height());
+            let (mut left, mut top, mut right, mut bottom) = (width, height, 0, 0);
+            for y in 0..height {
+                for x in 0..width {
+                    if !emu.fb.pixel(x, y) {
+                        left = left.min(x);
+                        top = top.min(y);
+                        right = right.max(x);
+                        bottom = bottom.max(y);
+                    }
+                }
+            }
+            assert!(right > left && bottom > top, "bookplate must be visible");
+            assert!(
+                ((left + right) as isize - width as isize).abs() < 12,
+                "bookplate must be horizontally centered: {orientation:?}"
+            );
+            assert!(
+                top >= height / 2 - 48 && bottom <= height / 2 + 40,
+                "bookplate must follow frame height: {orientation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_portrait_layout_displays_the_loading_bookplate() {
+        let mut emu = WebEmulator::boot();
+        emu.state.view = AppView::Reading;
+        emu.state.orientation = DisplayOrientation::PortraitButtonsLeft;
+        assert!(!emu.store_ready_for(0));
+        emu.render(RenderKind::Page);
+        let stale_frame = emu.fb.bytes().to_vec();
+        emu.load_status = LoadStatus::Loading;
+        emu.render(RenderKind::Page);
+        assert!(
+            stale_frame.as_slice() == emu.fb.bytes().as_slice(),
+            "stale layout must not render old page records into the new frame"
+        );
+    }
 }
