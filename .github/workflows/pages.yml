@@ -50,20 +50,44 @@ jobs:
         run: cargo run --manifest-path tools/emulator/Cargo.toml --target x86_64-unknown-linux-gnu --no-default-features --features device-x3 -- --scenario fixtures/scenarios --check fixtures/golden
       - name: Assemble site
         env:
+          GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release_tag || 'latest' }}
         run: |
           mkdir -p _site
           cp -R web/. _site/
           cp tools/web-emulator/target/wasm32-unknown-unknown/release/x4_web_emulator.wasm _site/
           if [ "$RELEASE_TAG" = latest ]; then
-            gh release download --repo "$GITHUB_REPOSITORY" \
-              --pattern firmware-x4.bin --pattern firmware-x3.bin \
-              --dir _site
-          else
-            gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-              --pattern firmware-x4.bin --pattern firmware-x3.bin \
-              --dir _site
+            RELEASE_TAG=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
           fi
+          export RELEASE_TAG
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern firmware-x4.bin --pattern firmware-x3.bin \
+            --pattern SHA256SUMS --dir _site
+          (cd _site && sha256sum --check SHA256SUMS)
+          python3 - <<'PY'
+          import html
+          import json
+          import os
+          import pathlib
+          import re
+
+          site = pathlib.Path("_site")
+          version = os.environ["RELEASE_TAG"]
+          index = site / "index.html"
+          page, count = re.subn(
+              r'(<span class="k">Version</span><b>)[^<]*(</b>)',
+              lambda match: match[1] + html.escape(version) + match[2],
+              index.read_text(),
+          )
+          if count != 1:
+              raise SystemExit("Expected exactly one firmware version label")
+          index.write_text(page)
+          for device in ("x4", "x3"):
+              path = site / f"manifest-{device}.json"
+              manifest = json.loads(path.read_text())
+              manifest["version"] = version
+              path.write_text(json.dumps(manifest, indent=2) + "\n")
+          PY
           tools/verify_web_flasher.sh _site
       - uses: actions/upload-pages-artifact@v3
         with:
