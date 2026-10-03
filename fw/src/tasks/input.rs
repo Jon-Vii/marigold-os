@@ -134,8 +134,14 @@ const PAGE: &[Band] = &[
 pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
     esp_println::println!("input: started");
 
-    let mut last_power = false;
-    let mut power_ticks = 0u8;
+    // Wake from deep sleep is a reboot triggered by this same button. If it
+    // is still held when polling starts (~1 s after wake), treat that as the
+    // wake press already consumed: report Power only after a release and a
+    // new press. Otherwise a held button reads as a fresh press and sends the
+    // device straight back to sleep, in a loop for as long as it is held.
+    let held_at_start = pins.power.is_low();
+    let mut last_power = held_at_start;
+    let mut power_ticks = if held_at_start { DEBOUNCE_TICKS } else { 0 };
     let mut nav_stable = StableButton::new();
     let mut page_stable = StableButton::new();
     let mut raw_log_ticks = 0u8;
