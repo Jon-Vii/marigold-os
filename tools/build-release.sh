@@ -45,7 +45,7 @@ CHIP=esp32c3
 FLASH_SIZE=16mb
 PARTS=partitions.csv
 APP_LABEL=app0                # the ota_0 partition's label in partitions.csv
-ELF=target/riscv32imc-unknown-none-elf/release/fw
+ELF="${CARGO_TARGET_DIR:-target}/riscv32imc-unknown-none-elf/release/fw"
 OUT=target/release-images
 FW="$OUT/firmware$SUFFIX.bin"
 FULL="$OUT/full-flash$SUFFIX.bin"
@@ -78,6 +78,20 @@ fi
 
 echo "==> full-flash$SUFFIX.bin (merged 16 MB, unlocked-only, write to 0x0)"
 espflash save-image "${common[@]}" --merge "$ELF" "$FULL"
+
+# Same checks the release workflow runs before publishing: descriptor,
+# device name, no development features, checksums. When MARIGOLD_VERSION is
+# set (as in CI), the descriptor must carry exactly that version.
+echo "==> verifying firmware$SUFFIX.bin"
+verify=(--device "$DEVICE")
+if [[ -n "${MARIGOLD_VERSION:-}" ]]; then
+  verify+=(--expect-version "$MARIGOLD_VERSION")
+fi
+if command -v uv >/dev/null 2>&1; then
+  uv run --script tools/verify_release_images.py "${verify[@]}" "$FW"
+else
+  python3 tools/verify_release_images.py "${verify[@]}" "$FW"
+fi
 
 echo
 echo "Artifacts in $OUT:"
