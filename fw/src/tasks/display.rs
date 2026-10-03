@@ -307,6 +307,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                             send_loaded_library_event(&LibraryEvent::ChapterCursor {
                                 book_id: request.book_id,
                                 current_chapter: current,
+                                page: request.page,
                             });
                         }
                     }
@@ -802,6 +803,7 @@ fn handle_storage_command(
                     send_loaded_library_event(&LibraryEvent::ChapterCursor {
                         book_id,
                         current_chapter: sd_library.current_chapter(),
+                        page: target_pages as u32,
                     });
                     return;
                 }
@@ -1248,10 +1250,15 @@ fn progress_record(
     record: app_core::PersistedAppState,
 ) -> AppStateRecord {
     let (source_hash, source_size) = source_identity(sd_library, record.book_id);
+    // Resolve the chapter of the saved page itself, not whichever chapter the
+    // tracker saw last: an earlier render (a provisional page 0 while an
+    // open resumed elsewhere) can leave the tracker behind the saved page.
     let chapter = if ReaderSource::from_book_id(record.book_id).is_sd()
         && sd_library.loaded_index == ReaderStore::selected_book_index(record.book_id)
     {
-        sd_library.current_chapter()
+        sd_library
+            .chapter_for_page_of((source_hash, source_size), record.screen)
+            .unwrap_or_else(|| sd_library.current_chapter())
     } else {
         record.chapter
     };

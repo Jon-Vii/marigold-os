@@ -1210,6 +1210,14 @@ impl ReaderStore {
         0
     }
 
+    /// The chapter `page` falls in for the book `source`, when the resident
+    /// chapter-page map belongs to that book.
+    pub(crate) fn chapter_for_page_of(&self, source: (u32, u32), page: u32) -> Option<u16> {
+        (self.chapter_page_count > 0
+            && (self.chapter_page_token.0, self.chapter_page_token.1) == source)
+            .then(|| self.current_chapter_for_page(page))
+    }
+
     pub(crate) fn set_current_chapter(&mut self, chapter: u16, title: &str, source: (u32, u32)) {
         self.current_chapter = chapter;
         self.current_chapter_source = source;

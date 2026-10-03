@@ -544,10 +544,14 @@ pub enum LibraryEvent {
     /// The firmware re-resolved the current chapter for the page just rendered,
     /// over the whole-book (uncapped) map. Sent on reading renders so the cursor
     /// keeps tracking past `MAX_SD_CHAPTERS` between section loads, where the
-    /// reducer's own `sd_chapter_for_page` saturates.
+    /// reducer's own `sd_chapter_for_page` saturates. `page` is the page the
+    /// chapter was resolved for: a cursor computed for an earlier render (a
+    /// provisional page 0 drawn while an open resumed elsewhere) must not
+    /// overwrite the chapter of the page now shown.
     ChapterCursor {
         book_id: u32,
         current_chapter: u16,
+        page: u32,
     },
     CustomFont {
         available: bool,
@@ -1154,8 +1158,9 @@ impl ReaderState {
             LibraryEvent::ChapterCursor {
                 book_id,
                 current_chapter,
+                page,
             } => {
-                if self.book_id == book_id {
+                if self.book_id == book_id && self.page == page {
                     // Adopt the firmware's uncapped chapter silently. The Reading
                     // view shows page-within-chapter, not the chapter itself, so no
                     // repaint is needed -- Home/sleep/Chapters and the persisted
@@ -2067,6 +2072,34 @@ mod tests {
         );
         assert_eq!(jumping.selection, 150);
         assert_eq!(jumping.persisted().screen, 400);
+    }
+
+    #[test]
+    fn chapter_cursor_for_another_page_is_ignored() {
+        let mut state = ReaderState::boot();
+        state.view = AppView::Reading;
+        state.book_id = ReaderSource::sd(0).book_id();
+        state.page = 459;
+        state.chapter = 12;
+        // Computed for the provisional page 0 drawn before the resume landed.
+        let stale = state.apply_library_event(
+            CTX,
+            LibraryEvent::ChapterCursor {
+                book_id: state.book_id,
+                current_chapter: 0,
+                page: 0,
+            },
+        );
+        assert_eq!(stale.chapter, 12);
+        let current = state.apply_library_event(
+            CTX,
+            LibraryEvent::ChapterCursor {
+                book_id: state.book_id,
+                current_chapter: 13,
+                page: 459,
+            },
+        );
+        assert_eq!(current.chapter, 13);
     }
 
     #[test]
