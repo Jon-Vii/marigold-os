@@ -24,6 +24,9 @@ pub fn is_legacy_trigger_alias(name: &str) -> bool {
 
 /// First byte of every ESP-IDF application image.
 pub const IMAGE_MAGIC: u8 = 0xE9;
+/// Image header chip id (bytes 12..14, little endian) for the ESP32-C3. An
+/// image for another chip passes every other check but cannot run here.
+pub const ESP32C3_CHIP_ID: u16 = 0x0005;
 
 const HEADER_LEN: usize = 24;
 const SEG_HEADER_LEN: usize = 8;
@@ -50,6 +53,8 @@ pub enum ImageError {
     TooLarge,
     /// First byte is not `0xE9`.
     BadMagic,
+    /// Built for a chip other than the ESP32-C3.
+    WrongChip,
     /// Segment table is malformed or a segment runs past end-of-file.
     BadSegments,
     /// XOR checksum byte does not match the image body.
@@ -206,6 +211,9 @@ pub fn validate_image<S: ImageSource>(
     if header[0] != IMAGE_MAGIC {
         return Err(ImageError::BadMagic);
     }
+    if u16::from_le_bytes([header[12], header[13]]) != ESP32C3_CHIP_ID {
+        return Err(ImageError::WrongChip);
+    }
     let segment_count = header[1];
     // Byte 23 (`hash_appended`) flags a SHA-256 trailer over the whole image.
     let hash_appended = header[23] != 0;
@@ -218,7 +226,10 @@ pub fn validate_image<S: ImageSource>(
 
     let mut buf = [0u8; STREAM_CHUNK];
     for _ in 0..segment_count {
-        if pos + SEG_HEADER_LEN > image_len {
+        if pos
+            .checked_add(SEG_HEADER_LEN)
+            .is_none_or(|end| end > image_len)
+        {
             return Err(ImageError::BadSegments);
         }
         let mut seg_header = [0u8; SEG_HEADER_LEN];
@@ -230,7 +241,7 @@ pub fn validate_image<S: ImageSource>(
         let data_len =
             u32::from_le_bytes([seg_header[4], seg_header[5], seg_header[6], seg_header[7]])
                 as usize;
-        if pos + data_len > image_len {
+        if pos.checked_add(data_len).is_none_or(|end| end > image_len) {
             return Err(ImageError::BadSegments);
         }
 
@@ -574,6 +585,7 @@ mod tests {
         let mut header = [0u8; HEADER_LEN];
         header[0] = IMAGE_MAGIC;
         header[1] = segment_lens.len() as u8;
+        header[12..14].copy_from_slice(&ESP32C3_CHIP_ID.to_le_bytes());
         header[23] = if hash_appended { 1 } else { 0 };
         img.extend_from_slice(&header);
 
@@ -693,6 +705,17 @@ mod tests {
         let checksum_at = ((pos + 16) & !15usize) - 1;
         img[checksum_at] = checksum;
         img
+    }
+
+    #[test]
+    fn rejects_image_built_for_another_chip() {
+        let mut image = valid_image(true);
+        image[12..14].copy_from_slice(&0x0009u16.to_le_bytes()); // ESP32-S3
+        let len = image.len();
+        assert_eq!(
+            validate_image(&mut cursor(image), len, None),
+            Err(ImageError::WrongChip)
+        );
     }
 
     #[test]
