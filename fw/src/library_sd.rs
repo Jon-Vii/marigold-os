@@ -681,12 +681,14 @@ pub(crate) fn find_index_by_identity(
     .flatten()
 }
 
-/// Empty every book cache under CACHE2 whose book is no longer in the freshly
-/// written catalog -- the orphans left when a book is deleted (through the shelf
-/// or by pulling the card). Each cache is matched by its stored source identity,
-/// not its key name, so a live book's cache is never swept. Reading position
-/// lives in the global STATE.BIN and is untouched. Bounded per pass; any excess
-/// is handled by the next scan.
+/// Delete the caches of books no longer on the card. Runs right after a scan
+/// has written and re-validated the catalog, the one moment the full book
+/// set is known. A cache folder is live when its name is the cache key of a
+/// catalog book, so liveness never depends on reading the cache's own index
+/// (a folder whose index is missing or torn still belongs to its book, and a
+/// leftover shell with no index is still recognised as an orphan). Folders
+/// are taken in rounds of `SWEEP_BATCH`, skipping those already kept, so
+/// orphans past the first batch are reached too.
 fn sweep_orphan_caches<
     D,
     T,
@@ -700,49 +702,94 @@ fn sweep_orphan_caches<
     T: TimeSource,
 {
     use core::fmt::Write;
-    const SWEEP_MAX_PER_PASS: usize = 48;
-    // Collect cache-dir names up front: embedded-sdmmc forbids opening files
-    // while a directory iteration holds the lock.
-    let mut keys: heapless::Vec<String<8>, SWEEP_MAX_PER_PASS> = heapless::Vec::new();
-    if let Ok(xteink) = root.open_dir(proto::cache::CACHE_ROOT_DIR) {
-        if let Ok(cache) = xteink.open_dir(proto::cache::CACHE_V2_DIR) {
-            let _ = cache.iterate_dir(|entry| {
-                if !entry.attributes.is_directory() {
-                    return;
-                }
-                let mut name = String::<8>::new();
-                let _ = write!(name, "{}", entry.name);
-                if name.is_empty() || name.as_str() == "." || name.as_str() == ".." {
-                    return;
-                }
-                // Past capacity silently drops; the leftover keys sweep next scan.
-                let _ = keys.push(name);
-            });
-        }
-    }
+    const SWEEP_BATCH: usize = 48;
+    const SWEEP_MAX_ROUNDS: usize = 16;
+    let mut kept = 0usize;
     let mut swept = 0u32;
-    for key in &keys {
-        let header = crate::reader_cache_files::read_cache_header(root, key.as_str());
-        // An unreadable index may be a transient card error or an interrupted
-        // generation. Reclaim only after verifying an orphan's identity.
-        if header.is_none() {
-            continue;
+    for _ in 0..SWEEP_MAX_ROUNDS {
+        // Collect folder names up front: embedded-sdmmc forbids opening
+        // files while a directory iteration holds the lock. Deleting only
+        // removes entries, so kept folders keep their relative order and
+        // skipping `kept` of them resumes where the last round stopped.
+        let mut keys: heapless::Vec<String<8>, SWEEP_BATCH> = heapless::Vec::new();
+        let Ok(xteink) = root.open_dir(proto::cache::CACHE_ROOT_DIR) else {
+            return;
+        };
+        let Ok(cache) = xteink.open_dir(proto::cache::CACHE_V2_DIR) else {
+            return;
+        };
+        let mut seen = 0usize;
+        let _ = cache.iterate_dir(|entry| {
+            if !entry.attributes.is_directory() {
+                return;
+            }
+            let mut name = String::<8>::new();
+            let _ = write!(name, "{}", entry.name);
+            if name.is_empty() || name.as_str() == "." || name.as_str() == ".." {
+                return;
+            }
+            seen += 1;
+            if seen > kept {
+                let _ = keys.push(name);
+            }
+        });
+        drop(cache);
+        drop(xteink);
+        if keys.is_empty() {
+            break;
         }
-        // A verified cache that still maps to a catalog book stays.
-        let live = header
-            .as_ref()
-            .map(|h| find_in_catalog(root, h.source_hash, h.source_size, None).is_some())
-            .unwrap_or(false);
-        if live {
-            continue;
+        let mut live = [false; SWEEP_BATCH];
+        if mark_live_cache_keys(root, &keys, &mut live).is_err() {
+            // The catalog could not be read back: delete nothing.
+            return;
         }
-        let section_count = header.map(|h| h.section_count).unwrap_or(0);
-        crate::reader_cache_files::empty_cache_dir(root, key.as_str(), section_count);
-        swept += 1;
+        for (key, is_live) in keys.iter().zip(live) {
+            if !is_live && crate::reader_cache_files::empty_cache_dir(root, key.as_str()) {
+                swept += 1;
+            } else {
+                kept += 1;
+            }
+        }
+        if keys.len() < SWEEP_BATCH {
+            break;
+        }
     }
     if swept > 0 {
         esp_println::println!("cache: swept {} orphan cache(s)", swept);
     }
+}
+
+/// Set `live[i]` when `keys[i]` is the cache key of a book in the catalog.
+fn mark_live_cache_keys<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    keys: &[String<8>],
+    live: &mut [bool],
+) -> Result<(), ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    with_catalog_file(root, |file, count| {
+        seek_to_record(file, 0)?;
+        let mut record = [0u8; CATALOG_RECORD_BYTES];
+        for _ in 0..count as usize {
+            read_exact_file(file, &mut record)?;
+            let book = decode_record(&record);
+            let key = proto::cache::cache_key_for(book.display_name.as_str(), book.byte_size);
+            for (candidate, is_live) in keys.iter().zip(live.iter_mut()) {
+                if candidate.as_str().eq_ignore_ascii_case(key.as_str()) {
+                    *is_live = true;
+                }
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Stream the whole catalog into the browser shelf buffer as

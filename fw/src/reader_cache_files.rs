@@ -938,36 +938,11 @@ pub(crate) fn delete_upload_label<
     let _ = crate::sd_session::remove_file_reclaiming_clusters(&labels, file_name.as_str());
 }
 
-/// Read a book cache's v2 header (for its stored source identity and section
-/// count), or None when the cache has no readable BOOK.BIN. Used by the orphan
-/// sweep to decide whether a cache still belongs to a book on the card.
-pub(crate) fn read_cache_header<
-    D,
-    T,
-    const MAX_DIRS: usize,
-    const MAX_FILES: usize,
-    const MAX_VOLUMES: usize,
->(
-    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    key: &str,
-) -> Option<BookV2Header>
-where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    with_verified_v2_book_file(root, key, |file| {
-        let mut header_bytes = [0u8; BOOK_V2_HEADER_BYTES];
-        read_exact_file(file, &mut header_bytes).ok()?;
-        decode_book_v2_header(&header_bytes).ok()
-    })
-    .flatten()
-}
-
-/// Delete one book cache completely: every section file, BOOK/TOC/COVER, then
-/// the emptied `SECTIONS/` and `<key>/` directories themselves. Directory
-/// deletion refuses non-empty targets, so a cache whose header undercounts its
-/// sections just leaves its shells for the next sweep pass. The global reading
-/// position in XTEINK/STATE.BIN is never touched.
+/// Delete a book's whole cache folder: every file in it (index generations,
+/// TOC, cover, saved position) and its SECTIONS folder, then the folder
+/// itself. Used only for orphans (books no longer on the card), so the saved
+/// position goes too; leaving it behind kept the folder alive forever. True
+/// when the folder is gone.
 pub(crate) fn empty_cache_dir<
     D,
     T,
@@ -977,41 +952,70 @@ pub(crate) fn empty_cache_dir<
 >(
     root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     key: &str,
-    _section_count: u16,
-) where
+) -> bool
+where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
     let Ok(xteink) = root.open_dir(CACHE_ROOT_DIR) else {
-        return;
+        return false;
     };
     let Ok(cache) = xteink.open_dir(CACHE_V2_DIR) else {
-        return;
+        return false;
     };
     {
         let Ok(book) = cache.open_dir(key) else {
-            return;
+            return false;
         };
         if let Ok(sections) = book.open_dir(CACHE_SECTIONS_DIR) {
-            let mut name = String::<CACHE_SECTION_FILE_BYTES>::new();
-            for spine in 0..(MAX_BOOK_SECTIONS * 2) as u16 {
-                name.clear();
-                section_file_name(spine, &mut name);
-                let _ =
-                    crate::sd_session::remove_file_reclaiming_clusters(&sections, name.as_str());
-            }
+            delete_all_files(&sections);
         }
         // The SECTIONS handle has dropped; the empty directory can go now.
         let _ = book.delete_file_in_dir(CACHE_SECTIONS_DIR);
-        let _ = crate::sd_session::remove_file_reclaiming_clusters(&book, CACHE_BOOK_FILE);
-        for name in book_generation::NAMES {
-            let _ = crate::sd_session::remove_file_reclaiming_clusters(&book, name);
-        }
-        let _ = crate::sd_session::remove_file_reclaiming_clusters(&book, CACHE_TOC_FILE);
-        let _ = crate::sd_session::remove_file_reclaiming_clusters(&book, CACHE_COVER_FILE);
+        delete_all_files(&book);
     }
     // Likewise the book handle: closed by the scope above, deletable here.
-    let _ = cache.delete_file_in_dir(key);
+    cache.delete_file_in_dir(key).is_ok()
+}
+
+/// Delete every plain file in `dir`, listing it in batches (a directory
+/// iteration holds the volume lock, so names are collected first). Listing
+/// beats probing every possible section name, which cost hundreds of
+/// directory searches per folder.
+fn delete_all_files<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    dir: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    use core::fmt::Write;
+    const BATCH: usize = 32;
+    // Bounded: a folder holds at most two banks of sections plus a few files.
+    for _ in 0..(2 * MAX_BOOK_SECTIONS / BATCH + 4) {
+        let mut names: heapless::Vec<String<12>, BATCH> = heapless::Vec::new();
+        let _ = dir.iterate_dir(|entry| {
+            if entry.attributes.is_directory()
+                || entry.attributes.is_volume()
+                || entry.attributes.is_lfn()
+            {
+                return;
+            }
+            let mut name = String::<12>::new();
+            if write!(name, "{}", entry.name).is_ok() {
+                let _ = names.push(name);
+            }
+        });
+        if names.is_empty() {
+            return;
+        }
+        let mut removed_any = false;
+        for name in &names {
+            removed_any |= crate::sd_session::remove_file_reclaiming_clusters(dir, name.as_str());
+        }
+        if !removed_any {
+            return;
+        }
+    }
 }
 
 pub(crate) fn write_v2_book_index<

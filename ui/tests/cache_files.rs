@@ -428,11 +428,6 @@ fn corrupted_new_generation_falls_back_for_loading_and_orphan_identity() {
         BookIndexLoadResult::Hit
     );
     assert_eq!(store.book_total_pages, 1);
-    let header = reader_cache_files::read_cache_header(&root, KEY).unwrap();
-    assert_eq!(
-        header.source_hash, ID.0,
-        "sweep must not trust the corrupted newer identity"
-    );
 }
 
 #[test]
@@ -1011,8 +1006,17 @@ fn deleting_files_and_cache_directories_returns_every_cluster() {
         &store,
         false
     ));
+    // Both position generations: an orphan's saved place must not keep its
+    // folder alive.
+    reader_cache_files::write_position_file(&root, KEY, 3, 42).unwrap();
+    reader_cache_files::write_position_file(&root, KEY, 3, 43).unwrap();
     assert!(free_clusters(&disk) < baseline);
-    reader_cache_files::empty_cache_dir(&root, KEY, 1);
+    assert!(reader_cache_files::empty_cache_dir(&root, KEY));
+    {
+        let xteink = root.open_dir(proto::cache::CACHE_ROOT_DIR).unwrap();
+        let cache = xteink.open_dir(proto::cache::CACHE_V2_DIR).unwrap();
+        assert!(cache.open_dir(KEY).is_err(), "the folder itself is removed");
+    }
     assert_eq!(
         free_clusters(&disk),
         baseline,
