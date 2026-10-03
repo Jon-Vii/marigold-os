@@ -912,7 +912,9 @@ where
     let mut lfn_storage = [0u8; 192];
     let mut lfn_buffer = LfnBuffer::new(&mut lfn_storage);
     dir.iterate_dir_lfn(&mut lfn_buffer, |entry, long_name| {
-        if entry.attributes.is_directory() || entry.attributes.is_volume() {
+        // An empty file is never a book: an upload cut off by power loss
+        // leaves one behind (its size lands only when the file closes).
+        if entry.attributes.is_directory() || entry.attributes.is_volume() || entry.size == 0 {
             return;
         }
 
