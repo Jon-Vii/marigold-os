@@ -331,6 +331,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                 );
                 // Display commands are polled first, so a position queued just
                 // ahead of this sleep may still sit in the storage queue.
+                crate::stack_probe::report("sleep");
                 fold_queued_progress(&mut epd, &mut sd_cs, sd_library, &mut progress);
                 // One retry, then sleep regardless: refusing to sleep over a
                 // failed write (a pulled card) only drained the battery, and
@@ -488,6 +489,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                     &mut state_restored,
                     &mut pending_reader,
                 );
+                crate::stack_probe::report("storage");
             }
         }
     }

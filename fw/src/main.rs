@@ -127,6 +127,83 @@ pub mod tasks;
 pub mod upload;
 mod views;
 
+/// Main-stack high-water mark. Boot paints the unused stack with a pattern;
+/// `report` later finds the deepest word overwritten and logs it whenever
+/// the mark grows, so hardware runs show real stack use next to the
+/// link-time floor in build.rs. The executor and the interrupt-priority
+/// input executor both run on this stack; radio threads have their own.
+pub(crate) mod stack_probe {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    const PAINT: u32 = 0x5A5A_A5A5;
+    /// Bytes above `_stack_end` left untouched: esp-hal's stack-guard word
+    /// sits 60 bytes in, under a write watchpoint.
+    const GUARD_SKIP: usize = 128;
+    static REPORTED: AtomicU32 = AtomicU32::new(0);
+
+    // Linker symbols bounding the main stack (it grows down from the start).
+    #[allow(unsafe_code)]
+    unsafe extern "C" {
+        static _stack_start: u32;
+        static _stack_end: u32;
+    }
+
+    fn bounds() -> (usize, usize) {
+        let top = core::ptr::addr_of!(_stack_start) as usize;
+        let bottom = core::ptr::addr_of!(_stack_end) as usize + GUARD_SKIP;
+        (bottom, top)
+    }
+
+    /// Paint everything below the current frame. Call first thing in main.
+    #[allow(unsafe_code)]
+    pub(crate) fn paint() {
+        let sp: usize;
+        // SAFETY: reads the stack pointer only.
+        unsafe { core::arch::asm!("mv {}, sp", out(reg) sp) };
+        let (bottom, _) = bounds();
+        let mut word = bottom & !3;
+        // Leave a margin under the live frame for this function's own use.
+        let end = sp.saturating_sub(256) & !3;
+        while word < end {
+            // SAFETY: [bottom, sp - 256) is unused main stack at boot: no
+            // frame lives below the current one yet and the guard word is
+            // excluded above.
+            unsafe { (word as *mut u32).write_volatile(PAINT) };
+            word += 4;
+        }
+    }
+
+    /// Bytes of main stack ever used (top minus the deepest touched word).
+    #[allow(unsafe_code)]
+    pub(crate) fn high_water() -> usize {
+        let (bottom, top) = bounds();
+        let mut word = bottom & !3;
+        while word < top {
+            // SAFETY: in-bounds aligned read of the main stack region.
+            if unsafe { (word as *const u32).read_volatile() } != PAINT {
+                break;
+            }
+            word += 4;
+        }
+        top - word
+    }
+
+    /// Log the mark when it has grown since the last report.
+    pub(crate) fn report(context: &str) {
+        let used = high_water() as u32;
+        if used > REPORTED.load(Ordering::Relaxed) {
+            REPORTED.store(used, Ordering::Relaxed);
+            let (bottom, top) = bounds();
+            esp_println::println!(
+                "bench: stack_high_water used={} region={} context={}",
+                used,
+                top - bottom + GUARD_SKIP,
+                context
+            );
+        }
+    }
+}
+
 pub static INPUT_EVENTS: Channel<CriticalSectionRawMutex, InputEvent, 8> = Channel::new();
 pub static INPUT_START: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
 pub static INPUT_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -175,6 +252,7 @@ where
 
 #[esp_hal::main]
 fn main() -> ! {
+    stack_probe::paint();
     // Config::default() leaves the ESP32-C3 at 80 MHz; layout, panel byte
     // transforms, and EPUB inflate are all CPU-bound, so run at full speed
     // and rely on race-to-idle for power.
