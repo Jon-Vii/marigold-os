@@ -1,6 +1,9 @@
 # Bench program plan
 
-Status: Draft
+Status: **shipped.** `tools/bench/bench.py` (every suite below) and
+`tools/bench/benches.toml` landed July 8 2026; later additions such as
+`send.py` live beside them. Current usage is in `docs/agents/bench.md`. The
+text below is the original plan.
 
 ## Problem
 
@@ -104,7 +107,8 @@ Telemetry to parse or add:
 - display refresh mode and BUSY duration;
 - optional battery millivolts at start/end.
 
-Budgets to start with, based on `docs/IMPLEMENTATION_PLAN.md` measurements:
+Budgets to start with, based on the June 10 2026 measurements (then in
+`docs/IMPLEMENTATION_PLAN.md`, now `docs/agents/verification.md`):
 
 - median press-to-settled page turn: target under 550 ms plus debounce;
 - fast refresh BUSY: warn above 500 ms;

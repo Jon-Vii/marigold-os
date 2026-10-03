@@ -18,3 +18,8 @@ This is a single-context repo: read the domain and architecture docs in `docs/`,
 
 Development bench runs use `tools/bench/bench.py` and structured `bench:` serial
 telemetry. See `docs/agents/bench.md`.
+
+### Verification
+
+The host and firmware gate that CI runs, golden-frame regeneration, and dated
+hardware measurements. See `docs/agents/verification.md`.
