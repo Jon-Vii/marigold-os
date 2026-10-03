@@ -1401,6 +1401,33 @@ impl FatVolume {
         Ok(new_cluster)
     }
 
+    /// Marigold: free every cluster of a chain, the first included. Used after
+    /// a directory entry is deleted, so the file's or directory's clusters
+    /// return to the free pool instead of leaking.
+    pub(crate) fn free_cluster_chain<D>(
+        &mut self,
+        block_cache: &mut BlockCache<D>,
+        first: ClusterId,
+    ) -> Result<(), Error<D::Error>>
+    where
+        D: BlockDevice,
+    {
+        if first.0 < RESERVED_ENTRIES {
+            // No clusters allocated (an empty file).
+            return Ok(());
+        }
+        self.truncate_cluster_chain(block_cache, first)?;
+        self.update_fat(block_cache, first, ClusterId::EMPTY)?;
+        if let Some(ref mut number_free_cluster) = self.free_clusters_count {
+            *number_free_cluster += 1;
+        }
+        match self.next_free_cluster {
+            Some(next_free) if next_free.0 <= first.0 => {}
+            _ => self.next_free_cluster = Some(first),
+        }
+        Ok(())
+    }
+
     /// Marks the input cluster as an EOF and all the subsequent clusters in the chain as free
     pub(crate) fn truncate_cluster_chain<D>(
         &mut self,

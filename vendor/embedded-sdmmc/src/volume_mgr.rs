@@ -794,6 +794,17 @@ where
             }
         }
 
+        // Marigold: release the deleted entry's clusters. Upstream only marks
+        // the directory entry deleted, which leaks the whole chain (or, after
+        // a truncate, its first cluster). The entry goes first: a failure
+        // between the two steps leaks clusters, never leaves an entry
+        // pointing at freed ones.
+        match &mut data.open_volumes[volume_idx].volume_type {
+            VolumeType::Fat(fat) => {
+                fat.free_cluster_chain(&mut data.block_cache, dir_entry.cluster)?
+            }
+        }
+
         Ok(())
     }
 

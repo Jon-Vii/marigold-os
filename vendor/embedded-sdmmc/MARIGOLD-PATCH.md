@@ -24,6 +24,16 @@ junk after the marker read exactly the first directory sector, deleted entries
 are skipped, full sectors continue, and full clusters follow their FAT links.
 This lookup correction is independent of the experimental batching feature.
 
+Deleting a file or directory now releases its clusters. Upstream
+`delete_file_in_dir` only marks the directory entry deleted, so every cluster
+of a deleted file leaked (Marigold truncated first, which still left the first
+cluster allocated; a deleted directory leaked all of its own). After the entry
+is deleted, `free_cluster_chain` frees the whole chain from the entry's first
+cluster, updating the free-cluster hint and count. The entry goes first, so a
+failure between the two steps leaks clusters rather than leaving an entry that
+points at freed ones. `ui/tests/cache_files.rs` counts free clusters on a
+simulated card to cover single files and a whole book cache.
+
 The default-off `contiguous-file-read` feature changes only the FAT file read
 path. Full sectors within the current cluster reach `BlockDevice::read` in
 batches of at most 16 sectors (8 KiB), which the existing SD driver handles with

@@ -942,3 +942,80 @@ fn justified_lines_fill_the_measure_except_a_paragraphs_last() {
         "short line is not stretched"
     );
 }
+
+/// Free data clusters on the simulated FAT16 card, read from FAT #1.
+fn free_clusters(disk: &fat::Disk) -> usize {
+    let bytes = disk.bytes.borrow();
+    // Partition at LBA 1, one reserved sector, then 64 FAT sectors.
+    let fat = &bytes[2 * 512..(2 + 64) * 512];
+    // Data clusters: 16384 sectors - reserved - 2 FATs - 32 root sectors.
+    let clusters = 16384 - 1 - 2 * 64 - 32;
+    (2..2 + clusters)
+        .filter(|cluster| fat[cluster * 2] == 0 && fat[cluster * 2 + 1] == 0)
+        .count()
+}
+
+#[test]
+fn deleting_files_and_cache_directories_returns_every_cluster() {
+    let disk = fat::Disk::new();
+    let manager: VolumeManager<_, _, 8, 8, 1> =
+        VolumeManager::new_with_limits(&disk, fat::Clock, 0);
+    let volume = manager.open_volume(VolumeIdx(0)).unwrap();
+    let root = volume.open_root_dir().unwrap();
+
+    let start = free_clusters(&disk);
+    {
+        let file = root
+            .open_file_in_dir("A.BIN", embedded_sdmmc::Mode::ReadWriteCreateOrTruncate)
+            .unwrap();
+        file.write(&[7u8; 512 * 3]).unwrap();
+    }
+    assert_eq!(free_clusters(&disk), start - 3);
+    assert!(sd_session::remove_file_reclaiming_clusters(&root, "A.BIN"));
+    assert_eq!(
+        free_clusters(&disk),
+        start,
+        "a removed file frees all its clusters"
+    );
+
+    // A whole book cache: index generations, a section, and its folders.
+    // Another book's cache first, so the shared XTEINK/CACHE2 folders exist
+    // before the baseline.
+    assert!(reader_cache_files::prepare_book_replacement(&root, "E0000002").is_some());
+    let baseline = free_clusters(&disk);
+    let mut store = ReaderStore::new();
+    assert_eq!(
+        reader_cache_files::prepare_book_replacement(&root, KEY),
+        Some(0)
+    );
+    for line in 0..30 {
+        append_fixture_line(&mut store, 0, line);
+    }
+    store.set_cached_spine(0);
+    assert!(reader_cache_files::write_v2_section_cache(
+        &root, KEY, ID, 0, &store
+    ));
+    let sections = [BookV2SectionRecord {
+        section: 0,
+        spine: 0,
+        start_page: 0,
+        page_count: store.page_count as u16,
+        partial: false,
+    }];
+    assert!(reader_cache_files::write_v2_book_index(
+        &root,
+        KEY,
+        ID,
+        store.page_count as u32,
+        &sections,
+        &store,
+        false
+    ));
+    assert!(free_clusters(&disk) < baseline);
+    reader_cache_files::empty_cache_dir(&root, KEY, 1);
+    assert_eq!(
+        free_clusters(&disk),
+        baseline,
+        "emptying a book cache frees its files and folders"
+    );
+}
