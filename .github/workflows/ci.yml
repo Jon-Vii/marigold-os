@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # release.yml runs this gate against the tagged commit before publishing.
+  workflow_call:
+    inputs:
+      ref:
+        description: "Commit to check out (defaults to the triggering ref)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  host:
+    name: Host tests, goldens, formatting
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      # No toolchain argument: rustup reads rust-toolchain.toml (channel,
+      # components, and targets) from the repo root.
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup set profile minimal
+          rustup toolchain install
+          rustc --version
+          echo "HOST_TARGET=$(rustc -vV | sed -n 's/^host: //p')" >> "$GITHUB_ENV"
+
+      # The emulator and web emulator are separate workspaces with their own
+      # lockfiles and target directories.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            tools/emulator -> target
+            tools/web-emulator -> target
+
+      - name: Formatting
+        run: |
+          cargo fmt --all --check
+          cargo fmt --manifest-path tools/emulator/Cargo.toml --all --check
+          cargo fmt --manifest-path tools/web-emulator/Cargo.toml --all --check
+          cargo fmt --manifest-path tools/preview/Cargo.toml --all --check
+
+      # .cargo/config.toml defaults to the firmware target, so every host
+      # command names the target explicitly.
+      - name: Host crate tests
+        run: cargo test -p app-core -p proto -p ui -p display --target "$HOST_TARGET"
+
+      - name: UI tests at X3 geometry
+        run: cargo test -p ui --target "$HOST_TARGET" --features display/device-x3
+
+      - name: Emulator tests (X4)
+        run: cargo test --manifest-path tools/emulator/Cargo.toml --target "$HOST_TARGET" --no-default-features
+
+      - name: Emulator tests (X3)
+        run: cargo test --manifest-path tools/emulator/Cargo.toml --target "$HOST_TARGET" --no-default-features --features device-x3
+
+      - name: Emulator golden frames (X4)
+        run: cargo run --manifest-path tools/emulator/Cargo.toml --target "$HOST_TARGET" --no-default-features -- --scenario fixtures/scenarios --check fixtures/golden
+
+      - name: Emulator golden frames (X3)
+        run: cargo run --manifest-path tools/emulator/Cargo.toml --target "$HOST_TARGET" --no-default-features --features device-x3 -- --scenario fixtures/scenarios --check fixtures/golden
+
+      - name: Web emulator tests
+        run: cargo test --manifest-path tools/web-emulator/Cargo.toml --target "$HOST_TARGET"
+
+      - name: Bench parser tests
+        run: python3 -m unittest discover -s tools/bench -p 'test_*.py'
+
+      - name: Web flasher safety contract
+        run: tools/verify_web_flasher.sh web --safety-only
+
+      - name: Upload golden frame diffs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-diff
+          path: target/golden-diff/
+          if-no-files-found: ignore
+
+  firmware:
+    name: Firmware clippy and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup set profile minimal
+          rustup toolchain install
+          rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Default target is riscv32imc-unknown-none-elf (.cargo/config.toml).
+      - name: Clippy (workspace, X4)
+        run: cargo clippy --workspace --release -- -D warnings
+
+      - name: Clippy (firmware, X3)
+        run: cargo clippy -p fw --release --features device-x3 -- -D warnings
+
+      # Linking runs the stack-floor and framebuffer-size assertions that
+      # fw/build.rs emits into ram-layout.x.
+      - name: Build firmware (X4)
+        run: cargo build -p fw --release
+
+      - name: Build firmware (X3)
+        run: cargo build -p fw --release --features device-x3
