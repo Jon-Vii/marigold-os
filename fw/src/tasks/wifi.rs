@@ -11,8 +11,9 @@
 use crate::sync_mem::{self, SyncLoan};
 use crate::upload::{upload_short_alias, wireless_epub_filename, UploadBegin, UploadChunk};
 use crate::{
-    StorageCommand, SyncCommand, SyncEvent, STORAGE_COMMANDS, SYNC_COMMANDS, SYNC_EVENTS,
-    SYNC_LOANS, UPLOAD_BEGINS, UPLOAD_CHUNKS, UPLOAD_RESULTS, UPLOAD_RETURNS,
+    PowerEvent, StorageCommand, SyncCommand, SyncEvent, POWER_EVENTS, STORAGE_COMMANDS,
+    SYNC_COMMANDS, SYNC_EVENTS, SYNC_LOANS, UPLOAD_BEGINS, UPLOAD_CHUNKS, UPLOAD_RESULTS,
+    UPLOAD_RETURNS,
 };
 use app_core::{SyncError, WifiCredentials};
 use embassy_executor::Spawner;
@@ -92,12 +93,11 @@ pub async fn run(spawner: Spawner, wifi: WIFI<'static>) {
 
     let rng = Rng::new();
     let seed = (u64::from(rng.random()) << 32) | u64::from(rng.random());
-    // The radio serves one short kosync exchange, not a throughput
-    // workload. Default buffering (10 static RX bufs at ~1.6 KB each, 32
-    // dynamic, AMPDU on) would blow the loaned heap, which also lost its
+    // The radio serves the browser shelf page and book uploads from a
+    // small loaned heap. Default buffering (10 static RX bufs at ~1.6 KB
+    // each, 32 dynamic, AMPDU on) would blow it; the heap also lost its
     // dram2 share to the main stack (see sync_mem). These mirror the old
-    // ESP_WIFI_CONFIG_* compile-time trims that esp-radio no longer
-    // reads. Revisit for the AP file-upload phase.
+    // ESP_WIFI_CONFIG_* compile-time trims that esp-radio no longer reads.
     let radio_config = ControllerConfig::default()
         .with_static_rx_buf_num(4)
         .with_dynamic_rx_buf_num(8)
@@ -287,6 +287,7 @@ async fn upload_server(
         if socket.accept(80).await.is_err() {
             continue;
         }
+        note_browser_activity();
 
         let mut filled = 0;
         let head = loop {
@@ -464,6 +465,8 @@ async fn stream_book(
             }
         }
         remaining -= len.min(remaining);
+        // A long upload is one request; keep idle sleep away while it flows.
+        note_browser_activity();
         UPLOAD_CHUNKS
             .send(UploadChunk {
                 buffer: Some(buffer),
@@ -654,6 +657,7 @@ async fn credential_portal(
         if socket.accept(80).await.is_err() {
             continue;
         }
+        note_browser_activity();
 
         let mut filled = 0;
         let saved = loop {
@@ -798,9 +802,15 @@ fn raw_query_name(path: &[u8]) -> Option<&[u8]> {
 }
 
 /// Accepts an existing 8.3 catalog open-name verbatim: short, printable
-/// ASCII, no path separators. Deletion must not invent or mangle names.
+/// ASCII, no path separators. Deletion must not invent or mangle names, and
+/// only ever removes books: every shelf entry's short name ends in `.EPU`,
+/// so nothing else on the card (firmware images, the reader's own files)
+/// can be removed through this endpoint.
 fn valid_short_name(raw: &[u8]) -> Option<crate::upload::UploadName> {
     if raw.is_empty() || raw.len() > 12 {
+        return None;
+    }
+    if raw.len() < 5 || !raw[raw.len() - 4..].eq_ignore_ascii_case(b".EPU") {
         return None;
     }
     let mut name = crate::upload::UploadName::new();
@@ -941,4 +951,10 @@ impl Session {
                 SyncError::Join
             })
     }
+}
+
+/// Browser traffic is user activity: without this, idle sleep (which only
+/// hears about button presses) cut off a long upload after ten minutes.
+fn note_browser_activity() {
+    let _ = POWER_EVENTS.try_send(PowerEvent::Activity);
 }

@@ -183,7 +183,12 @@ pub fn dns_answer(query: &[u8], portal_ip: [u8; 4], out: &mut [u8]) -> Option<us
         at += 1 + len;
     }
     let qtype = u16::from_be_bytes([*query.get(at)?, *query.get(at + 1)?]);
+    // QTYPE and QCLASS must both be present: a packet cut after QTYPE used
+    // to index past the end of the query and halt the device.
     let question_end = at + 4;
+    if query.len() < question_end {
+        return None;
+    }
     let answers = if qtype == 1 || qtype == 255 {
         1u16
     } else {
@@ -345,6 +350,25 @@ mod tests {
         packet.extend_from_slice(extra);
         packet.push(255);
         packet
+    }
+
+    #[test]
+    fn dns_question_cut_short_is_ignored_not_a_panic() {
+        // Header, root QNAME, then QTYPE with no QCLASS (and one byte of it).
+        let mut query = [0u8; 16];
+        query[5] = 1; // QDCOUNT = 1
+        query[12] = 0; // root label
+        query[13] = 0;
+        query[14] = 1; // QTYPE = A
+        let mut out = [0u8; 64];
+        for len in 12..=16 {
+            assert_eq!(dns_answer(&query[..len], [192, 168, 4, 1], &mut out), None);
+        }
+        // With QCLASS present the same query is answered.
+        let mut full = [0u8; 17];
+        full[..16].copy_from_slice(&query);
+        full[16] = 1; // QCLASS = IN
+        assert!(dns_answer(&full, [192, 168, 4, 1], &mut out).is_some());
     }
 
     #[test]

@@ -477,18 +477,60 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) {
         let _ = remove_file_reclaiming_clusters(&xteink, "CATALOG.BIN");
         esp_println::println!("upload: catalog snapshot invalidated");
     }
-    let books = match root.open_dir("BOOKS") {
-        Ok(books) => books,
-        Err(_) => match root.make_dir_in_dir("BOOKS") {
-            Ok(()) => match root.open_dir("BOOKS") {
-                Ok(books) => books,
-                Err(_) => refuse_uploads_forever_setup().await,
-            },
-            Err(_) => refuse_uploads_forever_setup().await,
-        },
+    let exit = match open_books_dir(&root) {
+        Some(books) => serve_uploads(&root, &books).await,
+        None => {
+            // No /BOOKS and none can be made: nothing on the card to
+            // protect. Refuse uploads but still honour Exit and Sleep.
+            esp_println::println!("upload: BOOKS directory unavailable");
+            refuse_uploads_until_exit().await
+        }
     };
+    drop(root);
+    let _ = volume_mgr.close_volume(raw_volume);
+    drop(volume_mgr);
+    finish_upload_session(epd, exit).await;
+}
 
-    let exit = loop {
+fn open_books_dir<
+    'a,
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &'a Directory<'a, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> Option<Directory<'a, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    match root.open_dir("BOOKS") {
+        Ok(books) => Some(books),
+        Err(_) => match root.make_dir_in_dir("BOOKS") {
+            Ok(()) => root.open_dir("BOOKS").ok(),
+            Err(_) => None,
+        },
+    }
+}
+
+/// Serve upload and removal requests until the session's Exit or a Sleep.
+async fn serve_uploads<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    books: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> UploadSessionExit
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    loop {
         let begin = match select(
             UPLOAD_BEGINS.receive(),
             select(UPLOAD_STOP_REQUESTS.receive(), DISPLAY_COMMANDS.receive()),
@@ -496,32 +538,32 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) {
         .await
         {
             Either::First(begin) => begin,
-            Either::Second(Either::First(())) => break UploadSessionExit::Wireless,
+            Either::Second(Either::First(())) => return UploadSessionExit::Wireless,
             Either::Second(Either::Second(DisplayCommand::Sleep)) => {
-                break UploadSessionExit::Sleep
+                return UploadSessionExit::Sleep
             }
             Either::Second(Either::Second(DisplayCommand::Render(_))) => continue,
         };
         let ok = if begin.delete {
             let removed = if begin.in_books {
-                remove_file_reclaiming_clusters(&books, begin.name.as_str())
+                remove_file_reclaiming_clusters(books, begin.name.as_str())
             } else {
-                remove_file_reclaiming_clusters(&root, begin.name.as_str())
+                remove_file_reclaiming_clusters(root, begin.name.as_str())
             };
             if removed {
-                crate::reader_cache_files::delete_upload_label(&root, begin.name.as_str());
+                crate::reader_cache_files::delete_upload_label(root, begin.name.as_str());
             }
             removed
         } else {
-            match write_one_book(&books, &begin).await {
+            match write_one_book(books, &begin).await {
                 UploadWrite::Finished(Some(written_name)) => {
                     // New uploads carry their display name in VFAT itself.
                     // Remove a stale sidecar sharing the chosen alias.
-                    crate::reader_cache_files::delete_upload_label(&root, written_name.as_str());
+                    crate::reader_cache_files::delete_upload_label(root, written_name.as_str());
                     true
                 }
                 UploadWrite::Finished(None) => false,
-                UploadWrite::Interrupted(exit) => break exit,
+                UploadWrite::Interrupted(exit) => return exit,
             }
         };
         esp_println::println!(
@@ -531,12 +573,7 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) {
             ok
         );
         UPLOAD_RESULTS.send(ok).await;
-    };
-    drop(books);
-    drop(root);
-    let _ = volume_mgr.close_volume(raw_volume);
-    drop(volume_mgr);
-    finish_upload_session(epd, exit).await;
+    }
 }
 
 async fn finish_upload_session(epd: &mut Epd, exit: UploadSessionExit) {
@@ -751,8 +788,9 @@ async fn recycle(chunk: UploadChunk) {
     }
 }
 
-/// Setup failed: answer every upload attempt with failure, forever; the
-/// session ends with the reset like everything else in sync mode.
+/// Setup failed: answer every upload or removal with failure until the
+/// session's Exit or a Sleep. Removals send no chunks, so they are answered
+/// at once; waiting for chunks there deadlocked the web server.
 async fn refuse_uploads_until_exit() -> UploadSessionExit {
     loop {
         match select(
@@ -761,6 +799,7 @@ async fn refuse_uploads_until_exit() -> UploadSessionExit {
         )
         .await
         {
+            Either::First(begin) if begin.delete => UPLOAD_RESULTS.send(false).await,
             Either::First(_) => match drain_until_end().await {
                 Ok(()) => UPLOAD_RESULTS.send(false).await,
                 Err(exit) => return exit,
@@ -770,29 +809,6 @@ async fn refuse_uploads_until_exit() -> UploadSessionExit {
                 return UploadSessionExit::Sleep
             }
             Either::Second(Either::Second(DisplayCommand::Render(_))) => {}
-        }
-    }
-}
-
-/// A missing/uncreatable BOOKS directory has no FAT file to protect. Keep
-/// rejecting requests; the next hardware reset remounts from scratch.
-async fn refuse_uploads_forever_setup() -> ! {
-    loop {
-        match select(UPLOAD_BEGINS.receive(), UPLOAD_STOP_REQUESTS.receive()).await {
-            Either::First(_) => match drain_until_end().await {
-                Ok(()) => UPLOAD_RESULTS.send(false).await,
-                Err(UploadSessionExit::Wireless) => {
-                    crate::upload::UPLOAD_SESSION_ACTIVE
-                        .store(false, portable_atomic::Ordering::SeqCst);
-                    UPLOAD_STOPPED.send(()).await;
-                }
-                Err(UploadSessionExit::Sleep) => {}
-            },
-            Either::Second(()) => {
-                crate::upload::UPLOAD_SESSION_ACTIVE
-                    .store(false, portable_atomic::Ordering::SeqCst);
-                UPLOAD_STOPPED.send(()).await;
-            }
         }
     }
 }
