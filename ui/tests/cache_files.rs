@@ -877,3 +877,68 @@ fn no_break_space_line_is_kept_as_a_blank_spacer() {
         "ASCII-blank lines are still skipped"
     );
 }
+
+#[test]
+fn justified_lines_fill_the_measure_except_a_paragraphs_last() {
+    use display::fb::Framebuffer;
+    let mut store = ReaderStore::new();
+    let body = proto::text::TextRole::Body;
+    let justify = proto::text::TextAlign::Justify;
+    let regular = display::font::FontStyle::Regular;
+    // A mid-paragraph line, a paragraph's last line, and a mid-paragraph
+    // line too short to stretch (it would open rivers).
+    assert!(store.push_line_block(
+        "It was the best of times, it was the worst of times, it was the age of",
+        regular,
+        body,
+        justify,
+        false,
+        0,
+    ));
+    assert!(store.push_line_block("wisdom.", regular, body, justify, true, 0));
+    assert!(store.push_line_block("A short line", regular, body, justify, false, 0));
+    reader_layout::rebuild_page_index(&mut store);
+
+    let mut fb = Framebuffer::new();
+    fb.clear(true);
+    ui::reading::draw_reading_page_body(&mut fb, &store, store.pages[0]);
+    let page_box = ui::reading::ReadingBlocks::page_box(&store);
+    let target = page_box.right - ui::reading::READER_WRAP_SAFETY;
+    let settings = ui::reading::ReadingBlocks::type_settings(&store);
+    let advance = ui::reading::line_advance(settings, body);
+    let blocks_y = {
+        let mut ys = Vec::new();
+        ui::reading::for_each_drawable_block(&store, store.pages[0], |block| {
+            ys.push(block.y);
+            true
+        });
+        ys
+    };
+    let rightmost_ink = |line: usize| -> i16 {
+        // The x-height band just above the baseline: clear of the line
+        // above's descenders and of this line's own.
+        let baseline = blocks_y[line];
+        let mut right = -1;
+        for y in (baseline - 9)..baseline {
+            for x in 0..fb.frame_width() as i16 {
+                if !fb.pixel(x as usize, y as usize) {
+                    right = right.max(x);
+                }
+            }
+        }
+        right
+    };
+    let first = rightmost_ink(0);
+    assert!(
+        (target - 6..=target).contains(&first),
+        "mid-paragraph line ends at {first}, target {target}"
+    );
+    assert!(
+        rightmost_ink(1) < target - 200,
+        "last line keeps natural spacing"
+    );
+    assert!(
+        rightmost_ink(2) < target - 200,
+        "short line is not stretched"
+    );
+}

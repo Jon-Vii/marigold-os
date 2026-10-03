@@ -111,6 +111,9 @@ pub struct ReaderDrawableBlock<'a> {
     /// First-line indent for the block's opening line; 0 for continuation
     /// lines, headings, and centered text.
     pub indent: i16,
+    /// The block ends its paragraph. A justified paragraph's last line
+    /// keeps its natural spacing.
+    pub paragraph_end: bool,
 }
 
 pub fn block_height(source: &impl ReadingBlocks, index: usize) -> i16 {
@@ -290,6 +293,7 @@ pub fn for_each_drawable_block(
             style,
             font: body_font(settings, style),
             indent: block_first_line_indent(source, index),
+            paragraph_end: source.paragraph_end(index),
         }) {
             break;
         }
@@ -332,14 +336,26 @@ pub fn draw_reading_page_body(fb: &mut Framebuffer, source: &impl ReadingBlocks,
             TextAlign::Justify => {
                 let x = page_box.x_for(role);
                 if block.record.line_count == 1 {
-                    draw_styled_line(
-                        fb,
-                        settings,
-                        block.text,
-                        x + block.indent,
-                        block.y,
-                        block.style,
-                    );
+                    if block.paragraph_end {
+                        draw_styled_line(
+                            fb,
+                            settings,
+                            block.text,
+                            x + block.indent,
+                            block.y,
+                            block.style,
+                        );
+                    } else {
+                        draw_justified_styled_line(
+                            fb,
+                            settings,
+                            block.text,
+                            x + block.indent,
+                            block.y,
+                            page_box.right,
+                            block.style,
+                        );
+                    }
                 } else {
                     draw_justified_wrapped_literata(
                         fb,
@@ -823,6 +839,106 @@ pub fn draw_styled_line(
             false,
         );
     }
+    cursor_x
+}
+
+/// Extra width to spread across a justified line's inter-word gaps, or
+/// `None` when it should keep natural spacing: no gaps, nothing to add, or
+/// a line so short (under two thirds of the measure) that stretching it
+/// would open rivers -- typically a line cut short by an unbreakable word.
+pub fn justify_extra(x: i16, natural_width: i16, right: i16, gaps: usize) -> Option<i16> {
+    let target = right - READER_WRAP_SAFETY;
+    let extra = target - (x + natural_width);
+    if gaps == 0 || extra <= 0 || extra * 3 > target - x {
+        return None;
+    }
+    Some(extra)
+}
+
+/// Inter-word gaps in a stored line: ASCII spaces before more text. A
+/// no-break space is part of its word and never stretches.
+pub fn justify_gap_count(text: &str) -> usize {
+    text.as_bytes()
+        .windows(2)
+        .filter(|pair| pair[0] == b' ' && pair[1] != b' ')
+        .count()
+}
+
+/// One step of a styled line walked for justified drawing.
+pub enum StyledWordStep<'a> {
+    /// A run of non-space text (style markers included) and the style in
+    /// effect at its start.
+    Word(&'a str, FontStyle),
+    /// An inter-word space and the style in effect there.
+    Gap(FontStyle),
+}
+
+/// Walk a styled line word by word for justified drawing. Shared by the
+/// built-in and SD custom-font drawers so both justify the same way. Stops
+/// early (returning false) when `visit` does.
+pub fn walk_styled_words(
+    text: &str,
+    default_style: FontStyle,
+    mut visit: impl FnMut(StyledWordStep<'_>) -> bool,
+) -> bool {
+    let mut style = default_style;
+    for (index, segment) in text.split(' ').enumerate() {
+        if segment.is_empty() {
+            continue;
+        }
+        if index > 0 && !visit(StyledWordStep::Gap(style)) {
+            return false;
+        }
+        if !visit(StyledWordStep::Word(segment, style)) {
+            return false;
+        }
+        let mut chars = segment.chars();
+        while let Some(ch) = chars.next() {
+            if ch == STYLE_MARKER {
+                if let Some(code) = chars.next() {
+                    style = style_from_marker_code(code).unwrap_or(style);
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Draw one stored line justified to `right`: the leftover width is spread
+/// across its inter-word spaces (earlier gaps take the remainder pixels).
+/// Falls back to natural spacing when `justify_extra` declines.
+pub fn draw_justified_styled_line(
+    fb: &mut Framebuffer,
+    settings: TypeSettings,
+    text: &str,
+    x: i16,
+    baseline_y: i16,
+    right: i16,
+    default_style: FontStyle,
+) -> i16 {
+    let gaps = justify_gap_count(text);
+    let natural = styled_text_ink_width(text, settings, default_style);
+    let Some(extra) = justify_extra(x, natural, right, gaps) else {
+        return draw_styled_line(fb, settings, text, x, baseline_y, default_style);
+    };
+    let per_gap = extra / gaps as i16;
+    let mut remainder = extra % gaps as i16;
+    let mut cursor_x = x;
+    walk_styled_words(text, default_style, |step| {
+        match step {
+            StyledWordStep::Word(word, style) => {
+                cursor_x = draw_styled_line(fb, settings, word, cursor_x, baseline_y, style);
+            }
+            StyledWordStep::Gap(style) => {
+                cursor_x += measure_text(body_font(settings, style), " ") as i16 + per_gap;
+                if remainder > 0 {
+                    cursor_x += 1;
+                    remainder -= 1;
+                }
+            }
+        }
+        true
+    });
     cursor_x
 }
 
