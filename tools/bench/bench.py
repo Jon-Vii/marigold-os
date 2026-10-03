@@ -1,4 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
 """Development bench harness for MarigoldOS hardware runs.
 
 The harness deliberately starts as a serial log collector and parser. The
@@ -27,7 +31,7 @@ from typing import Any, Iterable
 
 try:
     import tomllib
-except ImportError:  # pragma: no cover - Python < 3.11 fallback.
+except ImportError:  # pragma: no cover - Python < 3.11; load_budgets refuses.
     tomllib = None  # type: ignore[assignment]
 
 try:
@@ -566,10 +570,25 @@ def event_sort_key(event: dict[str, Any]) -> tuple[int, float]:
 
 
 def load_budgets(path: Path | None) -> dict[str, Any]:
-    if path is None or tomllib is None or not path.exists():
+    """Read warning budgets. Only a missing default file means "no budgets";
+    a budgets file that cannot be read is an error, never a silent skip."""
+    if path is None:
         return {}
-    with path.open("rb") as handle:
-        return tomllib.load(handle)
+    if not path.exists():
+        if path == DEFAULT_BUDGETS:
+            return {}
+        raise SystemExit(f"bench: budgets file {path} does not exist")
+    if tomllib is None:
+        version = f"{sys.version_info.major}.{sys.version_info.minor}"
+        raise SystemExit(
+            f"bench: cannot read budgets {path}: Python {version} has no tomllib. "
+            "Run tools/bench/bench.py directly (uv picks Python 3.11+) or use python3.11+."
+        )
+    try:
+        with path.open("rb") as handle:
+            return tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise SystemExit(f"bench: cannot read budgets {path}: {error}") from error
 
 
 def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> list[str]:

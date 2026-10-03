@@ -93,5 +93,19 @@ class BenchReportTests(unittest.TestCase):
         self.assertEqual(warnings, ["storage-cache: no parsed bench telemetry"])
 
 
+class BenchBudgetTests(unittest.TestCase):
+    def test_checked_in_budgets_load(self) -> None:
+        self.assertIn("page-turn", bench.load_budgets(bench.DEFAULT_BUDGETS))
+
+    def test_unreadable_budgets_fail_instead_of_skipping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            broken = Path(tmp) / "benches.toml"
+            broken.write_text("[page-turn\n", encoding="utf-8")
+            with self.assertRaises(SystemExit):
+                bench.load_budgets(broken)
+            with self.assertRaises(SystemExit):
+                bench.load_budgets(Path(tmp) / "missing.toml")
+
+
 if __name__ == "__main__":
     unittest.main()

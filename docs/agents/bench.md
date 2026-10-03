@@ -4,6 +4,13 @@ Use `tools/bench/bench.py` for hardware-facing development benches. The
 emulator and golden frames remain the fast behavior oracle; bench runs answer
 board-specific timing, SD/cache, sleep, and soak questions.
 
+`bench.py` needs Python 3.11+ to read the warning budgets in
+`tools/bench/benches.toml` (it uses `tomllib`). Run it directly as below: its
+`uv run --script` shebang picks a suitable Python. `python3 tools/bench/...`
+also works when `python3` is 3.11 or newer; on older interpreters, any command
+that reads budgets exits with an error instead of skipping them. `send.py` and
+`check_forward_turns.py` need only the standard library.
+
 ## When to run
 
 - Run `tools/bench/bench.py channel-stress --host` during normal development
