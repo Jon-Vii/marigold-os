@@ -109,7 +109,6 @@ pub fn push_pretty_file_stem<const N: usize>(stem: &str, out: &mut String<N>) {
                 capitalize_next = false;
                 ch
             }
-            '.' => break,
             _ => {
                 if ch.is_alphanumeric() {
                     capitalize_next = false;
@@ -213,5 +212,12 @@ mod tests {
         label.clear();
         push_pretty_file_stem("Märchen 😀", &mut label);
         assert_eq!(label, "Märchen 😀");
+    }
+
+    #[test]
+    fn pretty_file_stems_keep_periods_inside_titles() {
+        let mut label = String::<64>::new();
+        push_pretty_file_stem("Dr. Jekyll and Mr. Hyde - R. L. Stevenson", &mut label);
+        assert_eq!(label, "Dr. Jekyll and Mr. Hyde R. L. Stevenson");
     }
 }
