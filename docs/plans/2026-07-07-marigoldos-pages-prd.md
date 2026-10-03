@@ -1,7 +1,11 @@
 # MarigoldOS Pages Site — PRD
 
-Status: **planning.** Scope agreed in a grilling session (2026-07-07). No code
-written yet. This document is the shared understanding to build against.
+Status: **shipped** (July 2026). The landing page with the live emulator and
+the esp-web-tools flasher is `web/index.html`, deployed by
+`.github/workflows/pages.yml`; tagged releases build and publish the images
+through `.github/workflows/release.yml`. The feature-card screenshot gallery
+was cut from the page and its build step removed (`e0e932f`). The text below
+is the original plan, scoped in a grilling session (2026-07-07).
 
 ## Summary
 

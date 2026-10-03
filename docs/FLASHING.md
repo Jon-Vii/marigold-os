@@ -26,15 +26,15 @@ CrossPoint firmware family:
 
 | Partition | Type | Offset | Size |
 |---|---|---|---|
-| nvs | data/nvs | `0x9000` | 20 KB |
-| otadata | data/ota | `0xe000` | 8 KB |
-| app0 | app/ota_0 | `0x10000` | 6.5 MB |
-| app1 | app/ota_1 | `0x650000` | 6.5 MB |
-| spiffs | data/spiffs | `0xc90000` | 3.4 MB |
-| coredump | data/coredump | `0xff0000` | 64 KB |
+| nvs | data/nvs | `0x9000` | 20 KiB (`0x5000`) |
+| otadata | data/ota | `0xe000` | 8 KiB (`0x2000`) |
+| app0 | app/ota_0 | `0x10000` | 6.25 MiB (`0x640000`) |
+| app1 | app/ota_1 | `0x650000` | 6.25 MiB (`0x640000`) |
+| spiffs | data/spiffs | `0xc90000` | 3.375 MiB (`0x360000`) |
+| coredump | data/coredump | `0xff0000` | 64 KiB (`0x10000`) |
 
-The app is ~2 MB, so it fits `ota_0` with room to spare. `cargo run` now flashes
-against this table (see `.cargo/config.toml`).
+The app image is about 3.9 MB, so it fits `ota_0` with room to spare.
+`cargo run` now flashes against this table (see `.cargo/config.toml`).
 
 ### Why the stock bootloader accepts our image
 
@@ -83,10 +83,10 @@ Produces local images in `target/release-images/`:
 - **`full-flash*.bin`** — merged 16 MB images (bootloader + partition table +
   app) for local bench recovery on unlocked units only.
 
-Tagged GitHub releases publish one canonical app image per hardware target:
-`firmware-x4.bin` and `firmware-x3.bin`. The release does not repeat those
-bytes under updater-specific aliases. Rename the selected device image according
-to the installation path:
+Tagged GitHub releases publish one canonical app image per hardware target,
+`firmware-x4.bin` and `firmware-x3.bin`, plus a `SHA256SUMS` file. The release
+does not repeat those bytes under updater-specific aliases. Rename the selected
+device image according to the installation path:
 
 | Installation path | X4 card filename | X3 card filename |
 | --- | --- | --- |
@@ -112,10 +112,11 @@ development conveniences, not separate release payloads.
 
 The X3 is the X4's sibling: same ESP32-C3 and 16 MB flash, but stock X3 units
 may retain a different dual-OTA partition table (`ota_1` at `0x780000`, with
-7.44 MB slots) from the Marigold/CrossPoint layout (`ota_1` at `0x650000`, with
-6.25 MB slots). It uses a smaller 792×528 UC8253 panel with a BQ27220 battery
-gauge instead of the X4's ADC divider. Support lives behind the
-`device-x3` feature; the default build is unchanged for the X4. X3 support has
+7.44 MiB (`0x770000`) slots) from the Marigold/CrossPoint layout (`ota_1` at
+`0x650000`, with 6.25 MiB (`0x640000`) slots). It uses a smaller 792×528
+UC8253 panel with a BQ27220 battery gauge instead of the X4's ADC divider.
+Support lives behind the `device-x3` feature; the default build is unchanged
+for the X4. X3 support has
 now been validated on hardware, so the web flasher and release pipeline publish
 first-class X3 images alongside X4 images.
 
@@ -139,9 +140,10 @@ the X4 image. The app-only flash paths are otherwise the same as the X4 below.
 > as a serial port. Serial is behind the same native USB-Serial-JTAG as the X4.
 
 When testing, **capture the serial log** (`cargo run` monitors it, or
-`espflash monitor`): panel init, the `X3` BUSY-wait completions, per-refresh
-timings, and `input: bq27220` battery reads are what pin down which bring-up
-value (BUSY timing → orientation → waveforms → battery) needs adjustment.
+`espflash monitor`): panel init, the `display: x3 busy` lines, per-refresh
+timings, and the `input: battery seeded` / `battery: gauge` lines are what pin
+down which bring-up value (BUSY timing → orientation → waveforms → battery)
+needs adjustment.
 
 ## Flashing an unlocked unit
 
@@ -162,9 +164,10 @@ esptool.py --chip esp32c3 write_flash 0x0 target/release-images/full-flash.bin
 > [!WARNING]
 > On a locked unit, USB flashing is the recovery path of last resort and it's
 > disabled. If you install a firmware that has **no over-the-air / SD update
-> path of its own**, and USB re-locks, there is no way back. This firmware does
-> not yet ship that recovery path (see [Status](#status)), so **do not install
-> it on a locked unit you can't afford to brick.**
+> path of its own**, and USB re-locks, there is no way back. This firmware
+> ships an SD update path (see [In-app update](#in-app-update-the-recovery-net)),
+> but it has not yet been confirmed on a locked unit (see [Status](#status)), so
+> **do not install it on a locked unit you can't afford to brick.**
 
 Two mechanisms exist, both pioneered by CrossPoint:
 
@@ -252,8 +255,8 @@ Implemented and verified on host tooling:
       local updater-name aliases (`update.bin`, `update-x3.bin`,
       `FWUPDATE.BIN`, `FWUPDX3.BIN`), and local-only `full-flash*.bin` bench
       images (`tools/build-release.sh`). Tagged releases publish only the two
-      canonical device images. Every SD alias remains an app image written to
-      `0x10000`, matching the OEM updater.
+      canonical device images plus `SHA256SUMS`. Every SD alias remains an
+      app image written to `0x10000`, matching the OEM updater.
 - [x] `cargo run` flashes the stock-compatible layout.
 - [x] **Image validator** (`proto::ota::validate_image`) — the integrity gate
       (magic / segment walk / XOR checksum / SHA-256 trailer) that must pass

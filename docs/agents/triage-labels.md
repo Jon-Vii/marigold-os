@@ -12,4 +12,6 @@ The skills speak in terms of five canonical triage roles. This file maps those r
 
 When a skill mentions a role (e.g. "apply the AFK-ready triage label"), use the corresponding label string from this table.
 
+Resolved issues are marked `Status: completed`. That is a closed state, not a triage role, so it has no row above.
+
 Edit the right-hand column to match whatever vocabulary you actually use.

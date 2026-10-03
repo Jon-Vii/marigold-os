@@ -6,7 +6,7 @@ readers: ESP32-C3, monochrome e-paper panels, no PSRAM.
 The design goal is not to imitate a desktop OS. It is a small data pipeline:
 
 ```text
-buttons -> app state -> display command -> framebuffer -> SSD1677 RAM -> refresh -> sleep
+buttons -> app state -> display command -> framebuffer -> panel RAM -> refresh -> sleep
 ```
 
 ## Current architecture diagram
@@ -18,15 +18,15 @@ flowchart TD
     app_task["app_task<br/>owns ReaderState reducer shell"]
     display_task["board I/O + display task<br/>single owner of EPD bus, SD CS,<br/>ReaderStore, framebuffer"]
     power_task["power_task<br/>idle timer + deep sleep"]
-    wifi_task["wifi_task<br/>sync session + browser shelf"]
+    wifi_task["wifi_task<br/>wireless session + browser shelf"]
 
     app_core["app-core<br/>Copy message contracts<br/>ReaderState reducer<br/>RefreshPlanner"]
-    display_crate["display<br/>1 bpp framebuffer<br/>drawing + fonts<br/>SSD1677 transforms"]
+    display_crate["display<br/>1 bpp framebuffer<br/>drawing + fonts<br/>SSD1677/UC8253 panel descriptions"]
     proto["proto<br/>bounded book/storage/text/cache models<br/>ZIP/EPUB/XHTML parser pieces"]
-    hal_ext["hal-ext<br/>SPI DMA, RTC, NVM helpers"]
+    hal_ext["hal-ext<br/>SPI DMA, RTC, NVM helpers,<br/>BQ27220 gauge"]
     ui["ui<br/>bounded layout/render helpers"]
 
-    epd["SSD1677 e-ink panel<br/>800x480 BW/RED RAM"]
+    epd["e-ink panel<br/>X4: SSD1677 800x480<br/>X3: UC8253 792x528"]
     sd["microSD FAT<br/>/BOOKS + card root EPUBs<br/>/XTEINK cache + catalog + state"]
     sleep["ESP32-C3 deep sleep"]
 
@@ -65,29 +65,36 @@ flowchart TD
 ## Rules
 
 - `#![no_std]`, no heap allocation in the reading path. The one
-  exception is the Wi-Fi sync session, which donates loaned buffers to
-  esp-alloc and ends in a reset (see "Wi-Fi sync session").
-- One 48 KB 1 bpp framebuffer.
+  exception is the wireless session, which donates loaned buffers to
+  esp-alloc and ends in a reset (see "Wireless session").
+- Two 1 bpp framebuffers: the one views draw into, and the retained previous
+  frame that fast refreshes diff against, which lives at the top of dram2
+  (`fw::sync_mem`, placed by `fw/build.rs`). Each is 48 KB on the X4 (52 KB on
+  the X3).
 - Display ownership is single-writer: only `display_task` touches the EPD bus.
 - Reader state ownership is single-writer: only `app_task` mutates page/menu state.
 - Messages are small `Copy` values. Bulk bytes stay in caller-owned buffers.
 - Power requests display sleep through `display_task`; it never touches SPI.
-- Hardware assumptions live in one of two places:
-  - X4 board wiring in `fw/src/main.rs` and `fw/src/tasks/input.rs`.
-  - SSD1677 protocol in `display/src/epd.rs`.
+- Hardware assumptions live in a few places:
+  - Board wiring (X4 and X3) in `fw/src/main.rs` and `fw/src/tasks/input.rs`.
+  - Panel-controller descriptions in `display/src/epd/`: `ssd1677.rs` (X4) and
+    `uc8253.rs` (X3), selected at compile time by the `device-x3` feature.
+  - Panel refresh flows in `fw/src/display_flush/`.
 
 ## Workspace
 
 ```text
 app-core/ app state reducer and Copy message contracts shared by firmware/tools
-display/   framebuffer, drawing primitives, SSD1677 constants and address math
+display/   framebuffer, drawing primitives, fonts, SSD1677 (X4) and UC8253 (X3)
+           panel descriptions
 hal-ext/   thin async wrappers over ESP HAL peripherals
 fw/        boot, Embassy executor, task wiring, board-owned peripherals
+           (esp-hal 1.1, esp-rtos, and esp-radio, pinned in fw/Cargo.toml)
 ui/        shared shell rendering plus ui::reading, the reader page-plan seam
            (page bounds, ink measurement, wrapping) used by fw and host tools
 proto/     bounded book/storage/text/cache models plus ZIP/EPUB/XHTML parser pieces
 tools/emulator/ host-side development emulator and scenario runner
-tools/cargo.sh  rustup-stable Cargo wrapper for firmware builds/checks
+tools/cargo.sh  rustup Cargo wrapper on the toolchain pinned in rust-toolchain.toml
 tools/bench/    serial bench harness for hardware timing, storage/cache,
                 sleep, soak, and host channel-stress checks
 ```
@@ -98,13 +105,14 @@ tools/bench/    serial bench harness for hardware timing, storage/cache,
 app_task
   owns ReaderState
   InputEvent -> DisplayCommand::Render
-  modes: Home, Library, Reading, Chapters, Sync, Settings
+  views (AppView): Home, Library, Reading, Chapters, Wireless, Settings,
+  FirmwareUpdate
 
 board_io/display task
   owns EpdBus, SD CS, ReaderStore, and Framebuffer
   DisplayCommand::Render -> pure framebuffer render from the current ReaderStore snapshot
   StorageCommand::* -> serialized SD/FAT/catalog/cache work on the shared SPI bus
-  DisplayCommand::Sleep -> sleep screen full refresh -> SSD1677 deep sleep -> PowerEvent::DisplayAsleep
+  DisplayCommand::Sleep -> sleep screen full refresh -> panel deep sleep -> PowerEvent::DisplayAsleep
   sends DisplayEvent::Settled to app_task when render completes
 
 input_task
@@ -113,7 +121,7 @@ input_task
 
 power_task
   observes activity and display-settled events
-  asks display_task to sleep the SSD1677, then enters ESP32-C3 deep sleep
+  asks display_task to sleep the panel, then enters ESP32-C3 deep sleep
 
 wifi_task
   parked until SyncCommand::Start arrives from the Wireless screen
@@ -128,19 +136,22 @@ wifi_task
 The wireless session is one-way and modal because the radio blob needs ~100 KB of
 heap this firmware does not have while reading. `fw::sync_mem` owns the
 plumbing: the display task dismantles the EPUB scratch into raw regions
-(`reader_cache::dismantle_scratch`), and the wifi task donates them plus a
-16 KB claim on the otherwise unused dram2 boot-loader shadow segment to
-esp-alloc. The previous-frame framebuffer also lives in dram2 now so
-esp-wifi's static demand fits in main DRAM with the ~41 KB stack region
-intact. The smaller scratch buffers are reused directly as TCP socket and
-HTTP buffers. Once loaned, the reader pipeline cannot come back: leaving
-the Wireless screen after the radio ran maps to `SyncCommand::Exit`, which is
-a software reset; boot restore then reloads the saved position.
+(`reader_cache::dismantle_scratch`), and the wifi task donates two of them to
+esp-alloc as heap. The smaller scratch buffers are reused directly as TCP
+socket and HTTP buffers. dram2 (the boot-loader shadow segment) holds only the
+previous-frame framebuffer, packed against its top so the radio's static
+demand fits in main DRAM; `fw/build.rs` hands the gap beneath it to the main
+stack, and the trimmed `ControllerConfig` in `fw/src/tasks/wifi.rs` keeps the
+radio within the smaller heap. Once loaned, the reader pipeline cannot come
+back: leaving the Wireless screen after the radio ran maps to
+`SyncCommand::Exit`, which is a software reset; boot restore then reloads the
+saved position.
 
 Before the loan the display task flushes any coalesced reading position
-to STATE.BIN, because the session's only exit is the reset. (An earlier
-iteration also exchanged the position with a kosync server here; that
-shipped unused and was removed — the session is purely a book server.)
+to the state record (STATEA/STATEB), because the session's only exit is the
+reset. (An earlier iteration also exchanged the position with a kosync
+server here; that shipped unused and was removed — the session is purely a
+book server.)
 
 Once joined, the wifi task serves a shelf page at the device's LAN
 address (the Wireless screen's `Serving` status hands out the URL, with
@@ -162,14 +173,15 @@ overwriting an unrelated file. Legacy short-only `.EPU` uploads and their
 abort an active writer, reclaim the incomplete file's FAT chain, close the SD
 session, and only then sleep or reset. The boot rescan surfaces new books.
 
-Station credentials come from `/XTEINK/WIFI.BIN` (written by the
-onboarding portal below), falling back to compile-time `option_env!`
-values (`XTEINK_WIFI_SSID`/`XTEINK_WIFI_PASS`) for dev builds.
-At boot the display task reads WIFI.BIN once and reports the saved
+Station credentials come from alternating `/XTEINK/WIFIA.BIN`/`WIFIB.BIN`
+generations (written by the onboarding portal below; a legacy `WIFI.BIN` is
+still read), falling back to compile-time `option_env!` values
+(`XTEINK_WIFI_SSID`/`XTEINK_WIFI_PASS`) for dev builds.
+At boot the display task reads the saved credentials once and reports the saved
 network's name as `SyncEvent::NetworkSaved`, so the Wireless screen can
 show which network is saved and offer connect/forget honestly instead of
 guessing from build flags. Forget is a two-press flow (the browse key
-arms it, Confirm deletes WIFI.BIN via
+arms it, Confirm deletes both generations and any legacy `WIFI.BIN` via
 `StorageCommand::ForgetWifiCredentials`) and is only reachable while the
 radio is untouched; it drops the screen back to the set-up offer — the
 recovery path for a wrong password or a changed router that used to
@@ -181,14 +193,14 @@ server, a DNS catch-all (every name resolves to the portal, which makes
 phones raise their sign-in sheet unprompted), and a credential form on
 port 80. The Wireless screen shows a baked-at-build-time join QR
 (`tools/generate_qr.py`). Submitted credentials travel to the display
-task as a `StoreWifiCredentials` Copy message, land in WIFI.BIN, and the
+task as a `StoreWifiCredentials` Copy message, land on the card, and the
 next session joins as a station. `proto::captive` holds the sans-IO
 DHCP/DNS/HTTP codecs under host tests; the wifi task only owns sockets.
 
 Embassy is used for cooperative waits: ADC retry delays, button polling, SPI DMA
 transfers, BUSY waits, and sleep windows all yield instead of spinning. The real
 battery win comes after display settle: the power task asks the display task to
-draw a visible sleep screen, power down the SSD1677, then move the ESP32-C3 into
+draw a visible sleep screen, power down the panel, then move the ESP32-C3 into
 deep sleep. The power button also requests this same sleep path instead of being
 treated as ordinary navigation input.
 
@@ -232,27 +244,36 @@ firmware images can coexist.
 ## Display model
 
 `display::fb::Framebuffer` is the source of truth. White is bit `1`, black is
-bit `0`, row-major, 100 bytes per row.
+bit `0`, row-major, `ROW_BYTES` per row (100 on the X4, 99 on the X3). Each
+framebuffer also carries its `FbFrame`, the drawing frame for how the device
+is held (see orientation below).
 
-The SSD1677 path writes the current framebuffer to BW RAM (`0x24`). The first
-refresh after boot also writes the current framebuffer to RED RAM (`0x26`) and
-runs the multi-flash full waveform (~3.5 s), the only mode that reliably clears
-unknown pixels. Normal page turns use a second retained framebuffer as the RED
+On the X4, the SSD1677 path writes the current framebuffer to BW RAM
+(`0x24`). The first refresh after boot also writes the current framebuffer to
+RED RAM (`0x26`) and runs the multi-flash full waveform (~3.5 s), the only mode
+that reliably clears unknown pixels. Normal page turns use a second retained framebuffer as the RED
 RAM previous-frame source, then trigger the SSD1677 fast waveform (~421 ms).
 
-Between those sits `RefreshMode::FastClean`, the one-flicker clean: the
-display-mode-1 waveform run with the temperature register overridden to 90 C,
-selecting the hotter (shorter) OTP LUT — ghost cleanup in ~1.5 s at a small
-contrast cost. Waking from the sleep screen and view/context changes use it
+Between those sits `RefreshMode::FastClean`, the one-flicker clean. On the
+SSD1677 it is the display-mode-1 waveform run with the temperature register
+overridden to 90 C, selecting the hotter (shorter) OTP LUT — ghost cleanup in
+~1.5 s at a small contrast cost. Waking from the sleep screen and view/context changes use it
 instead of the full waveform, since the panel's contents are known. After a
 FastClean settles, the update sequence reloads the sensed temperature so later
 fast refreshes return to sensor-accurate timing.
 
-The user-facing `RefreshPolicy` in Settings selects between `FastOnly`,
-`FullOnWake` (the default), and `FullEveryTen`, which inserts a FastClean
-cleanup after every ten fast refreshes.
+The X3's UC8253 has two RAM planes (DTM1 "old", DTM2 "new") instead of BW/RED
+and has its waveform LUTs uploaded per refresh, so each `RefreshMode` maps to a
+LUT bank plus a CDI mode byte; FastClean is a half-scrub LUT bank (see
+`display/src/epd/uc8253.rs`).
 
-`display::epd` contains three transform constants currently validated during bring-up:
+The user-facing `RefreshPolicy` in Settings selects between `FastOnly`,
+`FullOnWake` (the default), and `FullEveryTen`. Under `FullEveryTen`, once
+`DEFAULT_FULL_REFRESH_INTERVAL` (currently 8) consecutive fast refreshes have
+accumulated, the refresh planner schedules a cleaning refresh (FastClean)
+instead of the next fast one.
+
+`display::epd::ssd1677` contains three transform constants currently validated during bring-up:
 `MIRROR_X = true`, `MIRROR_Y = false`, and `REVERSE_BITS = true`. The logical
 framebuffer API stays upright while firmware and host tools remap bytes/bits
 before panel-RAM writes. This fixes the X4 panel's observed horizontal byte
@@ -260,9 +281,8 @@ order and bit order without leaking hardware orientation into app rendering.
 `MIRROR_Y=true` was tested and rejected because it made glyphs vertically
 mirrored/upside down.
 
-Physical orientation is an app/layout concern, not an SSD1677 streaming concern.
-The current readable build places logical top on the physical button side. The
-reader state already carries a complete orientation enum:
+Physical orientation is an app/layout concern, not a panel streaming concern.
+The reader state carries a four-variant orientation enum:
 
 ```rust
 enum DisplayOrientation {
@@ -273,10 +293,17 @@ enum DisplayOrientation {
 }
 ```
 
-Default reader mode is `LandscapeButtonsBottom`, but the low-level display
-transform above should stay fixed unless corruption returns.
+Default reader mode is `LandscapeButtonsBottom`. Settings cycles three holds:
+the two landscapes and `PortraitButtonsLeft` (front buttons below the screen).
+`PortraitButtonsRight` stays in the enum for the persistence format and renders
+like `PortraitButtonsLeft`. Renderers draw through `display::fb::FbFrame`
+(`Landscape`, `LandscapeFlipped`, `Portrait`, or `Native` for boot and
+byte-level tooling): `set_pixel`/`pixel` take upright coordinates in the held
+frame and map them onto the panel's native row-major buffer, folding in the
+panel's inverted row scan. The low-level display transform above should stay
+fixed unless corruption returns.
 
-Addressing follows the OpenX4 community SDK behavior:
+X4 (SSD1677) addressing follows the OpenX4 community SDK behavior:
 
 - SPI mode 0, 40 MHz.
 - BUSY is active high.
@@ -292,7 +319,7 @@ InputEvent        Copy enum
 ReaderState       view/book/page/chapter/settings/battery fields
 RenderRequest     view/book/page/orientation/refresh/battery/dirty rect
 Layout<N>         parallel arrays of kind/rect/parent/text span
-Framebuffer       single flat byte array
+Framebuffer       flat byte array plus its drawing frame (FbFrame)
 ```
 
 `app-core` owns the reader reducer and the shared message contracts. The
@@ -412,10 +439,11 @@ source-matching legacy `BOOK.BIN` first to avoid probing absent generation files
 for every old catalog entry. Page totals and section loading retain generation
 selection. Each fresh catalog write also sweeps `CACHE2` and reclaims caches whose stored source identity no
 longer matches any catalogued book, deleting the data files and the emptied
-directories while leaving `STATE.BIN` intact. Files renders the current
-snapshot immediately. It may show “Library unavailable” before any successful
-cache/scan, and “No books found” only after a completed scan proves the card
-has no EPUBs.
+directories while leaving the global state record intact. Files renders the
+current snapshot immediately. It shows “reading the card…” until a snapshot or
+scan result arrives, “the library is unavailable” when a scan fails with no
+snapshot to fall back on, and “no books — add EPUB files to /books” when the
+snapshot or a completed scan has no EPUBs.
 
 ```text
 /XTEINK/CACHE2/E<hash>/BOOKA.BIN
@@ -425,9 +453,12 @@ has no EPUBs.
 /XTEINK/CACHE2/E<hash>/COVER.BIN
 /XTEINK/CACHE2/E<hash>/SECTIONS/S000.BIN
 /XTEINK/CACHE2/E<hash>/SECTIONS/S001.BIN
+/XTEINK/CACHE2/E<hash>/POSA.BIN       (per-book position, alternating with POSB.BIN)
 /XTEINK/CATALOG.BIN
 /XTEINK/LABELS/<stem>.TXT
-/XTEINK/STATE.BIN
+/XTEINK/STATEA.BIN
+/XTEINK/STATEB.BIN
+/XTEINK/STATE.BIN                     (legacy fallback)
 ```
 
 Each book index holds a `BookV2Header`, one `BookV2SectionRecord` per section
@@ -453,24 +484,29 @@ commits; a missing or stale sidecar can be repaired from the committed index.
 The active firmware state keeps only loaded book metadata, the full section index, the active section's page/block records and
 text bytes, and small ZIP/XML scratch buffers. Spine XHTML members of any size
 stream completely through the resumable block parser in bounded inflate
-windows, so chapter content is never truncated by scratch-buffer limits. `STATE.BIN`
-stores the encoded `AppStateRecord`; version 2 and later records include the
-SD source size and path-derived hash so boot restore can map saved progress
-back onto the scanned SD catalog instead of trusting a volatile list index.
-The current version 3 also persists the type settings (font size and line
-spacing).
+windows, so chapter content is never truncated by scratch-buffer limits. The
+global state record (alternating `STATEA.BIN`/`STATEB.BIN` generations, with a
+legacy `STATE.BIN` still read) stores the encoded `AppStateRecord`; version 2
+and later records include the SD source size and path-derived hash so boot
+restore can map saved progress back onto the scanned SD catalog instead of
+trusting a volatile list index. The current version 4 also persists the type
+settings (size, spacing, weight, and family) and the front-button order.
 
 `COVER.BIN` is an optional Home-cover sidecar for the same cache key. It stores
 a tiny header followed by a 202x303, 1-bit, row-packed bitmap matching the Dock
-Clean cover slot. Firmware treats it as flat DOD data: valid records are drawn
-directly, while missing or invalid records fall back to generated cover art. The
+Clean cover slot. Firmware still loads a valid record into the reader store as
+flat DOD data, but the current Home title page does not draw it. The
 host preview tool can generate the sidecar from EPUB JPEG/PNG covers with
 `--cover-bin` or write it directly to a mounted SD cache path with `--sd-root`.
 
-Reading and chapter navigation typography use generated Literata bitmap assets.
-The host generator downloads OFL Literata TTFs and emits Latin-1 glyph
-metrics/bitmaps for Regular, Italic, Bold, and BoldItalic. Firmware does not
-rasterize TTFs on-device.
+Reading and chapter navigation typography use generated bitmap assets for two
+OFL faces, Literata (the default) and Merriweather, plus an optional SD-card
+custom font pack (`docs/CUSTOM_FONTS.md`). `tools/generate_literata.py`
+downloads the Literata TTFs and emits glyph metrics/bitmaps for Regular, Italic,
+Bold, and BoldItalic covering the ranges in its `RANGES` table: Basic Latin,
+Latin-1, Latin Extended-A/B and Additional, Greek, Cyrillic, general
+punctuation, currency and letterlike symbols, arrows, and geometric shapes.
+Firmware does not rasterize TTFs on-device.
 
 ## Development emulator
 
@@ -530,7 +566,8 @@ tools/bench/bench.py sleep-sync --port /dev/cu.usbmodem101 --cycles 10
 tools/bench/bench.py report target/bench/latest.jsonl
 ```
 
-Typical development loop:
+Typical development loop (the full gate that CI runs is in
+`docs/agents/verification.md`):
 
 ```sh
 cargo test -p app-core -p proto -p ui --target aarch64-apple-darwin
@@ -557,10 +594,12 @@ Parity boundary: everything rendered by the shared crates tracks firmware
 changes automatically. The firmware shell (`fw/`) is not compiled; the wasm
 crate carries small stand-ins for it:
 
-- a fake SD layer: three public-domain books plus a tour, parsed from
+- a fake SD layer: eight public-domain books (`SHELF` in
+  `tools/web-emulator/src/books.rs`), parsed from
   `tools/web-emulator/books/*.txt` (regenerated by `books/convert.py`) into
   `BlockRecord`s and paginated with the real `ui::reading` walk
-- a scripted Wi-Fi session ending at `SyncEvent::Serving`
+- a scripted Wi-Fi session: a join ending at `SyncEvent::Serving`, or the
+  onboarding portal when no network is saved
 - SD reading-screen composition using the shared `ui::reading` page body,
   page-in-chapter counter, and loading bookplate; the wasm crate supplies its
   own book metadata and storage readiness, and holds the bookplate until the
@@ -574,10 +613,11 @@ cp tools/web-emulator/target/wasm32-unknown-unknown/release/x4_web_emulator.wasm
 python3 -m http.server -d web   # local check
 ```
 
-`.github/workflows/pages.yml` runs the same build, checks the golden frames,
-exports browser-presented scenario screenshots into `images/screens/`, and
-publishes `web/` to GitHub Pages on every push to main that touches `web/`, the
-wasm crate, shared crates, or scenario fixtures. A tagged release dispatches
+`.github/workflows/pages.yml` runs the same build, checks the X4 and X3 golden
+frames, verifies the web flasher's app-only install contract
+(`tools/verify_web_flasher.sh`), and publishes `web/` to GitHub Pages on every
+push to main that touches `web/`, the wasm crate, shared crates, or scenario
+fixtures. A tagged release dispatches
 the Pages workflow with its tag, which copies that release's flash images into
 the Pages artifact so the ESP web flasher can fetch same-origin firmware. The
 built `.wasm` and release images are gitignored; only sources are committed.
@@ -586,25 +626,28 @@ built `.wasm` and release images are gitignored; only sources are committed.
 
 The firmware now has the e-reader surfaces as explicit app state:
 
-- `Home`: current book cover/metadata plus Continue, Library, Sync, and Settings.
+- `Home`: current book title page plus Continue, Library, Wireless, and Settings.
 - `Library`: selects a book or opens settings.
 - `Reading`: owns the active book/page position.
 - `Chapters`: selects a chapter within the current book.
-- `Settings`: cycles refresh policy, font size, line spacing, typeface, and
-  type weight. `DisplayOrientation` is persisted for future reading-layout
-  work, but it is not currently exposed as a user-facing setting.
+- `Wireless`: the wireless session's connect/forget, onboarding, and shelf
+  status screen.
+- `Settings`: cycles typeface, font size, type weight, line spacing, refresh
+  policy, orientation, and front-button order, and opens `FirmwareUpdate`, the
+  SD firmware picker.
 
-Every surface renders in landscape: the X4 is held that way for its side page
-buttons, so `Home`, `Library`, and `Settings` share the reading posture rather
-than rotating into portrait. Home is cover-led: the current book is the visual
-anchor, with a restrained menu down the side for Continue, Library, Sync, and
-Settings.
-Reading mode keeps the page quiet: tiny book title, rendered-screen count within
-the chapter, symbolic battery, and a thin whole-book progress bar. Home shows a
-small battery percentage because it is a status surface. GPIO0 is sampled as the
-current rough battery source using a 2:1 divider assumption and a simple
-3300-4200 mV LiPo percentage curve. The current book may be the built-in
-fallback or the restored/last-selected microSD EPUB. Home triggers SD scan and
+Landscape is the default hold: the X4 is held that way for its side page
+buttons, and `Home`, `Library`, and `Settings` share the reading posture. The
+portrait hold redraws every surface upright through `FbFrame::Portrait`, with
+the margin-key labels moved to a row along the bottom edge. Home is a title
+page: the current book's title, author, a progress rule, and the chapter name,
+with the key labels for Continue, Library, Wireless, and Settings beside it.
+Reading mode is full bleed: its only resident furniture is the page-in-chapter
+counter. Home shows a small battery percentage because it is a status surface.
+On the X4, GPIO0 is sampled as the current rough battery source using a 2:1
+divider assumption and a simple 3300-4200 mV LiPo percentage curve; the X3
+reads state of charge from its BQ27220 gauge. The current book may be the
+built-in fallback or the restored/last-selected microSD EPUB. Home triggers SD scan and
 state restore on first render, then `Read` resumes the current EPUB through the
 same cache-loading path as Files. If there is no current SD EPUB, `Read` opens
 Files when EPUBs are present and falls back to the built-in reader when the card
@@ -643,6 +686,9 @@ fw::catalog             the built-in fallback book's static content
 fw::sync_mem            the one-way memory loan for the Wi-Fi session
 fw::upload              browser-to-shelf upload ping-pong plumbing
 fw::views               Home/Files/Reading/Chapters/Settings drawing
+fw::custom_font         SD-card custom font pack metrics and glyph drawing
+fw::firmware_files      root-level firmware image catalog for the Settings picker
+fw::ota_update          boot-time SD firmware update, otadata switch, recovery combo
 fw::tasks::display      task loop, refresh policy, and event publishing
 ```
 
@@ -653,9 +699,10 @@ size.
 
 Persistent app state is represented by `hal_ext::nvm::AppStateRecord`, a compact
 versioned/checksummed record for book id, chapter, rendered screen, shell
-orientation, reading orientation, refresh policy, source hash, and source file
-size. The firmware stores it at `/XTEINK/STATE.BIN` for SD reading progress;
-flash/NVM fallback remains separate from the record format.
+orientation, reading orientation, refresh policy, type settings, front-button
+order, source hash, and source file size. The firmware stores it on the card as
+alternating `/XTEINK/STATEA.BIN`/`STATEB.BIN` generations (legacy `STATE.BIN`
+is still read); there is no flash copy.
 
 ## Performance
 
@@ -666,8 +713,8 @@ flash/NVM fallback remains separate from the record format.
 | Cold-boot full refresh | 3.5 s |
 | Reopen a cached book | tens of milliseconds |
 | RAM | 400 KB SRAM, no PSRAM |
-| Usable stack | ~43 KB |
-| Framebuffer | one, 48 KB, 1 bit per pixel |
+| Main stack | linked region about 35.9 KB on X4; the link fails below 27 KB (`fw/build.rs`) |
+| Framebuffers | two (current + previous frame), 48 KB each on X4, 1 bit per pixel |
 
 ## Bring-up checklist
 
@@ -688,6 +735,6 @@ flash/NVM fallback remains separate from the record format.
    constants so normal firmware only refreshes on debounced button edges.
 6. Measure deep-sleep current.
 
-Storage, saved progress, Wi-Fi sync, and the FastClean refresh mode have
-all landed since this checklist was written; partial-window refresh
-remains deliberately shelved.
+Storage, saved progress, the wireless session, portrait orientation, and the
+FastClean refresh mode have all landed since this checklist was written;
+partial-window refresh remains deliberately shelved.

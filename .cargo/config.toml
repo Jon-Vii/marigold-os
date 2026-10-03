@@ -13,6 +13,4 @@ rustflags = [
 [build]
 target = "riscv32imc-unknown-none-elf"
 
-# Radio buffer trims moved to runtime: esp-radio dropped the old
-# ESP_WIFI_CONFIG_* compile-time options, so the kosync-session sizing now
-# lives in the ControllerConfig built in fw/src/tasks/wifi.rs.
+# Radio buffer sizing lives in the ControllerConfig in fw/src/tasks/wifi.rs.

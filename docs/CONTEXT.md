@@ -49,9 +49,9 @@ Use this term for the deepened pagination/rendering seam that firmware reading v
 The one-way Wi-Fi mode behind the Wireless screen: join the saved
 network and serve the browser shelf page (catalog listing, EPUB upload,
 book removal) until the done press, or run the onboarding portal when no
-network is saved. Entering it loans the EPUB scratch (plus the dram2
-segment) to the radio as heap, so the reader pipeline is gone until the
-session ends in a software reset. The display task keeps serving
+network is saved. Entering it loans the EPUB scratch to the radio as
+heap, so the reader pipeline is gone until the session ends in a
+software reset. The display task keeps serving
 renders, progress writes, and upload writes during the session; it
 refuses every scratch-using storage command.
 
@@ -67,6 +67,6 @@ message contracts, not in display-task flags. Ask the session
 
 ### Refresh plan
 
-The display-policy decision that maps render history, view/book context, selection changes, library changes, sleep/wake state, and refresh policy into an SSD1677 refresh mode.
+The display-policy decision that maps render history, view/book context, selection changes, library changes, sleep/wake state, and refresh policy into a panel refresh mode (`RefreshMode`), which the X4 (SSD1677) and X3 (UC8253) drivers each realize.
 
-Use this term for the shared full-vs-fast refresh decision used by firmware and emulator. Keep panel command streaming, framebuffer transforms, and adapter-specific panel state outside the refresh plan.
+Use this term for the shared refresh-mode decision (full, fast-clean, or fast) used by firmware and emulator. Keep panel command streaming, framebuffer transforms, and adapter-specific panel state outside the refresh plan.
