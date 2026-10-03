@@ -823,3 +823,57 @@ fn advisory_generation_titles_validate_source_without_reading_commit_footer() {
         BookIndexLoadResult::Hit
     );
 }
+
+#[test]
+fn full_block_table_reports_failure_instead_of_dropping_the_line() {
+    let mut store = ReaderStore::new();
+    let capacity = store.block_capacity();
+    for _ in 0..capacity {
+        assert!(store.push_line_block(
+            "w",
+            display::font::FontStyle::Regular,
+            proto::text::TextRole::Body,
+            proto::text::TextAlign::Left,
+            false,
+            0,
+        ));
+    }
+    // The builder flushes the section and retries on `false`; `true` here
+    // used to mean "stored" while the line was silently discarded.
+    assert!(!store.push_line_block(
+        "this line must not vanish",
+        display::font::FontStyle::Regular,
+        proto::text::TextRole::Body,
+        proto::text::TextAlign::Left,
+        false,
+        0,
+    ));
+    assert_eq!(store.block_count(), capacity);
+}
+
+#[test]
+fn no_break_space_line_is_kept_as_a_blank_spacer() {
+    let mut store = ReaderStore::new();
+    assert!(store.push_line_block(
+        "\u{a0}",
+        display::font::FontStyle::Regular,
+        proto::text::TextRole::Body,
+        proto::text::TextAlign::Justify,
+        true,
+        0,
+    ));
+    assert_eq!(store.block_count(), 1);
+    assert!(store.push_line_block(
+        "   ",
+        display::font::FontStyle::Regular,
+        proto::text::TextRole::Body,
+        proto::text::TextAlign::Justify,
+        true,
+        0,
+    ));
+    assert_eq!(
+        store.block_count(),
+        1,
+        "ASCII-blank lines are still skipped"
+    );
+}

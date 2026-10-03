@@ -15,7 +15,6 @@ use miniz_oxide::{DataFormat, MZError, MZFlush, MZStatus};
 // truncating, so keep it comfortably ahead. One value for firmware and host so
 // a host test exercises the same ceiling the device does.
 pub const MAX_SPINE_ITEMS: usize = 192;
-pub const MAX_MANIFEST_ITEMS: usize = 224;
 pub const MAX_ENTRY_NAME_BYTES: usize = 160;
 const ZIP_TAIL_READ_WINDOW: usize = 512;
 const ZIP_EOCD_MIN_BYTES: u32 = 22;
@@ -57,8 +56,23 @@ impl<'a> XmlCursor<'a> {
     pub fn next_token(&mut self) -> Option<Token<'a>> {
         while self.cursor < self.input.len() {
             let rest = &self.input[self.cursor..];
+            // Same rules as `StreamingXmlTokenizer`: a comment ends only at
+            // `-->`, and CDATA content is text.
+            if let Some(body) = rest.strip_prefix("<!--") {
+                let end = body.find("-->")?;
+                self.cursor += 4 + end + 3;
+                continue;
+            }
+            if let Some(body) = rest.strip_prefix("<![CDATA[") {
+                let end = body.find("]]>")?;
+                self.cursor += 9 + end + 3;
+                if end > 0 {
+                    return Some(Token::Text(&body[..end]));
+                }
+                continue;
+            }
             if let Some(after_lt) = rest.strip_prefix('<') {
-                let end = after_lt.find('>')?;
+                let end = tag_close_index(after_lt)?;
                 self.cursor += end + 2;
                 let tag = after_lt[..end].trim();
                 if tag.starts_with('!') || tag.starts_with('?') {
@@ -79,6 +93,27 @@ impl<'a> XmlCursor<'a> {
         }
         None
     }
+}
+
+/// Index of the `>` closing a tag body. Quoted attribute values may hold
+/// `>`; declarations (`<!DOCTYPE ...>`) treat quotes literally, matching
+/// the streaming tokenizer.
+fn tag_close_index(after_lt: &str) -> Option<usize> {
+    let bytes = after_lt.as_bytes();
+    if bytes.first() == Some(&b'!') {
+        return after_lt.find('>');
+    }
+    let mut quote = None;
+    for (index, &byte) in bytes.iter().enumerate() {
+        match quote {
+            Some(open) if byte == open => quote = None,
+            Some(_) => {}
+            None if byte == b'"' || byte == b'\'' => quote = Some(byte),
+            None if byte == b'>' => return Some(index),
+            None => {}
+        }
+    }
+    None
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1275,7 +1310,6 @@ pub enum EpubError {
     MissingContainer,
     MissingOpfPath,
     MissingOpf,
-    TooManyManifestItems,
     TooManySpineItems,
 }
 
@@ -1397,7 +1431,8 @@ impl From<ZipError> for EpubError {
 /// tables hold a long book's chapters within the tight EPUB-open stack budget,
 /// where fat `&str` items (8 bytes each on 32-bit) overflowed it. This mirrors
 /// the offset+len encoding every stored record already uses (`TocRecord`,
-/// `BlockRecord`, `SpineRecord`). The OPF is <= 16 KB, so `u16` always fits.
+/// `BlockRecord`, `SpineRecord`). Spans index the OPF string arena
+/// (`EpubPackage::opf_text`), which is at most `u16::MAX` bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Span {
     pub off: u16,
@@ -1417,33 +1452,6 @@ impl Span {
     }
 }
 
-/// The span of `sub` within `opf`. `sub` must be a subslice of `opf` (every
-/// parsed attribute value is); anything else, or a range past `u16`, collapses
-/// to an empty span rather than panicking.
-fn span_in(opf: &str, sub: &str) -> Span {
-    let base = opf.as_ptr() as usize;
-    let start = sub.as_ptr() as usize;
-    if start < base {
-        return Span::default();
-    }
-    let off = start - base;
-    if off + sub.len() > opf.len() || off > u16::MAX as usize || sub.len() > u16::MAX as usize {
-        return Span::default();
-    }
-    Span {
-        off: off as u16,
-        len: sub.len() as u16,
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct ManifestItem {
-    pub id: Span,
-    pub href: Span,
-    pub media_type: Span,
-    pub properties: Span,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct SpineItem {
     pub href: Span,
@@ -1459,11 +1467,13 @@ pub struct EpubPackage<'a> {
     pub text_reference_href: Option<&'a str>,
     pub nav_href: Option<&'a str>,
     pub ncx_href: Option<&'a str>,
+    /// The cover image's href: the `cover-image` item, else an image whose id
+    /// or href says cover.
+    pub cover_href: Option<&'a str>,
     /// True when the OPF held more spine items than `MAX_SPINE_ITEMS`, so the
     /// spine (and the book) is clipped. Callers flag the book partial instead
     /// of silently dropping the tail chapters.
     pub spine_truncated: bool,
-    pub manifest: Vec<ManifestItem, MAX_MANIFEST_ITEMS>,
     pub spine: Vec<SpineItem, MAX_SPINE_ITEMS>,
 }
 
@@ -1491,6 +1501,7 @@ pub fn load_epub_package<'a>(
     epub_bytes: &'a [u8],
     container_scratch: &'a mut [u8],
     opf_scratch: &'a mut [u8],
+    opf_arena: &'a mut [u8],
     book_id: BookId,
     source_path: &'a str,
 ) -> Result<EpubPackage<'a>, EpubError> {
@@ -1504,9 +1515,9 @@ pub fn load_epub_package<'a>(
 
     let opf_entry = zip.find(opf_path).map_err(|_| EpubError::MissingOpf)?;
     let opf_len = zip.read_entry(opf_entry, opf_scratch)?;
-    let opf_xml = core::str::from_utf8(&opf_scratch[..opf_len]).map_err(|_| EpubError::Utf8)?;
     parse_opf(
-        opf_xml,
+        &opf_scratch[..opf_len],
+        opf_arena,
         book_id,
         source_path,
         epub_bytes.len() as u32,
@@ -1514,174 +1525,569 @@ pub fn load_epub_package<'a>(
     )
 }
 
+/// Parse an OPF held whole in memory. Thin wrapper over
+/// [`parse_opf_streamed`], so slice and streamed callers share one parser.
 pub fn parse_opf<'a>(
-    opf_xml: &'a str,
+    opf_xml: &[u8],
+    arena: &'a mut [u8],
     book_id: BookId,
     source_path: &'a str,
     byte_size: u32,
     opf_path: &'a str,
 ) -> Result<EpubPackage<'a>, EpubError> {
-    let title = element_text(opf_xml, "title").unwrap_or("Untitled");
-    let author = element_text(opf_xml, "creator").unwrap_or("Unknown Author");
+    parse_opf_streamed(
+        |feed| feed(opf_xml),
+        arena,
+        book_id,
+        source_path,
+        byte_size,
+        opf_path,
+    )
+}
 
-    let spine_idrefs = collect_spine_idrefs(opf_xml);
-    let mut manifest = Vec::new();
-    let mut in_manifest = false;
-    let mut cursor = XmlCursor::new(opf_xml);
-    while let Some(token) = cursor.next_token() {
-        match token {
-            Token::Start(tag) if tag_name_is(tag, "manifest") => in_manifest = true,
-            Token::End(tag) if tag_name_is(tag, "manifest") => in_manifest = false,
-            Token::Start(tag) if in_manifest && tag_name_is(tag, "item") => {
-                let Some(id) = attr_value(tag, "id") else {
-                    continue;
-                };
-                let Some(href) = attr_value(tag, "href") else {
-                    continue;
-                };
-                let media_type = attr_value(tag, "media-type").unwrap_or("");
-                let properties = attr_value(tag, "properties").unwrap_or("");
-                if manifest_item_needed(id, href, media_type, properties, &spine_idrefs) {
-                    manifest
-                        .push(ManifestItem {
-                            id: span_in(opf_xml, id),
-                            href: span_in(opf_xml, href),
-                            media_type: span_in(opf_xml, media_type),
-                            properties: span_in(opf_xml, properties),
-                        })
-                        .map_err(|_| EpubError::TooManyManifestItems)?;
+/// Parse an OPF package document of any size in bounded memory.
+///
+/// `replay` streams the whole OPF (as decoded bytes, in any chunking) into
+/// the callback it is given; it is called two or three times. The first
+/// pass records which manifest ids the spine uses; the second keeps only
+/// those manifest items (plus nav/NCX/cover) and resolves the spine; a
+/// third runs only for OPFs whose spine resolves to nothing, falling back
+/// to manifest order. Every string the package refers to is copied into
+/// `arena` (`EpubPackage::opf_text` then views it), so the OPF itself never
+/// has to fit in RAM. A spine longer than `MAX_SPINE_ITEMS` or an arena
+/// that runs out marks the package `spine_truncated` instead of silently
+/// dropping chapters.
+///
+/// Never inlined: its tokenizer, spine filter and manifest table are
+/// several KB, and must be popped before the caller streams chapters on the
+/// deepest stack path of the EPUB build.
+#[inline(never)]
+pub fn parse_opf_streamed<'a, R>(
+    mut replay: R,
+    arena: &'a mut [u8],
+    book_id: BookId,
+    source_path: &'a str,
+    byte_size: u32,
+    opf_path: &'a str,
+) -> Result<EpubPackage<'a>, EpubError>
+where
+    R: FnMut(&mut dyn FnMut(&[u8]) -> Result<(), EpubError>) -> Result<(), EpubError>,
+{
+    let mut tokenizer = StreamingXmlTokenizer::new();
+    let mut filter = SpineIdFilter::new();
+    {
+        let mut in_spine = false;
+        replay(&mut |chunk| {
+            tokenizer.feed(chunk, &mut |event| {
+                match event {
+                    TokEvent::StartTag(tag) if tag_name_is(tag, "spine") => in_spine = true,
+                    TokEvent::EndTag(tag) if tag_name_is(tag, "spine") => in_spine = false,
+                    TokEvent::StartTag(tag) if in_spine && tag_name_is(tag, "itemref") => {
+                        if let Some(idref) = attr_value(tag, "idref") {
+                            filter.insert(idref);
+                        }
+                    }
+                    _ => {}
                 }
-            }
-            _ => {}
-        }
+                Ok::<(), EpubError>(())
+            })
+        })?;
     }
 
-    let mut spine = Vec::new();
-    let mut spine_truncated = false;
-    let mut in_spine = false;
-    let mut cursor = XmlCursor::new(opf_xml);
-    while let Some(token) = cursor.next_token() {
-        match token {
-            Token::Start(tag) if tag_name_is(tag, "spine") => in_spine = true,
-            Token::End(tag) if tag_name_is(tag, "spine") => in_spine = false,
-            Token::Start(tag) if in_spine && tag_name_is(tag, "itemref") => {
-                let Some(idref) = attr_value(tag, "idref") else {
-                    continue;
-                };
-                let Some(item) = manifest.iter().find(|item| item.id.of(opf_xml) == idref) else {
-                    continue;
-                };
-                // Manifest spans already index the same OPF, so copy them
-                // straight across.
-                if spine
-                    .push(SpineItem {
-                        href: item.href,
-                        media_type: item.media_type,
-                        properties: item.properties,
-                    })
-                    .is_err()
-                {
-                    spine_truncated = true;
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    if spine.is_empty() {
-        collect_fallback_spine_items(opf_xml, &mut spine)?;
-    }
-
-    let text_reference_href = find_guide_reference(opf_xml, "text")
-        .or_else(|| find_guide_reference(opf_xml, "start"))
-        .map(strip_fragment);
-    let nav_href = manifest
-        .iter()
-        .find(|item| {
-            item.properties
-                .of(opf_xml)
-                .split_ascii_whitespace()
-                .any(|prop| prop == "nav")
-        })
-        .map(|item| item.href.of(opf_xml));
-    let ncx_href = manifest
-        .iter()
-        .find(|item| {
-            item.media_type
-                .of(opf_xml)
-                .eq_ignore_ascii_case("application/x-dtbncx+xml")
-                || item.href.of(opf_xml).ends_with(".ncx")
-        })
-        .map(|item| item.href.of(opf_xml));
-
-    Ok(EpubPackage {
+    let mut package = EpubPackage {
         meta: BookMeta {
             id: book_id,
-            title,
-            author,
+            title: "Untitled",
+            author: "Unknown Author",
             source_path,
             byte_size,
             source: BookSource::MicroSd,
-            cover_status: cover_status(&manifest, opf_xml),
+            cover_status: CoverStatus::Missing,
         },
-        opf_text: opf_xml,
+        opf_text: "",
         opf_path,
-        text_reference_href,
-        nav_href,
-        ncx_href,
-        spine_truncated,
-        manifest,
-        spine,
-    })
+        text_reference_href: None,
+        nav_href: None,
+        ncx_href: None,
+        cover_href: None,
+        spine_truncated: false,
+        spine: Vec::new(),
+    };
+
+    let summary = {
+        let mut collector = OpfCollector::new(arena, &filter);
+        for fallback in [false, true] {
+            if fallback && !package.spine.is_empty() {
+                break;
+            }
+            collector.begin_pass(fallback);
+            tokenizer = StreamingXmlTokenizer::new();
+            replay(&mut |chunk| {
+                tokenizer.feed(chunk, &mut |event| {
+                    collector.handle(event, &mut package.spine);
+                    Ok::<(), EpubError>(())
+                })
+            })?;
+            tokenizer.finish(&mut |event| {
+                collector.handle(event, &mut package.spine);
+                Ok::<(), EpubError>(())
+            })?;
+        }
+        collector.summary()
+    };
+
+    let arena: &'a [u8] = arena;
+    let text = core::str::from_utf8(&arena[..summary.len]).map_err(|_| EpubError::Utf8)?;
+    package.opf_text = text;
+    if let Some(title) = summary.title {
+        package.meta.title = title.of(text);
+    }
+    if let Some(author) = summary.author {
+        package.meta.author = author.of(text);
+    }
+    package.text_reference_href = summary
+        .text_reference
+        .or(summary.start_reference)
+        .map(|span| strip_fragment(span.of(text)));
+    package.nav_href = summary.nav.map(|span| span.of(text));
+    package.ncx_href = summary.ncx.map(|span| span.of(text));
+    package.cover_href = summary.cover.map(|span| span.of(text));
+    package.meta.cover_status = if summary.any_cover {
+        CoverStatus::Present
+    } else {
+        CoverStatus::Missing
+    };
+    package.spine_truncated = filter.overflow || summary.lost;
+    Ok(package)
 }
 
-fn collect_fallback_spine_items(
-    opf_xml: &str,
-    spine: &mut Vec<SpineItem, MAX_SPINE_ITEMS>,
-) -> Result<(), EpubError> {
-    let mut in_manifest = false;
-    let mut cursor = XmlCursor::new(opf_xml);
-    while let Some(token) = cursor.next_token() {
-        match token {
-            Token::Start(tag) if tag_name_is(tag, "manifest") => in_manifest = true,
-            Token::End(tag) if tag_name_is(tag, "manifest") => in_manifest = false,
-            Token::Start(tag) if in_manifest && tag_name_is(tag, "item") => {
-                let Some(href) = attr_value(tag, "href") else {
-                    continue;
-                };
-                let media_type = attr_value(tag, "media-type").unwrap_or("");
-                let properties = attr_value(tag, "properties").unwrap_or("");
-                if manifest_item_is_reading_candidate(href, media_type, properties) {
-                    let _ = spine.push(SpineItem {
-                        href: span_in(opf_xml, href),
-                        media_type: span_in(opf_xml, media_type),
-                        properties: span_in(opf_xml, properties),
-                    });
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(())
+/// First-pass record of the spine's idrefs as FNV-1a hashes. A collision
+/// only keeps one extra manifest item; the spine itself resolves by
+/// comparing the real id strings.
+struct SpineIdFilter {
+    hashes: [u32; MAX_SPINE_ITEMS],
+    len: usize,
+    overflow: bool,
 }
 
-fn collect_spine_idrefs(opf_xml: &str) -> Vec<&str, MAX_SPINE_ITEMS> {
-    let mut idrefs = Vec::new();
-    let mut in_spine = false;
-    let mut cursor = XmlCursor::new(opf_xml);
-    while let Some(token) = cursor.next_token() {
-        match token {
-            Token::Start(tag) if tag_name_is(tag, "spine") => in_spine = true,
-            Token::End(tag) if tag_name_is(tag, "spine") => in_spine = false,
-            Token::Start(tag) if in_spine && tag_name_is(tag, "itemref") => {
-                if let Some(idref) = attr_value(tag, "idref") {
-                    let _ = idrefs.push(idref);
-                }
-            }
-            _ => {}
+impl SpineIdFilter {
+    fn new() -> Self {
+        Self {
+            hashes: [0; MAX_SPINE_ITEMS],
+            len: 0,
+            overflow: false,
         }
     }
-    idrefs
+
+    fn insert(&mut self, id: &str) {
+        if self.len == self.hashes.len() {
+            self.overflow = true;
+            return;
+        }
+        self.hashes[self.len] = fnv1a_update(FNV_OFFSET, id.as_bytes());
+        self.len += 1;
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        let hash = fnv1a_update(FNV_OFFSET, id.as_bytes());
+        self.hashes[..self.len].contains(&hash)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpfCapture {
+    None,
+    Title,
+    Author,
+}
+
+struct OpfSummary {
+    len: usize,
+    title: Option<Span>,
+    author: Option<Span>,
+    text_reference: Option<Span>,
+    start_reference: Option<Span>,
+    nav: Option<Span>,
+    ncx: Option<Span>,
+    cover: Option<Span>,
+    any_cover: bool,
+    lost: bool,
+}
+
+/// A kept manifest item, stored at the top of the arena (growing down) so
+/// the manifest table never sits on the stack. Strings grow up from the
+/// bottom; the two meet only when the arena is genuinely full.
+const OPF_ITEM_RECORD_BYTES: usize = 10;
+const OPF_NO_INTERNED: u8 = u8::MAX;
+
+#[derive(Clone, Copy)]
+struct OpfItemRecord {
+    id: Span,
+    href: Span,
+    media_type: u8,
+    properties: u8,
+}
+
+impl OpfItemRecord {
+    fn encode(&self, out: &mut [u8]) {
+        out[0..2].copy_from_slice(&self.id.off.to_le_bytes());
+        out[2..4].copy_from_slice(&self.id.len.to_le_bytes());
+        out[4..6].copy_from_slice(&self.href.off.to_le_bytes());
+        out[6..8].copy_from_slice(&self.href.len.to_le_bytes());
+        out[8] = self.media_type;
+        out[9] = self.properties;
+    }
+
+    fn decode(bytes: &[u8]) -> Self {
+        let word = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+        Self {
+            id: Span {
+                off: word(0),
+                len: word(2),
+            },
+            href: Span {
+                off: word(4),
+                len: word(6),
+            },
+            media_type: bytes[8],
+            properties: bytes[9],
+        }
+    }
+}
+
+/// Second/third-pass state: copies the strings the package needs into the
+/// arena, keeps the manifest items the spine names as arena records, and
+/// resolves the spine against them.
+struct OpfCollector<'b, 'f> {
+    arena: &'b mut [u8],
+    len: usize,
+    /// Start of the record table at the top of the arena.
+    records_start: usize,
+    filter: &'f SpineIdFilter,
+    fallback: bool,
+    in_manifest: bool,
+    in_spine: bool,
+    in_guide: bool,
+    capture: OpfCapture,
+    capture_text: heapless::String<256>,
+    title: Option<Span>,
+    author: Option<Span>,
+    text_reference: Option<Span>,
+    start_reference: Option<Span>,
+    nav: Option<Span>,
+    ncx: Option<Span>,
+    cover: Option<Span>,
+    image_cover: Option<Span>,
+    any_cover: bool,
+    interned: Vec<Span, 8>,
+    lost: bool,
+}
+
+impl<'b, 'f> OpfCollector<'b, 'f> {
+    fn new(arena: &'b mut [u8], filter: &'f SpineIdFilter) -> Self {
+        let top = arena.len().min(u16::MAX as usize);
+        Self {
+            arena,
+            len: 0,
+            records_start: top,
+            filter,
+            fallback: false,
+            in_manifest: false,
+            in_spine: false,
+            in_guide: false,
+            capture: OpfCapture::None,
+            capture_text: heapless::String::new(),
+            title: None,
+            author: None,
+            text_reference: None,
+            start_reference: None,
+            nav: None,
+            ncx: None,
+            cover: None,
+            image_cover: None,
+            any_cover: false,
+            interned: Vec::new(),
+            lost: false,
+        }
+    }
+
+    fn begin_pass(&mut self, fallback: bool) {
+        self.fallback = fallback;
+        self.in_manifest = false;
+        self.in_spine = false;
+        self.in_guide = false;
+        self.capture = OpfCapture::None;
+    }
+
+    fn summary(&self) -> OpfSummary {
+        OpfSummary {
+            len: self.len,
+            title: self.title,
+            author: self.author,
+            text_reference: self.text_reference,
+            start_reference: self.start_reference,
+            nav: self.nav,
+            ncx: self.ncx,
+            cover: self.cover.or(self.image_cover),
+            any_cover: self.any_cover,
+            lost: self.lost,
+        }
+    }
+
+    fn text(&self, span: Span) -> &str {
+        let start = span.off as usize;
+        core::str::from_utf8(&self.arena[start..start + span.len as usize]).unwrap_or("")
+    }
+
+    fn push(&mut self, text: &str) -> Option<Span> {
+        let end = self.len + text.len();
+        if end > self.records_start {
+            self.lost = true;
+            return None;
+        }
+        self.arena[self.len..end].copy_from_slice(text.as_bytes());
+        let span = Span {
+            off: self.len as u16,
+            len: text.len() as u16,
+        };
+        self.len = end;
+        Some(span)
+    }
+
+    /// Media types and properties repeat across every item; store each
+    /// distinct value once and refer to it by index.
+    fn intern(&mut self, text: &str) -> Option<u8> {
+        if text.is_empty() {
+            return Some(OPF_NO_INTERNED);
+        }
+        if let Some(index) = self
+            .interned
+            .iter()
+            .position(|span| self.text(*span) == text)
+        {
+            return Some(index as u8);
+        }
+        if self.interned.is_full() {
+            return Some(OPF_NO_INTERNED);
+        }
+        let span = self.push(text)?;
+        let _ = self.interned.push(span);
+        Some((self.interned.len() - 1) as u8)
+    }
+
+    fn interned_span(&self, index: u8) -> Span {
+        self.interned
+            .get(index as usize)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn record_count(&self) -> usize {
+        (self.arena.len().min(u16::MAX as usize) - self.records_start) / OPF_ITEM_RECORD_BYTES
+    }
+
+    fn record(&self, index: usize) -> OpfItemRecord {
+        let at = self.arena.len().min(u16::MAX as usize) - (index + 1) * OPF_ITEM_RECORD_BYTES;
+        OpfItemRecord::decode(&self.arena[at..at + OPF_ITEM_RECORD_BYTES])
+    }
+
+    fn push_record(&mut self, record: OpfItemRecord) -> bool {
+        if self.records_start < self.len + OPF_ITEM_RECORD_BYTES {
+            self.lost = true;
+            return false;
+        }
+        self.records_start -= OPF_ITEM_RECORD_BYTES;
+        let at = self.records_start;
+        record.encode(&mut self.arena[at..at + OPF_ITEM_RECORD_BYTES]);
+        true
+    }
+
+    fn handle(&mut self, event: TokEvent<'_>, spine: &mut Vec<SpineItem, MAX_SPINE_ITEMS>) {
+        match event {
+            TokEvent::StartTag(tag) => {
+                let self_closing = tag.ends_with('/');
+                if tag_name_is(tag, "manifest") {
+                    self.in_manifest = !self_closing;
+                } else if tag_name_is(tag, "spine") {
+                    self.in_spine = !self_closing;
+                } else if tag_name_is(tag, "guide") {
+                    self.in_guide = !self_closing;
+                } else if self.in_manifest && tag_name_is(tag, "item") {
+                    self.handle_item(tag, spine);
+                } else if self.in_spine && tag_name_is(tag, "itemref") {
+                    if !self.fallback {
+                        self.handle_itemref(tag, spine);
+                    }
+                } else if self.in_guide && tag_name_is(tag, "reference") {
+                    if !self.fallback {
+                        self.handle_reference(tag);
+                    }
+                } else if !self_closing && !self.fallback {
+                    if self.title.is_none() && tag_name_is(tag, "title") {
+                        self.capture = OpfCapture::Title;
+                        self.capture_text.clear();
+                    } else if self.author.is_none() && tag_name_is(tag, "creator") {
+                        self.capture = OpfCapture::Author;
+                        self.capture_text.clear();
+                    }
+                }
+            }
+            TokEvent::EndTag(tag) => {
+                if tag_name_is(tag, "manifest") {
+                    self.in_manifest = false;
+                } else if tag_name_is(tag, "spine") {
+                    self.in_spine = false;
+                } else if tag_name_is(tag, "guide") {
+                    self.in_guide = false;
+                } else if self.capture != OpfCapture::None
+                    && (tag_name_is(tag, "title") || tag_name_is(tag, "creator"))
+                {
+                    let mut value = heapless::String::<256>::new();
+                    let _ = value.push_str(self.capture_text.as_str().trim());
+                    let span = if value.is_empty() {
+                        None
+                    } else {
+                        self.push(value.as_str())
+                    };
+                    match self.capture {
+                        OpfCapture::Title => self.title = span,
+                        OpfCapture::Author => self.author = span,
+                        OpfCapture::None => {}
+                    }
+                    self.capture = OpfCapture::None;
+                }
+            }
+            TokEvent::Text(text) => {
+                if self.capture != OpfCapture::None {
+                    append_owned_text(&mut self.capture_text, text);
+                }
+            }
+        }
+    }
+
+    fn handle_item(&mut self, tag: &str, spine: &mut Vec<SpineItem, MAX_SPINE_ITEMS>) {
+        let Some(id) = attr_value(tag, "id") else {
+            return;
+        };
+        let Some(href) = attr_value(tag, "href") else {
+            return;
+        };
+        let media_type = attr_value(tag, "media-type").unwrap_or("");
+        let properties = attr_value(tag, "properties").unwrap_or("");
+        if self.fallback {
+            if !manifest_item_is_reading_candidate(href, media_type, properties) {
+                return;
+            }
+            if spine.is_full() {
+                self.lost = true;
+                return;
+            }
+            let (Some(href), Some(media_type), Some(properties)) = (
+                self.push(href),
+                self.intern(media_type),
+                self.intern(properties),
+            ) else {
+                return;
+            };
+            let _ = spine.push(SpineItem {
+                href,
+                media_type: self.interned_span(media_type),
+                properties: self.interned_span(properties),
+            });
+            return;
+        }
+        let is_nav = properties
+            .split_ascii_whitespace()
+            .any(|prop| prop == "nav");
+        let is_ncx =
+            media_type.eq_ignore_ascii_case("application/x-dtbncx+xml") || href.ends_with(".ncx");
+        let is_cover_image = properties
+            .split_ascii_whitespace()
+            .any(|prop| prop == "cover-image");
+        let names_cover = id == "cover" || href.contains("cover");
+        let is_image = media_type.starts_with("image/");
+        if names_cover || is_cover_image {
+            self.any_cover = true;
+        }
+        if is_nav && self.nav.is_none() {
+            self.nav = self.push(href);
+        }
+        if is_ncx && self.ncx.is_none() {
+            self.ncx = self.push(href);
+        }
+        if is_cover_image && self.cover.is_none() {
+            self.cover = self.push(href);
+        } else if is_image
+            && self.image_cover.is_none()
+            && (id.eq_ignore_ascii_case("cover") || href.to_ascii_lowercase_contains("cover"))
+        {
+            self.image_cover = self.push(href);
+        }
+        if !self.filter.contains(id) {
+            return;
+        }
+        let (Some(id), Some(href), Some(media_type), Some(properties)) = (
+            self.push(id),
+            self.push(href),
+            self.intern(media_type),
+            self.intern(properties),
+        ) else {
+            return;
+        };
+        self.push_record(OpfItemRecord {
+            id,
+            href,
+            media_type,
+            properties,
+        });
+    }
+
+    fn handle_itemref(&mut self, tag: &str, spine: &mut Vec<SpineItem, MAX_SPINE_ITEMS>) {
+        let Some(idref) = attr_value(tag, "idref") else {
+            return;
+        };
+        let Some(record) = (0..self.record_count())
+            .map(|index| self.record(index))
+            .find(|record| self.text(record.id) == idref)
+        else {
+            return;
+        };
+        if spine
+            .push(SpineItem {
+                href: record.href,
+                media_type: self.interned_span(record.media_type),
+                properties: self.interned_span(record.properties),
+            })
+            .is_err()
+        {
+            self.lost = true;
+        }
+    }
+
+    fn handle_reference(&mut self, tag: &str) {
+        let Some(href) = attr_value(tag, "href") else {
+            return;
+        };
+        if self.text_reference.is_none() && attr_word_eq(tag, "type", "text") {
+            self.text_reference = self.push(href);
+        } else if self.start_reference.is_none() && attr_word_eq(tag, "type", "start") {
+            self.start_reference = self.push(href);
+        }
+    }
+}
+
+/// ASCII-case-insensitive substring test without allocating.
+trait AsciiContains {
+    fn to_ascii_lowercase_contains(&self, needle: &str) -> bool;
+}
+
+impl AsciiContains for str {
+    fn to_ascii_lowercase_contains(&self, needle: &str) -> bool {
+        let needle = needle.as_bytes();
+        self.as_bytes()
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle))
+    }
 }
 
 fn manifest_item_is_reading_candidate(href: &str, media_type: &str, properties: &str) -> bool {
@@ -1698,23 +2104,6 @@ fn manifest_item_is_reading_candidate(href: &str, media_type: &str, properties: 
     media_type.eq_ignore_ascii_case("application/xhtml+xml")
         || href.ends_with(".xhtml")
         || href.ends_with(".html")
-}
-
-fn manifest_item_needed(
-    id: &str,
-    href: &str,
-    media_type: &str,
-    properties: &str,
-    spine_idrefs: &Vec<&str, MAX_SPINE_ITEMS>,
-) -> bool {
-    spine_idrefs.contains(&id)
-        || properties
-            .split_ascii_whitespace()
-            .any(|prop| prop == "nav" || prop == "cover-image")
-        || media_type.eq_ignore_ascii_case("application/x-dtbncx+xml")
-        || id == "cover"
-        || href.contains("cover")
-        || href.ends_with(".ncx")
 }
 
 pub fn xhtml_text_blocks_with_css<const BLOCK_LEN: usize, const BLOCKS: usize>(
@@ -1745,7 +2134,7 @@ pub fn xhtml_text_blocks_with_css<const BLOCK_LEN: usize, const BLOCKS: usize>(
                         && !text
                             .chars()
                             .next()
-                            .map(|ch| ch.is_whitespace() || is_leading_punctuation_char(ch))
+                            .map(|ch| is_html_space(ch) || is_leading_punctuation_char(ch))
                             .unwrap_or(true)
                     {
                         let _ = last.text.push(' ');
@@ -1753,11 +2142,8 @@ pub fn xhtml_text_blocks_with_css<const BLOCK_LEN: usize, const BLOCKS: usize>(
                     append_owned_text(&mut last.text, text);
                     trim_owned(&mut last.text);
                     self.continuation_open = !paragraph_end;
-                    self.pending_space = text
-                        .chars()
-                        .next_back()
-                        .map(|ch| ch.is_whitespace())
-                        .unwrap_or(false);
+                    self.pending_space =
+                        text.chars().next_back().map(is_html_space).unwrap_or(false);
                     return Ok(());
                 }
             }
@@ -1765,11 +2151,7 @@ pub fn xhtml_text_blocks_with_css<const BLOCK_LEN: usize, const BLOCKS: usize>(
             append_owned_text(&mut owned, text);
             let result = flush_owned_block(&mut owned, role, style, align, self.output);
             self.continuation_open = !paragraph_end;
-            self.pending_space = text
-                .chars()
-                .next_back()
-                .map(|ch| ch.is_whitespace())
-                .unwrap_or(false);
+            self.pending_space = text.chars().next_back().map(is_html_space).unwrap_or(false);
             result
         }
     }
@@ -1818,6 +2200,9 @@ pub struct XhtmlBlockStreamParser {
     list_kind_stack: [ListKind; 8],
     list_count_stack: [u16; 8],
     list_depth: usize,
+    /// The open block holds only a list marker (`1. `): a `<p>` inside the
+    /// `<li>` continues it instead of stranding the number on its own line.
+    list_marker_pending: bool,
     table_align_stack: [TextAlign; 4],
     table_depth: usize,
 }
@@ -1839,6 +2224,7 @@ impl XhtmlBlockStreamParser {
             list_kind_stack: [ListKind::Unordered; 8],
             list_count_stack: [0u16; 8],
             list_depth: 0,
+            list_marker_pending: false,
             table_align_stack: [TextAlign::Justify; 4],
             table_depth: 0,
         }
@@ -1850,19 +2236,41 @@ impl XhtmlBlockStreamParser {
         css: Option<&CssRules>,
         sink: &mut impl XhtmlBlockSink,
     ) -> Result<(), XhtmlError> {
+        let self_closing = tag.trim_end().ends_with('/');
+        if self.skip_depth > 0 {
+            // Count nested elements of the skipped name so the skip ends at
+            // the matching close tag, not the first inner one.
+            if !self_closing && self.skip_tag_matches(tag) {
+                self.skip_depth = self.skip_depth.saturating_add(1);
+            }
+            return Ok(());
+        }
+        self.handle_start_tag(tag, css, sink)?;
+        // `<i/>`, `<h2/>`, `<ol/>`: an XHTML self-closed element opens and
+        // closes at once. Without the matching end its style or role would
+        // leak over the rest of the chapter.
+        if self_closing
+            && !tag_is_void(tag.trim_end().trim_end_matches('/'))
+            && !tag_starts_skip(tag)
+        {
+            if let Some(name) = tag_local_name(tag) {
+                self.handle_end(name, sink)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_start_tag(
+        &mut self,
+        tag: &str,
+        css: Option<&CssRules>,
+        sink: &mut impl XhtmlBlockSink,
+    ) -> Result<(), XhtmlError> {
         if tag_name_is(tag, "body") {
             self.in_body = true;
             return Ok(());
         }
-        if self.skip_depth == 0
-            && (tag_name_is(tag, "head")
-                || tag_name_is(tag, "style")
-                || tag_name_is(tag, "script")
-                || tag_name_is(tag, "svg")
-                || tag_name_is(tag, "nav")
-                || tag_is_hidden(tag)
-                || tag_is_pagebreak(tag))
-        {
+        if self.skip_depth == 0 && tag_starts_skip(tag) {
             if !tag_is_void(tag) {
                 self.skip_tag = tag_local_name(tag).map(bounded_skip_name);
                 self.skip_depth = self.skip_depth.saturating_add(1);
@@ -1883,11 +2291,26 @@ impl XhtmlBlockStreamParser {
             append_table_cell_separator(&mut self.block);
         } else if tag_name_is(tag, "br") {
             self.flush(sink)?;
+        } else if tag_name_is(tag, "hr") {
+            // A thematic break is a scene break; render it the way the
+            // reader already normalizes typed `* * *` separators.
+            self.flush(sink)?;
+            sink.push_block(
+                "* * *",
+                TextRole::Body,
+                FontStyle::Regular,
+                TextAlign::Center,
+                true,
+            )?;
         } else if tag_name_is(tag, "img") {
             self.flush(sink)?;
-            let placeholder = attr_value(tag, "alt").unwrap_or("[Image]");
+            let mut placeholder = heapless::String::<160>::new();
+            match attr_value(tag, "alt") {
+                Some(alt) => append_owned_text(&mut placeholder, alt),
+                None => append_owned_text(&mut placeholder, "[Image]"),
+            }
             sink.push_block(
-                placeholder,
+                placeholder.as_str(),
                 TextRole::Body,
                 FontStyle::Italic,
                 TextAlign::Center,
@@ -1905,7 +2328,9 @@ impl XhtmlBlockStreamParser {
                 self.list_depth += 1;
             }
         } else if tag_starts_block(tag) {
-            self.flush(sink)?;
+            if !self.list_marker_pending || tag_name_is(tag, "li") {
+                self.flush(sink)?;
+            }
             self.align = block_align_for_tag(tag, css)
                 .or_else(|| current_table_align(&self.table_align_stack, self.table_depth))
                 .unwrap_or(TextAlign::Justify);
@@ -1916,6 +2341,7 @@ impl XhtmlBlockStreamParser {
                     &self.list_kind_stack,
                     self.list_depth,
                 );
+                self.list_marker_pending = true;
             }
         } else if tag_name_is(tag, "h1") {
             self.flush(sink)?;
@@ -2014,6 +2440,9 @@ impl XhtmlBlockStreamParser {
         if !self.in_body || self.skip_depth > 0 {
             return Ok(());
         }
+        if self.list_marker_pending && !is_html_blank(text) {
+            self.list_marker_pending = false;
+        }
         append_text_to_sink_block(
             &mut self.block,
             text,
@@ -2029,6 +2458,7 @@ impl XhtmlBlockStreamParser {
     }
 
     fn flush(&mut self, sink: &mut impl XhtmlBlockSink) -> Result<(), XhtmlError> {
+        self.list_marker_pending = false;
         flush_sink_block(
             &mut self.block,
             self.role,
@@ -2229,6 +2659,12 @@ enum TokState {
     Text,
     Tag,
     TagQuoted(u8),
+    /// Inside `<!-- ... -->`; counts the trailing run of `-` so `-->`
+    /// closes it. Quotes and `>` inside a comment mean nothing.
+    Comment(u8),
+    /// Inside `<![CDATA[ ... ]]>`; content is character data. Counts the
+    /// trailing run of `]` that may be the start of the terminator.
+    CData(u8),
 }
 
 enum TokEvent<'a> {
@@ -2244,8 +2680,9 @@ const STREAM_ENTITY_HOLDBACK_BYTES: usize = 12;
 
 /// Byte-level XML tokenizer. Emits StartTag/EndTag/Text events with all
 /// content held in bounded internal buffers — never borrows from the caller's
-/// input. Comments/PI/doctype tags are treated as opaque skip-until-`>` blocks,
-/// matching the imperfections (but bounded behaviour) of [`XmlCursor`].
+/// input. Comments run to `-->` regardless of quotes or `>` inside them,
+/// CDATA sections emit their content as text, and processing instructions
+/// and doctypes are skipped.
 ///
 /// Text accumulates as raw bytes: a forced flush when the buffer fills
 /// holds back incomplete UTF-8 sequences and incomplete entities, so the
@@ -2253,7 +2690,9 @@ const STREAM_ENTITY_HOLDBACK_BYTES: usize = 12;
 /// entity, regardless of how the input is chunked.
 pub struct StreamingXmlTokenizer {
     state: TokState,
-    tag_buf: heapless::String<STREAM_TAG_BUF_BYTES>,
+    /// Raw tag bytes. Kept as bytes (not chars) so multi-byte UTF-8 in
+    /// attribute values survives; decoded once when the tag closes.
+    tag_buf: heapless::Vec<u8, STREAM_TAG_BUF_BYTES>,
     text_buf: heapless::Vec<u8, STREAM_TEXT_CHUNK_BYTES>,
     tag_overflow: bool,
 }
@@ -2268,7 +2707,7 @@ impl StreamingXmlTokenizer {
     pub fn new() -> Self {
         Self {
             state: TokState::Text,
-            tag_buf: heapless::String::new(),
+            tag_buf: heapless::Vec::new(),
             text_buf: heapless::Vec::new(),
             tag_overflow: false,
         }
@@ -2348,6 +2787,12 @@ impl StreamingXmlTokenizer {
     where
         F: FnMut(TokEvent<'_>) -> Result<(), E>,
     {
+        if let TokState::CData(brackets) = self.state {
+            for _ in 0..brackets {
+                self.push_text_byte(b']', emit)?;
+            }
+            self.state = TokState::Text;
+        }
         if matches!(self.state, TokState::Text) {
             self.flush_text(emit, true)?;
         }
@@ -2371,24 +2816,44 @@ impl StreamingXmlTokenizer {
             }
             TokState::Tag => {
                 if byte == b'>' {
-                    if !self.tag_overflow {
-                        let tag = self.tag_buf.as_str().trim();
-                        if !(tag.starts_with('!') || tag.starts_with('?')) {
-                            if let Some(name) = tag.strip_prefix('/') {
-                                emit(TokEvent::EndTag(name.trim()))?;
-                            } else if !tag.is_empty() {
-                                emit(TokEvent::StartTag(tag))?;
-                            }
+                    // An overlong tag still emits its (truncated) prefix: the
+                    // name and leading attributes are what block structure,
+                    // skip and style decisions key on. Dropping it whole would
+                    // let a hidden element's content leak into the page.
+                    let valid = match core::str::from_utf8(&self.tag_buf) {
+                        Ok(tag) => tag,
+                        Err(error) => {
+                            core::str::from_utf8(&self.tag_buf[..error.valid_up_to()]).unwrap_or("")
+                        }
+                    };
+                    let tag = valid.trim();
+                    if !(tag.starts_with('!') || tag.starts_with('?')) {
+                        if let Some(name) = tag.strip_prefix('/') {
+                            emit(TokEvent::EndTag(name.trim()))?;
+                        } else if !tag.is_empty() {
+                            emit(TokEvent::StartTag(tag))?;
                         }
                     }
                     self.tag_buf.clear();
                     self.tag_overflow = false;
                     self.state = TokState::Text;
                 } else if byte == b'"' || byte == b'\'' {
+                    // Quotes only delimit attribute values inside an element
+                    // tag; in a declaration (`<!DOCTYPE`, `<!-- `) they are
+                    // literal and must not hide the closing `>`.
                     self.push_tag_byte(byte);
-                    self.state = TokState::TagQuoted(byte);
+                    if self.tag_buf.first() != Some(&b'!') {
+                        self.state = TokState::TagQuoted(byte);
+                    }
                 } else {
                     self.push_tag_byte(byte);
+                    if self.tag_buf.as_slice() == b"!--" {
+                        self.tag_buf.clear();
+                        self.state = TokState::Comment(0);
+                    } else if self.tag_buf.as_slice() == b"![CDATA[" {
+                        self.tag_buf.clear();
+                        self.state = TokState::CData(0);
+                    }
                 }
             }
             TokState::TagQuoted(quote) => {
@@ -2397,6 +2862,38 @@ impl StreamingXmlTokenizer {
                     self.state = TokState::Tag;
                 }
             }
+            TokState::Comment(dashes) => {
+                self.state = match byte {
+                    b'-' => TokState::Comment(dashes.saturating_add(1)),
+                    b'>' if dashes >= 2 => TokState::Text,
+                    _ => TokState::Comment(0),
+                };
+            }
+            TokState::CData(brackets) => match byte {
+                b']' => self.state = TokState::CData(brackets.saturating_add(1)),
+                b'>' if brackets >= 2 => {
+                    for _ in 2..brackets {
+                        self.push_text_byte(b']', emit)?;
+                    }
+                    self.state = TokState::Text;
+                }
+                _ => {
+                    for _ in 0..brackets {
+                        self.push_text_byte(b']', emit)?;
+                    }
+                    self.state = TokState::CData(0);
+                    // CDATA content is literal: an `&` here is not an
+                    // entity, so escape it before the shared text path
+                    // decodes entities.
+                    if byte == b'&' {
+                        for &escaped in b"&amp;" {
+                            self.push_text_byte(escaped, emit)?;
+                        }
+                    } else {
+                        self.push_text_byte(byte, emit)?;
+                    }
+                }
+            },
         }
         Ok(())
     }
@@ -2405,7 +2902,7 @@ impl StreamingXmlTokenizer {
         if self.tag_overflow {
             return;
         }
-        if self.tag_buf.push(byte as char).is_err() {
+        if self.tag_buf.push(byte).is_err() {
             self.tag_overflow = true;
         }
     }
@@ -2914,18 +3411,78 @@ fn normalized_marker_byte(marker: &str, index: usize) -> Option<u8> {
         .nth(index)
 }
 
+/// Elements whose whole subtree contributes no reading text.
+fn tag_starts_skip(tag: &str) -> bool {
+    tag_name_is(tag, "head")
+        || tag_name_is(tag, "style")
+        || tag_name_is(tag, "script")
+        || tag_name_is(tag, "svg")
+        || tag_name_is(tag, "nav")
+        || tag_is_hidden(tag)
+        || tag_is_pagebreak(tag)
+}
+
 fn tag_is_hidden(tag: &str) -> bool {
-    tag.contains("display:none")
-        || tag.contains("display: none")
-        || tag.contains("visibility:hidden")
-        || tag.contains("visibility: hidden")
-        || tag.contains("hidden=\"hidden\"")
-        || tag.contains("hidden='hidden'")
-        || tag.contains("hidden ")
-        || tag.ends_with(" hidden")
+    tag_contains_style_value(tag, "display", "none")
+        || tag_contains_style_value(tag, "visibility", "hidden")
+        || tag_has_attr(tag, "hidden")
         || attr_value(tag, "aria-hidden")
             .map(|value| value.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
+}
+
+/// Whether the start tag carries an attribute named `name` (boolean or
+/// valued). Walks attribute names properly, so a word inside another
+/// attribute's quoted value (`title="the hidden door"`) never matches.
+fn tag_has_attr(tag: &str, name: &str) -> bool {
+    let bytes = tag.as_bytes();
+    // Skip the element name.
+    let mut at = bytes
+        .iter()
+        .position(|byte| byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    while at < bytes.len() {
+        while at < bytes.len() && (bytes[at].is_ascii_whitespace() || bytes[at] == b'/') {
+            at += 1;
+        }
+        let start = at;
+        while at < bytes.len()
+            && !bytes[at].is_ascii_whitespace()
+            && bytes[at] != b'='
+            && bytes[at] != b'/'
+        {
+            at += 1;
+        }
+        if at > start && tag[start..at].eq_ignore_ascii_case(name) {
+            return true;
+        }
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        if at < bytes.len() && bytes[at] == b'=' {
+            at += 1;
+            while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+                at += 1;
+            }
+            match bytes.get(at) {
+                Some(&quote) if quote == b'"' || quote == b'\'' => {
+                    at += 1;
+                    while at < bytes.len() && bytes[at] != quote {
+                        at += 1;
+                    }
+                    at += 1;
+                }
+                _ => {
+                    while at < bytes.len() && !bytes[at].is_ascii_whitespace() {
+                        at += 1;
+                    }
+                }
+            }
+        } else if at == start {
+            at += 1;
+        }
+    }
+    false
 }
 
 fn tag_is_pagebreak(tag: &str) -> bool {
@@ -3085,12 +3642,23 @@ fn tag_ends_block(tag: &str) -> bool {
         || tag_name_is(tag, "tr")
 }
 
+/// HTML collapses only ASCII whitespace. Other spaces (notably U+00A0
+/// from `&nbsp;`) are ordinary characters: they never collapse, never
+/// trim, and never break a line.
+fn is_html_space(ch: char) -> bool {
+    matches!(ch, ' ' | '\t' | '\n' | '\r' | '\u{0C}')
+}
+
+fn is_html_blank(text: &str) -> bool {
+    text.chars().all(is_html_space)
+}
+
 fn append_owned_text<const N: usize>(out: &mut heapless::String<N>, text: &str) {
     let mut previous_space = out
         .as_str()
         .chars()
         .last()
-        .map(|ch| ch.is_whitespace())
+        .map(is_html_space)
         .unwrap_or(false);
     let mut cursor = 0usize;
     while cursor < text.len() {
@@ -3103,7 +3671,7 @@ fn append_owned_text<const N: usize>(out: &mut heapless::String<N>, text: &str) 
             };
             (ch, ch.len_utf8())
         };
-        if ch.is_whitespace() {
+        if is_html_space(ch) {
             if !previous_space && out.push(' ').is_err() {
                 break;
             }
@@ -3137,7 +3705,7 @@ fn append_text_to_sink_block<const N: usize>(
         .as_str()
         .chars()
         .last()
-        .map(|ch| ch.is_whitespace())
+        .map(is_html_space)
         .unwrap_or(false);
     let mut cursor = 0usize;
     while cursor < text.len() {
@@ -3150,8 +3718,8 @@ fn append_text_to_sink_block<const N: usize>(
             };
             (ch, ch.len_utf8())
         };
-        let should_push_space = ch.is_whitespace() && !previous_space;
-        let should_push_char = !ch.is_whitespace();
+        let should_push_space = is_html_space(ch) && !previous_space;
+        let should_push_char = !is_html_space(ch);
         if should_push_space {
             if out.push(' ').is_err() {
                 flush_sink_block_at_word_boundary(out, role, style, align, sink)?;
@@ -3181,12 +3749,12 @@ fn flush_sink_block_at_word_boundary<const N: usize>(
     align: TextAlign,
     sink: &mut impl XhtmlBlockSink,
 ) -> Result<(), XhtmlError> {
-    let Some(split) = block.as_str().trim_end().rfind(char::is_whitespace) else {
+    let Some(split) = block.as_str().trim_end().rfind(is_html_space) else {
         return flush_sink_block(block, role, style, align, sink);
     };
     let carry_start = block.as_str()[split..]
         .char_indices()
-        .find(|(_, ch)| !ch.is_whitespace())
+        .find(|(_, ch)| !is_html_space(*ch))
         .map(|(index, _)| split + index)
         .unwrap_or(block.len());
     let mut carry = heapless::String::<N>::new();
@@ -3208,8 +3776,15 @@ fn flush_sink_block_continue<const N: usize>(
     align: TextAlign,
     sink: &mut impl XhtmlBlockSink,
 ) -> Result<(), XhtmlError> {
-    if block.as_str().trim().is_empty() {
+    if is_html_blank(block.as_str()) {
+        // Inter-word space between two styled runs (`<i>a</i> <i>b</i>`):
+        // keep a single space as the next run's leading text instead of
+        // dropping it, so the words don't glue together.
+        let had_space = !block.is_empty();
         block.clear();
+        if had_space {
+            let _ = block.push(' ');
+        }
         return Ok(());
     }
     let result = sink.push_block(block.as_str(), role, style, align, false);
@@ -3250,7 +3825,7 @@ fn append_table_cell_separator<const N: usize>(out: &mut heapless::String<N>) {
         .as_str()
         .chars()
         .last()
-        .map(|ch| !ch.is_whitespace())
+        .map(|ch| !is_html_space(ch))
         .unwrap_or(false)
     {
         let _ = out.push(' ');
@@ -3282,7 +3857,7 @@ fn flush_sink_block<const N: usize>(
     align: TextAlign,
     sink: &mut impl XhtmlBlockSink,
 ) -> Result<(), XhtmlError> {
-    if block.as_str().trim().is_empty() {
+    if is_html_blank(block.as_str()) {
         block.clear();
         return sink.push_block("", role, style, align, true);
     }
@@ -3293,46 +3868,293 @@ fn flush_sink_block<const N: usize>(
 
 /// Decode the HTML entity at the start of `input` (`&amp;`, `&#x2014;`, ...).
 /// Shared by firmware cache building and host preview so EPUB text renders
-/// identically on both sides.
+/// identically on both sides. Named entities cover the HTML 4 set (what the
+/// XHTML 1.1 DTDs that EPUB 2 books reference define) plus XML's `&apos;`.
 pub fn decode_html_entity(input: &str) -> Option<char> {
     if let Some(decoded) = decode_numeric_entity(input) {
-        Some(decoded)
-    } else if input.starts_with("&amp;") {
-        Some('&')
-    } else if input.starts_with("&lt;") {
-        Some('<')
-    } else if input.starts_with("&gt;") {
-        Some('>')
-    } else if input.starts_with("&quot;") {
-        Some('"')
-    } else if input.starts_with("&apos;") {
-        Some('\'')
-    } else if input.starts_with("&nbsp;") {
-        Some(' ')
-    } else if input.starts_with("&mdash;") {
-        Some('—')
-    } else if input.starts_with("&ndash;") {
-        Some('–')
-    } else if input.starts_with("&lsquo;") {
-        Some('‘')
-    } else if input.starts_with("&rsquo;") {
-        Some('’')
-    } else if input.starts_with("&ldquo;") {
-        Some('“')
-    } else if input.starts_with("&rdquo;") {
-        Some('”')
-    } else if input.starts_with("&hellip;") {
-        Some('…')
-    } else {
-        None
+        return Some(decoded);
     }
+    let rest = input.strip_prefix('&')?;
+    let end = rest
+        .bytes()
+        .take(NAMED_ENTITY_MAX_LEN + 1)
+        .position(|byte| byte == b';')?;
+    let mut key = [0u8; NAMED_ENTITY_MAX_LEN];
+    key[..end].copy_from_slice(&rest.as_bytes()[..end]);
+    NAMED_ENTITIES
+        .binary_search_by(|(candidate, _)| candidate.cmp(&key))
+        .ok()
+        .map(|index| NAMED_ENTITIES[index].1)
 }
+
+const NAMED_ENTITY_MAX_LEN: usize = 8;
+
+/// HTML 4 named character references, NUL-padded and sorted for binary
+/// search. Names are inline byte arrays, not separate string literals: tiny
+/// literals land in the merged constant pool, which this chip's linker
+/// script keeps in RAM.
+#[rustfmt::skip]
+const NAMED_ENTITIES: &[([u8; NAMED_ENTITY_MAX_LEN], char)] = &[
+    ([b'A', b'E', b'l', b'i', b'g', 0, 0, 0], '\u{00C6}'),
+    ([b'A', b'a', b'c', b'u', b't', b'e', 0, 0], '\u{00C1}'),
+    ([b'A', b'c', b'i', b'r', b'c', 0, 0, 0], '\u{00C2}'),
+    ([b'A', b'g', b'r', b'a', b'v', b'e', 0, 0], '\u{00C0}'),
+    ([b'A', b'l', b'p', b'h', b'a', 0, 0, 0], '\u{0391}'),
+    ([b'A', b'r', b'i', b'n', b'g', 0, 0, 0], '\u{00C5}'),
+    ([b'A', b't', b'i', b'l', b'd', b'e', 0, 0], '\u{00C3}'),
+    ([b'A', b'u', b'm', b'l', 0, 0, 0, 0], '\u{00C4}'),
+    ([b'B', b'e', b't', b'a', 0, 0, 0, 0], '\u{0392}'),
+    ([b'C', b'c', b'e', b'd', b'i', b'l', 0, 0], '\u{00C7}'),
+    ([b'C', b'h', b'i', 0, 0, 0, 0, 0], '\u{03A7}'),
+    ([b'D', b'a', b'g', b'g', b'e', b'r', 0, 0], '\u{2021}'),
+    ([b'D', b'e', b'l', b't', b'a', 0, 0, 0], '\u{0394}'),
+    ([b'E', b'T', b'H', 0, 0, 0, 0, 0], '\u{00D0}'),
+    ([b'E', b'a', b'c', b'u', b't', b'e', 0, 0], '\u{00C9}'),
+    ([b'E', b'c', b'i', b'r', b'c', 0, 0, 0], '\u{00CA}'),
+    ([b'E', b'g', b'r', b'a', b'v', b'e', 0, 0], '\u{00C8}'),
+    ([b'E', b'p', b's', b'i', b'l', b'o', b'n', 0], '\u{0395}'),
+    ([b'E', b't', b'a', 0, 0, 0, 0, 0], '\u{0397}'),
+    ([b'E', b'u', b'm', b'l', 0, 0, 0, 0], '\u{00CB}'),
+    ([b'G', b'a', b'm', b'm', b'a', 0, 0, 0], '\u{0393}'),
+    ([b'I', b'a', b'c', b'u', b't', b'e', 0, 0], '\u{00CD}'),
+    ([b'I', b'c', b'i', b'r', b'c', 0, 0, 0], '\u{00CE}'),
+    ([b'I', b'g', b'r', b'a', b'v', b'e', 0, 0], '\u{00CC}'),
+    ([b'I', b'o', b't', b'a', 0, 0, 0, 0], '\u{0399}'),
+    ([b'I', b'u', b'm', b'l', 0, 0, 0, 0], '\u{00CF}'),
+    ([b'K', b'a', b'p', b'p', b'a', 0, 0, 0], '\u{039A}'),
+    ([b'L', b'a', b'm', b'b', b'd', b'a', 0, 0], '\u{039B}'),
+    ([b'M', b'u', 0, 0, 0, 0, 0, 0], '\u{039C}'),
+    ([b'N', b't', b'i', b'l', b'd', b'e', 0, 0], '\u{00D1}'),
+    ([b'N', b'u', 0, 0, 0, 0, 0, 0], '\u{039D}'),
+    ([b'O', b'E', b'l', b'i', b'g', 0, 0, 0], '\u{0152}'),
+    ([b'O', b'a', b'c', b'u', b't', b'e', 0, 0], '\u{00D3}'),
+    ([b'O', b'c', b'i', b'r', b'c', 0, 0, 0], '\u{00D4}'),
+    ([b'O', b'g', b'r', b'a', b'v', b'e', 0, 0], '\u{00D2}'),
+    ([b'O', b'm', b'e', b'g', b'a', 0, 0, 0], '\u{03A9}'),
+    ([b'O', b'm', b'i', b'c', b'r', b'o', b'n', 0], '\u{039F}'),
+    ([b'O', b's', b'l', b'a', b's', b'h', 0, 0], '\u{00D8}'),
+    ([b'O', b't', b'i', b'l', b'd', b'e', 0, 0], '\u{00D5}'),
+    ([b'O', b'u', b'm', b'l', 0, 0, 0, 0], '\u{00D6}'),
+    ([b'P', b'h', b'i', 0, 0, 0, 0, 0], '\u{03A6}'),
+    ([b'P', b'i', 0, 0, 0, 0, 0, 0], '\u{03A0}'),
+    ([b'P', b'r', b'i', b'm', b'e', 0, 0, 0], '\u{2033}'),
+    ([b'P', b's', b'i', 0, 0, 0, 0, 0], '\u{03A8}'),
+    ([b'R', b'h', b'o', 0, 0, 0, 0, 0], '\u{03A1}'),
+    ([b'S', b'c', b'a', b'r', b'o', b'n', 0, 0], '\u{0160}'),
+    ([b'S', b'i', b'g', b'm', b'a', 0, 0, 0], '\u{03A3}'),
+    ([b'T', b'H', b'O', b'R', b'N', 0, 0, 0], '\u{00DE}'),
+    ([b'T', b'a', b'u', 0, 0, 0, 0, 0], '\u{03A4}'),
+    ([b'T', b'h', b'e', b't', b'a', 0, 0, 0], '\u{0398}'),
+    ([b'U', b'a', b'c', b'u', b't', b'e', 0, 0], '\u{00DA}'),
+    ([b'U', b'c', b'i', b'r', b'c', 0, 0, 0], '\u{00DB}'),
+    ([b'U', b'g', b'r', b'a', b'v', b'e', 0, 0], '\u{00D9}'),
+    ([b'U', b'p', b's', b'i', b'l', b'o', b'n', 0], '\u{03A5}'),
+    ([b'U', b'u', b'm', b'l', 0, 0, 0, 0], '\u{00DC}'),
+    ([b'X', b'i', 0, 0, 0, 0, 0, 0], '\u{039E}'),
+    ([b'Y', b'a', b'c', b'u', b't', b'e', 0, 0], '\u{00DD}'),
+    ([b'Y', b'u', b'm', b'l', 0, 0, 0, 0], '\u{0178}'),
+    ([b'Z', b'e', b't', b'a', 0, 0, 0, 0], '\u{0396}'),
+    ([b'a', b'a', b'c', b'u', b't', b'e', 0, 0], '\u{00E1}'),
+    ([b'a', b'c', b'i', b'r', b'c', 0, 0, 0], '\u{00E2}'),
+    ([b'a', b'c', b'u', b't', b'e', 0, 0, 0], '\u{00B4}'),
+    ([b'a', b'e', b'l', b'i', b'g', 0, 0, 0], '\u{00E6}'),
+    ([b'a', b'g', b'r', b'a', b'v', b'e', 0, 0], '\u{00E0}'),
+    ([b'a', b'l', b'e', b'f', b's', b'y', b'm', 0], '\u{2135}'),
+    ([b'a', b'l', b'p', b'h', b'a', 0, 0, 0], '\u{03B1}'),
+    ([b'a', b'm', b'p', 0, 0, 0, 0, 0], '\u{0026}'),
+    ([b'a', b'n', b'd', 0, 0, 0, 0, 0], '\u{2227}'),
+    ([b'a', b'n', b'g', 0, 0, 0, 0, 0], '\u{2220}'),
+    ([b'a', b'p', b'o', b's', 0, 0, 0, 0], '\u{0027}'),
+    ([b'a', b'r', b'i', b'n', b'g', 0, 0, 0], '\u{00E5}'),
+    ([b'a', b's', b'y', b'm', b'p', 0, 0, 0], '\u{2248}'),
+    ([b'a', b't', b'i', b'l', b'd', b'e', 0, 0], '\u{00E3}'),
+    ([b'a', b'u', b'm', b'l', 0, 0, 0, 0], '\u{00E4}'),
+    ([b'b', b'd', b'q', b'u', b'o', 0, 0, 0], '\u{201E}'),
+    ([b'b', b'e', b't', b'a', 0, 0, 0, 0], '\u{03B2}'),
+    ([b'b', b'r', b'v', b'b', b'a', b'r', 0, 0], '\u{00A6}'),
+    ([b'b', b'u', b'l', b'l', 0, 0, 0, 0], '\u{2022}'),
+    ([b'c', b'a', b'p', 0, 0, 0, 0, 0], '\u{2229}'),
+    ([b'c', b'c', b'e', b'd', b'i', b'l', 0, 0], '\u{00E7}'),
+    ([b'c', b'e', b'd', b'i', b'l', 0, 0, 0], '\u{00B8}'),
+    ([b'c', b'e', b'n', b't', 0, 0, 0, 0], '\u{00A2}'),
+    ([b'c', b'h', b'i', 0, 0, 0, 0, 0], '\u{03C7}'),
+    ([b'c', b'i', b'r', b'c', 0, 0, 0, 0], '\u{02C6}'),
+    ([b'c', b'l', b'u', b'b', b's', 0, 0, 0], '\u{2663}'),
+    ([b'c', b'o', b'n', b'g', 0, 0, 0, 0], '\u{2245}'),
+    ([b'c', b'o', b'p', b'y', 0, 0, 0, 0], '\u{00A9}'),
+    ([b'c', b'r', b'a', b'r', b'r', 0, 0, 0], '\u{21B5}'),
+    ([b'c', b'u', b'p', 0, 0, 0, 0, 0], '\u{222A}'),
+    ([b'c', b'u', b'r', b'r', b'e', b'n', 0, 0], '\u{00A4}'),
+    ([b'd', b'A', b'r', b'r', 0, 0, 0, 0], '\u{21D3}'),
+    ([b'd', b'a', b'g', b'g', b'e', b'r', 0, 0], '\u{2020}'),
+    ([b'd', b'a', b'r', b'r', 0, 0, 0, 0], '\u{2193}'),
+    ([b'd', b'e', b'g', 0, 0, 0, 0, 0], '\u{00B0}'),
+    ([b'd', b'e', b'l', b't', b'a', 0, 0, 0], '\u{03B4}'),
+    ([b'd', b'i', b'a', b'm', b's', 0, 0, 0], '\u{2666}'),
+    ([b'd', b'i', b'v', b'i', b'd', b'e', 0, 0], '\u{00F7}'),
+    ([b'e', b'a', b'c', b'u', b't', b'e', 0, 0], '\u{00E9}'),
+    ([b'e', b'c', b'i', b'r', b'c', 0, 0, 0], '\u{00EA}'),
+    ([b'e', b'g', b'r', b'a', b'v', b'e', 0, 0], '\u{00E8}'),
+    ([b'e', b'm', b'p', b't', b'y', 0, 0, 0], '\u{2205}'),
+    ([b'e', b'm', b's', b'p', 0, 0, 0, 0], '\u{2003}'),
+    ([b'e', b'n', b's', b'p', 0, 0, 0, 0], '\u{2002}'),
+    ([b'e', b'p', b's', b'i', b'l', b'o', b'n', 0], '\u{03B5}'),
+    ([b'e', b'q', b'u', b'i', b'v', 0, 0, 0], '\u{2261}'),
+    ([b'e', b't', b'a', 0, 0, 0, 0, 0], '\u{03B7}'),
+    ([b'e', b't', b'h', 0, 0, 0, 0, 0], '\u{00F0}'),
+    ([b'e', b'u', b'm', b'l', 0, 0, 0, 0], '\u{00EB}'),
+    ([b'e', b'u', b'r', b'o', 0, 0, 0, 0], '\u{20AC}'),
+    ([b'e', b'x', b'i', b's', b't', 0, 0, 0], '\u{2203}'),
+    ([b'f', b'n', b'o', b'f', 0, 0, 0, 0], '\u{0192}'),
+    ([b'f', b'o', b'r', b'a', b'l', b'l', 0, 0], '\u{2200}'),
+    ([b'f', b'r', b'a', b'c', b'1', b'2', 0, 0], '\u{00BD}'),
+    ([b'f', b'r', b'a', b'c', b'1', b'4', 0, 0], '\u{00BC}'),
+    ([b'f', b'r', b'a', b'c', b'3', b'4', 0, 0], '\u{00BE}'),
+    ([b'f', b'r', b'a', b's', b'l', 0, 0, 0], '\u{2044}'),
+    ([b'g', b'a', b'm', b'm', b'a', 0, 0, 0], '\u{03B3}'),
+    ([b'g', b'e', 0, 0, 0, 0, 0, 0], '\u{2265}'),
+    ([b'g', b't', 0, 0, 0, 0, 0, 0], '\u{003E}'),
+    ([b'h', b'A', b'r', b'r', 0, 0, 0, 0], '\u{21D4}'),
+    ([b'h', b'a', b'r', b'r', 0, 0, 0, 0], '\u{2194}'),
+    ([b'h', b'e', b'a', b'r', b't', b's', 0, 0], '\u{2665}'),
+    ([b'h', b'e', b'l', b'l', b'i', b'p', 0, 0], '\u{2026}'),
+    ([b'i', b'a', b'c', b'u', b't', b'e', 0, 0], '\u{00ED}'),
+    ([b'i', b'c', b'i', b'r', b'c', 0, 0, 0], '\u{00EE}'),
+    ([b'i', b'e', b'x', b'c', b'l', 0, 0, 0], '\u{00A1}'),
+    ([b'i', b'g', b'r', b'a', b'v', b'e', 0, 0], '\u{00EC}'),
+    ([b'i', b'm', b'a', b'g', b'e', 0, 0, 0], '\u{2111}'),
+    ([b'i', b'n', b'f', b'i', b'n', 0, 0, 0], '\u{221E}'),
+    ([b'i', b'n', b't', 0, 0, 0, 0, 0], '\u{222B}'),
+    ([b'i', b'o', b't', b'a', 0, 0, 0, 0], '\u{03B9}'),
+    ([b'i', b'q', b'u', b'e', b's', b't', 0, 0], '\u{00BF}'),
+    ([b'i', b's', b'i', b'n', 0, 0, 0, 0], '\u{2208}'),
+    ([b'i', b'u', b'm', b'l', 0, 0, 0, 0], '\u{00EF}'),
+    ([b'k', b'a', b'p', b'p', b'a', 0, 0, 0], '\u{03BA}'),
+    ([b'l', b'A', b'r', b'r', 0, 0, 0, 0], '\u{21D0}'),
+    ([b'l', b'a', b'm', b'b', b'd', b'a', 0, 0], '\u{03BB}'),
+    ([b'l', b'a', b'n', b'g', 0, 0, 0, 0], '\u{2329}'),
+    ([b'l', b'a', b'q', b'u', b'o', 0, 0, 0], '\u{00AB}'),
+    ([b'l', b'a', b'r', b'r', 0, 0, 0, 0], '\u{2190}'),
+    ([b'l', b'c', b'e', b'i', b'l', 0, 0, 0], '\u{2308}'),
+    ([b'l', b'd', b'q', b'u', b'o', 0, 0, 0], '\u{201C}'),
+    ([b'l', b'e', 0, 0, 0, 0, 0, 0], '\u{2264}'),
+    ([b'l', b'f', b'l', b'o', b'o', b'r', 0, 0], '\u{230A}'),
+    ([b'l', b'o', b'w', b'a', b's', b't', 0, 0], '\u{2217}'),
+    ([b'l', b'o', b'z', 0, 0, 0, 0, 0], '\u{25CA}'),
+    ([b'l', b'r', b'm', 0, 0, 0, 0, 0], '\u{200E}'),
+    ([b'l', b's', b'a', b'q', b'u', b'o', 0, 0], '\u{2039}'),
+    ([b'l', b's', b'q', b'u', b'o', 0, 0, 0], '\u{2018}'),
+    ([b'l', b't', 0, 0, 0, 0, 0, 0], '\u{003C}'),
+    ([b'm', b'a', b'c', b'r', 0, 0, 0, 0], '\u{00AF}'),
+    ([b'm', b'd', b'a', b's', b'h', 0, 0, 0], '\u{2014}'),
+    ([b'm', b'i', b'c', b'r', b'o', 0, 0, 0], '\u{00B5}'),
+    ([b'm', b'i', b'd', b'd', b'o', b't', 0, 0], '\u{00B7}'),
+    ([b'm', b'i', b'n', b'u', b's', 0, 0, 0], '\u{2212}'),
+    ([b'm', b'u', 0, 0, 0, 0, 0, 0], '\u{03BC}'),
+    ([b'n', b'a', b'b', b'l', b'a', 0, 0, 0], '\u{2207}'),
+    ([b'n', b'b', b's', b'p', 0, 0, 0, 0], '\u{00A0}'),
+    ([b'n', b'd', b'a', b's', b'h', 0, 0, 0], '\u{2013}'),
+    ([b'n', b'e', 0, 0, 0, 0, 0, 0], '\u{2260}'),
+    ([b'n', b'i', 0, 0, 0, 0, 0, 0], '\u{220B}'),
+    ([b'n', b'o', b't', 0, 0, 0, 0, 0], '\u{00AC}'),
+    ([b'n', b'o', b't', b'i', b'n', 0, 0, 0], '\u{2209}'),
+    ([b'n', b's', b'u', b'b', 0, 0, 0, 0], '\u{2284}'),
+    ([b'n', b't', b'i', b'l', b'd', b'e', 0, 0], '\u{00F1}'),
+    ([b'n', b'u', 0, 0, 0, 0, 0, 0], '\u{03BD}'),
+    ([b'o', b'a', b'c', b'u', b't', b'e', 0, 0], '\u{00F3}'),
+    ([b'o', b'c', b'i', b'r', b'c', 0, 0, 0], '\u{00F4}'),
+    ([b'o', b'e', b'l', b'i', b'g', 0, 0, 0], '\u{0153}'),
+    ([b'o', b'g', b'r', b'a', b'v', b'e', 0, 0], '\u{00F2}'),
+    ([b'o', b'l', b'i', b'n', b'e', 0, 0, 0], '\u{203E}'),
+    ([b'o', b'm', b'e', b'g', b'a', 0, 0, 0], '\u{03C9}'),
+    ([b'o', b'm', b'i', b'c', b'r', b'o', b'n', 0], '\u{03BF}'),
+    ([b'o', b'p', b'l', b'u', b's', 0, 0, 0], '\u{2295}'),
+    ([b'o', b'r', 0, 0, 0, 0, 0, 0], '\u{2228}'),
+    ([b'o', b'r', b'd', b'f', 0, 0, 0, 0], '\u{00AA}'),
+    ([b'o', b'r', b'd', b'm', 0, 0, 0, 0], '\u{00BA}'),
+    ([b'o', b's', b'l', b'a', b's', b'h', 0, 0], '\u{00F8}'),
+    ([b'o', b't', b'i', b'l', b'd', b'e', 0, 0], '\u{00F5}'),
+    ([b'o', b't', b'i', b'm', b'e', b's', 0, 0], '\u{2297}'),
+    ([b'o', b'u', b'm', b'l', 0, 0, 0, 0], '\u{00F6}'),
+    ([b'p', b'a', b'r', b'a', 0, 0, 0, 0], '\u{00B6}'),
+    ([b'p', b'a', b'r', b't', 0, 0, 0, 0], '\u{2202}'),
+    ([b'p', b'e', b'r', b'm', b'i', b'l', 0, 0], '\u{2030}'),
+    ([b'p', b'e', b'r', b'p', 0, 0, 0, 0], '\u{22A5}'),
+    ([b'p', b'h', b'i', 0, 0, 0, 0, 0], '\u{03C6}'),
+    ([b'p', b'i', 0, 0, 0, 0, 0, 0], '\u{03C0}'),
+    ([b'p', b'i', b'v', 0, 0, 0, 0, 0], '\u{03D6}'),
+    ([b'p', b'l', b'u', b's', b'm', b'n', 0, 0], '\u{00B1}'),
+    ([b'p', b'o', b'u', b'n', b'd', 0, 0, 0], '\u{00A3}'),
+    ([b'p', b'r', b'i', b'm', b'e', 0, 0, 0], '\u{2032}'),
+    ([b'p', b'r', b'o', b'd', 0, 0, 0, 0], '\u{220F}'),
+    ([b'p', b'r', b'o', b'p', 0, 0, 0, 0], '\u{221D}'),
+    ([b'p', b's', b'i', 0, 0, 0, 0, 0], '\u{03C8}'),
+    ([b'q', b'u', b'o', b't', 0, 0, 0, 0], '\u{0022}'),
+    ([b'r', b'A', b'r', b'r', 0, 0, 0, 0], '\u{21D2}'),
+    ([b'r', b'a', b'd', b'i', b'c', 0, 0, 0], '\u{221A}'),
+    ([b'r', b'a', b'n', b'g', 0, 0, 0, 0], '\u{232A}'),
+    ([b'r', b'a', b'q', b'u', b'o', 0, 0, 0], '\u{00BB}'),
+    ([b'r', b'a', b'r', b'r', 0, 0, 0, 0], '\u{2192}'),
+    ([b'r', b'c', b'e', b'i', b'l', 0, 0, 0], '\u{2309}'),
+    ([b'r', b'd', b'q', b'u', b'o', 0, 0, 0], '\u{201D}'),
+    ([b'r', b'e', b'a', b'l', 0, 0, 0, 0], '\u{211C}'),
+    ([b'r', b'e', b'g', 0, 0, 0, 0, 0], '\u{00AE}'),
+    ([b'r', b'f', b'l', b'o', b'o', b'r', 0, 0], '\u{230B}'),
+    ([b'r', b'h', b'o', 0, 0, 0, 0, 0], '\u{03C1}'),
+    ([b'r', b'l', b'm', 0, 0, 0, 0, 0], '\u{200F}'),
+    ([b'r', b's', b'a', b'q', b'u', b'o', 0, 0], '\u{203A}'),
+    ([b'r', b's', b'q', b'u', b'o', 0, 0, 0], '\u{2019}'),
+    ([b's', b'b', b'q', b'u', b'o', 0, 0, 0], '\u{201A}'),
+    ([b's', b'c', b'a', b'r', b'o', b'n', 0, 0], '\u{0161}'),
+    ([b's', b'd', b'o', b't', 0, 0, 0, 0], '\u{22C5}'),
+    ([b's', b'e', b'c', b't', 0, 0, 0, 0], '\u{00A7}'),
+    ([b's', b'h', b'y', 0, 0, 0, 0, 0], '\u{00AD}'),
+    ([b's', b'i', b'g', b'm', b'a', 0, 0, 0], '\u{03C3}'),
+    ([b's', b'i', b'g', b'm', b'a', b'f', 0, 0], '\u{03C2}'),
+    ([b's', b'i', b'm', 0, 0, 0, 0, 0], '\u{223C}'),
+    ([b's', b'p', b'a', b'd', b'e', b's', 0, 0], '\u{2660}'),
+    ([b's', b'u', b'b', 0, 0, 0, 0, 0], '\u{2282}'),
+    ([b's', b'u', b'b', b'e', 0, 0, 0, 0], '\u{2286}'),
+    ([b's', b'u', b'm', 0, 0, 0, 0, 0], '\u{2211}'),
+    ([b's', b'u', b'p', 0, 0, 0, 0, 0], '\u{2283}'),
+    ([b's', b'u', b'p', b'1', 0, 0, 0, 0], '\u{00B9}'),
+    ([b's', b'u', b'p', b'2', 0, 0, 0, 0], '\u{00B2}'),
+    ([b's', b'u', b'p', b'3', 0, 0, 0, 0], '\u{00B3}'),
+    ([b's', b'u', b'p', b'e', 0, 0, 0, 0], '\u{2287}'),
+    ([b's', b'z', b'l', b'i', b'g', 0, 0, 0], '\u{00DF}'),
+    ([b't', b'a', b'u', 0, 0, 0, 0, 0], '\u{03C4}'),
+    ([b't', b'h', b'e', b'r', b'e', b'4', 0, 0], '\u{2234}'),
+    ([b't', b'h', b'e', b't', b'a', 0, 0, 0], '\u{03B8}'),
+    ([b't', b'h', b'e', b't', b'a', b's', b'y', b'm'], '\u{03D1}'),
+    ([b't', b'h', b'i', b'n', b's', b'p', 0, 0], '\u{2009}'),
+    ([b't', b'h', b'o', b'r', b'n', 0, 0, 0], '\u{00FE}'),
+    ([b't', b'i', b'l', b'd', b'e', 0, 0, 0], '\u{02DC}'),
+    ([b't', b'i', b'm', b'e', b's', 0, 0, 0], '\u{00D7}'),
+    ([b't', b'r', b'a', b'd', b'e', 0, 0, 0], '\u{2122}'),
+    ([b'u', b'A', b'r', b'r', 0, 0, 0, 0], '\u{21D1}'),
+    ([b'u', b'a', b'c', b'u', b't', b'e', 0, 0], '\u{00FA}'),
+    ([b'u', b'a', b'r', b'r', 0, 0, 0, 0], '\u{2191}'),
+    ([b'u', b'c', b'i', b'r', b'c', 0, 0, 0], '\u{00FB}'),
+    ([b'u', b'g', b'r', b'a', b'v', b'e', 0, 0], '\u{00F9}'),
+    ([b'u', b'm', b'l', 0, 0, 0, 0, 0], '\u{00A8}'),
+    ([b'u', b'p', b's', b'i', b'h', 0, 0, 0], '\u{03D2}'),
+    ([b'u', b'p', b's', b'i', b'l', b'o', b'n', 0], '\u{03C5}'),
+    ([b'u', b'u', b'm', b'l', 0, 0, 0, 0], '\u{00FC}'),
+    ([b'w', b'e', b'i', b'e', b'r', b'p', 0, 0], '\u{2118}'),
+    ([b'x', b'i', 0, 0, 0, 0, 0, 0], '\u{03BE}'),
+    ([b'y', b'a', b'c', b'u', b't', b'e', 0, 0], '\u{00FD}'),
+    ([b'y', b'e', b'n', 0, 0, 0, 0, 0], '\u{00A5}'),
+    ([b'y', b'u', b'm', b'l', 0, 0, 0, 0], '\u{00FF}'),
+    ([b'z', b'e', b't', b'a', 0, 0, 0, 0], '\u{03B6}'),
+    ([b'z', b'w', b'j', 0, 0, 0, 0, 0], '\u{200D}'),
+    ([b'z', b'w', b'n', b'j', 0, 0, 0, 0], '\u{200C}'),
+];
 
 /// Decode a numeric character reference (`&#8212;` or `&#x2014;`) at the
 /// start of `input`.
 pub fn decode_numeric_entity(input: &str) -> Option<char> {
     let rest = input.strip_prefix("&#")?;
-    let end = rest.find(';')?;
+    let end = rest.bytes().take(9).position(|byte| byte == b';')?;
     let entity = &rest[..end];
     let value = if let Some(hex) = entity
         .strip_prefix('x')
@@ -3342,6 +4164,9 @@ pub fn decode_numeric_entity(input: &str) -> Option<char> {
     } else {
         entity.parse::<u32>().ok()?
     };
+    if value == 0 {
+        return None;
+    }
     char::from_u32(value)
 }
 
@@ -3380,7 +4205,7 @@ fn trim_owned<const N: usize>(text: &mut heapless::String<N>) {
     let trim_len = text
         .as_str()
         .char_indices()
-        .find(|(_, ch)| !ch.is_whitespace())
+        .find(|(_, ch)| !is_html_space(*ch))
         .map(|(index, _)| index)
         .unwrap_or(text.len());
     if trim_len == 0 {
@@ -3587,56 +4412,6 @@ fn attr_word_eq(tag: &str, name: &str, word: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn find_guide_reference<'a>(xml: &'a str, reference_type: &str) -> Option<&'a str> {
-    let mut in_guide = false;
-    let mut cursor = XmlCursor::new(xml);
-    while let Some(token) = cursor.next_token() {
-        match token {
-            Token::Start(tag) if tag_name_is(tag, "guide") => in_guide = true,
-            Token::End(tag) if tag_name_is(tag, "guide") => in_guide = false,
-            Token::Start(tag)
-                if in_guide
-                    && tag_name_is(tag, "reference")
-                    && attr_word_eq(tag, "type", reference_type) =>
-            {
-                return attr_value(tag, "href");
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn element_text<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
-    let mut cursor = XmlCursor::new(xml);
-    let mut in_target = false;
-    while let Some(token) = cursor.next_token() {
-        match token {
-            Token::Start(start) if tag_name_is(start, tag) => {
-                in_target = true;
-            }
-            Token::End(end) if tag_name_is(end, tag) => {
-                in_target = false;
-            }
-            Token::Text(text) if in_target => return Some(text),
-            _ => {}
-        }
-    }
-    None
-}
-
-fn cover_status(manifest: &[ManifestItem], opf: &str) -> CoverStatus {
-    if manifest.iter().any(|item| {
-        item.id.of(opf) == "cover"
-            || item.href.of(opf).contains("cover")
-            || item.media_type.of(opf).starts_with("image/")
-    }) {
-        CoverStatus::Present
-    } else {
-        CoverStatus::Missing
-    }
-}
-
 fn style_for(bold_depth: u8, italic_depth: u8) -> FontStyle {
     match (bold_depth > 0, italic_depth > 0) {
         (true, true) => FontStyle::BoldItalic,
@@ -3708,8 +4483,10 @@ mod tests {
             </package>
         "#;
 
+        let mut arena = [0u8; 4096];
         let package = parse_opf(
-            opf,
+            opf.as_bytes(),
+            &mut arena,
             BookId(7),
             "/books/flowers.epub",
             1234,
@@ -3720,6 +4497,7 @@ mod tests {
         assert_eq!(package.meta.title, "Flowers for Algernon");
         assert_eq!(package.meta.author, "Daniel Keyes");
         assert_eq!(package.meta.cover_status, CoverStatus::Present);
+        assert_eq!(package.cover_href, Some("images/cover.jpg"));
         assert_eq!(package.spine.len(), 1);
         assert_eq!(package.spine[0].href.of(package.opf_text), "text/ch1.xhtml");
     }
@@ -3784,10 +4562,12 @@ mod tests {
                 false
             )
         );
+        // The space between the two runs travels with the second run, so
+        // the words never glue together.
         assert_eq!(
             sink.fragments[3],
             (
-                "bold".into(),
+                " bold".into(),
                 TextRole::Body,
                 FontStyle::Bold,
                 TextAlign::Justify,
@@ -4311,10 +5091,17 @@ mod tests {
             </package>
         "#;
 
-        let package = parse_opf(opf, BookId(9), "/books/time.epub", 42, "OPS/content.opf")
-            .expect("opf parses");
+        let mut arena = [0u8; 4096];
+        let package = parse_opf(
+            opf.as_bytes(),
+            &mut arena,
+            BookId(9),
+            "/books/time.epub",
+            42,
+            "OPS/content.opf",
+        )
+        .expect("opf parses");
 
-        assert_eq!(package.manifest.len(), 3);
         assert_eq!(package.spine.len(), 1);
         assert_eq!(package.spine[0].href.of(package.opf_text), "text/ch1.xhtml");
         assert_eq!(package.text_reference_href, Some("text/start.xhtml"));
@@ -4336,11 +5123,108 @@ mod tests {
             </package>
         "#;
 
-        let package = parse_opf(opf, BookId(11), "/books/loose.epub", 42, "OPS/content.opf")
-            .expect("opf parses");
+        let mut arena = [0u8; 4096];
+        let package = parse_opf(
+            opf.as_bytes(),
+            &mut arena,
+            BookId(11),
+            "/books/loose.epub",
+            42,
+            "OPS/content.opf",
+        )
+        .expect("opf parses");
 
         assert_eq!(package.spine.len(), 1);
         assert_eq!(package.spine[0].href.of(package.opf_text), "text/ch1.xhtml");
+    }
+
+    /// An OPF with `chapters` spine items plus `extra` manifest-only items
+    /// (images, CSS) that the reader never needs.
+    fn large_opf(chapters: usize, extra: usize) -> std::string::String {
+        let mut opf = std::string::String::from(
+            "<?xml version=\"1.0\"?><package><metadata>\
+             <dc:title>Pride &amp; Prejudice \u{2014} \u{dc}ber</dc:title>\
+             <dc:creator>Jane Austen</dc:creator></metadata><manifest>",
+        );
+        for index in 0..extra {
+            opf.push_str(&std::format!(
+                "<item id=\"img{index}\" href=\"images/illustration-{index:05}.jpg\" \
+                 media-type=\"image/jpeg\"/>\n"
+            ));
+        }
+        for index in 0..chapters {
+            opf.push_str(&std::format!(
+                "<item id=\"ch{index}\" href=\"text/chapter-{index:04}.xhtml\" \
+                 media-type=\"application/xhtml+xml\"/>\n"
+            ));
+        }
+        opf.push_str("</manifest><spine toc=\"ncx\">");
+        for index in 0..chapters {
+            opf.push_str(&std::format!("<itemref idref=\"ch{index}\"/>"));
+        }
+        opf.push_str("</spine><guide><reference type=\"text\" href=\"text/chapter-0002.xhtml#x\"/></guide></package>");
+        opf
+    }
+
+    fn parse_streamed_in_chunks<'a>(
+        opf: &str,
+        chunk: usize,
+        arena: &'a mut [u8],
+    ) -> Result<EpubPackage<'a>, EpubError> {
+        parse_opf_streamed(
+            |feed| {
+                for piece in opf.as_bytes().chunks(chunk) {
+                    feed(piece)?;
+                }
+                Ok(())
+            },
+            arena,
+            BookId(1),
+            "/books/big.epub",
+            0,
+            "OPS/content.opf",
+        )
+    }
+
+    #[test]
+    fn opf_far_larger_than_the_arena_keeps_every_spine_item() {
+        let opf = large_opf(150, 1200);
+        assert!(opf.len() > 100_000, "fixture should dwarf the arena");
+        for chunk in [1usize, 37, 4096] {
+            let mut arena = [0u8; 16_384];
+            let package = parse_streamed_in_chunks(&opf, chunk, &mut arena).expect("parses");
+            assert_eq!(package.spine.len(), 150, "chunk {chunk}");
+            assert!(!package.spine_truncated);
+            assert_eq!(
+                package.spine[0].href.of(package.opf_text),
+                "text/chapter-0000.xhtml"
+            );
+            assert_eq!(
+                package.spine[149].href.of(package.opf_text),
+                "text/chapter-0149.xhtml"
+            );
+            assert_eq!(package.meta.title, "Pride & Prejudice \u{2014} \u{dc}ber");
+            assert_eq!(package.meta.author, "Jane Austen");
+            assert_eq!(package.text_reference_href, Some("text/chapter-0002.xhtml"));
+        }
+    }
+
+    #[test]
+    fn opf_spine_past_the_cap_is_flagged_truncated() {
+        let opf = large_opf(250, 0);
+        let mut arena = [0u8; 16_384];
+        let package = parse_streamed_in_chunks(&opf, 512, &mut arena).expect("parses");
+        assert_eq!(package.spine.len(), MAX_SPINE_ITEMS);
+        assert!(package.spine_truncated);
+    }
+
+    #[test]
+    fn opf_arena_exhaustion_is_flagged_not_silent() {
+        let opf = large_opf(40, 0);
+        let mut arena = [0u8; 600];
+        let package = parse_streamed_in_chunks(&opf, 64, &mut arena).expect("parses");
+        assert!(package.spine.len() < 40);
+        assert!(package.spine_truncated);
     }
 
     #[test]
@@ -4359,7 +5243,8 @@ mod tests {
         xhtml_text_blocks_with_css(xhtml, None, &mut blocks).expect("blocks fit");
 
         assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].text, "Visible text & symbols");
+        // `&nbsp;` stays a no-break space rather than collapsing.
+        assert_eq!(blocks[0].text, "Visible\u{a0}text & symbols");
     }
 
     #[test]
@@ -4773,6 +5658,171 @@ mod tests {
         assert_eq!(&output, b"01234567");
     }
 
+    type Fragment = (std::string::String, TextRole, FontStyle, TextAlign, bool);
+
+    struct AllFragments(StdVec<Fragment>);
+
+    impl XhtmlBlockSink for AllFragments {
+        fn push_block(
+            &mut self,
+            text: &str,
+            role: TextRole,
+            style: FontStyle,
+            align: TextAlign,
+            paragraph_end: bool,
+        ) -> Result<(), XhtmlError> {
+            self.0
+                .push((text.into(), role, style, align, paragraph_end));
+            Ok(())
+        }
+    }
+
+    /// Parse `xhtml` through the whole-document path and the streamed path
+    /// at several chunk sizes; every path must agree. Returns the fragments.
+    fn parse_both_ways(xhtml: &str) -> StdVec<Fragment> {
+        let mut whole = AllFragments(StdVec::new());
+        xhtml_blocks_to_sink(xhtml, None, &mut whole).expect("whole parse");
+        for chunk_len in [1usize, 3, 7, 4096] {
+            let mut streamed = AllFragments(StdVec::new());
+            let mut tokenizer = StreamingXmlTokenizer::new();
+            let mut parser = XhtmlBlockStreamParser::new(false);
+            for chunk in xhtml.as_bytes().chunks(chunk_len) {
+                tokenizer
+                    .feed_xhtml_blocks(chunk, &mut parser, None, &mut streamed)
+                    .expect("chunk feeds");
+            }
+            tokenizer
+                .finish_xhtml_blocks(&mut parser, &mut streamed)
+                .expect("finish");
+            assert_eq!(whole.0, streamed.0, "chunk size {chunk_len}");
+        }
+        whole.0
+    }
+
+    /// Join fragments the way the reader does: runs concatenate, paragraph
+    /// ends start a new line, runs of spaces collapse.
+    fn reading_text(fragments: &[Fragment]) -> std::string::String {
+        let mut out = std::string::String::new();
+        for (text, _, _, _, paragraph_end) in fragments {
+            out.push_str(text);
+            if *paragraph_end {
+                out.push('\n');
+            }
+        }
+        let mut collapsed = std::string::String::new();
+        for line in out.split('\n') {
+            let words: StdVec<&str> = line.split(' ').filter(|word| !word.is_empty()).collect();
+            if !words.is_empty() {
+                collapsed.push_str(&words.join(" "));
+                collapsed.push('\n');
+            }
+        }
+        collapsed
+    }
+
+    #[test]
+    fn comment_with_quote_or_markup_does_not_swallow_or_leak_text() {
+        let text = reading_text(&parse_both_ways(
+            r#"<body><p>One</p><!-- "an unbalanced quote ” --><p>Two</p>
+            <!-- <p>DRAFT</p> --><p>Three</p></body>"#,
+        ));
+        assert_eq!(text, "One\nTwo\nThree\n");
+    }
+
+    #[test]
+    fn cdata_section_is_text() {
+        let text = reading_text(&parse_both_ways(
+            "<body><p><![CDATA[a < b > c]]> done</p></body>",
+        ));
+        assert_eq!(text, "a < b > c done\n");
+    }
+
+    #[test]
+    fn quoted_greater_than_inside_attribute_does_not_end_the_tag() {
+        let text = reading_text(&parse_both_ways(
+            r#"<body><p title="a>b">Text one</p></body>"#,
+        ));
+        assert_eq!(text, "Text one\n");
+    }
+
+    #[test]
+    fn non_ascii_attribute_values_survive() {
+        let fragments = parse_both_ways(r#"<body><img src="x.png" alt="Café Ægir"/></body>"#);
+        assert_eq!(reading_text(&fragments), "Café Ægir\n");
+    }
+
+    #[test]
+    fn adjacent_styled_runs_keep_the_space_between_them() {
+        let text = reading_text(&parse_both_ways(
+            "<body><p>see <i>Dune</i> <i>Messiah</i> and <b>A</b> <b>B</b>.</p></body>",
+        ));
+        assert_eq!(text, "see Dune Messiah and A B.\n");
+    }
+
+    #[test]
+    fn paragraph_inside_list_item_keeps_its_marker() {
+        let text = reading_text(&parse_both_ways(
+            "<body><ol><li><p>First</p></li><li>\n  <p>Second</p></li></ol></body>",
+        ));
+        assert_eq!(text, "1. First\n2. Second\n");
+    }
+
+    #[test]
+    fn horizontal_rule_becomes_a_scene_break() {
+        let fragments = parse_both_ways("<body><p>before</p><hr/><p>after</p></body>");
+        assert!(fragments
+            .iter()
+            .any(|(text, _, _, align, end)| text == "* * *"
+                && *align == TextAlign::Center
+                && *end));
+        assert_eq!(reading_text(&fragments), "before\n* * *\nafter\n");
+    }
+
+    #[test]
+    fn self_closed_inline_and_heading_tags_do_not_leak_style() {
+        let fragments = parse_both_ways("<body><p>a<i/>b</p><h2/><ol/><p>body text</p></body>");
+        let body = fragments
+            .iter()
+            .find(|(text, ..)| text.contains("body text"))
+            .expect("body paragraph");
+        assert_eq!(body.1, TextRole::Body);
+        assert_eq!(body.2, FontStyle::Regular);
+        assert_eq!(body.3, TextAlign::Justify);
+    }
+
+    #[test]
+    fn nested_hidden_content_stays_hidden() {
+        let text = reading_text(&parse_both_ways(
+            r#"<body><div style="display:none"><div>inner</div>LEAKED</div><p>shown</p></body>"#,
+        ));
+        assert_eq!(text, "shown\n");
+    }
+
+    #[test]
+    fn hidden_as_a_word_in_another_attribute_is_not_hidden() {
+        let text = reading_text(&parse_both_ways(
+            r#"<body><p title="The hidden door">Visible</p><p hidden="">Gone</p><p hidden>Gone</p></body>"#,
+        ));
+        assert_eq!(text, "Visible\n");
+    }
+
+    #[test]
+    fn overlong_tag_still_applies_its_leading_attributes() {
+        let filler = "x".repeat(1500);
+        let text = reading_text(&parse_both_ways(&std::format!(
+            r#"<body><div hidden="hidden" data-filler="{filler}">secret</div><p>ok</p></body>"#
+        )));
+        assert_eq!(text, "ok\n");
+    }
+
+    #[test]
+    fn named_html_entities_decode() {
+        let text = reading_text(&parse_both_ways(
+            "<body><p>caf&eacute; &copy; &Aring; &mdash; &bogus; &amp;lt;</p></body>",
+        ));
+        assert_eq!(text, "café © Å — &bogus; &lt;\n");
+    }
+
     #[test]
     fn streamed_xhtml_blocks_match_whole_document_parse_for_any_chunking() {
         // Rich enough to exercise every state-machine path: headings,
@@ -4801,6 +5851,12 @@ mod tests {
               <p class="center">Centered<br/>after break</p>
               <img src="x.png" alt="A picture"/>
               <span epub:type="pagebreak" title="12"></span>
+              <!-- a "quoted" comment with <p>markup</p> -->
+              <p>see <i>Dune</i> <i>Messiah</i> &eacute;t&eacute;</p>
+              <ol><li><p>item para</p></li></ol>
+              <hr/><h2/><p title="the hidden door">kept</p>
+              <div style="display:none"><div>x</div>leak</div>
+              <img alt="Café Ægir"/>
             </body></html>"#
         );
 

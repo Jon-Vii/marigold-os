@@ -16,8 +16,8 @@ use heapless::String;
 use proto::book::BookId;
 use proto::cache::BookV2SectionRecord;
 use proto::epub::{
-    decode_html_entity, parse_opf, strip_fragment, CssRules, Epub3NavStreamParser, EpubTocSink,
-    EpubZipOps, NcxStreamParser, ReadAt, StreamingXmlTokenizer, TocError, XhtmlBlockSink,
+    parse_opf_streamed, strip_fragment, Epub3NavStreamParser, EpubTocSink, EpubZipOps,
+    NcxStreamParser, ReadAt, StreamingXmlTokenizer, TocError, XhtmlBlockSink,
     XhtmlBlockStreamParser, XhtmlError, ZipInflateScratch, ZipStream, MAX_ENTRY_NAME_BYTES,
 };
 use proto::text::{TextAlign, TextRole};
@@ -881,7 +881,6 @@ fn set_preview_error_from_error(library: &mut ReaderStore, error: ReaderCacheErr
         ReaderCacheError::Zip(proto::epub::ZipError::Inflate) => "ZIP INFLATE",
         ReaderCacheError::Zip(proto::epub::ZipError::Io) => "OPEN BUDGET",
         ReaderCacheError::Zip(_) => "ZIP",
-        ReaderCacheError::Epub(proto::epub::EpubError::TooManyManifestItems) => "OPF MANIFEST",
         ReaderCacheError::Epub(proto::epub::EpubError::TooManySpineItems) => "OPF SPINE",
         ReaderCacheError::Epub(proto::epub::EpubError::MissingOpfPath) => "NO OPF",
         ReaderCacheError::Epub(proto::epub::EpubError::MissingOpf) => "NO OPF FILE",
@@ -1071,27 +1070,34 @@ where
         opf_entry.compressed_size,
         opf_entry.uncompressed_size
     );
-    let (opf_len, opf_complete) = zip.read_entry_prefix_streamed(
-        opf_entry,
-        scratch.compressed,
-        scratch.opf,
-        &mut *scratch.zip_inflate,
-    )?;
-    if !opf_complete {
-        esp_println::println!(
-            "epub: opf prefix truncated at {} of {} bytes",
-            opf_len,
-            opf_entry.uncompressed_size
-        );
-    }
-    let opf_xml =
-        core::str::from_utf8(&scratch.opf[..opf_len]).map_err(|_| ReaderCacheError::Utf8)?;
-    let package = parse_opf(opf_xml, BookId(2), source_path, 0, opf_path)?;
+    // The OPF streams through the idle XHTML window (twice: spine ids, then
+    // the items they name) and only the strings the package needs land in
+    // the OPF arena, so an OPF of any size parses without truncation.
+    let package = {
+        let zip = &mut zip;
+        let compressed = &mut *scratch.compressed;
+        let window = &mut *scratch.xhtml;
+        let inflate = &mut *scratch.zip_inflate;
+        parse_opf_streamed(
+            |feed| {
+                zip.read_entry_to_sink(opf_entry, compressed, window, inflate, &mut |chunk| {
+                    feed(chunk).map_err(|_| proto::epub::ZipError::Inflate)
+                })
+                .map_err(proto::epub::EpubError::from)
+            },
+            scratch.opf,
+            BookId(2),
+            source_path,
+            0,
+            opf_path,
+        )?
+    };
     esp_println::println!(
-        "epub: opf parsed after {} ms (spine={} truncated={})",
+        "epub: opf parsed after {} ms (spine={} truncated={} arena={})",
         open_started.elapsed().as_millis(),
         package.spine.len(),
-        package.spine_truncated
+        package.spine_truncated,
+        package.opf_text.len()
     );
 
     library.set_book_labels(package.meta.title, package.meta.author);
@@ -1138,7 +1144,6 @@ where
         open_started.elapsed().as_millis(),
         library.toc_count
     );
-    let css_rules = CssRules::new();
 
     esp_println::println!("epub: stage BuildV2BookCache");
     let spine_started = Instant::now();
@@ -1200,8 +1205,19 @@ where
             library.clear_lines();
             resolve_epub_href(opf_path, spine.href.of(package.opf_text), &mut xhtml_path)?;
             esp_println::println!("epub: find spine {}", xhtml_path.as_str());
-            let Ok(xhtml_entry) = zip.find_entry(&xhtml_path, scratch.header, scratch.name) else {
-                continue;
+            let xhtml_entry = match zip.find_entry(&xhtml_path, scratch.header, scratch.name) {
+                Ok(entry) => entry,
+                Err(proto::epub::ZipError::Io) => return Err(proto::epub::ZipError::Io.into()),
+                Err(err) => {
+                    // A dangling spine reference names no content to lose;
+                    // skip it (a retryable storage fault returned above).
+                    esp_println::println!(
+                        "epub: spine {} not found ({:?}); skipping it",
+                        xhtml_path.as_str(),
+                        err
+                    );
+                    continue;
+                }
             };
             esp_println::println!(
                 "epub: spine {} compressed={} uncompressed={}",
@@ -1257,7 +1273,7 @@ where
                         XhtmlBlockStreamParser::new(!has_body)
                     });
                     tokenizer
-                        .feed_xhtml_blocks(chunk, parser, Some(&css_rules), &mut sink)
+                        .feed_xhtml_blocks(chunk, parser, None, &mut sink)
                         .map_err(|err| {
                             parse_error = Some(err);
                             proto::epub::ZipError::Inflate
@@ -1287,7 +1303,21 @@ where
                         return Err(err.into());
                     }
                 }
-                Err(err) => return Err(err.into()),
+                // A storage fault is worth retrying, so it still fails the
+                // step. Anything else is a damaged member: keep what parsed,
+                // mark the book partial, and carry on with the next chapter
+                // rather than refusing to open the whole book.
+                Err(proto::epub::ZipError::Io) => {
+                    return Err(proto::epub::ZipError::Io.into());
+                }
+                Err(err) => {
+                    esp_println::println!(
+                        "epub: spine {} unreadable ({:?}); skipping it",
+                        xhtml_path.as_str(),
+                        err
+                    );
+                    *sink.book_partial = true;
+                }
             }
             sink.finish_spine(false);
             if sink.write_failed {
@@ -1509,10 +1539,19 @@ where
 
 fn href_matches_spine(href: &str, spine_href: &str) -> bool {
     let href = strip_fragment(href);
+    // TOC hrefs are relative to the nav/NCX file, spine hrefs to the OPF, so
+    // compare by path suffix -- but only on a `/` boundary, or "11.xhtml"
+    // would claim the spine item "1.xhtml".
     href == spine_href
-        || href.ends_with(spine_href)
-        || spine_href.ends_with(href)
+        || path_ends_with(href, spine_href)
+        || path_ends_with(spine_href, href)
         || file_name(href) == file_name(spine_href)
+}
+
+fn path_ends_with(path: &str, suffix: &str) -> bool {
+    !suffix.is_empty()
+        && path.ends_with(suffix)
+        && (path.len() == suffix.len() || path.as_bytes()[path.len() - suffix.len() - 1] == b'/')
 }
 
 fn file_name(value: &str) -> &str {
@@ -1864,7 +1903,10 @@ where
             || self.library.block_count() >= self.library.block_capacity().saturating_sub(4)
             || self.library.text_capacity_reached()
         {
-            flush_styled_preview_line(self, false);
+            // The line still being filled is not pushed here: the section
+            // carries its unfinished last page forward, and the line keeps
+            // collecting words until it wraps naturally. Pushing it early
+            // ended a line mid-paragraph at most section boundaries.
             self.flush_section(false, true);
         }
     }
@@ -1946,26 +1988,29 @@ fn push_styled_preview_fragment<
     let starts_with_space = text
         .chars()
         .next()
-        .map(|ch| ch.is_whitespace())
+        .map(|ch| ch.is_ascii_whitespace())
         .unwrap_or(false);
     let ends_with_space = text
         .chars()
         .next_back()
-        .map(|ch| ch.is_whitespace())
+        .map(|ch| ch.is_ascii_whitespace())
         .unwrap_or(false);
     let mut normalized = String::<MAX_READER_BLOCK_TEXT>::new();
-    push_normalized_decoded(text, &mut normalized);
+    push_normalized(text, &mut normalized);
     trim_trailing_space(&mut normalized);
-    if !sanitize_preview_block(&mut normalized) {
-        sink.dropping_paragraph = !paragraph_end;
-        sink.pending_space = false;
-        return;
-    }
+    // A fragment with no visible text only carries spacing. Handle it before
+    // the paragraph sanitizer, which treats an empty block as "drop the rest
+    // of this paragraph".
     if normalized.is_empty() {
         sink.pending_space |= starts_with_space || ends_with_space;
         if paragraph_end {
             flush_styled_preview_line(sink, true);
         }
+        return;
+    }
+    if !sanitize_preview_block(&mut normalized) {
+        sink.dropping_paragraph = !paragraph_end;
+        sink.pending_space = false;
         return;
     }
 
@@ -1996,7 +2041,9 @@ fn push_styled_preview_fragment<
     }
 
     let mut first_word = true;
-    for word in normalized.split_whitespace() {
+    // ASCII whitespace only: a no-break space joins its neighbours into one
+    // unbreakable word.
+    for word in normalized.split_ascii_whitespace() {
         let attach = is_leading_punctuation_word(word) && !sink.line.is_empty();
         let leading_space = !sink.line.is_empty()
             && !attach
@@ -2247,46 +2294,39 @@ fn is_decorative_separator(text: &str) -> bool {
     saw_mark && mark_count >= 3
 }
 
-fn push_normalized_decoded<const N: usize>(text: &str, out: &mut String<N>) {
+/// Collapse ASCII whitespace and drop invisible format characters. Entities
+/// were already decoded by the XHTML parser; decoding again here turned
+/// literal text such as `&lt;` (from `&amp;lt;`) into markup characters.
+fn push_normalized<const N: usize>(text: &str, out: &mut String<N>) {
     let mut previous_space = true;
-    let mut cursor = 0usize;
-    while cursor < text.len() {
-        let rest = &text[cursor..];
-        if let Some(decoded) = decode_html_entity(rest) {
-            if decoded.is_whitespace() {
-                if !previous_space && out.push(' ').is_err() {
-                    break;
-                }
-                previous_space = true;
-            } else if push_normalized_char(decoded, out).is_err() {
-                break;
-            } else {
-                previous_space = false;
-            }
-            cursor += rest.find(';').map(|index| index + 1).unwrap_or(1);
-            continue;
-        }
-
-        let Some(ch) = rest.chars().next() else {
-            break;
-        };
-        if ch.is_whitespace() {
+    for ch in text.chars() {
+        if ch.is_ascii_whitespace() {
             if !previous_space && out.push(' ').is_err() {
                 break;
             }
             previous_space = true;
+        } else if is_invisible_format_char(ch) {
+            continue;
         } else if push_normalized_char(ch, out).is_err() {
             break;
         } else {
             previous_space = false;
         }
-        cursor += ch.len_utf8();
     }
+}
+
+/// Characters with no glyph and no width: soft hyphen, zero-width
+/// space/joiners, word joiner, byte-order mark. Without this they render as
+/// missing-glyph boxes in the middle of words.
+fn is_invisible_format_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{00AD}' | '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' | '\u{FEFF}'
+    )
 }
 
 fn push_normalized_char<const N: usize>(ch: char, out: &mut String<N>) -> Result<(), ()> {
     match ch {
-        '\u{00A0}' => out.push(' ').map_err(|_| ()),
         ch if ch as u32 <= u16::MAX as u32 => out.push(ch).map_err(|_| ()),
         _ => out.push('?').map_err(|_| ()),
     }
@@ -2383,7 +2423,7 @@ fn trim_leading_space<const N: usize>(text: &mut String<N>) {
     let trim_len = text
         .as_str()
         .char_indices()
-        .find(|(_, ch)| !ch.is_whitespace())
+        .find(|(_, ch)| !ch.is_ascii_whitespace())
         .map(|(index, _)| index)
         .unwrap_or(text.len());
     if trim_len == 0 {

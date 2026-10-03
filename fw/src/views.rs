@@ -368,8 +368,22 @@ fn draw_reader_footer(
             (current, total)
         });
 
-    let mut label = String::<32>::new();
-    let _ = write!(label, "{}/{}", chapter_current, chapter_total);
+    let mut label = String::<48>::new();
+    // A book cut short by a capacity limit (spine or section count) says so
+    // on its last page instead of simply stopping.
+    let truncated_end = sd_library.book_cache_partial
+        && sd_library.book_next_spine().is_none()
+        && sd_library.book_total_pages > 0
+        && request.page.saturating_add(1) >= sd_library.book_total_pages;
+    if truncated_end {
+        let _ = write!(
+            label,
+            "{}/{} \u{b7} book cut short",
+            chapter_current, chapter_total
+        );
+    } else {
+        let _ = write!(label, "{}/{}", chapter_current, chapter_total);
+    }
     ui::reading::draw_reading_page_counter_aligned(
         fb,
         label.as_str(),

@@ -2169,7 +2169,8 @@ where
                 else {
                     return false;
                 };
-                if text.is_empty() || text.trim() != text {
+                if text.is_empty() || text.trim_matches(|ch: char| ch.is_ascii_whitespace()) != text
+                {
                     return false;
                 }
                 let flags = scratch[flags_at + index];

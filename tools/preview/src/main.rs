@@ -11,9 +11,8 @@ use proto::cache::{
     CACHE_ROOT_DIR, COVER_BYTES, COVER_HEIGHT, COVER_STRIDE, COVER_WIDTH,
 };
 use proto::epub::{
-    decode_html_entity, load_epub_package, parse_css_text_align, strip_fragment,
-    xhtml_blocks_to_sink, CssRules, EpubPackage, SpineItem, XhtmlBlockSink, XhtmlError, ZipArchive,
-    ZipEntry,
+    decode_html_entity, load_epub_package, strip_fragment, xhtml_blocks_to_sink, EpubPackage,
+    SpineItem, XhtmlBlockSink, XhtmlError, ZipArchive, ZipEntry,
 };
 use proto::text::{TextAlign, TextRole};
 use std::env;
@@ -132,17 +131,17 @@ fn preview_epub(
     let zip = ZipArchive::new(&bytes).map_err(|err| format!("zip: {err:?}"))?;
     let mut container = vec![0u8; 8192];
     let mut opf = vec![0u8; 128 * 1024];
+    let mut opf_arena = vec![0u8; 60 * 1024];
     let package = load_epub_package(
         &bytes,
         &mut container,
         &mut opf,
+        &mut opf_arena,
         BookId(1),
         epub_path.to_str().unwrap_or("book.epub"),
     )
     .map_err(|err| format!("epub package: {err:?}"))?;
 
-    let mut css_rules = CssRules::new();
-    load_css_rules(&zip, &package, &mut css_rules);
     if let Some(path) = cover_bin {
         write_cover_cache_file(&zip, &package, path)?;
     }
@@ -192,8 +191,7 @@ fn preview_epub(
             continue;
         };
         let mut sink = PreviewSink::new(&mut lines);
-        xhtml_blocks_to_sink(xhtml, Some(&css_rules), &mut sink)
-            .map_err(|err| format!("xhtml: {err:?}"))?;
+        xhtml_blocks_to_sink(xhtml, None, &mut sink).map_err(|err| format!("xhtml: {err:?}"))?;
         if paginate(&lines).len() >= page_limit {
             break;
         }
@@ -239,7 +237,9 @@ fn write_cover_cache_file(
     package: &EpubPackage<'_>,
     path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let cover = find_cover_href(package).ok_or("no cover image found in manifest")?;
+    let cover = package
+        .cover_href
+        .ok_or("no cover image found in manifest")?;
     let cover_path = resolve_epub_href(package.opf_path, cover);
     let entry = zip
         .entries()
@@ -283,27 +283,6 @@ fn write_cover_cache_file(
     Ok(())
 }
 
-fn find_cover_href<'a>(package: &'a EpubPackage<'a>) -> Option<&'a str> {
-    let opf = package.opf_text;
-    package
-        .manifest
-        .iter()
-        .find(|item| {
-            item.properties
-                .of(opf)
-                .split_ascii_whitespace()
-                .any(|prop| prop == "cover-image")
-        })
-        .or_else(|| {
-            package.manifest.iter().find(|item| {
-                item.media_type.of(opf).starts_with("image/")
-                    && (item.id.of(opf).eq_ignore_ascii_case("cover")
-                        || item.href.of(opf).to_ascii_lowercase().contains("cover"))
-            })
-        })
-        .map(|item| item.href.of(opf))
-}
-
 fn read_zip_entry(zip: &ZipArchive<'_>, entry: ZipEntry<'_>) -> Result<Vec<u8>, String> {
     let mut output = vec![0u8; entry.uncompressed_size as usize];
     let len = zip
@@ -311,26 +290,6 @@ fn read_zip_entry(zip: &ZipArchive<'_>, entry: ZipEntry<'_>) -> Result<Vec<u8>, 
         .map_err(|err| format!("zip entry {}: {err:?}", entry.name))?;
     output.truncate(len);
     Ok(output)
-}
-
-fn load_css_rules(zip: &ZipArchive<'_>, package: &EpubPackage<'_>, rules: &mut CssRules) {
-    rules.clear();
-    for item in package.manifest.iter().filter(|item| {
-        item.media_type.of(package.opf_text).contains("css")
-            || item.href.of(package.opf_text).ends_with(".css")
-    }) {
-        let path = resolve_epub_href(package.opf_path, item.href.of(package.opf_text));
-        let Some(entry) = zip.entries().flatten().find(|entry| entry.name == path) else {
-            continue;
-        };
-        let Ok(bytes) = read_zip_entry(zip, entry) else {
-            continue;
-        };
-        let Ok(css) = std::str::from_utf8(&bytes) else {
-            continue;
-        };
-        parse_css_text_align(css, rules);
-    }
 }
 
 #[derive(Clone, Copy)]

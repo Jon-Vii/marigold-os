@@ -453,7 +453,11 @@ pub const READER_WRAP_SAFETY: i16 = 4;
 /// and landscape pagination cache separately. v19: the shared page walk fits
 /// ink rather than trailing paragraph spacing at the page edge. Retire indexes
 /// built by the old firmware walk, including their whole-book page totals.
-const READER_LAYOUT_VERSION: u16 = 19;
+/// v20: cached text changed — the OPF streams whole (no more chapters lost
+/// past 16 KB of package document), spaces between styled runs and `&nbsp;`
+/// survive, scene breaks (`<hr>`) render, comments no longer swallow text,
+/// and lines no longer break early at section seams. Rebuild every book.
+const READER_LAYOUT_VERSION: u16 = 20;
 
 /// Panel-geometry salt folded into the version bits: wrap points and page
 /// heights depend on the page box, so pagination cached on one panel must

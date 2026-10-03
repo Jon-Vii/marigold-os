@@ -1329,9 +1329,16 @@ impl ReaderStore {
         paragraph_end: bool,
         spine_index: u16,
     ) -> bool {
-        let line = line.trim();
-        if line.is_empty() || self.block_count >= self.blocks.len() {
+        // ASCII trim only: a line that is just a no-break space is a
+        // deliberate blank line (`<p>&nbsp;</p>` spacers), not empty.
+        let line = line.trim_matches(|ch: char| ch.is_ascii_whitespace());
+        if line.is_empty() {
             return true;
+        }
+        if self.block_count >= self.blocks.len() {
+            // Full: report it so the builder flushes the section and retries
+            // the line in a fresh arena instead of losing it.
+            return false;
         }
         let start = self.text_len;
         let bytes = line.as_bytes();
