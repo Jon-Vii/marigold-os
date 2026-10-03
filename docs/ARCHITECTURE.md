@@ -217,8 +217,20 @@ page already sits inside the loaded section window are answered from RAM
 without an SD session. Page turns keep the current panel image until the
 storage reply, then render the requested page once. A section already present
 in the completed book index needs only a cache read and never a loading plate.
-Reading-progress writes are coalesced (at most one
-alternating STATEA/STATEB generation per 15 s, flushed before display sleep).
+Reading-progress writes are coalesced: same-book page turns land at most one
+alternating STATEA/STATEB generation per 15 s, and a coalesced position is
+written when its window ends even without another page turn, so a battery
+pull loses at most 15 s. Book, chapter, and layout changes write at once; a
+pending position is also written before display sleep, a Wi-Fi memory loan, a
+firmware stage, and a switch to another book. A failed write retries every
+30 s. One owner, `ProgressJournal` in the display task, holds these rules.
+
+Sleep always completes. The display task writes the pending position (one
+retry), paints the sleep image, powers the panel down, and answers
+`DisplayAsleep` even if the write, the refresh, or the power-down failed:
+staying awake after a failure only drained the battery, and wake is a reboot
+that re-initialises the panel. The power task still deep-sleeps if no answer
+arrives within 120 s.
 The board I/O task is still
 the single SPI owner, so display refresh and SD transactions cannot overlap, but
 the user-facing view is always drawn from the latest already-owned snapshot.
@@ -268,10 +280,12 @@ LUT bank plus a CDI mode byte; FastClean is a half-scrub LUT bank (see
 `display/src/epd/uc8253.rs`).
 
 The user-facing `RefreshPolicy` in Settings selects between `FastOnly`,
-`FullOnWake` (the default), and `FullEveryTen`. Under `FullEveryTen`, once
-`DEFAULT_FULL_REFRESH_INTERVAL` (currently 8) consecutive fast refreshes have
-accumulated, the refresh planner schedules a cleaning refresh (FastClean)
-instead of the next fast one.
+`FullOnWake` (the default), and `FullEveryTen` (shown as "clean every ten").
+Under `FullEveryTen`, once `DEFAULT_FULL_REFRESH_INTERVAL` (9) consecutive fast
+refreshes have accumulated, the refresh planner schedules a cleaning refresh
+(FastClean) for the tenth page instead of another fast one. Because deep sleep
+reboots the chip, every wake starts from a fresh planner with a Full refresh,
+so `FastOnly` and `FullOnWake` currently behave the same.
 
 `display::epd::ssd1677` contains three transform constants currently validated during bring-up:
 `MIRROR_X = true`, `MIRROR_Y = false`, and `REVERSE_BITS = true`. The logical
@@ -353,11 +367,14 @@ and the host preview tool:
   against. Both zip front-ends implement it, and one shared streaming inflate
   engine sits behind them, so entry reads behave identically regardless of
   whether compressed bytes come from random-access or forward-only storage.
-- `EpubPackage` for container/OPF metadata, manifest, and spine. Spine and
-  manifest strings are stored as offset+length spans into the shared OPF
-  text rather than inline strings, halving each item's size so long books
-  (192-item spine cap, 224-item manifest cap) fit within the tight
-  EPUB-open stack budget.
+- `EpubPackage` for OPF metadata, nav/NCX/cover hrefs, and the spine.
+  `parse_opf_streamed` reads the package document of any size in two
+  streamed passes (spine ids, then the manifest items they name) and copies
+  only the strings the package needs into a 16 KB arena; manifest records
+  live at the top of that arena rather than on the stack. Spine items are
+  offset+length spans into the arena. A spine past `MAX_SPINE_ITEMS` (192)
+  or an exhausted arena marks the package `spine_truncated`, and the book's
+  last page says it was cut short.
 - `xhtml_blocks_to_sink` with `TextRole`, `FontStyle`, and `TextAlign` as the
   single XHTML extraction path feeding bounded block records.
 - `BookV2Header` with `BookV2SectionRecord`, and `SectionV2Header` with
