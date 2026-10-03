@@ -27,6 +27,9 @@ fn prev_fb_bytes() -> usize {
 const MIN_STACK_BYTES: usize = 27 * 1024;
 
 fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rustc-env=MARIGOLD_VERSION={}", firmware_version());
+
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let fb = prev_fb_bytes();
 
@@ -67,4 +70,63 @@ ASSERT(_stack_start - _stack_end >= {min_stack},
     fs::write(out_dir.join("ram-layout.x"), script).unwrap();
     println!("cargo:rustc-link-search={}", out_dir.display());
     println!("cargo:rustc-link-arg-bins=-Tram-layout.x");
+}
+
+/// The app descriptor's version field is 32 bytes; keep one for the NUL.
+const VERSION_MAX_LEN: usize = 31;
+
+/// Version string for the app descriptor: `MARIGOLD_VERSION` when set (the
+/// release workflow passes the tag), else `git describe --tags --always
+/// --dirty`, else "unknown". Limited to printable ASCII and 31 bytes.
+///
+/// The script re-runs when HEAD, the checked-out branch, or the tags move.
+/// It does not watch the working tree, so a `-dirty` suffix reflects the
+/// tree as of the script's last run.
+fn firmware_version() -> String {
+    println!("cargo:rerun-if-env-changed=MARIGOLD_VERSION");
+    let raw = match env::var("MARIGOLD_VERSION") {
+        Ok(version) if !version.trim().is_empty() => version,
+        _ => {
+            watch_git_refs();
+            git(&["describe", "--tags", "--always", "--dirty"]).unwrap_or_default()
+        }
+    };
+    let version: String = raw
+        .trim()
+        .chars()
+        .filter(char::is_ascii_graphic)
+        .take(VERSION_MAX_LEN)
+        .collect();
+    if version.is_empty() {
+        "unknown".into()
+    } else {
+        version
+    }
+}
+
+fn git(args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git").args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
+/// Re-run when a commit, checkout, or tag changes what `git describe`
+/// reports. `git rev-parse --git-path` also resolves linked worktrees. Only
+/// existing paths are watched: Cargo treats a missing one as always stale.
+fn watch_git_refs() {
+    let branch = git(&["symbolic-ref", "-q", "HEAD"]);
+    let names = ["HEAD", "packed-refs", "refs/tags"]
+        .into_iter()
+        .chain(branch.as_deref());
+    for name in names {
+        if let Some(path) = git(&["rev-parse", "--git-path", name]) {
+            if std::path::Path::new(&path).exists() {
+                println!("cargo:rerun-if-changed={path}");
+            }
+        }
+    }
 }

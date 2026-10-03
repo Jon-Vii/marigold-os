@@ -32,7 +32,7 @@ pub static _ESP_APP_DESC: EspAppDesc = EspAppDesc {
     magic_word: 0xABCD5432,
     secure_version: 0,
     reserv1: [0; 2],
-    version: [0; 32],
+    version: descriptor_version(env!("MARIGOLD_VERSION")),
     #[cfg(not(feature = "device-x3"))]
     project_name: *b"xteink-x4\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
     #[cfg(feature = "device-x3")]
@@ -48,6 +48,19 @@ pub static _ESP_APP_DESC: EspAppDesc = EspAppDesc {
     reserv3: [0; 2],
     reserv2: [0; 18],
 };
+
+/// Copies the build's version string (`MARIGOLD_VERSION`, set by build.rs)
+/// into the descriptor's 32-byte field: truncated to 31 bytes, NUL-padded.
+const fn descriptor_version(version: &str) -> [u8; 32] {
+    let bytes = version.as_bytes();
+    let mut field = [0u8; 32];
+    let mut index = 0;
+    while index < bytes.len() && index < field.len() - 1 {
+        field[index] = bytes[index];
+        index += 1;
+    }
+    field
+}
 
 // The only allocator user is the Wi-Fi sync session; reader paths stay
 // allocation-free because no region exists until sync_mem donates the
