@@ -1,3 +1,4 @@
+mod golden;
 #[cfg(not(feature = "device-x3"))]
 mod panel;
 #[cfg(feature = "device-x3")]
@@ -99,11 +100,14 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             write_presented_png(&path, emu.framebuffer())?;
         }
         if let Some(path) = args.check {
-            compare_png(&path, emu.framebuffer())?;
+            golden::check_frame(&path, emu.framebuffer())?;
         }
         return Ok(());
     }
 
+    // Check every scenario before failing so one run reports (and writes
+    // diffs for) all mismatched frames.
+    let mut mismatches = Vec::new();
     for path in scenarios {
         let mut emu = Emulator::boot(args.sd_root.clone());
         let scenario = Scenario::load(&path)?;
@@ -124,13 +128,28 @@ fn run_headless(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             println!("presented {}", path.display());
         }
         if let Some(check) = &args.check {
-            let path = output_path(check, &path)?;
-            compare_png(&path, emu.framebuffer())?;
-            println!("matched {}", path.display());
+            let golden = output_path(check, &path)?;
+            match golden::check_frame(&golden, emu.framebuffer()) {
+                Ok(()) => println!("matched {}", golden.display()),
+                Err(err) => {
+                    eprintln!("MISMATCH {}: {err}", path.display());
+                    mismatches.push(path.display().to_string());
+                    continue;
+                }
+            }
         }
         println!("ok {}", path.display());
     }
-    Ok(())
+    if mismatches.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} golden frame(s) differ: {}",
+            mismatches.len(),
+            mismatches.join(", ")
+        )
+        .into())
+    }
 }
 
 fn scenario_paths(path: Option<&Path>) -> Result<Vec<PathBuf>, String> {
@@ -170,17 +189,6 @@ fn output_path(base: &Path, scenario: &Path) -> Result<PathBuf, String> {
         .and_then(|name| name.to_str())
         .ok_or_else(|| format!("scenario has no valid file stem: {}", scenario.display()))?;
     Ok(base.join(format!("{name}{suffix}.png")))
-}
-
-fn compare_png(path: &Path, fb: &display::fb::Framebuffer) -> Result<(), String> {
-    let mut actual = Vec::new();
-    render::encode_png(&mut actual, fb).map_err(|err| err.to_string())?;
-    let expected = std::fs::read(path).map_err(|err| format!("{}: {err}", path.display()))?;
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(format!("frame does not match {}", path.display()))
-    }
 }
 
 fn run_gui(args: Args) -> Result<(), Box<dyn std::error::Error>> {

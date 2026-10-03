@@ -103,18 +103,9 @@ pub fn write_presented_png(
     Ok(())
 }
 
+/// The golden format, so `--dump fixtures/golden` regenerates goldens.
 pub fn encode_png<W: Write>(writer: W, fb: &Framebuffer) -> Result<(), png::EncodingError> {
-    let mut encoder = png::Encoder::new(writer, display::WIDTH as u32, display::HEIGHT as u32);
-    encoder.set_color(png::ColorType::Grayscale);
-    encoder.set_depth(png::BitDepth::Eight);
-    let mut writer = encoder.write_header()?;
-    let mut data = Vec::with_capacity(display::WIDTH * display::HEIGHT);
-    for y in 0..display::HEIGHT {
-        for x in 0..display::WIDTH {
-            data.push(if fb.native_pixel(x, y) { 0xEE } else { 0x18 });
-        }
-    }
-    writer.write_image_data(&data)
+    crate::golden::encode_png(writer, fb)
 }
 
 pub fn encode_presented_png<W: Write>(

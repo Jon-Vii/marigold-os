@@ -5,9 +5,16 @@
 //! Golden images are pinned per-board (X4's 800x480 and X3's 792x528 each
 //! get their own files, see `golden_path`); pixel comparisons run on both.
 //!
+//! Frames compare by decoded pixels; a mismatch writes `<name>.actual.png`
+//! and `<name>.diff.png` under `target/golden-diff/` (see `src/golden.rs`).
+//!
 //! Regenerate after intentional typography changes with:
 //! `REGEN_READING_GOLDEN=1 cargo test --manifest-path tools/emulator/Cargo.toml --target <host> --test reading_golden`
-//! (repeat with `--features device-x3` to refresh the X3 frames too).
+//! (repeat with `--features device-x3` to refresh the X3 frames too). Only
+//! the value `1` regenerates.
+#[path = "../src/golden.rs"]
+mod golden;
+
 use std::path::{Path, PathBuf};
 
 use display::fb::Framebuffer;
@@ -219,27 +226,6 @@ fn portrait_fixture() -> FixtureBlocks {
     source
 }
 
-fn encode_png(fb: &Framebuffer) -> Vec<u8> {
-    // Same mapping as the emulator's render::encode_png so frames are
-    // directly comparable with the scenario goldens.
-    let mut bytes = Vec::new();
-    {
-        let mut encoder =
-            png::Encoder::new(&mut bytes, display::WIDTH as u32, display::HEIGHT as u32);
-        encoder.set_color(png::ColorType::Grayscale);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder.write_header().expect("png header");
-        let mut data = Vec::with_capacity(display::WIDTH * display::HEIGHT);
-        for y in 0..display::HEIGHT {
-            for x in 0..display::WIDTH {
-                data.push(if fb.native_pixel(x, y) { 0xEE } else { 0x18 });
-            }
-        }
-        writer.write_image_data(&data).expect("png data");
-    }
-    bytes
-}
-
 fn golden_path(name: &str) -> PathBuf {
     let suffix = if cfg!(feature = "device-x3") {
         "-x3"
@@ -251,29 +237,25 @@ fn golden_path(name: &str) -> PathBuf {
         .join(format!("{name}{suffix}.png"))
 }
 
+/// Compare `fb` with the named golden, or rewrite the golden when
+/// `REGEN_READING_GOLDEN=1`.
+fn assert_frame_matches_golden(fb: &Framebuffer, name: &str) {
+    let path = golden_path(name);
+    if golden::regen_requested("REGEN_READING_GOLDEN") {
+        golden::write_golden(&path, fb).expect("write golden");
+        return;
+    }
+    if let Err(err) = golden::check_frame(&path, fb) {
+        panic!("{err}\n(after an intentional change, rerun with REGEN_READING_GOLDEN=1)");
+    }
+}
+
 fn assert_page_matches_golden(source: &FixtureBlocks, page_index: usize, name: &str) {
     let page = page_record_at(source, page_index);
     assert!(page.block_count > 0, "page {page_index} should hold blocks");
     let mut fb = Framebuffer::new();
     draw_reading_page_body(&mut fb, source, page);
-    let actual = encode_png(&fb);
-    let path = golden_path(name);
-    if std::env::var("REGEN_READING_GOLDEN").is_ok() {
-        std::fs::write(&path, &actual).expect("write golden");
-        return;
-    }
-    let expected = std::fs::read(&path).unwrap_or_else(|err| {
-        panic!(
-            "missing golden {} ({err}); run with REGEN_READING_GOLDEN=1 to create",
-            path.display()
-        )
-    });
-    assert_eq!(
-        actual,
-        expected,
-        "reading page {page_index} diverged from {}",
-        path.display()
-    );
+    assert_frame_matches_golden(&fb, name);
 }
 
 #[test]
@@ -301,24 +283,7 @@ fn full_reading_surface_matches_golden() {
     draw_reading_page_body(&mut fb, &source, page);
     draw_reading_page_counter(&mut fb, "1/2");
 
-    let actual = encode_png(&fb);
-    let path = golden_path("reading-surface-0");
-    if std::env::var("REGEN_READING_GOLDEN").is_ok() {
-        std::fs::write(&path, &actual).expect("write golden");
-        return;
-    }
-    let expected = std::fs::read(&path).unwrap_or_else(|err| {
-        panic!(
-            "missing golden {} ({err}); run with REGEN_READING_GOLDEN=1 to create",
-            path.display()
-        )
-    });
-    assert_eq!(
-        actual,
-        expected,
-        "reading surface diverged from {}",
-        path.display()
-    );
+    assert_frame_matches_golden(&fb, "reading-surface-0");
 }
 
 /// The same blocks at the large size with relaxed leading: fewer lines fit
@@ -435,22 +400,5 @@ fn portrait_reading_surface_matches_golden() {
     draw_reading_page_body(&mut fb, &source, page);
     draw_reading_page_counter(&mut fb, "1/2");
 
-    let actual = encode_png(&fb);
-    let path = golden_path("reading-portrait-surface-0");
-    if std::env::var("REGEN_READING_GOLDEN").is_ok() {
-        std::fs::write(&path, &actual).expect("write golden");
-        return;
-    }
-    let expected = std::fs::read(&path).unwrap_or_else(|err| {
-        panic!(
-            "missing golden {} ({err}); run with REGEN_READING_GOLDEN=1 to create",
-            path.display()
-        )
-    });
-    assert_eq!(
-        actual,
-        expected,
-        "portrait reading surface diverged from {}",
-        path.display()
-    );
+    assert_frame_matches_golden(&fb, "reading-portrait-surface-0");
 }
