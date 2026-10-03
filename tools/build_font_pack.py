@@ -1,4 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "pillow==12.3.0",
+# ]
+# ///
 """Build or inspect a MarigoldOS custom typeface pack.
 
 The firmware cannot consume TTF/OTF files directly. This tool converts a small
@@ -173,7 +179,10 @@ def build_face(source: SourceFace, size_px: int, line_height: int, baseline: int
         from PIL import ImageFont
         from fontgen_common import kerning_entries, rasterize_glyph
     except ModuleNotFoundError as exc:
-        raise RuntimeError("Pillow is required. Use .venv-font/bin/python or install pillow.") from exc
+        raise RuntimeError(
+            "Pillow is required. Run `uv run --script tools/build_font_pack.py`, which "
+            "installs the pinned Pillow from the script header."
+        ) from exc
 
     font = ImageFont.truetype(str(source.path), size_px)
     metric_records = bytearray()

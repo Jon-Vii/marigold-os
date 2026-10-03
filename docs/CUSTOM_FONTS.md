@@ -15,7 +15,7 @@ installed, Settings stays unchanged.
 2. Build `CUSTOM.FNT` from a checkout of this repo:
 
    ```sh
-   python3 tools/build_font_pack.py build \
+   uv run --script tools/build_font_pack.py build \
      --regular path/to/Regular.ttf \
      --italic path/to/Italic.ttf \
      --bold path/to/Bold.ttf \
@@ -27,15 +27,16 @@ installed, Settings stays unchanged.
    For a regular-only font:
 
    ```sh
-   python3 tools/build_font_pack.py build \
+   uv run --script tools/build_font_pack.py build \
      --regular path/to/Regular.ttf \
      --name "My Typeface" \
      --out CUSTOM.FNT
    ```
 
-   The converter needs Pillow. If your system Python does not have it, install
-   it with `python3 -m pip install pillow`, or use the repo's font virtualenv if
-   one is present.
+   The converter runs through [uv](https://docs.astral.sh/uv/). The script
+   declares its own pinned Pillow, so `uv run --script` fetches it on first use;
+   no virtualenv or `pip install` is needed. On macOS and Linux you can also
+   run `tools/build_font_pack.py` directly.
 3. Copy the generated file to the SD card:
 
    ```text
@@ -66,7 +67,7 @@ This is useful for experiments, demos, or hardware batches that should ship with
 a specific custom typeface without relying on an SD card file.
 
 ```sh
-python3 tools/build_font_pack.py build \
+uv run --script tools/build_font_pack.py build \
   --regular path/to/Regular.ttf \
   --italic path/to/Italic.ttf \
   --bold path/to/Bold.ttf \
@@ -74,7 +75,7 @@ python3 tools/build_font_pack.py build \
   --name "My Typeface" \
   --out target/fonts/CUSTOM.FNT
 
-python3 tools/font_pack_to_rust.py \
+uv run --script tools/font_pack_to_rust.py \
   target/fonts/CUSTOM.FNT \
   --out display/src/custom_generated.rs
 

@@ -1,9 +1,74 @@
+"""Shared helpers for the font table generators.
+
+Imported by the generator scripts next to it; they carry the PEP 723
+dependency header (pinned Pillow), so this module has none of its own.
+"""
 from pathlib import Path
+from urllib.request import urlretrieve
+import argparse
+import hashlib
 import os
 import struct
+import sys
 
-from PIL import Image, ImageDraw
+import PIL
+from PIL import Image, ImageDraw, features
 
+
+ROOT = Path(__file__).resolve().parents[1]
+
+# The checked-in tables are reproducible byte-for-byte only with this exact
+# rasterizer. Other Pillow/FreeType builds shift hinting and rasterization and
+# churn every glyph. The generator headers pin the same Pillow version.
+PINNED_PILLOW = "12.3.0"
+PINNED_FREETYPE = "2.14.3"
+
+# Upstream font sources, pinned to the commits the checked-in tables were built
+# from and verified by SHA-256. Keyed by local file name under tools/fonts/.
+# googlefonts/literata "Built fonts 3.103".
+LITERATA_BASE = (
+    "https://raw.githubusercontent.com/googlefonts/literata/"
+    "0c2761b727a1b3a7cffd313c37f0f5163dfc7a63/fonts/ttf"
+)
+# google/fonts "Merriweather: Version 2.100 added".
+MERRIWEATHER_BASE = (
+    "https://raw.githubusercontent.com/google/fonts/"
+    "4fc3d16c59a4d5df700d37cbd9693e0d53f8d991/ofl/merriweather"
+)
+PINNED_FONTS = {
+    "Literata-Regular.ttf": (
+        f"{LITERATA_BASE}/Literata-Regular.ttf",
+        "0390890de9bb9d5862a6ba4125b82c61792ccc3d66b63e73eee75c1a16fcd208",
+    ),
+    "Literata-Italic.ttf": (
+        f"{LITERATA_BASE}/Literata-Italic.ttf",
+        "198f70cc9a17bab578553fa274b81984d58c440efe26bc06f1d841c194b6691a",
+    ),
+    "Literata-Bold.ttf": (
+        f"{LITERATA_BASE}/Literata-Bold.ttf",
+        "b6af95b3b443cdbce964aa06741596987f2f5c3ede46a2bc846e5addd99d061f",
+    ),
+    "Literata-BoldItalic.ttf": (
+        f"{LITERATA_BASE}/Literata-BoldItalic.ttf",
+        "1dade59381ad02f4679d7e993a7a406472e587ac332af7a6168d3ad9214a99dc",
+    ),
+    "Literata-SemiBold.ttf": (
+        f"{LITERATA_BASE}/Literata-SemiBold.ttf",
+        "ee8f9413ebc974e1c1cfc76f6bdb9d08ddaadc66eeddd7320a65f8c581284d6d",
+    ),
+    "Literata-SemiBoldItalic.ttf": (
+        f"{LITERATA_BASE}/Literata-SemiBoldItalic.ttf",
+        "bf22f3e03804210abc5ee62362eb80fdd20829f69ef73fe1213347022b26963d",
+    ),
+    "Merriweather.ttf": (
+        f"{MERRIWEATHER_BASE}/Merriweather%5Bopsz,wdth,wght%5D.ttf",
+        "d0ed0e359e396af7ad05e73dffd11a3a4c326ea0d0283c56bd9361cb2cc86a96",
+    ),
+    "Merriweather-Italic.ttf": (
+        f"{MERRIWEATHER_BASE}/Merriweather-Italic%5Bopsz,wdth,wght%5D.ttf",
+        "f68a8f4989258679e4fbaf50aa42400132b5373c2d9d2514ba82ef6e85947a0b",
+    ),
+}
 
 ADVANCE_SCALE = 16
 DEFAULT_THRESHOLD = 128
@@ -23,6 +88,100 @@ def text_render_threshold() -> int:
 
 
 THRESHOLD = text_render_threshold()
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def ensure_fonts(font_dir: Path, names) -> None:
+    """Download any missing pinned font into font_dir, then verify every one.
+
+    Cached copies are checked too, so a stale or corrupt file in the gitignored
+    tools/fonts/ directory fails loudly instead of silently changing glyphs.
+    """
+    font_dir.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        url, expected = PINNED_FONTS[name]
+        path = font_dir / name
+        if path.exists():
+            actual = file_sha256(path)
+            if actual != expected:
+                sys.exit(
+                    f"error: cached font {path} does not match the pinned upstream file\n"
+                    f"  expected sha256 {expected}\n"
+                    f"  actual   sha256 {actual}\n"
+                    f"It is stale or corrupt. Delete it to re-download it from\n  {url}"
+                )
+            continue
+        partial = path.with_name(path.name + ".part")
+        print(f"downloading {url}", file=sys.stderr)
+        urlretrieve(url, partial)
+        actual = file_sha256(partial)
+        if actual != expected:
+            partial.unlink()
+            sys.exit(
+                "error: downloaded font does not match the pinned hash\n"
+                f"  url             {url}\n"
+                f"  expected sha256 {expected}\n"
+                f"  actual   sha256 {actual}"
+            )
+        partial.replace(path)
+
+
+def check_rasterizer() -> None:
+    """Refuse to run under a Pillow/FreeType build other than the pinned one."""
+    freetype = features.version("freetype2")
+    if PIL.__version__ != PINNED_PILLOW or freetype != PINNED_FREETYPE:
+        sys.exit(
+            f"error: Pillow {PIL.__version__} / FreeType {freetype} is not the pinned "
+            f"Pillow {PINNED_PILLOW} / FreeType {PINNED_FREETYPE}.\n"
+            "Other builds drift hinting and rasterization and churn every glyph. Run the\n"
+            "generator through uv so its inline header installs the pinned Pillow:\n"
+            "  uv run --script tools/<generator>.py"
+        )
+
+
+def parse_generator_args(description: str, out: Path, *, reading_face: bool, argv=None):
+    """Parse a checked-in table generator's flags; refuse to overwrite without --force.
+
+    reading_face marks tables whose advances drive reader pagination, so an
+    intentional change also has to retire cached pagination on SD cards.
+    """
+    rel = out.relative_to(ROOT) if out.is_relative_to(ROOT) else out
+    parser = argparse.ArgumentParser(
+        description=description, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--force", action="store_true", help=f"overwrite the checked-in {rel}"
+    )
+    args = parser.parse_args(argv)
+    if out.exists() and not args.force:
+        steps = [
+            "refresh the emulator goldens in fixtures/golden (REGEN_READING_GOLDEN=1 for\n"
+            "    tools/emulator/tests/reading_golden.rs, on X4 and with --features device-x3,\n"
+            "    plus the fixtures/scenarios frames)",
+        ]
+        if reading_face:
+            steps.append(
+                "bump READER_LAYOUT_VERSION in ui/src/reading.rs so pagination cached\n"
+                "    under the old advances rebuilds"
+            )
+        sys.exit(
+            f"error: refusing to overwrite {rel}, a checked-in generated table.\n"
+            f"Regeneration is reproducible only with Pillow {PINNED_PILLOW} (bundled FreeType\n"
+            f"{PINNED_FREETYPE}), which `uv run --script` installs from this script's header;\n"
+            "any other build drifts hinting and rasterization and churns every glyph.\n"
+            "An intentional change must also:\n"
+            + "".join(f"  - {step}\n" for step in steps)
+            + "Re-run with --force to overwrite it."
+        )
+    check_rasterizer()
+    return args
 
 
 def advance_fp(font, text: str) -> int:
@@ -345,6 +504,12 @@ def kerning_entries(font_path: Path, cps, px: int):
                 entries.append((left, right, adjust_fp))
     entries = sorted(set(entries), key=lambda entry: (-abs(entry[2]), entry[0], entry[1]))
     return sorted(entries[:MAX_KERNING_ENTRIES])
+
+
+def write_generated(path: Path, out) -> None:
+    """Write a generated module ending in exactly one newline, as rustfmt leaves it."""
+    path.write_text("".join(out).rstrip("\n") + "\n")
+    print(f"wrote {path}")
 
 
 def write_kerning(out, name, entries, count_name=None):

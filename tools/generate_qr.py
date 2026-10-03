@@ -1,9 +1,16 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# dependencies = [
+#     "qrcode==8.2",
+# ]
+# ///
 """Bake the onboarding QR codes into ui/src/qr_generated.rs.
 
 The portal's QR contents are compile-time constants (an open hotspot
 join string and the portal URL), so the firmware never needs a QR
-encoder: run with `uv run --with qrcode tools/generate_qr.py`.
+encoder: run with `uv run --script tools/generate_qr.py` (or just
+`tools/generate_qr.py`), which installs the pinned qrcode.
 """
 
 from pathlib import Path

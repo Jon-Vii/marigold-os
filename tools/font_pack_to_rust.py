@@ -1,4 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# dependencies = []
+# ///
 """Convert an X4FT font pack into a compile-time Rust custom font module."""
 
 from __future__ import annotations
@@ -190,7 +194,8 @@ def emit_module(pack: dict[str, object]) -> str:
         out.append(f"    bitmap: &{face_name}_BITMAP,\n")
         out.append(f"    kerning: &{face_name}_KERNING,\n")
         out.append("};\n\n")
-    return "".join(out)
+    # End in exactly one newline, as rustfmt leaves it.
+    return "".join(out).rstrip("\n") + "\n"
 
 
 def main() -> None:
