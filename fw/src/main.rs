@@ -62,6 +62,25 @@ const fn descriptor_version(version: &str) -> [u8; 32] {
     field
 }
 
+/// What follows a panic, after esp-backtrace has printed the trace. A device
+/// in someone's hand must not sit halted with the CPU running and no
+/// watchdog until the battery is flat, so release builds give the trace two
+/// seconds to drain over USB and then reboot into the reader. Bench builds
+/// halt instead, keeping the evidence on the console.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+extern "Rust" fn custom_halt() -> ! {
+    #[cfg(feature = "bench-serial")]
+    loop {
+        core::hint::spin_loop();
+    }
+    #[cfg(not(feature = "bench-serial"))]
+    {
+        esp_hal::delay::Delay::new().delay_millis(2_000);
+        esp_hal::system::software_reset()
+    }
+}
+
 // The only allocator user is the Wi-Fi sync session; reader paths stay
 // allocation-free because no region exists until sync_mem donates the
 // loaned buffers.

@@ -47,8 +47,10 @@ esp-println       = { version = "0.17.0", features = ["esp32c3"] }
 esp-radio         = { version = "1.0.0-beta.0", features = ["esp32c3", "wifi", "unstable"] }
 esp-alloc         = "0.10.0"
 embassy-net       = { version = "0.9.1", features = ["proto-ipv4", "tcp", "udp", "dns", "dhcpv4", "medium-ethernet"] }
-# Prints registers + backtrace over USB on CPU exceptions, then halts in
-# place instead of silently resetting. Keep: crash evidence beats reboots.
-esp-backtrace     = { version = "0.19.0", features = ["esp32c3", "println", "panic-handler"] }
+# Prints registers + backtrace over USB on a panic. `custom-halt` lets
+# fw::main decide what follows: a reset after the trace has drained (a
+# halted reader sits awake until the battery dies), or a halt in bench
+# builds so the evidence stays on screen.
+esp-backtrace     = { version = "0.19.0", features = ["esp32c3", "println", "panic-handler", "custom-halt"] }
 esp-storage = { version = "0.9.0", features = ["esp32c3"] }
 embedded-storage = "0.3.1"
