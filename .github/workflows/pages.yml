@@ -88,6 +88,19 @@ jobs:
           )
           if count != 1:
               raise SystemExit("Expected exactly one firmware version label")
+          # Image sizes from the downloaded release; the page's device picker
+          # swaps between them. Pages from older tags lack the hook.
+          sizes = {
+              device: f'{(site / f"firmware-{device}.bin").stat().st_size / 1e6:.1f} MB'
+              for device in ("x4", "x3")
+          }
+          page, count = re.subn(
+              r'<b id="size">[^<]*</b>',
+              f'<b id="size" data-x4="{sizes["x4"]}" data-x3="{sizes["x3"]}">{sizes["x4"]}</b>',
+              page,
+          )
+          if count > 1:
+              raise SystemExit("Expected at most one firmware size label")
           index.write_text(page)
           for device in ("x4", "x3"):
               path = site / f"manifest-{device}.json"
