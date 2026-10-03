@@ -4,25 +4,86 @@ on:
   push:
     tags:
       - "v*"
+  # Rebuild and publish an existing tag, e.g. after fixing this workflow.
+  # The tag, not the dispatching branch, decides what gets built.
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to build and publish (e.g. v0.5.1)"
+        required: true
+        type: string
 
 permissions:
-  actions: write
-  contents: write
+  contents: read
 
 jobs:
-  release:
+  # Cheap checks first, so a tag without release notes or off main fails
+  # before the CI gate spends any time.
+  preflight:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      sha: ${{ steps.check.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Install Rust (stable, firmware target)
+      - id: check
+        name: Check tag, release notes, and main ancestry
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup target add riscv32imc-unknown-none-elf --toolchain stable
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          [[ "$TAG" =~ ^v[0-9][0-9A-Za-z.+-]*$ ]] || fail "'$TAG' is not a v* release tag"
+          sha=$(git rev-parse --verify --quiet "refs/tags/$TAG^{commit}") \
+            || fail "tag $TAG does not exist"
+          notes="docs/releases/$TAG.md"
+          git cat-file -e "$sha:$notes" 2>/dev/null \
+            || fail "$notes is missing from the tagged commit"
+          git merge-base --is-ancestor "$sha" origin/main \
+            || fail "tagged commit $sha is not on origin/main"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
-      - name: Install espflash
-        run: CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu cargo install espflash --locked
+  ci:
+    needs: preflight
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.preflight.outputs.sha }}
+
+  release:
+    needs: [preflight, ci]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
+    env:
+      TAG: ${{ needs.preflight.outputs.tag }}
+      # Stamped into the app descriptor by fw/build.rs and checked by
+      # tools/verify_release_images.py.
+      MARIGOLD_VERSION: ${{ needs.preflight.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
+
+      # No toolchain argument: rustup reads rust-toolchain.toml.
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup set profile minimal
+          rustup toolchain install
+          rustc --version
+
+      # Same espflash as the maintainer's local tools/build-release.sh, so CI
+      # and local images are packaged identically. The repo's cargo config
+      # defaults to the firmware target, hence the explicit host target.
+      - name: Install espflash 4.4.0
+        run: |
+          CARGO_BUILD_TARGET="$(rustc -vV | sed -n 's/^host: //p')" \
+            cargo install espflash@4.4.0 --locked
+          espflash --version
 
       - name: Build X4 release images
         run: tools/build-release.sh x4
@@ -38,7 +99,7 @@ jobs:
 
       - name: Verify release images and write checksums
         run: |
-          python3 tools/verify_release_images.py target/public-release
+          python3 tools/verify_release_images.py --expect-version "$TAG" target/public-release
           cd target/public-release
           sha256sum firmware-x4.bin firmware-x3.bin > SHA256SUMS
 
@@ -46,15 +107,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
+          gh release create "$TAG" \
             target/public-release/firmware-x4.bin \
             target/public-release/firmware-x3.bin \
             target/public-release/SHA256SUMS \
             --verify-tag --latest \
-            --title "${GITHUB_REF_NAME}" \
-            --notes-file "docs/releases/${GITHUB_REF_NAME}.md"
+            --title "$TAG" \
+            --notes-file "docs/releases/$TAG.md"
 
       - name: Publish release firmware to Pages
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run pages.yml --ref main -f release_tag="${GITHUB_REF_NAME}"
+        run: gh workflow run pages.yml --ref main -f release_tag="$TAG"
