@@ -172,7 +172,8 @@ pub async fn run() {
                             pending_storage = Some(command);
                         } else if matches!(
                             command,
-                            StorageCommand::LoadChapters { .. } | StorageCommand::ExtendSection { .. }
+                            StorageCommand::LoadChapters { .. }
+                                | StorageCommand::ExtendSection { .. }
                         ) {
                             awaiting_reader_data = true;
                         }
@@ -379,9 +380,9 @@ fn first_render_kind(boot_render_pending: &mut bool) -> RenderKind {
 }
 
 fn library_event_is_current(event: &crate::LibraryEvent) -> bool {
-    event.reader_request_id().map_or(true, |request_id| {
-        request_id == LATEST_READER_REQUEST_ID.load(Ordering::Relaxed)
-    })
+    event
+        .reader_request_id()
+        .is_none_or(|request_id| request_id == LATEST_READER_REQUEST_ID.load(Ordering::Relaxed))
 }
 
 fn resolve_open_position(

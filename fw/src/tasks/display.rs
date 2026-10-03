@@ -1063,19 +1063,18 @@ fn handle_storage_command(
             if pending_progress
                 .map(|pending| pending.book_id != record.book_id)
                 .unwrap_or(false)
-            {
-                if !flush_pending_progress(
+                && !flush_pending_progress(
                     epd,
                     sd_cs,
                     sd_library,
                     pending_progress,
                     last_progress_write,
-                ) {
-                    esp_println::println!(
-                        "storage: progress context switch deferred after write failure"
-                    );
-                    return;
-                }
+                )
+            {
+                esp_println::println!(
+                    "storage: progress context switch deferred after write failure"
+                );
+                return;
             }
             if context_changed || due {
                 let progress_start = Instant::now();

@@ -1343,7 +1343,7 @@ fn font_weight_label(weight: display::font::FontWeight) -> &'static str {
     }
 }
 
-fn font_family_label<'a>(family: display::font::FontFamily, custom_name: &'a str) -> &'a str {
+fn font_family_label(family: display::font::FontFamily, custom_name: &str) -> &str {
     match family {
         display::font::FontFamily::Literata => "literata",
         display::font::FontFamily::Merriweather => "merriweather",

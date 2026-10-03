@@ -152,13 +152,10 @@ impl BookStore {
 
     pub fn page(&self, index: u32) -> PageRecord {
         let clamped = (index as usize).min(self.pages.len().saturating_sub(1));
-        self.pages
-            .get(clamped)
-            .copied()
-            .unwrap_or(PageRecord {
-                first_block: 0,
-                block_count: 0,
-            })
+        self.pages.get(clamped).copied().unwrap_or(PageRecord {
+            first_block: 0,
+            block_count: 0,
+        })
     }
 
     pub fn chapter_for_page(&self, page: u32) -> u16 {
@@ -176,7 +173,12 @@ impl BookStore {
     /// Page-within-chapter position for the reader footer: (current, total).
     pub fn chapter_page_position(&self, page: u32) -> (u32, u32) {
         let chapter = self.chapter_for_page(page) as usize;
-        let start = u32::from(self.chapters.get(chapter).map(|c| c.start_page).unwrap_or(0));
+        let start = u32::from(
+            self.chapters
+                .get(chapter)
+                .map(|c| c.start_page)
+                .unwrap_or(0),
+        );
         let end = self
             .chapters
             .get(chapter + 1)

@@ -852,13 +852,11 @@ impl ReaderState {
                         next.page = self.sd_page_count.saturating_sub(1);
                     }
                     next.chapter = next.sd_chapter_for_page(next.page);
-                    next.selection = next.chapter as u16;
+                    next.selection = next.chapter;
                 } else {
-                    next.chapter = wrap_next(
-                        self.chapter as u16,
-                        (ctx.builtin_chapter_count as u16).max(1),
-                    );
-                    next.selection = next.chapter as u16;
+                    next.chapter =
+                        wrap_next(self.chapter, (ctx.builtin_chapter_count as u16).max(1));
+                    next.selection = next.chapter;
                     next.page = 0;
                 }
             }
@@ -869,13 +867,11 @@ impl ReaderState {
                         next.page = self.page - 1;
                     }
                     next.chapter = next.sd_chapter_for_page(next.page);
-                    next.selection = next.chapter as u16;
+                    next.selection = next.chapter;
                 } else {
-                    next.chapter = wrap_prev(
-                        self.chapter as u16,
-                        (ctx.builtin_chapter_count as u16).max(1),
-                    );
-                    next.selection = next.chapter as u16;
+                    next.chapter =
+                        wrap_prev(self.chapter, (ctx.builtin_chapter_count as u16).max(1));
+                    next.selection = next.chapter;
                     next.page = 0;
                 }
             }
@@ -885,7 +881,7 @@ impl ReaderState {
                 // `chapter` already tracks the reading position (kept current
                 // by the firmware's Loaded event, un-capped); opening the list
                 // lands the cursor there rather than on the saturated guess.
-                next.selection = self.chapter as u16;
+                next.selection = self.chapter;
             }
             (AppView::Reading, Some(Button::Back)) => {
                 next.pending_page = None;
@@ -893,10 +889,10 @@ impl ReaderState {
                 next.selection = 0;
             }
             (AppView::Chapters, Some(Button::Next | Button::PageNext)) => {
-                next.selection = wrap_next(self.selection, self.chapter_item_count(ctx) as u16);
+                next.selection = wrap_next(self.selection, self.chapter_item_count(ctx));
             }
             (AppView::Chapters, Some(Button::Previous | Button::PagePrevious)) => {
-                next.selection = wrap_prev(self.selection, self.chapter_item_count(ctx) as u16);
+                next.selection = wrap_prev(self.selection, self.chapter_item_count(ctx));
             }
             (AppView::Chapters, Some(Button::Confirm)) => {
                 next.chapter = self.selection;
@@ -1096,7 +1092,7 @@ impl ReaderState {
                     let last_page = self.sd_page_count.saturating_sub(1);
                     if self.view == AppView::Reading {
                         let resolved = page.filter(|resolved| {
-                            self.pending_page.map_or(true, |pending| {
+                            self.pending_page.is_none_or(|pending| {
                                 *resolved == pending
                                     || (complete && *resolved == pending.min(last_page))
                             })
@@ -1196,7 +1192,7 @@ impl ReaderState {
                 }
                 if self.read_request_pending {
                     self.view = AppView::Reading;
-                    self.selection = chapter as u16;
+                    self.selection = chapter;
                 } else if self.view == AppView::Library {
                     let restored_index =
                         ReaderSource::from_book_id(book_id).sd_index().unwrap_or(0);
@@ -1204,7 +1200,7 @@ impl ReaderState {
                 } else if self.view == AppView::Chapters {
                     // Home/Settings keep their own key selection; only the
                     // chapter list tracks the restored chapter cursor.
-                    self.selection = chapter as u16;
+                    self.selection = chapter;
                 }
                 self.read_request_pending = false;
                 if let Some(orientation) = display_orientation_from_u8(reading_orientation) {
@@ -1321,7 +1317,7 @@ impl ReaderState {
     pub fn persisted(self) -> PersistedAppState {
         PersistedAppState {
             book_id: self.book_id,
-            chapter: self.chapter as u16,
+            chapter: self.chapter,
             screen: self.page,
             shell_orientation: DisplayOrientation::PortraitButtonsLeft as u8,
             reading_orientation: self.orientation as u8,
@@ -1450,7 +1446,7 @@ fn apply_home_action(mut state: ReaderState, action: HomeAction) -> ReaderState 
             if ReaderSource::from_book_id(state.book_id).is_sd() {
                 state.view = AppView::Reading;
                 state.sd_complete = false;
-                state.selection = state.chapter as u16;
+                state.selection = state.chapter;
             } else if state.library_count > 0 {
                 state.view = AppView::Library;
             } else {

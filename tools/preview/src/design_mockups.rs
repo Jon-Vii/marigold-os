@@ -41,32 +41,100 @@ pub fn write_design_mockups(out: &Path) -> std::io::Result<()> {
         ("imprint-4-overlay", "In-book overlay", imprint_overlay),
         ("imprintdm-1-home", "Home", imprintdm_home),
         ("imprintdm-2-library", "Library", imprintdm_library),
-        ("imprintdm-3-reading", "Reading (full bleed)", imprintdm_reading),
-        ("imprintdm-4-overlay", "In-book overlay (summoned margin)", imprintdm_overlay),
+        (
+            "imprintdm-3-reading",
+            "Reading (full bleed)",
+            imprintdm_reading,
+        ),
+        (
+            "imprintdm-4-overlay",
+            "In-book overlay (summoned margin)",
+            imprintdm_overlay,
+        ),
         ("imprintdm-5-settings", "Settings", imprintdm_settings),
         ("imprintdm-6-sync", "Sync", imprintdm_sync),
-        ("imprintdm-7-sleep", "Sleep (persists on panel)", imprintdm_sleep),
+        (
+            "imprintdm-7-sleep",
+            "Sleep (persists on panel)",
+            imprintdm_sleep,
+        ),
         ("imprintdm-8-boot", "Boot", imprintdm_boot),
-        ("marginalia-1-thumb-tabs", "Thumb tabs", marginalia_thumb_tabs),
-        ("marginalia-2-registration", "Registration rule", marginalia_registration),
+        (
+            "marginalia-1-thumb-tabs",
+            "Thumb tabs",
+            marginalia_thumb_tabs,
+        ),
+        (
+            "marginalia-2-registration",
+            "Registration rule",
+            marginalia_registration,
+        ),
         ("marginalia-3-brackets", "Brackets", marginalia_brackets),
-        ("marginalia-4-ruled-column", "Ruled column", marginalia_ruled_column),
+        (
+            "marginalia-4-ruled-column",
+            "Ruled column",
+            marginalia_ruled_column,
+        ),
         ("marginalia-5-pilcrows", "Pilcrows", marginalia_pilcrows),
-        ("bracket-1-refined-drawn", "Drawn bracket, small caps", bracket_refined_drawn),
-        ("bracket-2-typeset-caps", "Typeset bracket, small caps", bracket_typeset_caps),
-        ("bracket-3-typeset-italic", "Typeset bracket, body italic", bracket_typeset_italic),
+        (
+            "bracket-1-refined-drawn",
+            "Drawn bracket, small caps",
+            bracket_refined_drawn,
+        ),
+        (
+            "bracket-2-typeset-caps",
+            "Typeset bracket, small caps",
+            bracket_typeset_caps,
+        ),
+        (
+            "bracket-3-typeset-italic",
+            "Typeset bracket, body italic",
+            bracket_typeset_italic,
+        ),
         ("bracket-4-emdash", "Em-dash, body italic", bracket_emdash),
         ("bracket-5-numerals", "Roman numerals", bracket_numerals),
-        ("altstudy-1-library-italic", "Library, em-dash + body italic", altstudy_library_italic),
-        ("altstudy-2-home-centered", "Home, centered title page", altstudy_home_centered),
+        (
+            "altstudy-1-library-italic",
+            "Library, em-dash + body italic",
+            altstudy_library_italic,
+        ),
+        (
+            "altstudy-2-home-centered",
+            "Home, centered title page",
+            altstudy_home_centered,
+        ),
         ("iter-1-baseline", "As flashed (baseline)", iter_baseline),
-        ("iter-2-caps-label", "Caps label, roman + pages", iter_caps_label),
+        (
+            "iter-2-caps-label",
+            "Caps label, roman + pages",
+            iter_caps_label,
+        ),
         ("iter-3-no-label", "No label, progress rule", iter_no_label),
-        ("iter-4-pages-only", "Italic label, pages only", iter_pages_only),
-        ("iter-5-author-caps", "Author in caps, progress rule", iter_author_caps),
-        ("iter-6-measure", "The measure: 142 ——— 380 (broken metaphor)", iter_measure),
-        ("iter-7-measure-fixed", "The measure, corrected: you-are-here", iter_measure_fixed),
-        ("iter-8-chapter-name", "Chosen: author caps + chapter name", iter_chapter_name),
+        (
+            "iter-4-pages-only",
+            "Italic label, pages only",
+            iter_pages_only,
+        ),
+        (
+            "iter-5-author-caps",
+            "Author in caps, progress rule",
+            iter_author_caps,
+        ),
+        (
+            "iter-6-measure",
+            "The measure: 142 ——— 380 (broken metaphor)",
+            iter_measure,
+        ),
+        (
+            "iter-7-measure-fixed",
+            "The measure, corrected: you-are-here",
+            iter_measure_fixed,
+        ),
+        (
+            "iter-8-chapter-name",
+            "Chosen: author caps + chapter name",
+            iter_chapter_name,
+        ),
     ];
     for (name, _, draw) in screens {
         let mut fb = Framebuffer::new();
@@ -76,7 +144,11 @@ pub fn write_design_mockups(out: &Path) -> std::io::Result<()> {
         crate::write_png(&dir.join(format!("{name}.png")), &fb)?;
     }
     write_gallery_html(&dir, screens)?;
-    println!("Wrote {} design mockups to {}", screens.len(), dir.display());
+    println!(
+        "Wrote {} design mockups to {}",
+        screens.len(),
+        dir.display()
+    );
     Ok(())
 }
 
@@ -221,7 +293,15 @@ fn ls_width(font: &BitmapFont, s: &str, extra: i16) -> i16 {
 }
 
 /// Letterspaced all-caps text, the small-caps stand-in for this bitmap setup.
-fn ls_caps(fb: &mut Framebuffer, font: &BitmapFont, s: &str, x: i16, y: i16, extra: i16, white: bool) -> i16 {
+fn ls_caps(
+    fb: &mut Framebuffer,
+    font: &BitmapFont,
+    s: &str,
+    x: i16,
+    y: i16,
+    extra: i16,
+    white: bool,
+) -> i16 {
     let upper = s.to_uppercase();
     let mut cx = x;
     for ch in upper.chars() {
@@ -376,7 +456,14 @@ fn big_ascii(fb: &mut Framebuffer, s: &str, x: i16, y: i16, scale: i16, white: b
         for (col, bits) in glyph.iter().enumerate() {
             for row in 0..7i16 {
                 if bits & (1 << (6 - row)) != 0 {
-                    rfill(fb, cx + col as i16 * scale, y + row * scale, scale, scale, white);
+                    rfill(
+                        fb,
+                        cx + col as i16 * scale,
+                        y + row * scale,
+                        scale,
+                        scale,
+                        white,
+                    );
                 }
             }
         }
@@ -395,7 +482,16 @@ fn big_ascii_center(fb: &mut Framebuffer, s: &str, cx: i16, y: i16, scale: i16, 
 
 // ------------------------------------------------------------- mock covers
 
-fn cover(fb: &mut Framebuffer, x: i16, y: i16, w: i16, h: i16, title_text: &str, author: &str, kind: u8) {
+fn cover(
+    fb: &mut Framebuffer,
+    x: i16,
+    y: i16,
+    w: i16,
+    h: i16,
+    title_text: &str,
+    author: &str,
+    kind: u8,
+) {
     rfill(fb, x, y, w, h, WHITE);
     stroke(fb, x, y, w, h, BLACK);
     if w >= 110 {
@@ -424,7 +520,14 @@ fn cover(fb: &mut Framebuffer, x: i16, y: i16, w: i16, h: i16, title_text: &str,
         2 => {
             dither(fb, x + 12, band_y, w - 24, band_h, 2);
             let sq = 26.min(band_h - 4);
-            rfill(fb, x + (w - sq) / 2, band_y + (band_h - sq) / 2, sq, sq, BLACK);
+            rfill(
+                fb,
+                x + (w - sq) / 2,
+                band_y + (band_h - sq) / 2,
+                sq,
+                sq,
+                BLACK,
+            );
         }
         3 => {
             for i in 0..3i16 {
@@ -749,7 +852,13 @@ fn folio_home(fb: &mut Framebuffer) {
         }
     }
 
-    center(fb, small(), "\u{00B7} 82% \u{00B7} 14:32 \u{00B7}", 400, 458);
+    center(
+        fb,
+        small(),
+        "\u{00B7} 82% \u{00B7} 14:32 \u{00B7}",
+        400,
+        458,
+    );
 }
 
 fn folio_library(fb: &mut Framebuffer) {
@@ -911,7 +1020,9 @@ fn cockpit_library(fb: &mut Framebuffer) {
     big_ascii(fb, "SIZE", 700, 56, 2, BLACK);
     hline(fb, 16, 78, 768);
 
-    let sizes = ["0.2M", "0.5M", "0.8M", "0.1M", "1.4M", "0.6M", "0.4M", "0.3M"];
+    let sizes = [
+        "0.2M", "0.5M", "0.8M", "0.1M", "1.4M", "0.6M", "0.4M", "0.3M",
+    ];
     for (i, (t, a, p)) in LIBRARY.iter().enumerate() {
         let y = 94 + i as i16 * 38;
         let selected = i == 1;
@@ -1022,7 +1133,13 @@ fn imprint_home(fb: &mut Framebuffer) {
         }
     }
 
-    center(fb, small(), "\u{00B7} 82% \u{00B7} 14:32 \u{00B7}", 400, 458);
+    center(
+        fb,
+        small(),
+        "\u{00B7} 82% \u{00B7} 14:32 \u{00B7}",
+        400,
+        458,
+    );
 }
 
 fn imprint_library(fb: &mut Framebuffer) {
@@ -1126,7 +1243,6 @@ fn dash_key(fb: &mut Framebuffer, slot: usize, lines: &[&str], primary: bool) {
         _ => {}
     }
 }
-
 
 /// Home, re-set on the rail's grid: everything left-aligned to the
 /// same column, apparatus bottom-right like every working screen.
@@ -1285,7 +1401,13 @@ fn imprintdm_sync(fb: &mut Framebuffer) {
     hline(fb, cx - 160, 56, 320);
 
     index_row(fb, "Network", "HOME-NET", 118, false);
-    index_row(fb, "Last sync", "9 June \u{00B7} 14 books received", 182, false);
+    index_row(
+        fb,
+        "Last sync",
+        "9 June \u{00B7} 14 books received",
+        182,
+        false,
+    );
     index_row(fb, "On device", "41 books \u{00B7} 28.4 MB", 246, false);
 
     text(
@@ -1318,7 +1440,13 @@ fn imprintdm_boot(fb: &mut Framebuffer) {
     rfill(fb, 240, 232, 320, 2, BLACK);
     hline(fb, 240, 238, 320);
     center(fb, small_italic(), "opening the library\u{2026}", 400, 292);
-    center(fb, small(), "edition 0.4 \u{00B7} set in Literata", 400, 456);
+    center(
+        fb,
+        small(),
+        "edition 0.4 \u{00B7} set in Literata",
+        400,
+        456,
+    );
 }
 
 // =====================================================================
@@ -1352,9 +1480,20 @@ fn marginalia_thumb_tabs(fb: &mut Framebuffer) {
         rfill(fb, 0, y - tab_h / 2, tab_w, tab_h, BLACK);
         for step in 0..5i16 {
             rfill(fb, tab_w - 5 + step, y - tab_h / 2, 1, 5 - step, WHITE);
-            rfill(fb, tab_w - 5 + step, y + tab_h / 2 - (5 - step), 1, 5 - step, WHITE);
+            rfill(
+                fb,
+                tab_w - 5 + step,
+                y + tab_h / 2 - (5 - step),
+                1,
+                5 - step,
+                WHITE,
+            );
         }
-        let font = if slot == HOME_PRIMARY { small_bold() } else { small() };
+        let font = if slot == HOME_PRIMARY {
+            small_bold()
+        } else {
+            small()
+        };
         ls_caps(fb, font, label, 14, y + 6, 1, WHITE);
     }
 }
@@ -1367,7 +1506,11 @@ fn marginalia_registration(fb: &mut Framebuffer) {
     for (slot, label) in HOME_KEYS.iter().enumerate() {
         let y = KEY_YS[slot];
         rfill(fb, 8, y - 1, 13, 2, BLACK);
-        let font = if slot == HOME_PRIMARY { small_bold() } else { small() };
+        let font = if slot == HOME_PRIMARY {
+            small_bold()
+        } else {
+            small()
+        };
         ls_caps(fb, font, label, 34, y + 6, 2, BLACK);
     }
 }
@@ -1381,7 +1524,11 @@ fn marginalia_brackets(fb: &mut Framebuffer) {
         vline(fb, 16, y - 14, 28);
         hline(fb, 16, y - 14, 7);
         hline(fb, 16, y + 13, 7);
-        let font = if slot == HOME_PRIMARY { small() } else { small_italic() };
+        let font = if slot == HOME_PRIMARY {
+            small()
+        } else {
+            small_italic()
+        };
         text(fb, font, label, 30, y + 6);
     }
 }
@@ -1394,7 +1541,11 @@ fn marginalia_ruled_column(fb: &mut Framebuffer) {
     for (slot, label) in HOME_KEYS.iter().enumerate() {
         let y = KEY_YS[slot];
         rfill(fb, 145, y - 1, 11, 2, BLACK);
-        let font = if slot == HOME_PRIMARY { small() } else { small_italic() };
+        let font = if slot == HOME_PRIMARY {
+            small()
+        } else {
+            small_italic()
+        };
         let lx = 136 - measure_text(font, label) as i16;
         text(fb, font, label, lx, y + 6);
     }
@@ -1407,7 +1558,11 @@ fn marginalia_pilcrows(fb: &mut Framebuffer) {
     for (slot, label) in HOME_KEYS.iter().enumerate() {
         let y = KEY_YS[slot];
         text(fb, small(), "\u{00B6}", 12, y + 6);
-        let font = if slot == HOME_PRIMARY { small_bold() } else { small() };
+        let font = if slot == HOME_PRIMARY {
+            small_bold()
+        } else {
+            small()
+        };
         ls_caps(fb, font, label, 34, y + 6, 1, BLACK);
     }
 }
@@ -1428,7 +1583,11 @@ fn bracket_refined_drawn(fb: &mut Framebuffer) {
         rfill(fb, 14, y - 18, 2, 36, BLACK);
         hline(fb, 16, y - 18, 9);
         hline(fb, 16, y + 17, 9);
-        let font = if slot == HOME_PRIMARY { small_bold() } else { small() };
+        let font = if slot == HOME_PRIMARY {
+            small_bold()
+        } else {
+            small()
+        };
         ls_caps(fb, font, label, 32, y + 6, 2, BLACK);
     }
 }
@@ -1440,7 +1599,11 @@ fn bracket_typeset_caps(fb: &mut Framebuffer) {
     for (slot, label) in HOME_KEYS.iter().enumerate() {
         let y = KEY_YS[slot];
         text(fb, title(), "[", 12, y + 11);
-        let font = if slot == HOME_PRIMARY { small_bold() } else { small() };
+        let font = if slot == HOME_PRIMARY {
+            small_bold()
+        } else {
+            small()
+        };
         ls_caps(fb, font, label, 32, y + 6, 2, BLACK);
     }
 }
@@ -1452,7 +1615,11 @@ fn bracket_typeset_italic(fb: &mut Framebuffer) {
     for (slot, label) in HOME_KEYS.iter().enumerate() {
         let y = KEY_YS[slot];
         text(fb, title(), "[", 12, y + 11);
-        let font = if slot == HOME_PRIMARY { body() } else { body_italic() };
+        let font = if slot == HOME_PRIMARY {
+            body()
+        } else {
+            body_italic()
+        };
         text(fb, font, label, 32, y + 8);
     }
 }
@@ -1464,7 +1631,11 @@ fn bracket_emdash(fb: &mut Framebuffer) {
     for (slot, label) in HOME_KEYS.iter().enumerate() {
         let y = KEY_YS[slot];
         text(fb, body(), "\u{2014}", 10, y + 8);
-        let font = if slot == HOME_PRIMARY { body() } else { body_italic() };
+        let font = if slot == HOME_PRIMARY {
+            body()
+        } else {
+            body_italic()
+        };
         text(fb, font, label, 44, y + 8);
     }
 }
@@ -1477,7 +1648,11 @@ fn bracket_numerals(fb: &mut Framebuffer) {
     for (slot, label) in HOME_KEYS.iter().enumerate() {
         let y = KEY_YS[slot];
         right(fb, body(), numerals[slot], 38, y + 8);
-        let font = if slot == HOME_PRIMARY { body() } else { body_italic() };
+        let font = if slot == HOME_PRIMARY {
+            body()
+        } else {
+            body_italic()
+        };
         text(fb, font, label, 50, y + 8);
     }
 }
@@ -1730,7 +1905,10 @@ fn write_gallery_html(
         ),
     ];
     for (prefix, heading, blurb) in sections {
-        writeln!(file, "<h2>{heading}</h2><p class=blurb>{blurb}</p><div class=row>")?;
+        writeln!(
+            file,
+            "<h2>{heading}</h2><p class=blurb>{blurb}</p><div class=row>"
+        )?;
         for (name, label, _) in screens.iter().filter(|(n, _, _)| n.starts_with(prefix)) {
             writeln!(
                 file,

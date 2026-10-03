@@ -157,7 +157,11 @@ fn scenario_paths(path: Option<&Path>) -> Result<Vec<PathBuf>, String> {
 }
 
 fn output_path(base: &Path, scenario: &Path) -> Result<PathBuf, String> {
-    let suffix = if cfg!(feature = "device-x3") { "-x3" } else { "" };
+    let suffix = if cfg!(feature = "device-x3") {
+        "-x3"
+    } else {
+        ""
+    };
     if base.extension().is_some_and(|ext| ext == "png") {
         return Ok(base.to_owned());
     }
@@ -297,9 +301,8 @@ impl Emulator {
         }
         if let LibraryEvent::FirmwareFiles { count } = event {
             self.firmware_entries.clear();
-            self.firmware_entries.extend(
-                (0..count).map(|index| format!("firmware-{}.bin", index + 1)),
-            );
+            self.firmware_entries
+                .extend((0..count).map(|index| format!("firmware-{}.bin", index + 1)));
         }
         self.state = self.state.apply_library_event(self.ctx, event);
         self.render(app_core::RenderKind::Page);

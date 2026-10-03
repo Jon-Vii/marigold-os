@@ -59,7 +59,9 @@ async fn enter_sleep(rtc: &mut Rtc<'_>) {
                 #[cfg(feature = "bench-serial")]
                 {
                     use esp_hal::gpio::RtcPinWithResistors;
-                    use esp_hal::rtc_cntl::sleep::{RtcioWakeupSource, TimerWakeupSource, WakeupLevel};
+                    use esp_hal::rtc_cntl::sleep::{
+                        RtcioWakeupSource, TimerWakeupSource, WakeupLevel,
+                    };
                     let mut pins: [(&mut dyn RtcPinWithResistors, WakeupLevel); 1] =
                         [(&mut button, WakeupLevel::Low)];
                     let gpio = RtcioWakeupSource::new(&mut pins);

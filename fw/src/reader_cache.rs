@@ -237,6 +237,7 @@ pub(crate) fn build_or_load_book_cache(
 }
 
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_or_load_book_cache_from_root<
     D,
     T,
@@ -618,6 +619,7 @@ pub(crate) fn restore_book_page_count(
 }
 
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 fn try_load_v2_book_cache<
     D,
     T,

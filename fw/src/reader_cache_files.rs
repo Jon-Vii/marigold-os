@@ -667,7 +667,9 @@ where
                 if record.page_count == 0
                     || usize::from(record.section) >= 2 * MAX_BOOK_SECTIONS
                     || record.start_page != expected_start
-                    || record.start_page.checked_add(u32::from(record.page_count))
+                    || record
+                        .start_page
+                        .checked_add(u32::from(record.page_count))
                         .is_none_or(|end| end > header.total_pages)
                     || header.next_spine.is_some_and(|next| record.spine >= next)
                     || (index + 1 == usize::from(header.section_count)

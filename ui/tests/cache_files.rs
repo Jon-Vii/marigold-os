@@ -763,31 +763,63 @@ fn advisory_generation_titles_validate_source_without_reading_commit_footer() {
     use embedded_sdmmc::Mode;
     use proto::cache::{CACHE_ROOT_DIR, CACHE_V2_DIR};
     let disk = fat::Disk::new();
-    let manager: VolumeManager<_,_,8,8,1> = VolumeManager::new_with_limits(&disk,fat::Clock,0);
+    let manager: VolumeManager<_, _, 8, 8, 1> =
+        VolumeManager::new_with_limits(&disk, fat::Clock, 0);
     let volume = manager.open_volume(VolumeIdx(0)).unwrap();
     let root = volume.open_root_dir().unwrap();
     let mut store = ReaderStore::new();
-    let section = BookV2SectionRecord {section:0,spine:0,start_page:0,page_count:1,partial:false};
+    let section = BookV2SectionRecord {
+        section: 0,
+        spine: 0,
+        start_page: 0,
+        page_count: 1,
+        partial: false,
+    };
     store.set_book_labels("First source", "Author");
-    assert!(reader_cache_files::write_v2_book_index(&root,KEY,ID,1,&[section],&store,false));
-    let second_id = (ID.0+1, ID.1+1);
+    assert!(reader_cache_files::write_v2_book_index(
+        &root,
+        KEY,
+        ID,
+        1,
+        &[section],
+        &store,
+        false
+    ));
+    let second_id = (ID.0 + 1, ID.1 + 1);
     store.set_book_labels("Second source", "Author");
-    assert!(reader_cache_files::write_v2_book_index(&root,KEY,second_id,1,&[section],&store,false));
+    assert!(reader_cache_files::write_v2_book_index(
+        &root,
+        KEY,
+        second_id,
+        1,
+        &[section],
+        &store,
+        false
+    ));
     let mut title = heapless::String::<64>::new();
-    assert!(reader_cache_files::read_cached_book_title(&root,KEY,ID,&mut title));
-    assert_eq!(title.as_str(),"First source");
+    assert!(reader_cache_files::read_cached_book_title(
+        &root, KEY, ID, &mut title
+    ));
+    assert_eq!(title.as_str(), "First source");
     // A readable source-matching label is useful even when its pagination
     // commit record is damaged; ordinary index loading still rejects it.
     {
-        let xteink=root.open_dir(CACHE_ROOT_DIR).unwrap();
-        let cache=xteink.open_dir(CACHE_V2_DIR).unwrap();
-        let book=cache.open_dir(KEY).unwrap();
-        let file=book.open_file_in_dir("BOOKB.BIN",Mode::ReadWriteAppend).unwrap();
-        file.seek_from_start(file.length()-16).unwrap();
-        file.write(&[0;4]).unwrap();
+        let xteink = root.open_dir(CACHE_ROOT_DIR).unwrap();
+        let cache = xteink.open_dir(CACHE_V2_DIR).unwrap();
+        let book = cache.open_dir(KEY).unwrap();
+        let file = book
+            .open_file_in_dir("BOOKB.BIN", Mode::ReadWriteAppend)
+            .unwrap();
+        file.seek_from_start(file.length() - 16).unwrap();
+        file.write(&[0; 4]).unwrap();
         file.close().unwrap();
     }
-    assert!(reader_cache_files::read_cached_book_title(&root,KEY,second_id,&mut title));
-    assert_eq!(title.as_str(),"Second source");
-    assert_ne!(reader_cache_files::load_v2_book_index(&root,KEY,second_id,&mut store),BookIndexLoadResult::Hit);
+    assert!(reader_cache_files::read_cached_book_title(
+        &root, KEY, second_id, &mut title
+    ));
+    assert_eq!(title.as_str(), "Second source");
+    assert_ne!(
+        reader_cache_files::load_v2_book_index(&root, KEY, second_id, &mut store),
+        BookIndexLoadResult::Hit
+    );
 }

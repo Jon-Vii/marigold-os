@@ -15,7 +15,9 @@ use display::epd::RefreshMode;
 use display::fb::Framebuffer;
 use display::font::TypeSettings;
 use display::{HEIGHT, WIDTH};
-use ui::app_render::{render_request as render_shared, render_sleep as render_shared_sleep, UiRenderModel};
+use ui::app_render::{
+    render_request as render_shared, render_sleep as render_shared_sleep, UiRenderModel,
+};
 use ui::reading::ReadingBlocks;
 use ui::{UiBook, UiLibraryStatus, UiTocItem};
 
@@ -144,11 +146,16 @@ impl WebEmulator {
                 // The real session joins the network and then serves the book
                 // upload page until the user finishes; there is no separate
                 // progress-exchange step to pretend at.
-                self.ops.push((now + 500.0, Op::Sync(SyncEvent::Connecting)));
                 self.ops
-                    .push((now + 1600.0, Op::Sync(SyncEvent::Connected([192, 168, 1, 27]))));
-                self.ops
-                    .push((now + 2600.0, Op::Sync(SyncEvent::Serving([192, 168, 1, 27]))));
+                    .push((now + 500.0, Op::Sync(SyncEvent::Connecting)));
+                self.ops.push((
+                    now + 1600.0,
+                    Op::Sync(SyncEvent::Connected([192, 168, 1, 27])),
+                ));
+                self.ops.push((
+                    now + 2600.0,
+                    Op::Sync(SyncEvent::Serving([192, 168, 1, 27])),
+                ));
             } else {
                 // No saved network: the onboarding hotspot comes up and a
                 // pretend phone submits credentials a few seconds later.
@@ -202,7 +209,9 @@ impl WebEmulator {
                         self.state.orientation,
                     ))
         });
-        self.store_book == Some(book_index) && layout_current && self.load_status == LoadStatus::Ready
+        self.store_book == Some(book_index)
+            && layout_current
+            && self.load_status == LoadStatus::Ready
     }
 
     fn finish_open(&mut self, book_index: u16) {
@@ -277,7 +286,9 @@ impl WebEmulator {
                 front_buttons: snapshot[9] as u8,
             },
         );
-        let book_index = ReaderSource::from_book_id(snapshot[0]).sd_index().unwrap_or(0);
+        let book_index = ReaderSource::from_book_id(snapshot[0])
+            .sd_index()
+            .unwrap_or(0);
         self.hydrate_book_metadata(book_index);
         self.apply_loaded_metadata(book_index);
         self.render(RenderKind::Page);
@@ -301,8 +312,8 @@ impl WebEmulator {
 
     fn render(&mut self, kind: RenderKind) {
         let request = self.state.render_request(kind);
-        let sd_reading = request.view == AppView::Reading
-            && ReaderSource::from_book_id(request.book_id).is_sd();
+        let sd_reading =
+            request.view == AppView::Reading && ReaderSource::from_book_id(request.book_id).is_sd();
         if sd_reading {
             self.fb
                 .set_frame(ui::app_render::fb_frame(request.orientation));
@@ -359,8 +370,8 @@ impl WebEmulator {
         }
 
         let progress = if request.page_count > 1 {
-            (((request.page + 1).min(request.page_count) as u64 * 1000)
-                / request.page_count as u64) as u16
+            (((request.page + 1).min(request.page_count) as u64 * 1000) / request.page_count as u64)
+                as u16
         } else {
             0
         };
@@ -419,7 +430,11 @@ impl WebEmulator {
     fn blit(&mut self) {
         for y in 0..HEIGHT {
             for x in 0..WIDTH {
-                let color = if self.fb.native_pixel(x, HEIGHT - 1 - y) { PAPER } else { INK };
+                let color = if self.fb.native_pixel(x, HEIGHT - 1 - y) {
+                    PAPER
+                } else {
+                    INK
+                };
                 let offset = (y * WIDTH + x) * 4;
                 self.rgba[offset] = color[0];
                 self.rgba[offset + 1] = color[1];

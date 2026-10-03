@@ -444,7 +444,6 @@ pub(crate) async fn upload_session(epd: &mut Epd, sd_cs: &mut Output<'static>) {
     if card.num_bytes().is_err() {
         esp_println::println!("upload: card init failed");
         let exit = refuse_uploads_until_exit().await;
-        drop(card);
         finish_upload_session(epd, exit).await;
         return;
     }

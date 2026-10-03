@@ -129,7 +129,10 @@ impl PanelModel {
                 &display::epd::FAST_CLEAN_TEMPERATURE,
             )?;
         }
-        self.command(CMD_DISPLAY_UPDATE_CTRL1, &display::epd::update_control_1(mode))?;
+        self.command(
+            CMD_DISPLAY_UPDATE_CTRL1,
+            &display::epd::update_control_1(mode),
+        )?;
         self.command(
             CMD_DISPLAY_UPDATE_CTRL2,
             &[display::epd::update_control_2(mode, true, false)],
@@ -151,7 +154,11 @@ impl PanelModel {
     pub fn deep_sleep(&mut self) -> Result<(), String> {
         self.command(
             CMD_DISPLAY_UPDATE_CTRL2,
-            &[display::epd::update_control_2(RefreshMode::PowerDown, true, false)],
+            &[display::epd::update_control_2(
+                RefreshMode::PowerDown,
+                true,
+                false,
+            )],
         )?;
         self.command(CMD_MASTER_ACTIVATION, &[])?;
         self.command(CMD_DEEP_SLEEP, &[0x01])?;
@@ -195,7 +202,8 @@ impl PanelModel {
             target[start..start + len].copy_from_slice(&band[..len]);
             y += display::BAND_ROWS;
         }
-        self.history.push(ram_history_entry(ram_command, WIDTH, HEIGHT));
+        self.history
+            .push(ram_history_entry(ram_command, WIDTH, HEIGHT));
         Ok(())
     }
 

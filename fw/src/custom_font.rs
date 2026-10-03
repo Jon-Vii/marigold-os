@@ -263,6 +263,7 @@ where
 /// Measure a whole styled text run while keeping one font-pack handle open.
 /// Pagination feeds many short XHTML chunks through this path, so the handle
 /// reuse removes the former open/seek/close cycle for every cache miss.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn for_each_metric<
     D,
     T,
@@ -501,8 +502,7 @@ where
         )?;
         for y in 0..metric.height as usize {
             let row = &bitmap[y * row_bytes..(y + 1) * row_bytes];
-            for x_byte in 0..row_bytes {
-                let byte = row[x_byte];
+            for (x_byte, &byte) in row.iter().enumerate() {
                 if byte == 0 {
                     continue;
                 }

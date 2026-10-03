@@ -196,10 +196,19 @@ impl Scenario {
             }
         }
         if let Some(panel_sleeping) = self.expect.panel_sleeping {
-            expect_eq("panel_sleeping", panel_sleeping, emu.panel().is_deep_sleep())?;
+            expect_eq(
+                "panel_sleeping",
+                panel_sleeping,
+                emu.panel().is_deep_sleep(),
+            )?;
         }
         if let Some(needle) = &self.expect.history_contains {
-            if !emu.panel().history().iter().any(|entry| entry.contains(needle)) {
+            if !emu
+                .panel()
+                .history()
+                .iter()
+                .any(|entry| entry.contains(needle))
+            {
                 return Err(format!("panel history does not contain {needle:?}"));
             }
         }
@@ -303,11 +312,9 @@ fn parse_library_event(kind: &str, step: &Step) -> Result<LibraryEvent, String> 
             chapter: step.chapter.unwrap_or(0),
             page: step.page.unwrap_or(0),
         }),
-        "FirmwareFiles" | "firmware-files" | "firmware_files" => {
-            Ok(LibraryEvent::FirmwareFiles {
-                count: step.count.unwrap_or(0),
-            })
-        }
+        "FirmwareFiles" | "firmware-files" | "firmware_files" => Ok(LibraryEvent::FirmwareFiles {
+            count: step.count.unwrap_or(0),
+        }),
         _ => Err(format!("unknown library event: {kind}")),
     }
 }
@@ -333,9 +340,7 @@ fn parse_view(value: &str) -> Result<AppView, String> {
         "Chapters" | "chapters" => Ok(AppView::Chapters),
         "Wireless" | "wireless" | "Sync" | "sync" => Ok(AppView::Wireless),
         "Settings" | "settings" => Ok(AppView::Settings),
-        "FirmwareUpdate" | "firmware-update" | "firmware_update" => {
-            Ok(AppView::FirmwareUpdate)
-        }
+        "FirmwareUpdate" | "firmware-update" | "firmware_update" => Ok(AppView::FirmwareUpdate),
         _ => Err(format!("unknown view: {value}")),
     }
 }

@@ -1,4 +1,7 @@
 [toolchain]
-channel = "stable"
-targets = ["riscv32imc-unknown-none-elf"]
+# Pinned, not "stable": the stack budget (fw/build.rs) and every hardware
+# bench run were measured on this exact compiler. Bump deliberately, then
+# re-run the -Zemit-stack-sizes check and the bench before a release.
+channel = "1.95.0"
+targets = ["riscv32imc-unknown-none-elf", "wasm32-unknown-unknown"]
 components = ["rust-src", "clippy", "rustfmt"]

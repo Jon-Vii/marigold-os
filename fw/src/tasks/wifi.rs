@@ -718,7 +718,7 @@ async fn scan_network_options(controller: &mut WifiController<'static>, out: &mu
         esp_println::println!("portal: network scan failed; manual entry remains available");
         return 0;
     };
-    networks.sort_by(|left, right| right.signal_strength.cmp(&left.signal_strength));
+    networks.sort_by_key(|network| core::cmp::Reverse(network.signal_strength));
     let mut at = 0usize;
     for (index, network) in networks.iter().enumerate() {
         let ssid = network.ssid.as_str();

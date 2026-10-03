@@ -299,7 +299,9 @@ where
             let record_start = Instant::now();
             read_exact_file(file, &mut record)?;
             #[cfg(feature = "bench-serial")]
-            { record_us += record_start.elapsed().as_micros(); }
+            {
+                record_us += record_start.elapsed().as_micros();
+            }
             let decoded = decode_record(&record);
             // Prefer the title saved when the book was last opened over the
             // file-stem label, so uploaded books (8.3 names) read as their
@@ -642,7 +644,9 @@ fn sweep_orphan_caches<
         let header = crate::reader_cache_files::read_cache_header(root, key.as_str());
         // An unreadable index may be a transient card error or an interrupted
         // generation. Reclaim only after verifying an orphan's identity.
-        if header.is_none() { continue; }
+        if header.is_none() {
+            continue;
+        }
         // A verified cache that still maps to a catalog book stays.
         let live = header
             .as_ref()

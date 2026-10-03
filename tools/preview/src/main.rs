@@ -481,7 +481,8 @@ fn push_styled_fragment(
         let mut candidate = sink.line.clone();
         append_styled_word(&mut candidate, word, style, leading_space);
         if !sink.line.is_empty()
-            && styled_text_ink_width(&candidate, TypeSettings::DEFAULT, style) + x
+            && styled_text_ink_width(&candidate, TypeSettings::DEFAULT, style)
+                + x
                 + READER_WRAP_SAFETY
                 > max_x
         {
@@ -1741,7 +1742,12 @@ fn stroke_rect_direct(fb: &mut Framebuffer, x: u16, y: u16, w: u16, h: u16) {
     fill_rect(fb, Rect::new(x + w - 1, y, 1, h), false);
 }
 
-fn write_shell_preview(out: &Path, name: &str, view: UiView, selection: u16) -> std::io::Result<()> {
+fn write_shell_preview(
+    out: &Path,
+    name: &str,
+    view: UiView,
+    selection: u16,
+) -> std::io::Result<()> {
     let mut fb = Framebuffer::new();
     let entries = [
         "/books/Flowers for Algernon.epub",

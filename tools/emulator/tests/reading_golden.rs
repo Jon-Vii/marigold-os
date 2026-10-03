@@ -17,11 +17,11 @@ use display::font::{
 };
 use proto::cache::BlockRecord;
 use proto::text::{TextAlign, TextRole};
-use ui::reading::{draw_reading_page_body, draw_reading_page_counter, page_record_at};
 use ui::reading::{
     block_first_line_indent, body_font, paginate_block_pages, wrapped_line_count, PageBox,
     ReadingBlocks,
 };
+use ui::reading::{draw_reading_page_body, draw_reading_page_counter, page_record_at};
 
 struct FixtureBlock {
     record: BlockRecord,
@@ -241,7 +241,11 @@ fn encode_png(fb: &Framebuffer) -> Vec<u8> {
 }
 
 fn golden_path(name: &str) -> PathBuf {
-    let suffix = if cfg!(feature = "device-x3") { "-x3" } else { "" };
+    let suffix = if cfg!(feature = "device-x3") {
+        "-x3"
+    } else {
+        ""
+    };
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/golden")
         .join(format!("{name}{suffix}.png"))
@@ -276,7 +280,10 @@ fn assert_page_matches_golden(source: &FixtureBlocks, page_index: usize, name: &
 fn reading_page_bodies_match_goldens() {
     let source = fixture(TypeSettings::DEFAULT);
     let pages = paginate_block_pages(&source);
-    assert!(pages >= 2, "fixture should span at least two pages, got {pages}");
+    assert!(
+        pages >= 2,
+        "fixture should span at least two pages, got {pages}"
+    );
 
     for page_index in 0..2 {
         assert_page_matches_golden(&source, page_index, &format!("reading-page-{page_index}"));
@@ -325,8 +332,7 @@ fn reading_page_bodies_match_goldens_large_relaxed() {
         weight: FontWeight::Normal,
         family: FontFamily::Literata,
     });
-    let default_pages =
-        paginate_block_pages(&fixture(TypeSettings::DEFAULT));
+    let default_pages = paginate_block_pages(&fixture(TypeSettings::DEFAULT));
     let pages = paginate_block_pages(&source);
     assert!(
         pages > default_pages,
@@ -388,14 +394,8 @@ fn default_grid_uses_selected_panel_height() {
         }
     };
     let fitting_lines = if cfg!(feature = "device-x3") { 19 } else { 17 };
-    assert_eq!(
-        paginate_block_pages(&paragraph_of(fitting_lines)),
-        1
-    );
-    assert_eq!(
-        paginate_block_pages(&paragraph_of(fitting_lines + 1)),
-        2
-    );
+    assert_eq!(paginate_block_pages(&paragraph_of(fitting_lines)), 1);
+    assert_eq!(paginate_block_pages(&paragraph_of(fitting_lines + 1)), 2);
 }
 
 /// Small/compact goes the other way: at least as much text per page.
@@ -407,8 +407,7 @@ fn small_compact_paginates_no_worse_than_default() {
         weight: FontWeight::Normal,
         family: FontFamily::Literata,
     });
-    let default_pages =
-        paginate_block_pages(&fixture(TypeSettings::DEFAULT));
+    let default_pages = paginate_block_pages(&fixture(TypeSettings::DEFAULT));
     let pages = paginate_block_pages(&source);
     assert!(
         pages <= default_pages,
