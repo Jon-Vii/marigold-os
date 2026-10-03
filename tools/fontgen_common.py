@@ -89,6 +89,24 @@ def text_render_threshold() -> int:
 
 THRESHOLD = text_render_threshold()
 
+# Italic faces are cut at a lower coverage threshold. At 128 their thin,
+# slanted strokes break into 1 px hairlines (half the stems of the 19 px
+# Literata italic) and the italic reads lighter than the roman beside it.
+# These values match the italic's ink to the upright's within a few percent
+# at the reading sizes. Merriweather's italic runs lighter, so it is cut
+# lower still. Uprights stay at THRESHOLD, so their tables are unchanged.
+ITALIC_THRESHOLD = 104
+MERRIWEATHER_ITALIC_THRESHOLD = 96
+
+
+def threshold_for(style: str, family: str = "literata") -> int:
+    """Coverage threshold for a face, by its table style name."""
+    if "ITALIC" not in style:
+        return THRESHOLD
+    if family == "merriweather":
+        return MERRIWEATHER_ITALIC_THRESHOLD
+    return ITALIC_THRESHOLD
+
 
 def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -188,7 +206,9 @@ def advance_fp(font, text: str) -> int:
     return max(int(round(font.getlength(text) * ADVANCE_SCALE)), ADVANCE_SCALE)
 
 
-def rasterize_glyph(font, code: int):
+def rasterize_glyph(font, code: int, threshold: int = None):
+    if threshold is None:
+        threshold = THRESHOLD
     ch = chr(code)
     bbox = font.getbbox(ch, anchor="ls")
     advance = advance_fp(font, ch)
@@ -207,7 +227,7 @@ def rasterize_glyph(font, code: int):
         byte = 0
         bits = 0
         for x in range(width):
-            if image.getpixel((x, y)) >= THRESHOLD:
+            if image.getpixel((x, y)) >= threshold:
                 byte |= 0x80 >> bits
             bits += 1
             if bits == 8:

@@ -25,6 +25,7 @@ from fontgen_common import (
     kerning_entries,
     parse_generator_args,
     rasterize_glyph,
+    threshold_for,
     write_generated,
     write_kerning,
 )
@@ -80,7 +81,7 @@ def main(argv=None):
             bitmap = []
             offset = 0
             for code in cps:
-                width, height, x_offset, y_offset, advance, rows = rasterize_glyph(font, code)
+                width, height, x_offset, y_offset, advance, rows = rasterize_glyph(font, code, threshold_for(style))
                 metrics.append((offset, len(rows), width, height, x_offset, y_offset, advance))
                 bitmap.extend(rows)
                 offset += len(rows)
