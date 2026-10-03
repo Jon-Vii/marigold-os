@@ -6,6 +6,11 @@ use esp_hal::rtc_cntl::Rtc;
 
 /// Idle time with no input before the device puts itself into deep sleep.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+/// Longest the sleep handshake waits for the display task. The display
+/// always answers a Sleep (it sleeps even after a failed write or refresh),
+/// so this only fires if that task is stuck; deep sleep then still happens
+/// instead of leaving the device awake until the battery dies.
+const SLEEP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[embassy_executor::task]
 pub async fn run(lpwr: LPWR<'static>) {
@@ -44,15 +49,23 @@ pub async fn run(lpwr: LPWR<'static>) {
 ///
 /// Deep sleep is terminal — the chip reboots on wake — so this only returns if
 /// a button press arrives during the display handshake and aborts the
-/// transition. Waiting for `DisplayAsleep` before cutting power guarantees the
-/// e-ink panel has settled on its sleep image and progress is safely on the SD
-/// card.
+/// transition. Waiting for `DisplayAsleep` lets the display write pending
+/// progress and paint its sleep image first; it answers even when either of
+/// those fails.
 async fn enter_sleep(rtc: &mut Rtc<'_>) {
     esp_println::println!("power: display sleep");
     DISPLAY_COMMANDS.send(DisplayCommand::Sleep).await;
+    let deadline = Instant::now() + SLEEP_HANDSHAKE_TIMEOUT;
 
     loop {
-        match POWER_EVENTS.receive().await {
+        let event = match select(POWER_EVENTS.receive(), Timer::at(deadline)).await {
+            Either::First(event) => event,
+            Either::Second(()) => {
+                esp_println::println!("power: display did not answer sleep; sleeping anyway");
+                PowerEvent::DisplayAsleep
+            }
+        };
+        match event {
             PowerEvent::DisplayAsleep => {
                 esp_println::println!("power: deep sleep");
                 let mut button = steal_wake_button();
@@ -72,12 +85,10 @@ async fn enter_sleep(rtc: &mut Rtc<'_>) {
                 #[cfg(not(feature = "bench-serial"))]
                 hal_ext::rtc::enter_deep_sleep_button(rtc, &mut button);
             }
-            PowerEvent::DisplayFailed => {
-                esp_println::println!("power: display sleep failed; staying awake");
-                return;
-            }
             PowerEvent::Activity => return,
-            PowerEvent::DisplaySettled | PowerEvent::SleepNow => {}
+            // Outcomes of renders still in flight when sleep was requested;
+            // they say nothing about the sleep transition itself.
+            PowerEvent::DisplaySettled | PowerEvent::DisplayFailed | PowerEvent::SleepNow => {}
         }
     }
 }

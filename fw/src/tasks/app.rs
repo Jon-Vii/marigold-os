@@ -28,6 +28,10 @@ pub async fn run() {
     let mut render_pending = false;
     let mut catalog_refresh_requested = true;
     let mut pending_storage: Option<StorageCommand> = None;
+    // The newest position write the storage queue could not take yet. Kept
+    // apart from `pending_storage` so a deferred open or forget can never
+    // overwrite it, and replaced (never queued behind) by a newer one.
+    let mut pending_progress: Option<StorageCommand> = None;
     // Type settings changed while away from Reading: the loaded section is
     // paginated under the old layout, so the next entry into Reading must
     // send an extend even though page and chapter are unchanged.
@@ -56,14 +60,59 @@ pub async fn run() {
     }
 
     loop {
-        match select4(
+        let incoming = select4(
             INPUT_EVENTS.receive(),
             DISPLAY_EVENTS.receive(),
             LIBRARY_EVENTS.receive(),
             SYNC_EVENTS.receive(),
         )
-        .await
-        {
+        .await;
+        // Library events arrive on two channels (inline with display events
+        // to keep their order relative to renders, or on their own queue);
+        // both take the same path.
+        let library_event = match incoming {
+            Either4::Second(DisplayEvent::Library(event)) | Either4::Third(event) => Some(event),
+            _ => None,
+        };
+        if let Some(event) = library_event {
+            if !library_event_is_current(&event) {
+                continue;
+            }
+            if let Some(book_id) = loaded_book_id(&event) {
+                if opening_book == Some(book_id) {
+                    opening_book = None;
+                }
+            }
+            let should_render = if boot_render_pending {
+                library_event_allows_first_render(&event)
+            } else {
+                library_event_affects_view(&state, &event)
+            };
+            let previous_persisted = state.persisted();
+            state = state.apply_library_event(ctx, event);
+            let resolved_position = resolve_open_position(&event, &state, &mut unresolved_position);
+            if matches!(event, crate::LibraryEvent::PrefixLoaded { .. })
+                && unresolved_position != Some(state.book_id)
+                && (resolved_position || previous_persisted != state.persisted())
+            {
+                queue_progress(
+                    StorageCommand::StoreProgress(state.persisted()),
+                    &mut pending_progress,
+                );
+            }
+            if !should_render {
+                continue;
+            }
+            if rendering {
+                render_pending = true;
+            } else {
+                send_render(first_render_kind(&mut boot_render_pending), &state).await;
+                rendering = true;
+                render_pending = false;
+            }
+            continue;
+        }
+        match incoming {
             Either4::First(event) => {
                 if matches!(event, InputEvent::Sample { button: None, .. }) {
                     // A button-less sample is a pure battery reading (the input
@@ -95,6 +144,13 @@ pub async fn run() {
                         .filter(|command| !should_send_storage_immediately(*command));
                     opening_book = None;
                     suppress_input_until_open_settled = false;
+                    // A position the queue could not take yet would otherwise
+                    // only leave on the next Settled, which never comes before
+                    // deep sleep. Hand it over first; the display task folds
+                    // it into the write it makes before sleeping.
+                    if let Some(command) = pending_progress.take() {
+                        STORAGE_COMMANDS.send(command).await;
+                    }
                     let _ = POWER_EVENTS.send(PowerEvent::SleepNow).await;
                     continue;
                 }
@@ -189,10 +245,10 @@ pub async fn run() {
                 if previous_persisted != next_persisted
                     && unresolved_position != Some(state.book_id)
                 {
-                    let command = StorageCommand::StoreProgress(next_persisted);
-                    if STORAGE_COMMANDS.try_send(command).is_err() && pending_storage.is_none() {
-                        pending_storage = Some(command);
-                    }
+                    queue_progress(
+                        StorageCommand::StoreProgress(next_persisted),
+                        &mut pending_progress,
+                    );
                 }
                 if let Some(command) = forget_command_for_transition(&previous, &state) {
                     log_storage_command("send", command);
@@ -249,6 +305,9 @@ pub async fn run() {
                         }
                         STORAGE_COMMANDS.send(command).await;
                     }
+                    if let Some(command) = pending_progress.take() {
+                        STORAGE_COMMANDS.send(command).await;
+                    }
                     if render_pending {
                         send_render(RenderKind::Page, &state).await;
                         rendering = true;
@@ -273,84 +332,10 @@ pub async fn run() {
                     rendering = false;
                     render_pending = false;
                 }
-                DisplayEvent::Library(event) => {
-                    if !library_event_is_current(&event) {
-                        continue;
-                    }
-                    if let Some(book_id) = loaded_book_id(&event) {
-                        if opening_book == Some(book_id) {
-                            opening_book = None;
-                        }
-                    }
-                    let should_render = if boot_render_pending {
-                        library_event_allows_first_render(&event)
-                    } else {
-                        library_event_affects_view(&state, &event)
-                    };
-                    let previous_persisted = state.persisted();
-                    state = state.apply_library_event(ctx, event);
-                    let resolved_position =
-                        resolve_open_position(&event, &state, &mut unresolved_position);
-                    if matches!(event, crate::LibraryEvent::PrefixLoaded { .. })
-                        && unresolved_position != Some(state.book_id)
-                        && (resolved_position || previous_persisted != state.persisted())
-                    {
-                        let command = StorageCommand::StoreProgress(state.persisted());
-                        if STORAGE_COMMANDS.try_send(command).is_err() && pending_storage.is_none()
-                        {
-                            pending_storage = Some(command);
-                        }
-                    }
-                    if !should_render {
-                        continue;
-                    }
-                    if rendering {
-                        render_pending = true;
-                    } else {
-                        send_render(first_render_kind(&mut boot_render_pending), &state).await;
-                        rendering = true;
-                        render_pending = false;
-                    }
-                }
+                // Routed through the shared library-event handler above.
+                DisplayEvent::Library(_) => {}
             },
-            Either4::Third(event) => {
-                if !library_event_is_current(&event) {
-                    continue;
-                }
-                if let Some(book_id) = loaded_book_id(&event) {
-                    if opening_book == Some(book_id) {
-                        opening_book = None;
-                    }
-                }
-                let should_render = if boot_render_pending {
-                    library_event_allows_first_render(&event)
-                } else {
-                    library_event_affects_view(&state, &event)
-                };
-                let previous_persisted = state.persisted();
-                state = state.apply_library_event(ctx, event);
-                let resolved_position =
-                    resolve_open_position(&event, &state, &mut unresolved_position);
-                if matches!(event, crate::LibraryEvent::PrefixLoaded { .. })
-                    && unresolved_position != Some(state.book_id)
-                    && (resolved_position || previous_persisted != state.persisted())
-                {
-                    let command = StorageCommand::StoreProgress(state.persisted());
-                    if STORAGE_COMMANDS.try_send(command).is_err() && pending_storage.is_none() {
-                        pending_storage = Some(command);
-                    }
-                }
-                if !should_render {
-                    continue;
-                }
-                if rendering {
-                    render_pending = true;
-                } else {
-                    send_render(first_render_kind(&mut boot_render_pending), &state).await;
-                    rendering = true;
-                    render_pending = false;
-                }
-            }
+            Either4::Third(_) => {}
             Either4::Fourth(event) => {
                 state = state.apply_sync_event(event);
                 if state.view != AppView::Wireless {
@@ -462,6 +447,17 @@ fn library_event_allows_first_render(event: &crate::LibraryEvent) -> bool {
         event,
         crate::LibraryEvent::Restored { .. } | crate::LibraryEvent::Scanned { .. }
     )
+}
+
+/// Send a position write now, or park it as the newest pending one. A
+/// successful send retires any older parked write so it can never land
+/// after (and overwrite) this newer position.
+fn queue_progress(command: StorageCommand, pending_progress: &mut Option<StorageCommand>) {
+    if STORAGE_COMMANDS.try_send(command).is_ok() {
+        *pending_progress = None;
+    } else {
+        *pending_progress = Some(command);
+    }
 }
 
 fn should_send_storage_immediately(command: StorageCommand) -> bool {

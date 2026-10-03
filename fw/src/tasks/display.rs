@@ -25,9 +25,13 @@ use hal_ext::nvm::AppStateRecord;
 use static_cell::ConstStaticCell;
 
 /// Same-book page-turn progress is coalesced: at most one durable state write
-/// per this interval, with a guaranteed flush before display sleep. A
-/// battery pull can lose at most this many seconds of reading position.
+/// per this interval. A coalesced position is written when the interval
+/// ends even if no further page is turned, and before display sleep, so a
+/// battery pull loses at most this many seconds of reading position.
 const PROGRESS_WRITE_MIN_SECS: u64 = 15;
+/// Spacing between retries of a position write that failed (card pulled or
+/// a transient fault), so a missing card cannot spin the task.
+const PROGRESS_RETRY_SECS: u64 = 30;
 
 static EPUB_TAIL: ConstStaticCell<[u8; READER_TAIL_SCRATCH]> =
     ConstStaticCell::new([0; READER_TAIL_SCRATCH]);
@@ -64,8 +68,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
     // transition and refusal rules live in app-core with the contracts.
     let mut sync_session = SyncSession::default();
     let mut refresh_planner = RefreshPlanner::new();
-    let mut pending_progress: Option<AppStateRecord> = None;
-    let mut last_progress_write: Option<Instant> = None;
+    let mut progress = ProgressJournal::new();
     // Durable state is consulted once per boot, after the first catalog with
     // entries lands; later catalog refreshes must not yank reading state.
     let mut state_restored = false;
@@ -144,11 +147,27 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
             )
             .await
             {
-                Either::First(command) => command,
-                Either::Second(()) => Either::Second(pending_reader.take().unwrap()),
+                Either::First(command) => Some(command),
+                Either::Second(()) => Some(Either::Second(pending_reader.take().unwrap())),
+            }
+        } else if let Some(due) = progress.deadline() {
+            match select(
+                select(DISPLAY_COMMANDS.receive(), STORAGE_COMMANDS.receive()),
+                embassy_time::Timer::at(due),
+            )
+            .await
+            {
+                Either::First(command) => Some(command),
+                Either::Second(()) => None,
             }
         } else {
-            select(DISPLAY_COMMANDS.receive(), STORAGE_COMMANDS.receive()).await
+            Some(select(DISPLAY_COMMANDS.receive(), STORAGE_COMMANDS.receive()).await)
+        };
+        let Some(incoming) = incoming else {
+            // A coalesced position's write window ended with no further
+            // page turn: land it now rather than waiting for the next one.
+            progress.flush(&mut epd, &mut sd_cs, sd_library);
+            continue;
         };
         match incoming {
             Either::First(DisplayCommand::Render(request)) => {
@@ -310,22 +329,25 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                     refresh_planner.screen_on(),
                     sleep_start.as_millis(),
                 );
-                if !flush_pending_progress(
-                    &mut epd,
-                    &mut sd_cs,
-                    sd_library,
-                    &mut pending_progress,
-                    &mut last_progress_write,
-                ) {
-                    esp_println::println!("display: sleep deferred; progress persistence failed");
-                    continue;
+                // Display commands are polled first, so a position queued just
+                // ahead of this sleep may still sit in the storage queue.
+                fold_queued_progress(&mut epd, &mut sd_cs, sd_library, &mut progress);
+                // One retry, then sleep regardless: refusing to sleep over a
+                // failed write (a pulled card) only drained the battery, and
+                // the position cannot reach the card either way.
+                if !progress.flush(&mut epd, &mut sd_cs, sd_library)
+                    && !progress.flush(&mut epd, &mut sd_cs, sd_library)
+                {
+                    esp_println::println!(
+                        "display: sleeping without saving the reading position; card write failed"
+                    );
                 }
                 let request = refresh_planner.last_request().or_else(|| {
                     sleep_request_from_saved_state(
                         &mut epd,
                         &mut sd_cs,
                         sd_library,
-                        &pending_progress,
+                        progress.pending(),
                     )
                 });
                 if let Some(request) = request {
@@ -362,25 +384,32 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                     false
                 };
                 prev_prestaged = false;
-                if display_flush::sleep_panel(&mut epd).await.is_ok() && sleep_frame_settled {
+                let panel_slept = display_flush::sleep_panel(&mut epd).await.is_ok();
+                let ok = panel_slept && sleep_frame_settled;
+                if ok {
                     refresh_planner.record_sleep();
-                    send_required_display_event(&DisplayEvent::Asleep);
-                    let _ = POWER_EVENTS.try_send(PowerEvent::DisplayAsleep);
-                    esp_println::println!(
-                        "bench: sleep phase=complete ok=true elapsed_ms={} t_ms={}",
-                        sleep_start.elapsed().as_millis(),
-                        Instant::now().as_millis(),
-                    );
                 } else {
-                    esp_println::println!("display: sleep transition failed");
-                    send_required_display_event(&DisplayEvent::Failed);
-                    let _ = POWER_EVENTS.try_send(PowerEvent::DisplayFailed);
+                    // The panel may hold a half-written frame or be powered
+                    // down; if this sleep is aborted, the next render must
+                    // re-initialise it rather than diff against a guess.
                     esp_println::println!(
-                        "bench: sleep phase=complete ok=false elapsed_ms={} t_ms={}",
-                        sleep_start.elapsed().as_millis(),
-                        Instant::now().as_millis(),
+                        "display: sleep transition incomplete (frame={} panel={})",
+                        sleep_frame_settled,
+                        panel_slept
                     );
+                    refresh_planner.record_panel_unknown();
                 }
+                // Deep sleep proceeds either way: wake is a full reboot that
+                // re-initialises the panel, and staying awake after a failed
+                // transition only drains the battery.
+                send_required_display_event(&DisplayEvent::Asleep);
+                let _ = POWER_EVENTS.try_send(PowerEvent::DisplayAsleep);
+                esp_println::println!(
+                    "bench: sleep phase=complete ok={} elapsed_ms={} t_ms={}",
+                    ok,
+                    sleep_start.elapsed().as_millis(),
+                    Instant::now().as_millis(),
+                );
             }
             Either::Second(StorageCommand::ReceiveUpload) => {
                 if sync_session.admits(&StorageCommand::ReceiveUpload) {
@@ -455,8 +484,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                     font_metrics,
                     &mut epub_scratch,
                     &mut sync_session,
-                    &mut pending_progress,
-                    &mut last_progress_write,
+                    &mut progress,
                     &mut state_restored,
                     &mut pending_reader,
                 );
@@ -595,8 +623,7 @@ fn handle_storage_command(
     font_metrics: &mut crate::custom_font::MetricCache,
     epub_scratch: &mut Option<&'static mut ReaderCacheScratch<'static>>,
     sync_session: &mut SyncSession,
-    pending_progress: &mut Option<AppStateRecord>,
-    last_progress_write: &mut Option<Instant>,
+    progress: &mut ProgressJournal,
     state_restored: &mut bool,
     pending_reader: &mut Option<StorageCommand>,
 ) {
@@ -612,16 +639,11 @@ fn handle_storage_command(
         StorageCommand::LoanSyncMemory => {
             *pending_reader = None;
             // The session only ends in a reset, so any coalesced position
-            // must reach the card before the scratch is dismantled.
-            if !flush_pending_progress(
-                epd,
-                sd_cs,
-                sd_library,
-                pending_progress,
-                last_progress_write,
-            ) {
-                esp_println::println!("storage: sync loan deferred; progress persistence failed");
-                return;
+            // must reach the card before the scratch is dismantled. A failed
+            // write must not withhold the loan: the wifi task waits on it,
+            // and the session's reset would lose the position regardless.
+            if !progress.flush(epd, sd_cs, sd_library) {
+                esp_println::println!("storage: sync loan proceeding; reading position not saved");
             }
             ensure_epub_scratch(epub_scratch);
             let Some(scratch) = epub_scratch.take() else {
@@ -713,6 +735,15 @@ fn handle_storage_command(
                     index
                 );
                 return;
+            }
+            // A coalesced position for the previous book locates that book's
+            // POS file through the active entry this open is about to
+            // replace; write it first or the switch silently drops it.
+            if progress
+                .pending_book()
+                .is_some_and(|pending| pending != book_id)
+            {
+                progress.flush(epd, sd_cs, sd_library);
             }
             // Read this book's catalog record into the active-entry slot so the
             // reader pipeline (load_position, build_or_load) resolves it from
@@ -994,13 +1025,7 @@ fn handle_storage_command(
             send_library_event(&LibraryEvent::FirmwareFiles { count });
         }
         StorageCommand::StageFirmwareUpdate { index } => {
-            if !flush_pending_progress(
-                epd,
-                sd_cs,
-                sd_library,
-                pending_progress,
-                last_progress_write,
-            ) {
+            if !progress.flush(epd, sd_cs, sd_library) {
                 esp_println::println!(
                     "storage: firmware stage deferred; progress persistence failed"
                 );
@@ -1016,92 +1041,8 @@ fn handle_storage_command(
             }
         }
         StorageCommand::StoreProgress(record) => {
-            let (source_hash, source_size) = source_identity(sd_library, record.book_id);
-            // The reducer derives chapter from the 128-capped sd_chapter_for_page,
-            // so a deep position would save a stuck chapter that the sleep/boot
-            // colophon then shows wrong until the book reopens. The firmware
-            // tracks the true chapter over the whole book; adopt it for the
-            // loaded SD book so saved/restored state names the chapter right.
-            let chapter = if ReaderSource::from_book_id(record.book_id).is_sd()
-                && sd_library.loaded_index == ReaderStore::selected_book_index(record.book_id)
-            {
-                sd_library.current_chapter()
-            } else {
-                record.chapter
-            };
-            let record = AppStateRecord {
-                book_id: record.book_id,
-                chapter,
-                screen: record.screen,
-                shell_orientation: record.shell_orientation,
-                reading_orientation: record.reading_orientation,
-                refresh_policy: record.refresh_policy,
-                font_size: record.font_size,
-                line_spacing: record.line_spacing,
-                font_weight: record.font_weight,
-                font_family: record.font_family,
-                front_buttons: record.front_buttons,
-                source_hash,
-                source_size,
-            };
-            // Coalesce same-context page turns; anything beyond the screen
-            // number changing (book, chapter, orientation, policy) is rare
-            // and worth landing immediately. A pending record for the same
-            // book is superseded by the new one; only a different book's
-            // pending position must be preserved first.
-            let context_changed = pending_progress
-                .map(|pending| {
-                    AppStateRecord {
-                        screen: record.screen,
-                        ..pending
-                    } != record
-                })
-                .unwrap_or(false);
-            let due = last_progress_write
-                .map(|written| written.elapsed().as_secs() >= PROGRESS_WRITE_MIN_SECS)
-                .unwrap_or(true);
-            if pending_progress
-                .map(|pending| pending.book_id != record.book_id)
-                .unwrap_or(false)
-                && !flush_pending_progress(
-                    epd,
-                    sd_cs,
-                    sd_library,
-                    pending_progress,
-                    last_progress_write,
-                )
-            {
-                esp_println::println!(
-                    "storage: progress context switch deferred after write failure"
-                );
-                return;
-            }
-            if context_changed || due {
-                let progress_start = Instant::now();
-                let stored = reader_cache::store_app_state(epd, sd_cs, sd_library, record);
-                if stored {
-                    *pending_progress = None;
-                    *last_progress_write = Some(Instant::now());
-                } else {
-                    *pending_progress = Some(record);
-                }
-                esp_println::println!(
-                    "bench: storage_progress action=write ok={} book_id={} page={} elapsed_ms={} t_ms={}",
-                    stored,
-                    record.book_id,
-                    record.screen,
-                    progress_start.elapsed().as_millis(),
-                    Instant::now().as_millis(),
-                );
-            } else {
-                *pending_progress = Some(record);
-                esp_println::println!(
-                    "bench: storage_progress action=coalesce book_id={} page={} t_ms={}",
-                    record.book_id,
-                    record.screen,
-                    Instant::now().as_millis(),
-                );
-            }
+            let record = progress_record(sd_library, record);
+            progress.stage(epd, sd_cs, sd_library, record);
         }
     }
 }
@@ -1241,9 +1182,9 @@ fn sleep_request_from_saved_state(
     epd: &mut Epd,
     sd_cs: &mut Output<'static>,
     library: &mut ReaderStore,
-    pending_progress: &Option<AppStateRecord>,
+    pending_progress: Option<AppStateRecord>,
 ) -> Option<RenderRequest> {
-    let record = match *pending_progress {
+    let record = match pending_progress {
         Some(record) => record,
         None => reader_cache::load_app_state(epd, sd_cs)?,
     };
@@ -1296,22 +1237,196 @@ fn sleep_request_from_saved_state(
     })
 }
 
-fn flush_pending_progress(
+/// The durable record for a reducer progress snapshot: the book's stable
+/// source identity, and for the loaded SD book the firmware's uncapped
+/// current chapter (the reducer's is capped at 128, so a deep position
+/// would otherwise save, and later show, a stuck chapter).
+fn progress_record(
+    sd_library: &ReaderStore,
+    record: app_core::PersistedAppState,
+) -> AppStateRecord {
+    let (source_hash, source_size) = source_identity(sd_library, record.book_id);
+    let chapter = if ReaderSource::from_book_id(record.book_id).is_sd()
+        && sd_library.loaded_index == ReaderStore::selected_book_index(record.book_id)
+    {
+        sd_library.current_chapter()
+    } else {
+        record.chapter
+    };
+    AppStateRecord {
+        book_id: record.book_id,
+        chapter,
+        screen: record.screen,
+        shell_orientation: record.shell_orientation,
+        reading_orientation: record.reading_orientation,
+        refresh_policy: record.refresh_policy,
+        font_size: record.font_size,
+        line_spacing: record.line_spacing,
+        font_weight: record.font_weight,
+        font_family: record.font_family,
+        front_buttons: record.front_buttons,
+        source_hash,
+        source_size,
+    }
+}
+
+/// Fold progress writes still waiting in the storage queue into the journal
+/// (the caller flushes it next); every other command is put back in order.
+/// Out of line: its command buffer must not widen the task loop's frame.
+#[inline(never)]
+fn fold_queued_progress(
     epd: &mut Epd,
     sd_cs: &mut Output<'static>,
     sd_library: &ReaderStore,
-    pending_progress: &mut Option<AppStateRecord>,
-    last_progress_write: &mut Option<Instant>,
-) -> bool {
-    if let Some(record) = *pending_progress {
+    progress: &mut ProgressJournal,
+) {
+    let mut kept: heapless::Vec<StorageCommand, 4> = heapless::Vec::new();
+    while let Ok(command) = STORAGE_COMMANDS.try_receive() {
+        match command {
+            StorageCommand::StoreProgress(record) => {
+                let record = progress_record(sd_library, record);
+                if progress
+                    .pending_book()
+                    .is_some_and(|pending| pending != record.book_id)
+                {
+                    progress.flush(epd, sd_cs, sd_library);
+                }
+                progress.replace_pending(record);
+            }
+            other => {
+                let _ = kept.push(other);
+            }
+        }
+    }
+    for command in kept {
+        if STORAGE_COMMANDS.try_send(command).is_err() {
+            esp_println::println!("display: storage command dropped before sleep");
+        }
+    }
+}
+
+/// Reading-position persistence: one owner for coalescing, the write
+/// deadline, and retries. Same-book page turns coalesce to at most one write
+/// per `PROGRESS_WRITE_MIN_SECS`; any other change (book, chapter, layout)
+/// lands at once. A coalesced record is written when its window ends, and
+/// on demand before sleep, a Wi-Fi loan, a firmware stage, or a book switch.
+struct ProgressJournal {
+    pending: Option<AppStateRecord>,
+    last_write: Option<Instant>,
+    /// When the pending record is next written (window end or retry).
+    due_at: Option<Instant>,
+}
+
+impl ProgressJournal {
+    const fn new() -> Self {
+        Self {
+            pending: None,
+            last_write: None,
+            due_at: None,
+        }
+    }
+
+    fn pending(&self) -> Option<AppStateRecord> {
+        self.pending
+    }
+
+    fn pending_book(&self) -> Option<u32> {
+        self.pending.map(|record| record.book_id)
+    }
+
+    /// When the loop must wake to write the pending record, if any.
+    fn deadline(&self) -> Option<Instant> {
+        self.pending.and(self.due_at)
+    }
+
+    /// Supersede the pending record without writing (used while draining
+    /// before sleep, which flushes right after).
+    fn replace_pending(&mut self, record: AppStateRecord) {
+        self.pending = Some(record);
+        self.due_at.get_or_insert_with(Instant::now);
+    }
+
+    #[inline(never)]
+    fn stage(
+        &mut self,
+        epd: &mut Epd,
+        sd_cs: &mut Output<'static>,
+        sd_library: &ReaderStore,
+        record: AppStateRecord,
+    ) {
+        // Only a different book's pending position must land first; a
+        // same-book record is simply superseded.
+        if self
+            .pending
+            .is_some_and(|pending| pending.book_id != record.book_id)
+            && !self.flush(epd, sd_cs, sd_library)
+        {
+            esp_println::println!("storage: progress context switch deferred after write failure");
+            return;
+        }
+        let context_changed = self.pending.is_some_and(|pending| {
+            AppStateRecord {
+                screen: record.screen,
+                ..pending
+            } != record
+        });
+        let due = self
+            .last_write
+            .map(|written| written.elapsed().as_secs() >= PROGRESS_WRITE_MIN_SECS)
+            .unwrap_or(true);
+        if context_changed || due {
+            self.write(epd, sd_cs, sd_library, record, "write");
+        } else {
+            self.pending = Some(record);
+            self.due_at = Some(
+                self.last_write.unwrap_or_else(Instant::now)
+                    + embassy_time::Duration::from_secs(PROGRESS_WRITE_MIN_SECS),
+            );
+            esp_println::println!(
+                "bench: storage_progress action=coalesce book_id={} page={} t_ms={}",
+                record.book_id,
+                record.screen,
+                Instant::now().as_millis(),
+            );
+        }
+    }
+
+    /// Write the pending record now. True when nothing is left pending.
+    #[inline(never)]
+    fn flush(
+        &mut self,
+        epd: &mut Epd,
+        sd_cs: &mut Output<'static>,
+        sd_library: &ReaderStore,
+    ) -> bool {
+        match self.pending {
+            Some(record) => self.write(epd, sd_cs, sd_library, record, "flush"),
+            None => true,
+        }
+    }
+
+    fn write(
+        &mut self,
+        epd: &mut Epd,
+        sd_cs: &mut Output<'static>,
+        sd_library: &ReaderStore,
+        record: AppStateRecord,
+        action: &str,
+    ) -> bool {
         let start = Instant::now();
         let stored = reader_cache::store_app_state(epd, sd_cs, sd_library, record);
         if stored {
-            *pending_progress = None;
-            *last_progress_write = Some(Instant::now());
+            self.pending = None;
+            self.due_at = None;
+            self.last_write = Some(Instant::now());
+        } else {
+            self.pending = Some(record);
+            self.due_at =
+                Some(Instant::now() + embassy_time::Duration::from_secs(PROGRESS_RETRY_SECS));
         }
         esp_println::println!(
-            "bench: storage_progress action=flush ok={} book_id={} page={} elapsed_ms={} t_ms={}",
+            "bench: storage_progress action={} ok={} book_id={} page={} elapsed_ms={} t_ms={}",
+            action,
             stored,
             record.book_id,
             record.screen,
@@ -1319,7 +1434,5 @@ fn flush_pending_progress(
             Instant::now().as_millis(),
         );
         stored
-    } else {
-        true
     }
 }

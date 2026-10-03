@@ -249,6 +249,16 @@ impl RefreshPlanner {
         self.panel_shows_sleep_screen = true;
     }
 
+    /// The panel's state is no longer known (a sleep transition failed part
+    /// way, or the controller may have powered down). The next render
+    /// re-initialises the controller and paints with a full refresh.
+    pub fn record_panel_unknown(&mut self) {
+        self.screen_on = false;
+        self.fast_refreshes = 0;
+        self.last_request = None;
+        self.panel_shows_sleep_screen = false;
+    }
+
     fn needs_clean_library_refresh(request: RenderRequest, last: RenderRequest) -> bool {
         // Only the library list actually redraws when the scan count moves;
         // other views repaint identical pixels and can ride the partial.
@@ -2614,6 +2624,22 @@ mod tests {
             display_refresh_outcome(false),
             (DisplayEvent::Failed, PowerEvent::DisplayFailed)
         );
+    }
+
+    #[test]
+    fn unknown_panel_state_forces_reinit_and_full_refresh() {
+        let mut planner = RefreshPlanner::new();
+        let request = ReaderState::boot().render_request(RenderKind::Page);
+        planner.record_render(request, RefreshMode::Full);
+        assert!(planner.screen_on());
+
+        // A sleep that failed part way leaves the controller in an unknown
+        // state: no fast diff against a frame the panel may not show, and
+        // the render path re-inits because nothing is on screen.
+        planner.record_panel_unknown();
+        assert!(!planner.screen_on());
+        assert!(planner.last_request().is_none());
+        assert_eq!(planner.mode_for(request), RefreshMode::Full);
     }
 
     #[test]
