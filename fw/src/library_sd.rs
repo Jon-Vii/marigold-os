@@ -16,9 +16,10 @@ const CATALOG_MAGIC: &[u8; 4] = b"X4CT";
 /// the card, not 255. v4 rebuilds stale records written before long filenames
 /// were safely bounded: those records could contain only `/`. An older catalog
 /// fails the version check and is rebuilt by a fresh scan -- no migration code
-/// needed.
-const CATALOG_VERSION: u8 = 4;
-const CATALOG_HEADER_BYTES: usize = 8;
+/// needed. v5 adds a fingerprint of the scanned book set at `header[8..12]`, so
+/// boot notices books added or removed with a computer and rescans.
+const CATALOG_VERSION: u8 = 5;
+const CATALOG_HEADER_BYTES: usize = 12;
 const CATALOG_RECORD_BYTES: usize = 92;
 /// Books staged in RAM per pass of the multi-pass scan write. embedded-sdmmc
 /// forbids writing to a file while a directory iteration holds its lock, so the
@@ -98,7 +99,11 @@ pub(crate) fn load_catalog_cache(
     // A valid header (even an empty catalog) counts as loaded; a missing or
     // wrong-version file returns false so the caller runs a fresh scan.
     let loaded = sd_session::with_root(epd, sd_cs, |root| {
-        read_catalog_window(root, library, 0).is_ok()
+        // The snapshot only stands while the card holds the same books: one
+        // read-only directory walk catches books copied on or deleted with
+        // a computer, which used to stay invisible (or listed) until the
+        // next Wi-Fi upload invalidated the snapshot.
+        catalog_matches_card(root) && read_catalog_window(root, library, 0).is_ok()
     })
     .unwrap_or(false);
     library.status = if !loaded {
@@ -124,6 +129,83 @@ pub(crate) fn load_catalog_cache(
         Instant::now().as_millis(),
     );
     loaded
+}
+
+/// Order-sensitive fingerprint of the book set a walk visits: any added,
+/// removed, renamed, or resized EPUB changes it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct LibraryFingerprint {
+    count: usize,
+    hash: u32,
+}
+
+impl LibraryFingerprint {
+    const fn new() -> Self {
+        Self {
+            count: 0,
+            hash: 0x811c_9dc5,
+        }
+    }
+
+    fn add(&mut self, display_path: &str, byte_size: u32) {
+        for byte in display_path
+            .as_bytes()
+            .iter()
+            .chain(byte_size.to_le_bytes().iter())
+        {
+            self.hash = (self.hash ^ *byte as u32).wrapping_mul(0x0100_0193);
+        }
+        self.count += 1;
+    }
+}
+
+/// Whether CATALOG.BIN still describes the card's books.
+fn catalog_matches_card<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let Ok(stored) = read_catalog_fingerprint(root) else {
+        return false;
+    };
+    let mut current = LibraryFingerprint::new();
+    if walk_epubs(root, &mut |path, _, _, size| current.add(path, size)).is_err() {
+        return false;
+    }
+    let matches = (current.count.min(u16::MAX as usize) as u16, current.hash) == stored;
+    if !matches {
+        esp_println::println!("sd: catalog stale; books changed on the card");
+    }
+    matches
+}
+
+fn read_catalog_fingerprint<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+) -> Result<(u16, u32), ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    with_catalog_file(root, |file, count| {
+        file.seek_from_start(8).map_err(|_| ())?;
+        let mut hash = [0u8; 4];
+        read_exact_file(file, &mut hash)?;
+        Ok((count, u32::from_le_bytes(hash)))
+    })
 }
 
 /// Walk both book locations (card root and `/BOOKS`), invoking `visit` with
@@ -167,11 +249,9 @@ where
         .open_file_in_dir(CATALOG_FILE, Mode::ReadWriteCreateOrTruncate)
         .map_err(|_| ())?;
 
-    let mut counted = 0usize;
-    {
-        let mut count = |_: &str, _: &str, _: bool, _: u32| counted += 1;
-        walk_epubs(root, &mut count)?;
-    }
+    let mut fingerprint = LibraryFingerprint::new();
+    walk_epubs(root, &mut |path, _, _, size| fingerprint.add(path, size))?;
+    let counted = fingerprint.count;
     let count = counted.min(u16::MAX as usize) as u16;
 
     let mut header = [0u8; CATALOG_HEADER_BYTES];
@@ -221,6 +301,7 @@ where
     }
     header[4] = CATALOG_VERSION;
     header[5..7].copy_from_slice(&count.to_le_bytes());
+    header[8..12].copy_from_slice(&fingerprint.hash.to_le_bytes());
     file.seek_from_start(0).map_err(|_| ())?;
     file.write(&header).map_err(|_| ())?;
     Ok(count)
