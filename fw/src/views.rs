@@ -329,6 +329,9 @@ fn draw_sd_reader_page_with_custom_font(
                 font_metrics,
                 plan.page(),
             ) {
+                // The custom face may have painted part of the page before
+                // failing; start the built-in fallback from a clean frame.
+                fb.clear(true);
                 ui::reading::draw_reading_page_body(fb, sd_library, plan.page());
             }
             draw_reader_footer(fb, request, sd_library, page_count);

@@ -375,11 +375,9 @@ pub fn draw_text(
     let mut cursor_fp = (x as i32) << 4;
     let mut previous = None;
     for ch in text.chars() {
-        let codepoint = ch as u32;
-        if codepoint > u16::MAX as u32 {
-            continue;
-        }
-        let codepoint = codepoint as u16;
+        // Characters past the BMP have no glyphs; draw the same `?` that
+        // `measure_text` counts, so centred and right-aligned text lines up.
+        let codepoint = u16::try_from(ch as u32).unwrap_or(b'?' as u16);
         let drawn = if font.glyph(codepoint).is_some() {
             codepoint
         } else {
@@ -477,4 +475,26 @@ pub fn fixed_round(value_fp: i32) -> i16 {
 #[inline]
 pub fn fixed_ceil(value_fp: i32) -> i16 {
     ((value_fp + 15) >> 4) as i16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drawing_advances_exactly_as_far_as_measuring() {
+        // Characters past the BMP are measured as `?`; drawing must advance
+        // the same distance or centred labels drift.
+        let font = literata(FontStyle::Regular);
+        let mut fb = Framebuffer::new();
+        for text in ["plain", "a\u{1F600}b", "\u{1F4D6} title"] {
+            let end = draw_text(&mut fb, font, text, 0, 40, false) as i32;
+            // Measuring rounds the final advance up, drawing to nearest.
+            let measured = measure_text(font, text) as i32;
+            assert!(
+                (0..=1).contains(&(measured - end)),
+                "{text}: {measured} vs {end}"
+            );
+        }
+    }
 }
