@@ -147,7 +147,10 @@ pub enum RefreshPolicy {
     FullEveryTen,
 }
 
-pub const DEFAULT_FULL_REFRESH_INTERVAL: u8 = 8;
+/// Fast refreshes between periodic cleans under `FullEveryTen`: nine fast
+/// turns, then the tenth page cleans (a one-flicker FastClean, not the
+/// multi-flash Full).
+pub const DEFAULT_FULL_REFRESH_INTERVAL: u8 = 9;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RefreshPlanner {
@@ -907,16 +910,20 @@ impl ReaderState {
             (AppView::Chapters, Some(Button::Confirm)) => {
                 next.chapter = self.selection;
                 next.page = if ReaderSource::from_book_id(self.book_id).is_sd() {
+                    // The resident map stops at MAX_SD_CHAPTERS; chapters past
+                    // it resolve their page from the on-disk TOC like an
+                    // unprepared one, never as page 0 of the book.
                     let target = self
                         .sd_chapter_pages
                         .get(self.selection as usize)
                         .copied()
-                        .unwrap_or(if self.sd_complete { 0 } else { u16::MAX });
-                    if !self.sd_complete && target == u16::MAX {
-                        // This chapter has no page in the readable prefix yet.
-                        // Keep the displayed position until the jump resolves.
-                        // Selection carries the requested chapter to storage;
-                        // chapter/page remain safe for Back, sleep, and progress.
+                        .unwrap_or(u16::MAX);
+                    if target == u16::MAX {
+                        // No known page for this chapter (not prepared yet,
+                        // or past the resident map). Keep the displayed
+                        // position until the jump resolves. Selection carries
+                        // the requested chapter to storage; chapter/page
+                        // remain safe for Back, sleep, and progress.
                         next.chapter = self.chapter;
                         self.page
                     } else {
@@ -1165,7 +1172,11 @@ impl ReaderState {
             }
             LibraryEvent::FirmwareFiles { count } => {
                 self.firmware_count = count;
-                self.selection = self.selection.min(count.saturating_sub(1));
+                // A scan can land after Back left the picker; the cursor then
+                // belongs to another view (Settings) and must not move.
+                if self.view == AppView::FirmwareUpdate {
+                    self.selection = self.selection.min(count.saturating_sub(1));
+                }
                 self.firmware_status = if count == 0 {
                     FirmwareUpdateStatus::Empty
                 } else {
@@ -2037,6 +2048,42 @@ mod tests {
     }
 
     #[test]
+    fn chapter_jump_past_the_resident_map_does_not_land_on_page_zero() {
+        let mut state = ReaderState::boot();
+        state.view = AppView::Chapters;
+        state.book_id = ReaderSource::sd(0).book_id();
+        state.chapter = 5;
+        state.page = 400;
+        state.sd_page_count = 3000;
+        state.sd_complete = true;
+        state.sd_chapter_count = 200;
+        state.selection = 150;
+        let jumping = press(state, Button::Confirm);
+        assert_eq!(jumping.view, AppView::Reading);
+        assert_eq!(
+            (jumping.chapter, jumping.page),
+            (5, 400),
+            "position holds until storage resolves the jump"
+        );
+        assert_eq!(jumping.selection, 150);
+        assert_eq!(jumping.persisted().screen, 400);
+    }
+
+    #[test]
+    fn late_firmware_scan_does_not_move_the_settings_cursor() {
+        let mut state = ReaderState::boot();
+        state.view = AppView::Settings;
+        state.selection = 7;
+        state = press(state, Button::Confirm);
+        assert_eq!(state.view, AppView::FirmwareUpdate);
+        state = press(state, Button::Back);
+        assert_eq!(state.view, AppView::Settings);
+        let cursor = state.selection;
+        state = state.apply_library_event(CTX, LibraryEvent::FirmwareFiles { count: 2 });
+        assert_eq!(state.selection, cursor);
+    }
+
+    #[test]
     fn unknown_chapter_jump_keeps_page_until_the_prefix_resolves_it() {
         let mut state = ReaderState::boot();
         state.view = AppView::Reading;
@@ -2137,7 +2184,9 @@ mod tests {
             state.sd_chapter_count = chapter_count;
             state.selection = chapter_count - 1;
             let state = press(state, Button::Confirm);
-            assert_eq!(state.chapter, chapter_count - 1);
+            // Past the resident page map the jump target travels in
+            // `selection` (a u16) until storage resolves its page.
+            assert_eq!(state.selection, chapter_count - 1);
             assert_eq!(state.chapter_item_count(ctx), chapter_count);
         }
     }

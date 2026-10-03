@@ -1300,7 +1300,7 @@ fn refresh_policy_label(policy: UiRefreshPolicy) -> &'static str {
     match policy {
         UiRefreshPolicy::FastOnly => "fast only",
         UiRefreshPolicy::FullOnWake => "full on wake",
-        UiRefreshPolicy::FullEveryTen => "full every ten",
+        UiRefreshPolicy::FullEveryTen => "clean every ten",
     }
 }
 
