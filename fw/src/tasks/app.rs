@@ -228,7 +228,8 @@ pub async fn run() {
                             pending_storage = Some(command);
                         } else if matches!(
                             command,
-                            StorageCommand::LoadChapters { .. }
+                            StorageCommand::OpenBook { .. }
+                                | StorageCommand::LoadChapters { .. }
                                 | StorageCommand::ExtendSection { .. }
                         ) {
                             awaiting_reader_data = true;
@@ -262,16 +263,14 @@ pub async fn run() {
                         esp_println::println!("app: sync command queue full");
                     }
                 }
-                // We used to suppress the render when an open was inflight
-                // and wait for the Loaded event. That's fine when the cache
-                // hits and the open returns in milliseconds, but on a cache
-                // miss the rebuild can take a minute and the UI looks frozen
-                // on the previous screen. Let the render through immediately:
-                // the Reading view draws "OPENING EPUB" while sd_library's
-                // loaded_index doesn't match the requested book. The chapter
-                // overview and page turns are exceptions: their cache reads
-                // are short, so they wait for Loaded rather than painting a
-                // partial frame. Storage paints a plate if preparation is needed.
+                // Reader commands render once, from their completion event,
+                // rather than painting the provisional state now. A book
+                // opened from the Library carries page 0 until storage reads
+                // its saved position, so an immediate paint showed the first
+                // page before the right one. Storage paints the loading plate
+                // itself whenever the open, extend, or jump needs preparation
+                // (see open_loading_plate_request), so a cache miss that
+                // rebuilds for a minute still never looks frozen.
                 if awaiting_reader_data {
                     render_pending = false;
                 } else if rendering {

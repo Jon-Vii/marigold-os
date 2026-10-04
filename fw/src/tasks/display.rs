@@ -443,13 +443,13 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                 if stale {
                     continue;
                 }
-                // A layout change re-paginates the book, which blocks this
-                // task for the whole rebuild. Paint the title/author plate
-                // first so the wait reads as loading, not frozen: the store
-                // still reports the old settings here, so the reader view
-                // lands on the loading branch. A same-layout open already
-                // shows the plate through the normal render path (the book
-                // isn't loaded yet), so it is skipped here.
+                // Preparing a book (a first build, or a layout change that
+                // re-paginates it) blocks this task for the whole rebuild.
+                // Paint the title/author plate first so the wait reads as
+                // loading, not frozen: the store still reports the old book
+                // or settings here, so the reader view lands on the loading
+                // branch. The app holds its render until the open completes,
+                // so this is the only paint a slow open gets.
                 if refresh_planner.screen_on() {
                     if let Some(loading_request) = open_loading_plate_request(
                         &command,
@@ -564,11 +564,10 @@ fn render_custom_reader(
 }
 
 /// The reader-view render to paint as a loading plate before an open/extend
-/// that needs book preparation. Prepared sections skip it even outside RAM.
-/// The app sends a normal Reading render around the same time as a book open,
-/// but the storage receiver can
-/// win that race; painting here keeps a first cache build from looking frozen
-/// on the previous screen.
+/// that needs book preparation. Prepared sections skip it even outside RAM,
+/// and the page then arrives in a single refresh from the completion event;
+/// painting here keeps a first cache build from looking frozen on the
+/// previous screen.
 fn open_loading_plate_request(
     command: &StorageCommand,
     sd_library: &ReaderStore,
