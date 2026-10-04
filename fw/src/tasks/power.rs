@@ -62,6 +62,9 @@ async fn enter_sleep(rtc: &mut Rtc<'_>) {
             Either::First(event) => event,
             Either::Second(()) => {
                 esp_println::println!("power: display did not answer sleep; sleeping anyway");
+                // Whatever the panel shows now, it isn't a finished sleep
+                // screen; wake must not trust an older mark.
+                crate::wake_mark::set(false);
                 PowerEvent::DisplayAsleep
             }
         };

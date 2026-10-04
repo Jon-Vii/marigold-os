@@ -26,7 +26,8 @@ impl AppStateRecord {
     const V3_ENCODED_LEN: usize = 32;
     const V1_ENCODED_LEN: usize = 24;
     const MAGIC: u32 = 0x5834_4F53;
-    const VERSION: u8 = 4;
+    const VERSION: u8 = 5;
+    const V4_VERSION: u8 = 4;
     const V3_VERSION: u8 = 3;
     const V2_VERSION: u8 = 2;
     const V1_VERSION: u8 = 1;
@@ -36,6 +37,9 @@ impl AppStateRecord {
     const DEFAULT_LINE_SPACING: u8 = 1;
     const DEFAULT_FONT_WEIGHT: u8 = 0;
     const DEFAULT_FONT_FAMILY: u8 = 0;
+    /// RefreshPolicy::FastOnly / FullOnWake as u8 in app-core.
+    const REFRESH_FAST_ONLY: u8 = 0;
+    const REFRESH_FULL_ON_WAKE: u8 = 1;
 
     pub const fn new(book_id: u32) -> Self {
         Self {
@@ -44,7 +48,7 @@ impl AppStateRecord {
             screen: 0,
             shell_orientation: 3,
             reading_orientation: 0,
-            refresh_policy: 1,
+            refresh_policy: Self::REFRESH_FAST_ONLY,
             font_size: Self::DEFAULT_FONT_SIZE,
             line_spacing: Self::DEFAULT_LINE_SPACING,
             font_weight: Self::DEFAULT_FONT_WEIGHT,
@@ -74,6 +78,7 @@ impl AppStateRecord {
         // front-button layout byte 30: records written before either carry
         // zero there, which is the respective default (Literata, pages
         // right), so no version bump was needed. Byte 31 stays reserved zero.
+        // V5 keeps the V4 layout; only the refresh-policy meaning moved.
         out[28] = self.font_weight;
         out[29] = self.font_family;
         out[30] = self.front_buttons;
@@ -89,8 +94,8 @@ impl AppStateRecord {
         if read_u32(bytes, 0) != Self::MAGIC {
             return None;
         }
-        match bytes[4] {
-            Self::VERSION => {
+        let record = match bytes[4] {
+            Self::VERSION | Self::V4_VERSION => {
                 if bytes.len() < Self::ENCODED_LEN {
                     return None;
                 }
@@ -98,7 +103,7 @@ impl AppStateRecord {
                 if checksum(&bytes[..32]) != expected {
                     return None;
                 }
-                Some(Self {
+                Self {
                     book_id: read_u32(bytes, 8),
                     chapter: read_u16(bytes, 12),
                     screen: read_u32(bytes, 14),
@@ -112,7 +117,7 @@ impl AppStateRecord {
                     front_buttons: bytes[30],
                     source_hash: read_u32(bytes, 18),
                     source_size: read_u32(bytes, 22),
-                })
+                }
             }
             Self::V3_VERSION | Self::V2_VERSION => {
                 if bytes.len() < Self::V3_ENCODED_LEN {
@@ -127,7 +132,7 @@ impl AppStateRecord {
                 } else {
                     (Self::DEFAULT_FONT_SIZE, Self::DEFAULT_LINE_SPACING)
                 };
-                Some(Self {
+                Self {
                     book_id: read_u32(bytes, 8),
                     chapter: read_u16(bytes, 12),
                     screen: read_u32(bytes, 14),
@@ -141,14 +146,14 @@ impl AppStateRecord {
                     front_buttons: 0,
                     source_hash: read_u32(bytes, 18),
                     source_size: read_u32(bytes, 22),
-                })
+                }
             }
             Self::V1_VERSION => {
                 let expected = read_u32(bytes, 20);
                 if checksum(&bytes[..20]) != expected {
                     return None;
                 }
-                Some(Self {
+                Self {
                     book_id: read_u32(bytes, 8),
                     chapter: read_u16(bytes, 12),
                     screen: read_u32(bytes, 14),
@@ -162,10 +167,21 @@ impl AppStateRecord {
                     front_buttons: 0,
                     source_hash: 0,
                     source_size: 0,
-                })
+                }
             }
-            _ => None,
+            _ => return None,
+        };
+        // Before V5 the wake refresh was always the full waveform, so "full
+        // on wake" (the old default) behaved exactly like "fast only". Older
+        // records move onto the new default, which wakes with the quick
+        // clean; "full on wake" now means it and has to be chosen again.
+        if bytes[4] != Self::VERSION && record.refresh_policy == Self::REFRESH_FULL_ON_WAKE {
+            return Some(Self {
+                refresh_policy: Self::REFRESH_FAST_ONLY,
+                ..record
+            });
         }
+        Some(record)
     }
 }
 
@@ -293,6 +309,32 @@ mod tests {
     fn app_state_round_trips_with_type_settings() {
         let encoded = record().encode();
         assert_eq!(AppStateRecord::decode(&encoded), Some(record()));
+    }
+
+    #[test]
+    fn pre_v5_full_on_wake_migrates_to_fast_only() {
+        // V4 and older records carry the old default (full on wake), which
+        // behaved like fast only; they move onto the new default. A V5 record
+        // keeps the choice, and V4's other policies pass through.
+        let mut current = record();
+        current.refresh_policy = AppStateRecord::REFRESH_FULL_ON_WAKE;
+        let encoded = current.encode();
+        assert_eq!(AppStateRecord::decode(&encoded), Some(current));
+
+        let as_v4 = |mut bytes: [u8; AppStateRecord::ENCODED_LEN]| {
+            bytes[4] = AppStateRecord::V4_VERSION;
+            let checksum = checksum(&bytes[..32]);
+            write_u32(&mut bytes, 32, checksum);
+            bytes
+        };
+        let v4 = as_v4(encoded);
+        let decoded = AppStateRecord::decode(&v4).expect("v4 decodes");
+        assert_eq!(decoded.refresh_policy, AppStateRecord::REFRESH_FAST_ONLY);
+        assert_eq!(decoded.book_id, 7);
+
+        let v4_every_ten = as_v4(record().encode());
+        let decoded = AppStateRecord::decode(&v4_every_ten).expect("v4 decodes");
+        assert_eq!(decoded.refresh_policy, 2);
     }
 
     #[test]

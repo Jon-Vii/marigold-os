@@ -279,13 +279,19 @@ and has its waveform LUTs uploaded per refresh, so each `RefreshMode` maps to a
 LUT bank plus a CDI mode byte; FastClean is a half-scrub LUT bank (see
 `display/src/epd/uc8253.rs`).
 
-The user-facing `RefreshPolicy` in Settings selects between `FastOnly`,
-`FullOnWake` (the default), and `FullEveryTen` (shown as "clean every ten").
+The user-facing `RefreshPolicy` in Settings selects between `FastOnly` (the
+default), `FullOnWake`, and `FullEveryTen` (shown as "clean every ten").
 Under `FullEveryTen`, once `DEFAULT_FULL_REFRESH_INTERVAL` (9) consecutive fast
 refreshes have accumulated, the refresh planner schedules a cleaning refresh
-(FastClean) for the tenth page instead of another fast one. Because deep sleep
-reboots the chip, every wake starts from a fresh planner with a Full refresh,
-so `FastOnly` and `FullOnWake` currently behave the same.
+(FastClean) for the tenth page instead of another fast one. Deep sleep reboots
+the chip, so the planner itself does not survive it; `fw::wake_mark` keeps the
+one fact that matters in the RTC STORE0 retention register (RTC fast memory is
+powered down in deep sleep). The display task sets it when the sleep screen
+finishes and consumes it at boot, trusting it only when the reset reason is a
+deep-sleep wake. A marked wake seeds the planner as if it had just slept, so
+the first paint takes FastClean; `FullOnWake` keeps the deep Full there. A cold
+boot, a reset for any other reason, or a sleep whose screen failed paints with
+Full.
 
 `display::epd::ssd1677` contains three transform constants currently validated during bring-up:
 `MIRROR_X = true`, `MIRROR_Y = false`, and `REVERSE_BITS = true`. The logical

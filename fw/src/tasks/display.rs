@@ -68,6 +68,13 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
     // transition and refusal rules live in app-core with the contracts.
     let mut sync_session = SyncSession::default();
     let mut refresh_planner = RefreshPlanner::new();
+    // Waking from deep sleep is a reboot; the mark says the panel still
+    // shows the sleep screen, so the first paint can take the quick clean.
+    let woke_on_sleep_screen = crate::wake_mark::take();
+    if woke_on_sleep_screen {
+        refresh_planner.record_sleep();
+    }
+    esp_println::println!("bench: wake sleep_screen={}", woke_on_sleep_screen);
     let mut progress = ProgressJournal::new();
     // Durable state is consulted once per boot, after the first catalog with
     // entries lands; later catalog refreshes must not yank reading state.
@@ -388,6 +395,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                 prev_prestaged = false;
                 let panel_slept = display_flush::sleep_panel(&mut epd).await.is_ok();
                 let ok = panel_slept && sleep_frame_settled;
+                crate::wake_mark::set(ok);
                 if ok {
                     refresh_planner.record_sleep();
                 } else {
@@ -1216,7 +1224,7 @@ fn sleep_request_from_saved_state(
         front_buttons: app_core::front_buttons_from_u8(record.front_buttons)
             .unwrap_or(app_core::FrontButtons::PagesRight),
         refresh_policy: refresh_policy_from_u8(record.refresh_policy)
-            .unwrap_or(app_core::RefreshPolicy::FullOnWake),
+            .unwrap_or(app_core::RefreshPolicy::FastOnly),
         font_size: display::font::FontSize::from_u8(record.font_size)
             .unwrap_or(display::font::FontSize::Medium),
         line_spacing: display::font::LineSpacing::from_u8(record.line_spacing)

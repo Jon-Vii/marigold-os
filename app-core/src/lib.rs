@@ -142,8 +142,14 @@ pub enum FrontButtons {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RefreshPolicy {
+    /// Page turns ride the fast refresh; waking onto the sleep screen this
+    /// firmware drew takes the one-flicker clean.
     FastOnly,
+    /// As `FastOnly`, but every wake takes the deep multi-flash full
+    /// waveform.
     FullOnWake,
+    /// As `FastOnly`, plus a clean after every `DEFAULT_FULL_REFRESH_INTERVAL`
+    /// fast turns.
     FullEveryTen,
 }
 
@@ -198,8 +204,12 @@ impl RefreshPlanner {
             // Cold boot leaves unknown pixels on the panel; only the deep
             // full waveform reliably clears them. After a display sleep the
             // panel still shows the sleep screen this firmware drew, so the
-            // one-flicker clean is enough to wake.
-            return if self.fast_refresh_enabled && self.panel_shows_sleep_screen {
+            // one-flicker clean is enough to wake, unless the reader asked
+            // for the full waveform on every wake.
+            return if self.fast_refresh_enabled
+                && self.panel_shows_sleep_screen
+                && request.refresh_policy != RefreshPolicy::FullOnWake
+            {
                 RefreshMode::FastClean
             } else {
                 RefreshMode::Full
@@ -245,6 +255,9 @@ impl RefreshPlanner {
         }
     }
 
+    /// The panel now shows the sleep screen. Also called at boot when the
+    /// chip woke from a deep sleep that left that screen up, since the
+    /// planner itself does not survive the reboot.
     pub fn record_sleep(&mut self) {
         self.screen_on = false;
         self.fast_refreshes = 0;
@@ -754,7 +767,7 @@ impl ReaderState {
             book_id: 1,
             orientation: DisplayOrientation::LandscapeButtonsBottom,
             front_buttons: FrontButtons::PagesRight,
-            refresh_policy: RefreshPolicy::FullOnWake,
+            refresh_policy: RefreshPolicy::FastOnly,
             font_size: FontSize::Medium,
             line_spacing: LineSpacing::Normal,
             font_weight: FontWeight::Normal,
@@ -2358,6 +2371,8 @@ mod tests {
         let mut state = press(ReaderState::boot(), Button::Next);
         state.selection = 4;
         let state = press(state, Button::Confirm);
+        assert_eq!(state.refresh_policy, RefreshPolicy::FullOnWake);
+        let state = press(state, Button::Confirm);
         assert_eq!(state.refresh_policy, RefreshPolicy::FullEveryTen);
         let state = press(state, Button::Back);
         assert_eq!(state.view, AppView::Home);
@@ -2742,6 +2757,26 @@ mod tests {
         // Disabling fast refresh falls back to the deep full everywhere.
         let conservative = RefreshPlanner::new().with_fast_refresh_enabled(false);
         assert_eq!(conservative.mode_for(request), RefreshMode::Full);
+    }
+
+    #[test]
+    fn full_on_wake_keeps_the_deep_full_after_sleep() {
+        let mut state = ReaderState::boot();
+        assert_eq!(state.refresh_policy, RefreshPolicy::FastOnly);
+        state.refresh_policy = RefreshPolicy::FullOnWake;
+        let request = state.render_request(RenderKind::Boot);
+
+        // Seeded as the display task does after a deep-sleep wake.
+        let mut planner = RefreshPlanner::new();
+        planner.record_sleep();
+        assert_eq!(planner.mode_for(request), RefreshMode::Full);
+        planner.record_render(request, RefreshMode::Full);
+
+        // Only the wake differs: page turns stay fast.
+        let turn = state.render_request(RenderKind::Page);
+        assert_eq!(planner.mode_for(turn), RefreshMode::FastClean);
+        planner.record_render(turn, RefreshMode::FastClean);
+        assert_eq!(planner.mode_for(turn), RefreshMode::Fast);
     }
 
     /// One of every StorageCommand variant, so the admission table below is

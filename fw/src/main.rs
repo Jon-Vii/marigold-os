@@ -126,6 +126,7 @@ mod sync_mem;
 pub mod tasks;
 pub mod upload;
 mod views;
+mod wake_mark;
 
 /// Main-stack high-water mark. Boot paints the unused stack with a pattern;
 /// `report` later finds the deepest word overwritten and logs it whenever
