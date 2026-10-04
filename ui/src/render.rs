@@ -192,6 +192,13 @@ fn render_home(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     dash_key(fb, layout, 2, "wireless", false);
     dash_key(fb, layout, 3, "settings", false);
 
+    // An empty card has no book to title: the keys stand alone, and
+    // continue leads to the Library, which says how to add books.
+    if shell.active_book.title.is_empty() {
+        draw_battery_percent(fb, layout, shell.battery_percent);
+        return;
+    }
+
     // Long titles wrap to further lines that grow upward, keeping the
     // author/rule/colophon furniture (and one-line titles) fixed. The
     // portrait title page drops its block deeper into the taller leaf

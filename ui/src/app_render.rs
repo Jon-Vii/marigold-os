@@ -133,6 +133,10 @@ fn sync_error_label(error: SyncError) -> &'static str {
 pub fn render_sleep(fb: &mut Framebuffer, request: RenderRequest, model: &UiRenderModel<'_>) {
     fb.set_frame(fb_frame(request.orientation));
     fb.clear(true);
+    // No book on the card: nothing to commemorate, so a blank plate.
+    if model.active_book.title.is_empty() {
+        return;
+    }
 
     // Centered ceremonial furniture, sized to the frame: the landscape
     // plate keeps its historical 800-wide geometry (including the X3's

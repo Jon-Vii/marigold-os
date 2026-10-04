@@ -44,7 +44,7 @@ pub async fn run() {
     let mut suppress_input_until_open_settled = false;
     let mut block_confirm_until: Option<Instant> = None;
     // Defer the first paint. ReaderState::boot() defaults to the built-in guide
-    // (book_id 1), so drawing it now flashes "About This Reader" until the saved
+    // (book_id 1), so drawing it now flashes an empty title page until the saved
     // book loads from SD ~1.5s later. Instead, kick the catalog + saved-position
     // restore now and leave the retained image (the sleep screen, on a deep-sleep
     // wake) up until it resolves; the first render is sent when Restored/Scanned

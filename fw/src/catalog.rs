@@ -4,7 +4,8 @@ pub const ACTIVE_BOOK_ID: BookId = BookId(1);
 
 pub const BOOKS: [BookMeta<'static>; 1] = [BookMeta {
     id: ACTIVE_BOOK_ID,
-    title: "About This Reader",
+    // Untitled: Home shows no book when the card holds none.
+    title: "",
     author: "",
     source_path: "/built-in/guide",
     byte_size: 0,
