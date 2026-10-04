@@ -1486,11 +1486,10 @@ fn apply_home_action(mut state: ReaderState, action: HomeAction) -> ReaderState 
                 state.view = AppView::Reading;
                 state.sd_complete = false;
                 state.selection = state.chapter;
-            } else if state.library_count > 0 {
-                state.view = AppView::Library;
             } else {
-                state.view = AppView::Reading;
-                state.book_id = 1;
+                // No card book is active: let the reader pick one, or see
+                // that the card holds none.
+                state.view = AppView::Library;
             }
         }
         HomeAction::Files => {
@@ -1625,10 +1624,19 @@ mod tests {
         state.apply_input(CTX, InputEvent::button(button))
     }
 
+    /// The title page with a book from the card active, as after a scan or
+    /// a restore.
+    fn card_book_state() -> ReaderState {
+        let mut state = ReaderState::boot();
+        state.library_count = 1;
+        state.book_id = ReaderSource::sd(0).book_id();
+        state
+    }
+
     #[test]
     fn home_navigation_opens_primary_views() {
         assert_eq!(
-            press(ReaderState::boot(), Button::Confirm).view,
+            press(card_book_state(), Button::Confirm).view,
             AppView::Reading
         );
         assert_eq!(
@@ -2454,11 +2462,24 @@ mod tests {
     }
 
     #[test]
+    fn continue_without_a_card_book_opens_the_library() {
+        // An empty card has nothing to continue; the Library says so.
+        let state = press(ReaderState::boot(), Button::Confirm);
+        assert_eq!(state.view, AppView::Library);
+        assert_eq!(state.book_id, 1);
+
+        // Books on the card but none active yet: pick one.
+        let mut state = ReaderState::boot();
+        state.library_count = 3;
+        assert_eq!(press(state, Button::Confirm).view, AppView::Library);
+    }
+
+    #[test]
     fn home_ignores_the_front_pair_swap() {
         // Home is positional: the same physical key opens the same view
         // whether or not the pairs are swapped, so the title page reads
         // identically for every user.
-        let mut state = ReaderState::boot();
+        let mut state = card_book_state();
         state.front_buttons = FrontButtons::PagesLeft;
 
         assert_eq!(press(state, Button::Back).view, AppView::Library);
@@ -2492,7 +2513,7 @@ mod tests {
 
     #[test]
     fn portrait_keeps_all_physical_buttons() {
-        let mut state = ReaderState::boot();
+        let mut state = card_book_state();
         state.orientation = DisplayOrientation::PortraitButtonsLeft;
 
         assert_eq!(press(state, Button::Back).view, AppView::Library);
@@ -2510,7 +2531,7 @@ mod tests {
 
     #[test]
     fn landscape_top_rotates_front_button_mapping() {
-        let mut state = ReaderState::boot();
+        let mut state = card_book_state();
         state.orientation = DisplayOrientation::LandscapeButtonsTop;
 
         assert_eq!(press(state, Button::Back).view, AppView::Settings);

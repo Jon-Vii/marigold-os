@@ -3,12 +3,11 @@ use crate::{
     UiSyncStatus, UiTocItem, UiView,
 };
 use app_core::{
-    AppView, Button, DisplayOrientation, FirmwareUpdateStatus, FrontButtons, RefreshPolicy,
-    RenderRequest, SyncError, SyncStatus,
+    AppView, DisplayOrientation, FirmwareUpdateStatus, FrontButtons, RefreshPolicy, RenderRequest,
+    SyncError, SyncStatus,
 };
 use display::fb::{FbFrame, Framebuffer};
 use display::font::{draw_text, literata_display, literata_small, measure_text, FontStyle};
-use display::render::draw_ascii;
 
 #[derive(Clone, Copy, Debug)]
 pub struct UiRenderModel<'a> {
@@ -46,7 +45,14 @@ pub fn fb_frame(orientation: DisplayOrientation) -> FbFrame {
 pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRenderModel<'_>) {
     fb.set_frame(fb_frame(request.orientation));
     if request.view == AppView::Reading {
-        render_builtin_reading(fb, request, model);
+        // Book pages come from the firmware's reader store; the shared
+        // renderer only ever holds the book's plate.
+        fb.clear(true);
+        crate::reading::draw_reading_bookplate(
+            fb,
+            model.active_book.title,
+            model.active_book.author,
+        );
         return;
     }
 
@@ -222,25 +228,6 @@ fn draw_font_centered_fit(
     draw_text(fb, font, shown, x, y, false);
 }
 
-fn render_builtin_reading(fb: &mut Framebuffer, request: RenderRequest, model: &UiRenderModel<'_>) {
-    fb.clear(true);
-    draw_ascii(fb, "READ MODE", 64, 96, false);
-    draw_ascii(fb, model.active_book.title, 64, 136, false);
-    draw_ascii(fb, "BACK RETURNS HOME", 64, 176, false);
-    let mut chapter_buf = [0u8; 10];
-    draw_ascii(fb, "CHAPTER", 64, 232, false);
-    draw_ascii(
-        fb,
-        fmt_u32(request.chapter as u32 + 1, &mut chapter_buf),
-        160,
-        232,
-        false,
-    );
-    if let Some(button) = request.last_button {
-        draw_ascii(fb, button_label(button), 64, 280, false);
-    }
-}
-
 fn ui_view(view: AppView) -> UiView {
     match view {
         AppView::Home => UiView::Home,
@@ -268,31 +255,4 @@ fn ui_refresh_policy(policy: RefreshPolicy) -> UiRefreshPolicy {
         RefreshPolicy::FullOnWake => UiRefreshPolicy::FullOnWake,
         RefreshPolicy::FullEveryTen => UiRefreshPolicy::FullEveryTen,
     }
-}
-
-fn button_label(button: Button) -> &'static str {
-    match button {
-        Button::Power => "POWER",
-        Button::Back => "BACK",
-        Button::Confirm => "OK",
-        Button::Previous => "PREV",
-        Button::Next => "NEXT",
-        Button::PagePrevious => "PAGE-",
-        Button::PageNext => "PAGE+",
-    }
-}
-
-fn fmt_u32(n: u32, buf: &mut [u8; 10]) -> &str {
-    let mut i = buf.len();
-    let mut v = n;
-    if v == 0 {
-        i -= 1;
-        buf[i] = b'0';
-    }
-    while v > 0 {
-        i -= 1;
-        buf[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-    }
-    core::str::from_utf8(&buf[i..]).unwrap_or("?")
 }
