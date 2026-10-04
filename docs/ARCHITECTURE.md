@@ -445,6 +445,17 @@ section is written does the new index commit; interruption leaves the previous
 generation readable. This full-book spacing reflow is synchronous. A spacing
 change to an unfinished prefix takes the fresh-build path instead.
 
+Either way the book's page numbers move, so a page number saved or requested
+under the old layout would land somewhere else in the text. Before the old
+pagination is replaced, the requested page is pinned as a `PageAnchor`: its
+spine item and how far through that spine's pages its middle sat. The spacing
+reflow pins it from the resident sections; a rebuild reads the old on-card
+index once (`read_v2_page_anchor`, header and section records only) before
+building. The pin stays in the `ReaderStore` across the rebuild's steps,
+`requested_page` resolves it to the same spot in the new pagination once that
+spine is laid out, and the completed load spends it. This covers a type or
+orientation change mid-book and opening a book last read under other settings.
+
 Cache paths use FAT 8.3-safe names because `embedded-sdmmc` operates on short
 file names in the firmware path. The library list is a windowed catalog
 snapshot at `/XTEINK/CATALOG.BIN` (v4: `X4CT` magic, u16 book count, 92-byte

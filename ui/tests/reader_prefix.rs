@@ -163,3 +163,117 @@ fn unknown_chapter_sentinel_reaches_the_navigation_event_map() {
     assert_eq!(pages[0], 0);
     assert_eq!(pages[1], u16::MAX);
 }
+
+#[test]
+fn page_fractions_map_an_unchanged_pagination_back_exactly() {
+    for pages in [1u32, 2, 3, 7, 20, 137, 1000, 32_767] {
+        for offset in [0, pages / 3, pages / 2, pages - 1] {
+            let fraction = reader_store::page_fraction(offset, pages);
+            assert_eq!(
+                reader_store::page_at_fraction(fraction, pages),
+                offset,
+                "offset {offset} of {pages}"
+            );
+        }
+    }
+}
+
+const ANCHOR_SOURCE: (u32, u32) = (77, 9_000);
+
+fn anchored_store() -> ReaderStore {
+    let mut store = ReaderStore::new();
+    store.set_active_entry(
+        0,
+        "Book",
+        "BOOK.EPU",
+        true,
+        ANCHOR_SOURCE.1,
+        ANCHOR_SOURCE.0,
+        None,
+    );
+    store
+}
+
+#[test]
+fn a_relaid_book_keeps_the_place_rather_than_the_page_number() {
+    // Old layout: spine 1 runs pages 10..30 across two sections.
+    let old = [
+        section(0, 0, 0, 10),
+        section(1, 1, 10, 12),
+        section(2, 1, 22, 8),
+        section(3, 2, 30, 5),
+    ];
+    let mut store = anchored_store();
+    store.set_book_index(35, false, &old);
+    store.anchor_resident_page(ANCHOR_SOURCE, 20);
+
+    // Larger type: spine 1 now runs pages 14..44. Page 20 sat just past the
+    // middle of the spine (10.5 of 20 pages), so the reader lands at 15.75
+    // of 30, page 29, not on page 20 near the spine's start.
+    let new = [
+        section(0, 0, 0, 14),
+        section(1, 1, 14, 16),
+        section(2, 1, 30, 14),
+        section(3, 2, 44, 7),
+    ];
+    store.set_book_index(51, false, &new);
+    assert_eq!(store.requested_page(20, None), Some(29));
+    // Only the pinned request translates; spine jumps and other pages don't.
+    assert_eq!(store.requested_page(21, None), Some(21));
+    assert_eq!(store.requested_page(20, Some(2)), Some(44));
+
+    // Another book's request for the same number stays a raw page.
+    store.set_active_entry(1, "Other", "OTHER.EPU", true, 1, 2, None);
+    assert_eq!(store.requested_page(20, None), Some(20));
+    store.set_active_entry(
+        0,
+        "Book",
+        "BOOK.EPU",
+        true,
+        ANCHOR_SOURCE.1,
+        ANCHOR_SOURCE.0,
+        None,
+    );
+
+    // A spent pin leaves page numbers alone.
+    store.set_page_anchor(None);
+    assert_eq!(store.requested_page(20, None), Some(20));
+}
+
+#[test]
+fn a_pin_waits_for_its_spine_and_survives_the_rebuild_steps() {
+    let mut store = anchored_store();
+    store.set_book_index(35, false, &[section(0, 0, 0, 10), section(1, 1, 10, 20)]);
+    store.anchor_resident_page(ANCHOR_SOURCE, 15);
+
+    // The rebuild has laid out spine 0 only: the place is not known yet.
+    store.set_book_index(14, false, &[section(0, 0, 0, 14)]);
+    store.set_book_next_spine(Some(1));
+    assert_eq!(store.requested_page(15, None), None);
+
+    // A later step re-pins the same request; the first pin must stand, as
+    // the resident sections no longer hold the old pagination.
+    store.anchor_resident_page(ANCHOR_SOURCE, 15);
+    assert!(store.anchors(ANCHOR_SOURCE, 15));
+    store.set_book_index(44, false, &[section(0, 0, 0, 14), section(1, 1, 14, 30)]);
+    store.set_book_next_spine(None);
+    // 5.5 of 20 pages through spine 1 is 8.25 of 30: page 14 + 8.
+    assert_eq!(store.requested_page(15, None), Some(22));
+}
+
+#[test]
+fn a_spine_that_laid_out_empty_lands_on_the_following_text() {
+    let mut store = anchored_store();
+    store.set_book_index(
+        12,
+        false,
+        &[
+            section(0, 0, 0, 4),
+            section(1, 1, 4, 4),
+            section(2, 2, 8, 4),
+        ],
+    );
+    store.anchor_resident_page(ANCHOR_SOURCE, 5);
+    store.set_book_index(10, false, &[section(0, 0, 0, 6), section(1, 2, 6, 4)]);
+    assert_eq!(store.requested_page(5, None), Some(6));
+}

@@ -2,8 +2,8 @@
 mod book_generation;
 use crate::reader_layout;
 use crate::reader_store::{
-    ReaderStore, EMPTY_BOOK_SECTION_RECORD, EMPTY_TOC_RECORD, MAX_BOOK_SECTIONS,
-    MAX_OVERVIEW_CHAPTERS, MAX_SD_TOC_ITEMS, MAX_SD_TOC_TEXT_BYTES,
+    page_fraction, PageAnchor, ReaderStore, EMPTY_BOOK_SECTION_RECORD, EMPTY_TOC_RECORD,
+    MAX_BOOK_SECTIONS, MAX_OVERVIEW_CHAPTERS, MAX_SD_TOC_ITEMS, MAX_SD_TOC_TEXT_BYTES,
 };
 use display::font::FontStyle;
 use embedded_sdmmc::{Directory, File, Mode, TimeSource};
@@ -599,6 +599,84 @@ where
         header.total_pages
     })
     .unwrap_or(0)
+}
+
+/// Pins `page` in the book's on-card pagination when that pagination was
+/// laid out under another layout than the store's current one (the type
+/// settings or orientation changed since it was built), so a rebuild can
+/// land on the same text. The place is None when the index already matches
+/// the current layout and page numbers still hold, or when the index is
+/// missing, unreadable, for another source, or short of the page. Reads
+/// only the header and the section records.
+#[inline(never)]
+pub(crate) fn read_v2_page_anchor<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    key: &str,
+    source_identity: (u32, u32),
+    library: &ReaderStore,
+    page: u32,
+) -> PageAnchor
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let place = with_verified_v2_book_file(root, key, |file| {
+        let mut header_bytes = [0u8; BOOK_V2_HEADER_BYTES];
+        read_exact_file(file, &mut header_bytes).ok()?;
+        let header = decode_book_v2_header(&header_bytes).ok()?;
+        let expected_config =
+            reader_layout::reader_layout_config(library.type_settings(), library.portrait());
+        if header.font_config == expected_config
+            || header.source_hash != source_identity.0
+            || header.source_size != source_identity.1
+            || page >= header.total_pages
+        {
+            return None;
+        }
+        // Records run in reading order with each spine's sections together,
+        // so the page's spine is whole once the next spine begins.
+        let (mut spine, mut start, mut pages) = (0u16, 0u32, 0u32);
+        let (mut started, mut found, mut corrupt) = (false, false, false);
+        read_records_batched(
+            file,
+            BOOK_V2_SECTION_RECORD_BYTES,
+            header.section_count as usize,
+            |_, bytes| {
+                let Ok(record) = decode_book_v2_section(bytes) else {
+                    corrupt = true;
+                    return false;
+                };
+                if started && record.spine == spine {
+                    pages += u32::from(record.page_count);
+                } else if found {
+                    return false;
+                } else {
+                    (spine, start, pages) = (
+                        record.spine,
+                        record.start_page,
+                        u32::from(record.page_count),
+                    );
+                    started = true;
+                }
+                found |= page >= record.start_page
+                    && page - record.start_page < u32::from(record.page_count);
+                true
+            },
+        );
+        (found && !corrupt).then(|| (spine, page_fraction(page - start, pages)))
+    })
+    .flatten();
+    PageAnchor {
+        source: source_identity,
+        page,
+        place,
+    }
 }
 
 pub(crate) fn load_v2_book_index<

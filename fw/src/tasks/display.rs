@@ -863,7 +863,10 @@ fn handle_storage_command(
                 });
                 return;
             }
+            // A finished load has spent any page pin it took; a later
+            // request for the same page number means the new pagination.
             if sd_library.reader_status() == BookLoadStatus::Error {
+                sd_library.set_page_anchor(None);
                 send_loaded_library_event(&LibraryEvent::ReaderLoadFailed {
                     request_id,
                     book_id,
@@ -880,6 +883,7 @@ fn handle_storage_command(
                 complete: sd_library.book_next_spine().is_none(),
                 page: sd_library.requested_page(target_pages as u32, None),
             });
+            sd_library.set_page_anchor(None);
             esp_println::println!(
                 "storage: open complete status={:?} pages={} chapters={}",
                 sd_library.reader_status(),
@@ -983,6 +987,7 @@ fn handle_storage_command(
                 *pending_reader = Some(command);
                 return;
             }
+            sd_library.set_page_anchor(None);
             if sd_library.reader_status() == BookLoadStatus::Error {
                 send_loaded_library_event(&LibraryEvent::ReaderLoadFailed {
                     request_id,

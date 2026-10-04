@@ -74,6 +74,73 @@ pub(crate) const EMPTY_BOOK_SECTION_RECORD: BookV2SectionRecord = BookV2SectionR
     partial: false,
 };
 
+/// A reading position that survives repagination. A type-settings or
+/// orientation change lays the book out again and moves every page number,
+/// so before the old pagination is replaced, the requested page is pinned
+/// to its spine item and how far through that spine's pages it sat. The
+/// rebuild resolves the pin against the new pagination, and the reader
+/// keeps their place in the text rather than their page number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PageAnchor {
+    /// `(source_hash, source_size)` of the book.
+    pub(crate) source: (u32, u32),
+    /// The page as requested, numbered in the old pagination.
+    pub(crate) page: u32,
+    /// `(spine, fraction)` for the page, or None when the old pagination
+    /// was consulted and the page number needs no translation.
+    pub(crate) place: Option<(u16, u16)>,
+}
+
+impl PageAnchor {
+    /// Pins `page` within one book's `sections` (reading order). The place
+    /// is None when no section holds the page.
+    pub(crate) fn in_sections(
+        source: (u32, u32),
+        page: u32,
+        sections: &[BookV2SectionRecord],
+    ) -> Self {
+        let place = sections
+            .iter()
+            .find(|section| {
+                page >= section.start_page
+                    && page - section.start_page < u32::from(section.page_count)
+            })
+            .and_then(|holder| {
+                let (start, pages) = spine_extent(sections, holder.spine)?;
+                Some((holder.spine, page_fraction(page - start, pages)))
+            });
+        Self {
+            source,
+            page,
+            place,
+        }
+    }
+}
+
+/// How far through `pages` the middle of page `offset` sits, in 1/65536ths.
+/// Taking the middle makes an unchanged pagination map back to the exact
+/// page (`page_at_fraction`) for any spine under 32,768 pages.
+pub(crate) fn page_fraction(offset: u32, pages: u32) -> u16 {
+    let pages = u64::from(pages.max(1));
+    let offset = u64::from(offset).min(pages - 1);
+    ((offset * 2 + 1) * 32_768 / pages) as u16
+}
+
+/// The page, of `pages`, that `fraction` (from `page_fraction`) falls on.
+pub(crate) fn page_at_fraction(fraction: u16, pages: u32) -> u32 {
+    ((u64::from(fraction) * u64::from(pages)) >> 16) as u32
+}
+
+/// First page and page count of `spine` within one book's `sections`.
+fn spine_extent(sections: &[BookV2SectionRecord], spine: u16) -> Option<(u32, u32)> {
+    let mut extent: Option<(u32, u32)> = None;
+    for section in sections.iter().filter(|section| section.spine == spine) {
+        let (_, pages) = extent.get_or_insert((section.start_page, 0));
+        *pages += u32::from(section.page_count);
+    }
+    extent
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LibraryScanStatus {
     NotScanned,
@@ -183,6 +250,9 @@ pub(crate) struct ReaderStore {
     book_generated_toc: bool,
     pub(crate) book_section_count: usize,
     pub(crate) book_sections: [BookV2SectionRecord; MAX_BOOK_SECTIONS],
+    /// Pin for the page a layout-changing load asked for, held across the
+    /// rebuild's steps until that load completes (see `PageAnchor`).
+    page_anchor: Option<PageAnchor>,
     pub(crate) toc_text: [u8; MAX_SD_TOC_TEXT_BYTES],
     pub(crate) toc_text_len: usize,
     pub(crate) toc: [TocRecord; MAX_SD_TOC_ITEMS],
@@ -284,6 +354,7 @@ impl ReaderStore {
             book_generated_toc: false,
             book_section_count: 0,
             book_sections: [EMPTY_BOOK_SECTION_RECORD; MAX_BOOK_SECTIONS],
+            page_anchor: None,
             toc_text: [0; MAX_SD_TOC_TEXT_BYTES],
             toc_text_len: 0,
             toc: [EMPTY_TOC_RECORD; MAX_SD_TOC_ITEMS],
@@ -906,6 +977,8 @@ impl ReaderStore {
             if self.book_next_spine.is_some_and(|next| spine >= next) {
                 return None;
             }
+        } else if let Some(place) = self.anchored_place(page) {
+            return self.page_for_place(place);
         }
         if page < self.book_total_pages {
             Some(page)
@@ -914,6 +987,57 @@ impl ReaderStore {
         } else {
             None
         }
+    }
+
+    /// Whether the old pagination was already consulted for this request.
+    pub(crate) fn anchors(&self, source: (u32, u32), page: u32) -> bool {
+        self.page_anchor
+            .is_some_and(|anchor| anchor.source == source && anchor.page == page)
+    }
+
+    pub(crate) fn set_page_anchor(&mut self, anchor: Option<PageAnchor>) {
+        self.page_anchor = anchor;
+    }
+
+    /// Pin `page` in the resident pagination before it is laid out again,
+    /// unless this request is already pinned.
+    pub(crate) fn anchor_resident_page(&mut self, source: (u32, u32), page: u32) {
+        if !self.anchors(source, page) {
+            self.page_anchor = Some(PageAnchor::in_sections(
+                source,
+                page,
+                &self.book_sections[..self.book_section_count],
+            ));
+        }
+    }
+
+    /// The pinned place for a request of `page` on the active book.
+    fn anchored_place(&self, page: u32) -> Option<(u16, u16)> {
+        let anchor = self.page_anchor?;
+        let active = self
+            .active_index
+            .map(|_| (self.active_entry.source_hash, self.active_entry.byte_size));
+        (anchor.page == page && active == Some(anchor.source))
+            .then_some(anchor.place)
+            .flatten()
+    }
+
+    /// Where a pinned place lands in the resident pagination. None until
+    /// its spine is laid out; a spine that laid out to no pages lands where
+    /// the following text starts.
+    fn page_for_place(&self, (spine, fraction): (u16, u16)) -> Option<u32> {
+        let sections = &self.book_sections[..self.book_section_count];
+        if let Some((start, pages)) = spine_extent(sections, spine) {
+            return Some(start + page_at_fraction(fraction, pages));
+        }
+        if self.book_next_spine.is_some_and(|next| spine >= next) {
+            return None;
+        }
+        sections
+            .iter()
+            .find(|section| section.spine > spine)
+            .map(|section| section.start_page)
+            .or(self.book_total_pages.checked_sub(1))
     }
 
     pub(crate) fn set_current_section_range(&mut self, start_page: u32, page_count: usize) {

@@ -1023,3 +1023,58 @@ fn deleting_files_and_cache_directories_returns_every_cluster() {
         "emptying a book cache frees its files and folders"
     );
 }
+
+#[test]
+fn page_anchor_reads_the_old_pagination_only_after_a_layout_change() {
+    use display::font::{FontSize, TypeSettings};
+    let disk = fat::Disk::new();
+    let manager: VolumeManager<_, _, 8, 8, 1> =
+        VolumeManager::new_with_limits(&disk, fat::Clock, 0);
+    let volume = manager.open_volume(VolumeIdx(0)).unwrap();
+    let root = volume.open_root_dir().unwrap();
+    let mut store = ReaderStore::new();
+    let record = |section: u16, spine: u16, start_page: u32, page_count: u16| BookV2SectionRecord {
+        section,
+        spine,
+        start_page,
+        page_count,
+        partial: false,
+    };
+    // Spine 1 spans pages 10..30 over two sections; spine 2 follows.
+    let sections = [
+        record(0, 0, 0, 10),
+        record(1, 1, 10, 12),
+        record(2, 1, 22, 8),
+        record(3, 2, 30, 5),
+    ];
+    assert!(reader_cache_files::write_v2_book_index(
+        &root, KEY, ID, 35, &sections, &store, false
+    ));
+
+    // Same layout: page numbers still hold.
+    let same = reader_cache_files::read_v2_page_anchor(&root, KEY, ID, &store, 20);
+    assert_eq!((same.source, same.page, same.place), (ID, 20, None));
+
+    // Larger type: page 20 is pinned 10.5 pages into spine 1's 20.
+    store.set_layout(
+        TypeSettings {
+            size: FontSize::Large,
+            ..TypeSettings::DEFAULT
+        },
+        false,
+    );
+    let pinned = reader_cache_files::read_v2_page_anchor(&root, KEY, ID, &store, 20);
+    assert_eq!(pinned.place, Some((1, reader_store::page_fraction(10, 20))));
+    // The holder's spine is whole even when it is the book's last.
+    let last = reader_cache_files::read_v2_page_anchor(&root, KEY, ID, &store, 34);
+    assert_eq!(last.place, Some((2, reader_store::page_fraction(4, 5))));
+    // Past the end, or another source's index, pins nothing.
+    assert_eq!(
+        reader_cache_files::read_v2_page_anchor(&root, KEY, ID, &store, 35).place,
+        None
+    );
+    assert_eq!(
+        reader_cache_files::read_v2_page_anchor(&root, KEY, (1, 2), &store, 20).place,
+        None
+    );
+}

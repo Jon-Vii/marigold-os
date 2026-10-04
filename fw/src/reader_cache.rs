@@ -295,6 +295,21 @@ where
     ) {
         return BookLoadStatus::Ready;
     }
+    // Preparation follows. If the type settings or orientation changed since
+    // the on-card pages were laid out, pin the requested page in them now,
+    // before the rebuild replaces them. Once per request: later steps of the
+    // same rebuild keep the pin rather than re-reading the index.
+    let target_page = target_pages as u32;
+    if requested_spine.is_none() && !library.anchors(source_identity, target_page) {
+        let anchor = reader_cache_files::read_v2_page_anchor(
+            root,
+            cache_key.as_str(),
+            source_identity,
+            library,
+            target_page,
+        );
+        library.set_page_anchor(Some(anchor));
+    }
 
     if in_books_dir {
         let load_result = match root.open_dir("BOOKS") {
@@ -644,6 +659,10 @@ where
     let mut result =
         reader_cache_files::load_v2_book_index(root, cache_key, source_identity, library);
     if result == BookIndexLoadResult::SpacingMismatch {
+        // The resident sections are still the old spacing's pages.
+        if requested_spine.is_none() {
+            library.anchor_resident_page(source_identity, requested_global_page);
+        }
         if !reader_cache_files::reflow_book_spacing(
             root,
             cache_key,
