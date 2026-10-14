@@ -53,7 +53,11 @@ static EPUB_SCRATCH: static_cell::StaticCell<ReaderCacheScratch<'static>> =
     static_cell::StaticCell::new();
 
 #[embassy_executor::task]
-pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
+pub async fn run(
+    mut epd: Epd,
+    mut sd_cs: Output<'static>,
+    scratch: &'static mut ReaderCacheScratch<'static>,
+) {
     esp_println::println!("display: started");
 
     static FB: static_cell::StaticCell<Framebuffer> = static_cell::StaticCell::new();
@@ -63,7 +67,9 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
     let prev_fb = crate::sync_mem::take_prev_fb().expect("prev_fb claimed once");
     static TX_BAND: static_cell::StaticCell<[u8; BAND_BYTES]> = static_cell::StaticCell::new();
     let tx_band = TX_BAND.init([0; BAND_BYTES]);
-    let mut epub_scratch = None;
+    // Present from boot until a sync session borrows it for the radio; that
+    // session ends in a reset, so it never needs rebuilding.
+    let mut epub_scratch = Some(scratch);
     // Storage-command admission for the sync session lifecycle; the loan
     // transition and refusal rules live in app-core with the contracts.
     let mut sync_session = SyncSession::default();
@@ -670,7 +676,6 @@ fn handle_storage_command(
             if !progress.flush(epd, sd_cs, sd_library) {
                 esp_println::println!("storage: sync loan proceeding; reading position not saved");
             }
-            ensure_epub_scratch(epub_scratch);
             let Some(scratch) = epub_scratch.take() else {
                 return;
             };
@@ -1146,29 +1151,36 @@ fn send_required_display_event(event: &DisplayEvent) {
     }
 }
 
-/// Kept out of line: first-call initialization moves a multi-KB scratch
-/// value into the static; that spike must not sit at the base of the EPUB
-/// open call chain's frame.
+/// Builds the EPUB scratch into its static, once, from `main` before the
+/// executor starts. Initialising it moves a ~21 KB value (mostly the inflate
+/// state) through the stack. Done lazily at the first book open, as it used
+/// to be, that spike sat on top of the display task and storage dispatcher
+/// and was the deepest the stack ever went; at the base of the stack it
+/// stays far below the reader's real call chains.
 #[inline(never)]
+pub(crate) fn init_epub_scratch() -> &'static mut ReaderCacheScratch<'static> {
+    EPUB_SCRATCH.init_with(|| {
+        ReaderCacheScratch::new(
+            EPUB_TAIL.take(),
+            EPUB_HEADER.take(),
+            EPUB_NAME.take(),
+            EPUB_COMPRESSED.take(),
+            EPUB_CONTAINER.take(),
+            EPUB_OPF.take(),
+            EPUB_XHTML.take(),
+            EPUB_BOOK_SECTIONS.take(),
+        )
+    })
+}
+
+/// The scratch is only ever absent while lent to a sync session, which
+/// refuses reader work and ends in a reset.
 fn ensure_epub_scratch<'a>(
     epub_scratch: &'a mut Option<&'static mut ReaderCacheScratch<'static>>,
 ) -> &'a mut ReaderCacheScratch<'static> {
-    if epub_scratch.is_none() {
-        esp_println::println!("storage: init epub scratch");
-        *epub_scratch = Some(EPUB_SCRATCH.init_with(|| {
-            ReaderCacheScratch::new(
-                EPUB_TAIL.take(),
-                EPUB_HEADER.take(),
-                EPUB_NAME.take(),
-                EPUB_COMPRESSED.take(),
-                EPUB_CONTAINER.take(),
-                EPUB_OPF.take(),
-                EPUB_XHTML.take(),
-                EPUB_BOOK_SECTIONS.take(),
-            )
-        }));
-    }
-    epub_scratch.as_deref_mut().unwrap()
+    epub_scratch
+        .as_deref_mut()
+        .expect("EPUB scratch is lent only to the sync session")
 }
 
 fn source_identity(library: &ReaderStore, book_id: u32) -> (u32, u32) {

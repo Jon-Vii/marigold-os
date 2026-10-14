@@ -378,12 +378,15 @@ fn main() -> ! {
         );
     }
 
+    // Built here, at the base of the stack, not at the first book open.
+    let epub_scratch = tasks::display::init_epub_scratch();
+
     let executor = EXECUTOR.init(Executor::new());
     executor.run(|spawner: Spawner| {
         #[cfg(feature = "device-x3")]
         spawner.spawn(tasks::input::battery_run(battery_gauge).unwrap());
         esp_println::println!("main: spawn display");
-        spawner.spawn(tasks::display::run(epd_bus, sd_cs).unwrap());
+        spawner.spawn(tasks::display::run(epd_bus, sd_cs, epub_scratch).unwrap());
         esp_println::println!("main: spawn power");
         spawner.spawn(tasks::power::run(peripherals.LPWR).unwrap());
         esp_println::println!("main: spawn app");
