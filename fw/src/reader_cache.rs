@@ -1467,15 +1467,20 @@ fn spine_item_is_navigation(
         || lower_href.ends_with("nav.html")
 }
 
-/// Without a guide or landmark, a first spine item named for the cover or
-/// title page is front matter; the text starts after it.
+/// Without a text reference or landmark, a first spine item that the guide
+/// names as the cover page, or whose name says cover or title page, is front
+/// matter; the text starts after it.
 fn inferred_text_start_spine(package: &proto::epub::EpubPackage<'_>) -> Option<u16> {
     if package.spine.len() <= 1 {
         return None;
     }
     let first = package.spine.first()?;
-    let lower_href = LowerAscii::<MAX_ENTRY_NAME_BYTES>::new(first.href.of(package.opf_text));
-    (lower_href.contains("titlepage")
+    let first_href = first.href.of(package.opf_text);
+    let lower_href = LowerAscii::<MAX_ENTRY_NAME_BYTES>::new(first_href);
+    (package
+        .cover_page_href
+        .is_some_and(|cover| href_matches_spine(cover, first_href))
+        || lower_href.contains("titlepage")
         || lower_href.contains("title-page")
         || lower_href.contains("cover"))
     .then_some(1)

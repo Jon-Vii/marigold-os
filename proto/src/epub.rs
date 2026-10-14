@@ -1469,6 +1469,9 @@ pub struct EpubPackage<'a> {
     pub opf_text: &'a str,
     pub opf_path: &'a str,
     pub text_reference_href: Option<&'a str>,
+    /// The guide's `cover` page reference: an XHTML page that only frames
+    /// the cover image (not the image itself, which is `cover_href`).
+    pub cover_page_href: Option<&'a str>,
     pub nav_href: Option<&'a str>,
     pub ncx_href: Option<&'a str>,
     /// The cover image's href: the `cover-image` item, else an image whose id
@@ -1611,6 +1614,7 @@ where
         opf_text: "",
         opf_path,
         text_reference_href: None,
+        cover_page_href: None,
         nav_href: None,
         ncx_href: None,
         cover_href: None,
@@ -1652,6 +1656,9 @@ where
     package.text_reference_href = summary
         .text_reference
         .or(summary.start_reference)
+        .map(|span| strip_fragment(span.of(text)));
+    package.cover_page_href = summary
+        .cover_reference
         .map(|span| strip_fragment(span.of(text)));
     package.nav_href = summary.nav.map(|span| span.of(text));
     package.ncx_href = summary.ncx.map(|span| span.of(text));
@@ -1711,6 +1718,7 @@ struct OpfSummary {
     author: Option<Span>,
     text_reference: Option<Span>,
     start_reference: Option<Span>,
+    cover_reference: Option<Span>,
     nav: Option<Span>,
     ncx: Option<Span>,
     cover: Option<Span>,
@@ -1778,6 +1786,7 @@ struct OpfCollector<'b, 'f> {
     author: Option<Span>,
     text_reference: Option<Span>,
     start_reference: Option<Span>,
+    cover_reference: Option<Span>,
     nav: Option<Span>,
     ncx: Option<Span>,
     cover: Option<Span>,
@@ -1805,6 +1814,7 @@ impl<'b, 'f> OpfCollector<'b, 'f> {
             author: None,
             text_reference: None,
             start_reference: None,
+            cover_reference: None,
             nav: None,
             ncx: None,
             cover: None,
@@ -1830,6 +1840,7 @@ impl<'b, 'f> OpfCollector<'b, 'f> {
             author: self.author,
             text_reference: self.text_reference,
             start_reference: self.start_reference,
+            cover_reference: self.cover_reference,
             nav: self.nav,
             ncx: self.ncx,
             cover: self.cover.or(self.image_cover),
@@ -2076,6 +2087,8 @@ impl<'b, 'f> OpfCollector<'b, 'f> {
             self.text_reference = self.push(href);
         } else if self.start_reference.is_none() && attr_word_eq(tag, "type", "start") {
             self.start_reference = self.push(href);
+        } else if self.cover_reference.is_none() && attr_word_eq(tag, "type", "cover") {
+            self.cover_reference = self.push(href);
         }
     }
 }
@@ -5178,7 +5191,7 @@ mod tests {
         let opf = r#"
             <package>
               <metadata><dc:title>The Time Machine</dc:title><dc:creator>H. G. Wells</dc:creator></metadata>
-              <guide><reference type="text" title="Start" href="text/start.xhtml#p1"/></guide>
+              <guide><reference type="cover" title="Cover" href="wrap0000.html"/><reference type="text" title="Start" href="text/start.xhtml#p1"/></guide>
               <manifest>
                 <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
                 <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
@@ -5203,6 +5216,7 @@ mod tests {
         assert_eq!(package.spine.len(), 1);
         assert_eq!(package.spine[0].href.of(package.opf_text), "text/ch1.xhtml");
         assert_eq!(package.text_reference_href, Some("text/start.xhtml"));
+        assert_eq!(package.cover_page_href, Some("wrap0000.html"));
         assert_eq!(package.nav_href, Some("nav.xhtml"));
         assert_eq!(package.ncx_href, Some("toc.ncx"));
     }
