@@ -769,10 +769,13 @@ fn handle_storage_command(
             }
             // A coalesced position for the previous book locates that book's
             // POS file through the active entry this open is about to
-            // replace; write it first or the switch silently drops it.
+            // replace; write it first or the switch silently drops it. A
+            // resume of the same book reads its POS file too, so a position
+            // still waiting out the write deadline lands first.
+            let resumes = is_open_book && chapter == 0 && target_pages == 0;
             if progress
                 .pending_book()
-                .is_some_and(|pending| pending != book_id)
+                .is_some_and(|pending| pending != book_id || resumes)
             {
                 progress.flush(epd, sd_cs, sd_library);
             }
