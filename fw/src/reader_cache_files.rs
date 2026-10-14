@@ -831,6 +831,7 @@ where
         );
         library.set_book_next_spine(header.next_spine);
         library.set_book_generated_toc(header.generated_toc);
+        library.set_text_start_spine(header.text_start_spine);
         if spacing_changed {
             BookIndexLoadResult::SpacingMismatch
         } else {
@@ -1156,6 +1157,7 @@ where
             ),
             custom_font_identity: library.custom_font_identity(),
             partial,
+            text_start_spine: library.text_start_spine(),
         };
         let mut bytes = [0u8; BOOK_V2_HEADER_BYTES];
         if encode_book_v2_header(header, &mut bytes).is_err() {

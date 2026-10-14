@@ -100,6 +100,17 @@ impl EpubTocSink for LibraryTocSink<'_, '_> {
         }
         Ok(())
     }
+
+    fn push_bodymatter(&mut self, href: &str) {
+        if let Some(spine) = self
+            .package
+            .spine
+            .iter()
+            .position(|item| href_matches_spine(href, item.href.of(self.package.opf_text)))
+        {
+            self.library.set_text_start_spine(u16::try_from(spine).ok());
+        }
+    }
 }
 
 impl<'a> ReaderCacheScratch<'a> {
@@ -1121,6 +1132,12 @@ where
 
     library.set_book_labels(package.meta.title, package.meta.author);
     library.clear_cover();
+    if resumed_sections == 0 {
+        // Found afresh below: the OPF guide's text reference, else the nav's
+        // bodymatter landmark (recorded while the TOC streams), else a guess.
+        // A resumed build keeps the start its prefix index recorded.
+        library.set_text_start_spine(None);
+    }
     if resumed_sections > 0 {
         // The prefix index and existing TOC sidecar remain authoritative.
     } else if zip.is_forward_only() {
@@ -1188,17 +1205,23 @@ where
         library.toc_count() == 0
     };
     library.set_book_generated_toc(generate_toc_from_headings);
-    let start_spine_index = package
-        .text_reference_href
-        .and_then(|href| {
+    if resumed_sections == 0 {
+        let guide_start = package.text_reference_href.and_then(|href| {
             package
                 .spine
                 .iter()
                 .position(|item| href_matches_spine(href, item.href.of(package.opf_text)))
-        })
-        .unwrap_or_else(|| inferred_start_spine_index(&package));
-
-    let start_spine_index = resume_next.map(usize::from).unwrap_or(start_spine_index);
+        });
+        let text_start = guide_start
+            .and_then(|spine| u16::try_from(spine).ok())
+            .or(library.text_start_spine())
+            .or_else(|| inferred_text_start_spine(&package));
+        library.set_text_start_spine(text_start.filter(|spine| *spine > 0));
+    }
+    // Front matter is part of the book: a first open lands at the text start
+    // (see ReaderStore::requested_page), and paging back or the Contents
+    // still reach the cover, title, and foreword pages.
+    let start_spine_index = resume_next.map(usize::from).unwrap_or(0);
     let mut next_spine = None;
     let mut processed_spine = false;
     // Each call processes at most one spine. No ZIP/parser/FAT borrow survives
@@ -1444,22 +1467,18 @@ fn spine_item_is_navigation(
         || lower_href.ends_with("nav.html")
 }
 
-fn inferred_start_spine_index(package: &proto::epub::EpubPackage<'_>) -> usize {
+/// Without a guide or landmark, a first spine item named for the cover or
+/// title page is front matter; the text starts after it.
+fn inferred_text_start_spine(package: &proto::epub::EpubPackage<'_>) -> Option<u16> {
     if package.spine.len() <= 1 {
-        return 0;
+        return None;
     }
-    let Some(first) = package.spine.first() else {
-        return 0;
-    };
+    let first = package.spine.first()?;
     let lower_href = LowerAscii::<MAX_ENTRY_NAME_BYTES>::new(first.href.of(package.opf_text));
-    if lower_href.contains("titlepage")
+    (lower_href.contains("titlepage")
         || lower_href.contains("title-page")
-        || lower_href.contains("cover")
-    {
-        1
-    } else {
-        0
-    }
+        || lower_href.contains("cover"))
+    .then_some(1)
 }
 
 fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {

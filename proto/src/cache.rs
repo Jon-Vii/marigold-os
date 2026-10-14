@@ -155,6 +155,10 @@ pub struct BookV2Header {
     pub font_config: u16,
     pub custom_font_identity: u64,
     pub partial: bool,
+    /// Raw spine ordinal where the main text starts (after cover, title,
+    /// and other front matter), when the book says or the builder could
+    /// tell. A book without a saved place first opens there.
+    pub text_start_spine: Option<u16>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -494,7 +498,14 @@ pub fn encode_book_v2_header(header: BookV2Header, out: &mut [u8]) -> Result<usi
     write_u16(out, 28, header.viewport_width);
     write_u16(out, 30, header.viewport_height);
     write_u16(out, 32, header.font_config);
-    write_u16(out, 34, 0);
+    // Formerly reserved zero, so older indexes read as "start unknown".
+    write_u16(
+        out,
+        34,
+        header
+            .text_start_spine
+            .map_or(0, |spine| spine.saturating_add(1)),
+    );
     write_u32(out, 36, header.toc_text_bytes);
     write_u32(out, 40, header.title_text_bytes);
     write_u32(out, 44, header.author_text_bytes);
@@ -531,6 +542,7 @@ pub fn decode_book_v2_header(input: &[u8]) -> Result<BookV2Header, CacheError> {
         viewport_height: read_u16(input, 30)?,
         font_config: read_u16(input, 32)?,
         custom_font_identity: read_u64(input, 48)?,
+        text_start_spine: read_u16(input, 34)?.checked_sub(1),
     })
 }
 
@@ -1165,6 +1177,7 @@ mod tests {
             font_config: 1,
             custom_font_identity: 0x8877_6655_4433_2211,
             partial: true,
+            text_start_spine: Some(3),
         };
         let section = BookV2SectionRecord {
             section: 1,
@@ -1185,8 +1198,10 @@ mod tests {
         let mut legacy = header_bytes;
         legacy[7] = 0;
         legacy[26..28].fill(0);
+        legacy[34..36].fill(0);
         let old = decode_book_v2_header(&legacy).unwrap();
         assert_eq!(old.next_spine, None);
+        assert_eq!(old.text_start_spine, None);
         assert!(!old.generated_toc);
         assert!(old.partial);
         assert_eq!(old.total_pages, header.total_pages);

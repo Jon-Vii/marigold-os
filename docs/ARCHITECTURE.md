@@ -421,6 +421,15 @@ section. Appending complete spines preserves earlier page numbers and chapter
 boundaries. Reopening can reuse the committed prefix after sleep or an
 interrupted later step.
 
+The build covers every spine item from the first (navigation documents
+aside), front matter included. It also records where the main text starts:
+the OPF guide's `text` (or `start`) reference, else the EPUB 3 nav's
+`bodymatter` landmark, else a first spine item named for the cover or title
+page. A book with no saved position first opens there, provided the start lies
+in the book's first quarter; paging back or the Contents still reach the cover
+and foreword. Before layout version 21 the builder dropped everything before
+that start instead.
+
 A source spine item can paginate into several sections, and several TOC
 chapters can refer to the same spine. The builder closes the current section and opens the next when its in-RAM arena
 fills, where the text budget (16 KB) is the binding limit for prose, well ahead
@@ -497,8 +506,9 @@ snapshot or a completed scan has no EPUBs.
 
 Each book index holds a `BookV2Header`, one `BookV2SectionRecord` per section
 (spine, start page, page count, partial), TOC records, and title/author/TOC text.
-The header also records the optional next-spine cursor and whether the TOC was
-generated from content. `BOOKA.BIN` and `BOOKB.BIN` add a generation/checksum
+The header also records the optional next-spine cursor, whether the TOC was
+generated from content, and the text-start spine (in two formerly reserved
+bytes, so older indexes read as "unknown"). `BOOKA.BIN` and `BOOKB.BIN` add a generation/checksum
 footer written last. Loading verifies the newest committed body and can fall
 back to the older valid generation or legacy index.
 

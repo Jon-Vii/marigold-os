@@ -1078,3 +1078,39 @@ fn page_anchor_reads_the_old_pagination_only_after_a_layout_change() {
         None
     );
 }
+
+#[test]
+fn the_text_start_round_trips_through_the_book_index() {
+    let disk = fat::Disk::new();
+    let manager: VolumeManager<_, _, 8, 8, 1> =
+        VolumeManager::new_with_limits(&disk, fat::Clock, 0);
+    let volume = manager.open_volume(VolumeIdx(0)).unwrap();
+    let root = volume.open_root_dir().unwrap();
+    let mut store = ReaderStore::new();
+    let sections = [
+        BookV2SectionRecord {
+            section: 0,
+            spine: 0,
+            start_page: 0,
+            page_count: 2,
+            partial: false,
+        },
+        BookV2SectionRecord {
+            section: 1,
+            spine: 2,
+            start_page: 2,
+            page_count: 8,
+            partial: false,
+        },
+    ];
+    store.set_text_start_spine(Some(2));
+    assert!(reader_cache_files::write_v2_book_index(
+        &root, KEY, ID, 10, &sections, &store, false
+    ));
+    let mut loaded = ReaderStore::new();
+    assert_eq!(
+        reader_cache_files::load_v2_book_index(&root, KEY, ID, &mut loaded),
+        BookIndexLoadResult::Hit
+    );
+    assert_eq!(loaded.text_start_spine(), Some(2));
+}

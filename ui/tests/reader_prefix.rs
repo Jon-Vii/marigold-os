@@ -277,3 +277,62 @@ fn a_spine_that_laid_out_empty_lands_on_the_following_text() {
     store.set_book_index(10, false, &[section(0, 0, 0, 6), section(1, 2, 6, 4)]);
     assert_eq!(store.requested_page(5, None), Some(6));
 }
+
+#[test]
+fn a_first_open_lands_where_the_text_starts() {
+    // Cover, title, and foreword (spines 0-2, five pages) before the text.
+    let sections = [
+        section(0, 0, 0, 1),
+        section(1, 1, 1, 1),
+        section(2, 2, 2, 3),
+        section(3, 3, 5, 20),
+        section(4, 4, 25, 15),
+    ];
+    let mut store = anchored_store();
+    store.set_book_index(40, false, &sections);
+    store.set_text_start_spine(Some(3));
+    assert_eq!(
+        store.requested_page(0, None),
+        Some(0),
+        "only a first open seeks"
+    );
+
+    store.seek_text_start(ANCHOR_SOURCE);
+    assert_eq!(store.requested_page(0, None), Some(5));
+    // Pages other than the opening request, and spine jumps, are untouched.
+    assert_eq!(store.requested_page(7, None), Some(7));
+    assert_eq!(store.requested_page(0, Some(1)), Some(1));
+
+    // Another book's first open does not borrow this book's start.
+    store.set_active_entry(1, "Other", "OTHER.EPU", true, 1, 2, None);
+    assert_eq!(store.requested_page(0, None), Some(0));
+    store.set_active_entry(
+        0,
+        "Book",
+        "BOOK.EPU",
+        true,
+        ANCHOR_SOURCE.1,
+        ANCHOR_SOURCE.0,
+        None,
+    );
+
+    // Once the load completes, page 0 is the cover again.
+    store.end_reader_request();
+    assert_eq!(store.requested_page(0, None), Some(0));
+}
+
+#[test]
+fn a_text_start_waits_for_its_spine_and_ignores_a_deep_marker() {
+    let mut store = anchored_store();
+    store.seek_text_start(ANCHOR_SOURCE);
+    store.set_book_index(5, false, &[section(0, 0, 0, 5)]);
+    store.set_book_next_spine(Some(1));
+    store.set_text_start_spine(Some(1));
+    assert_eq!(store.requested_page(0, None), None, "not laid out yet");
+
+    // A marker past the first quarter of the book is not trusted.
+    store.set_book_index(40, false, &[section(0, 0, 0, 12), section(1, 1, 12, 28)]);
+    store.set_book_next_spine(None);
+    store.set_text_start_spine(Some(1));
+    assert_eq!(store.requested_page(0, None), Some(0));
+}

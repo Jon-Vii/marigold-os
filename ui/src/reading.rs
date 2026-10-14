@@ -473,7 +473,9 @@ pub const READER_WRAP_SAFETY: i16 = 4;
 /// past 16 KB of package document), spaces between styled runs and `&nbsp;`
 /// survive, scene breaks (`<hr>`) render, comments no longer swallow text,
 /// and lines no longer break early at section seams. Rebuild every book.
-const READER_LAYOUT_VERSION: u16 = 20;
+/// v21: front matter before the text start is built into the book (it used
+/// to be dropped), which moves every page number after it.
+const READER_LAYOUT_VERSION: u16 = 21;
 
 /// Panel-geometry salt folded into the version bits: wrap points and page
 /// heights depend on the page box, so pagination cached on one panel must

@@ -790,26 +790,47 @@ fn handle_storage_command(
             // through untouched. Extends never resume.
             let mut chapter = chapter;
             let mut target_pages = target_pages;
+            let mut first_open = false;
             if is_open_book && chapter == 0 && target_pages == 0 {
-                if let Some((saved_chapter, saved_screen)) =
-                    reader_cache::load_position(epd, sd_cs, sd_library, index as usize)
-                {
-                    if saved_chapter > 0 || saved_screen > 0 {
-                        chapter = saved_chapter;
-                        target_pages = saved_screen.min(u16::MAX as u32) as u16;
-                        esp_println::println!(
-                            "storage: resume book {} at chapter {} screen {}",
-                            book_id,
-                            chapter,
-                            target_pages
-                        );
+                match reader_cache::load_position(epd, sd_cs, sd_library, index as usize) {
+                    Some((saved_chapter, saved_screen)) => {
+                        if saved_chapter > 0 || saved_screen > 0 {
+                            chapter = saved_chapter;
+                            target_pages = saved_screen.min(u16::MAX as u32) as u16;
+                            esp_println::println!(
+                                "storage: resume book {} at chapter {} screen {}",
+                                book_id,
+                                chapter,
+                                target_pages
+                            );
+                        }
                     }
+                    // Never read: open where the text starts, past the
+                    // cover and front matter, once the book says where.
+                    None => {
+                        if let Some(entry) = sd_library.catalog_entry(index as usize) {
+                            let source = (entry.source_hash, entry.byte_size);
+                            sd_library.seek_text_start(source);
+                            first_open = true;
+                            esp_println::println!(
+                                "storage: first open of book {}; seeking text start",
+                                book_id
+                            );
+                        }
+                    }
+                }
+            }
+            // A book already in memory knows where its text starts.
+            if first_open && sd_library.loaded_index == Some(index as usize) {
+                if let Some(page) = sd_library.requested_page(0, None) {
+                    target_pages = page.min(u16::MAX as u32) as u16;
                 }
             }
             // The requested page is usually inside the section window that
             // is already loaded; answering from RAM keeps ordinary page
             // turns free of card init, FAT, and cache-file traffic.
             if sd_library.covers_global_page(index as usize, target_pages as u32) {
+                sd_library.end_reader_request();
                 esp_println::println!(
                     "storage: open hit in RAM request={} book_id={} page={}",
                     request_id,
@@ -887,7 +908,7 @@ fn handle_storage_command(
             // A finished load has spent any page pin it took; a later
             // request for the same page number means the new pagination.
             if sd_library.reader_status() == BookLoadStatus::Error {
-                sd_library.set_page_anchor(None);
+                sd_library.end_reader_request();
                 send_loaded_library_event(&LibraryEvent::ReaderLoadFailed {
                     request_id,
                     book_id,
@@ -904,7 +925,7 @@ fn handle_storage_command(
                 complete: sd_library.book_next_spine().is_none(),
                 page: sd_library.requested_page(target_pages as u32, None),
             });
-            sd_library.set_page_anchor(None);
+            sd_library.end_reader_request();
             esp_println::println!(
                 "storage: open complete status={:?} pages={} chapters={}",
                 sd_library.reader_status(),
@@ -1008,7 +1029,7 @@ fn handle_storage_command(
                 *pending_reader = Some(command);
                 return;
             }
-            sd_library.set_page_anchor(None);
+            sd_library.end_reader_request();
             if sd_library.reader_status() == BookLoadStatus::Error {
                 send_loaded_library_event(&LibraryEvent::ReaderLoadFailed {
                     request_id,

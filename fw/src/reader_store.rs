@@ -253,6 +253,13 @@ pub(crate) struct ReaderStore {
     /// Pin for the page a layout-changing load asked for, held across the
     /// rebuild's steps until that load completes (see `PageAnchor`).
     page_anchor: Option<PageAnchor>,
+    /// Raw spine ordinal where the loaded book's main text starts, from its
+    /// index header or the build that writes it.
+    text_start_spine: Option<u16>,
+    /// `(source_hash, source_size)` of a book being opened for the first
+    /// time: its page-0 request means the start of the text. Spent with the
+    /// load, like the page anchor.
+    seek_text_start: Option<(u32, u32)>,
     pub(crate) toc_text: [u8; MAX_SD_TOC_TEXT_BYTES],
     pub(crate) toc_text_len: usize,
     pub(crate) toc: [TocRecord; MAX_SD_TOC_ITEMS],
@@ -355,6 +362,8 @@ impl ReaderStore {
             book_section_count: 0,
             book_sections: [EMPTY_BOOK_SECTION_RECORD; MAX_BOOK_SECTIONS],
             page_anchor: None,
+            text_start_spine: None,
+            seek_text_start: None,
             toc_text: [0; MAX_SD_TOC_TEXT_BYTES],
             toc_text_len: 0,
             toc: [EMPTY_TOC_RECORD; MAX_SD_TOC_ITEMS],
@@ -748,6 +757,7 @@ impl ReaderStore {
         self.book_cache_ready = false;
         self.book_cache_partial = false;
         self.book_section_count = 0;
+        self.text_start_spine = None;
         for record in self.book_sections.iter_mut() {
             *record = EMPTY_BOOK_SECTION_RECORD;
         }
@@ -977,8 +987,26 @@ impl ReaderStore {
             if self.book_next_spine.is_some_and(|next| spine >= next) {
                 return None;
             }
-        } else if let Some(place) = self.anchored_place(page) {
-            return self.page_for_place(place);
+        } else {
+            if let Some(start) = self.sought_text_start(page) {
+                match self.known_page_for_spine(start) {
+                    // Only a start in the book's first quarter: a marker that
+                    // deep is likelier wrong than that much front matter.
+                    Some(first)
+                        if self.book_next_spine.is_some()
+                            || first.saturating_mul(4) <= self.book_total_pages =>
+                    {
+                        return Some(first);
+                    }
+                    None if self.book_next_spine.is_some_and(|next| start >= next) => {
+                        return None;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(place) = self.anchored_place(page) {
+                return self.page_for_place(place);
+            }
         }
         if page < self.book_total_pages {
             Some(page)
@@ -1014,12 +1042,44 @@ impl ReaderStore {
     /// The pinned place for a request of `page` on the active book.
     fn anchored_place(&self, page: u32) -> Option<(u16, u16)> {
         let anchor = self.page_anchor?;
-        let active = self
-            .active_index
-            .map(|_| (self.active_entry.source_hash, self.active_entry.byte_size));
-        (anchor.page == page && active == Some(anchor.source))
+        (anchor.page == page && self.active_source() == Some(anchor.source))
             .then_some(anchor.place)
             .flatten()
+    }
+
+    fn active_source(&self) -> Option<(u32, u32)> {
+        self.active_index
+            .map(|_| (self.active_entry.source_hash, self.active_entry.byte_size))
+    }
+
+    pub(crate) fn text_start_spine(&self) -> Option<u16> {
+        self.text_start_spine
+    }
+
+    pub(crate) fn set_text_start_spine(&mut self, spine: Option<u16>) {
+        self.text_start_spine = spine;
+    }
+
+    /// The book `source` is opening for the first time; its page-0 request
+    /// resolves to the start of the text once that is known.
+    pub(crate) fn seek_text_start(&mut self, source: (u32, u32)) {
+        self.seek_text_start = Some(source);
+    }
+
+    /// The text-start spine a request of `page` on the active book seeks.
+    fn sought_text_start(&self, page: u32) -> Option<u16> {
+        (page == 0
+            && self.seek_text_start.is_some()
+            && self.seek_text_start == self.active_source())
+        .then_some(self.text_start_spine)
+        .flatten()
+    }
+
+    /// A reader load finished: its page pin and first-open seek are spent,
+    /// so a later request for the same page number means that page.
+    pub(crate) fn end_reader_request(&mut self) {
+        self.page_anchor = None;
+        self.seek_text_start = None;
     }
 
     /// Where a pinned place lands in the resident pagination. None until

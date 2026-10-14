@@ -1336,6 +1336,10 @@ pub trait XhtmlBlockSink {
 
 pub trait EpubTocSink {
     fn push_toc(&mut self, title: &str, href: &str, level: u8) -> Result<(), TocError>;
+
+    /// The EPUB 3 nav's `bodymatter` landmark: where the book's main text
+    /// starts, after its front matter. Reported at most once.
+    fn push_bodymatter(&mut self, _href: &str) {}
 }
 
 pub const MAX_CSS_RULES: usize = 96;
@@ -2506,6 +2510,8 @@ pub fn parse_epub3_nav_to_sink(xhtml: &str, sink: &mut impl EpubTocSink) -> Resu
     let body_required = xhtml.contains("<body") || xhtml.contains(":body");
     let mut in_body = !body_required;
     let mut in_nav = false;
+    let mut in_landmarks = false;
+    let mut bodymatter_seen = false;
     let mut skip_depth = 0u8;
     let mut skip_tag: Option<&str> = None;
     let mut list_depth = 0u8;
@@ -2536,8 +2542,25 @@ pub fn parse_epub3_nav_to_sink(xhtml: &str, sink: &mut impl EpubTocSink) -> Resu
                 }
             }
             _ if !in_body || skip_depth > 0 => {}
-            Token::Start(tag) if tag_name_is(tag, "nav") => in_nav = nav_start_is_toc(tag),
-            Token::End(tag) if tag_name_is(tag, "nav") => in_nav = false,
+            Token::Start(tag) if tag_name_is(tag, "nav") => {
+                in_nav = nav_start_is_toc(tag);
+                in_landmarks = attr_word_eq(tag, "epub:type", "landmarks");
+            }
+            Token::End(tag) if tag_name_is(tag, "nav") => {
+                in_nav = false;
+                in_landmarks = false;
+            }
+            Token::Start(tag)
+                if in_landmarks
+                    && !bodymatter_seen
+                    && tag_name_is(tag, "a")
+                    && attr_word_eq(tag, "epub:type", "bodymatter") =>
+            {
+                if let Some(target) = attr_value(tag, "href").filter(|href| !href.is_empty()) {
+                    sink.push_bodymatter(target);
+                    bodymatter_seen = true;
+                }
+            }
             Token::Start(tag) if in_nav && tag_name_is(tag, "ol") => {
                 list_depth = list_depth.saturating_add(1);
             }
@@ -3091,6 +3114,8 @@ pub struct Epub3NavStreamParser {
     in_body: bool,
     body_required: bool,
     in_nav: bool,
+    in_landmarks: bool,
+    bodymatter_seen: bool,
     list_depth: u8,
     href: heapless::String<256>,
     href_set: bool,
@@ -3110,6 +3135,8 @@ impl Epub3NavStreamParser {
             in_body: true,
             body_required: false,
             in_nav: false,
+            in_landmarks: false,
+            bodymatter_seen: false,
             list_depth: 0,
             href: heapless::String::new(),
             href_set: false,
@@ -3134,8 +3161,23 @@ impl Epub3NavStreamParser {
             _ if self.body_required && !self.in_body => {}
             TokEvent::StartTag(tag) if tag_name_is(tag, "nav") => {
                 self.in_nav = nav_start_is_toc(tag);
+                self.in_landmarks = attr_word_eq(tag, "epub:type", "landmarks");
             }
-            TokEvent::EndTag(tag) if tag_name_is(tag, "nav") => self.in_nav = false,
+            TokEvent::EndTag(tag) if tag_name_is(tag, "nav") => {
+                self.in_nav = false;
+                self.in_landmarks = false;
+            }
+            TokEvent::StartTag(tag)
+                if self.in_landmarks
+                    && !self.bodymatter_seen
+                    && tag_name_is(tag, "a")
+                    && attr_word_eq(tag, "epub:type", "bodymatter") =>
+            {
+                if let Some(href) = attr_value(tag, "href").filter(|href| !href.is_empty()) {
+                    sink.push_bodymatter(href);
+                    self.bodymatter_seen = true;
+                }
+            }
             TokEvent::StartTag(tag) if self.in_nav && tag_name_is(tag, "ol") => {
                 self.list_depth = self.list_depth.saturating_add(1);
             }
@@ -4709,6 +4751,62 @@ mod tests {
         assert_eq!(sink.items[0].2, 1);
         assert_eq!(sink.items[2].0.as_str(), "A room");
         assert_eq!(sink.items[2].2, 2);
+    }
+
+    #[test]
+    fn epub3_nav_reports_the_bodymatter_landmark_once() {
+        #[derive(Default)]
+        struct Sink {
+            toc: usize,
+            bodymatter: Vec<heapless::String<48>, 2>,
+        }
+        impl EpubTocSink for Sink {
+            fn push_toc(&mut self, _: &str, _: &str, _: u8) -> Result<(), TocError> {
+                self.toc += 1;
+                Ok(())
+            }
+            fn push_bodymatter(&mut self, href: &str) {
+                let mut stored = heapless::String::new();
+                stored.push_str(href).unwrap();
+                self.bodymatter.push(stored).unwrap();
+            }
+        }
+
+        let nav = r#"
+            <html><body>
+              <nav epub:type="toc"><ol>
+                <li><a epub:type="bodymatter" href="toc-link.xhtml">Not a landmark</a></li>
+              </ol></nav>
+              <nav epub:type="landmarks" id="landmarks"><ol>
+                <li><a epub:type="cover" href="cover.xhtml">Cover</a></li>
+                <li><a epub:type="bodymatter" href="text/chapter1.xhtml#c1">Start</a></li>
+                <li><a epub:type="bodymatter" href="text/later.xhtml">Second</a></li>
+              </ol></nav>
+            </body></html>
+        "#;
+        let mut sink = Sink::default();
+        parse_epub3_nav_to_sink(nav, &mut sink).expect("nav parses");
+        assert_eq!(sink.toc, 1, "landmarks never join the chapter list");
+        assert_eq!(sink.bodymatter.len(), 1);
+        assert_eq!(sink.bodymatter[0].as_str(), "text/chapter1.xhtml#c1");
+
+        // The streaming parser the firmware uses agrees, at any chunking.
+        for chunk in [1usize, 7, 64, nav.len()] {
+            let mut sink = Sink::default();
+            let mut tokenizer = StreamingXmlTokenizer::new();
+            let mut parser = Epub3NavStreamParser::new();
+            for part in nav.as_bytes().chunks(chunk) {
+                tokenizer
+                    .feed(part, &mut |event| parser.handle(event, &mut sink))
+                    .unwrap();
+            }
+            tokenizer
+                .finish(&mut |event| parser.handle(event, &mut sink))
+                .unwrap();
+            assert_eq!(sink.toc, 1);
+            assert_eq!(sink.bodymatter.len(), 1, "chunk {chunk}");
+            assert_eq!(sink.bodymatter[0].as_str(), "text/chapter1.xhtml#c1");
+        }
     }
 
     #[test]
