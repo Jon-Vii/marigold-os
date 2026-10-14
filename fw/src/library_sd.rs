@@ -103,7 +103,7 @@ pub(crate) fn load_catalog_cache(
         // read-only directory walk catches books copied on or deleted with
         // a computer, which used to stay invisible (or listed) until the
         // next Wi-Fi upload invalidated the snapshot.
-        catalog_matches_card(root) && read_catalog_window(root, library, 0).is_ok()
+        catalog_matches_card(root) && read_catalog_count(root, library).is_ok()
     })
     .unwrap_or(false);
     library.status = if !loaded {
@@ -347,6 +347,31 @@ where
 /// Load the list window `[start, start+LIBRARY_WINDOW)` from the card into the
 /// store, and set the total book count from the header. O(1) seek to the start
 /// record -- no scan.
+/// Adopt the snapshot's book count without reading any entries. The Library
+/// refills its window before it first draws (`ensure_library_window`) and the
+/// reading path reads its book's record directly (`load_active_entry`), so
+/// boot, and with it every wake, skips a title lookup per listed book.
+fn read_catalog_count<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    library: &mut ReaderStore,
+) -> Result<(), ()>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    with_catalog_file(root, |_, count| {
+        library.set_catalog_total(count);
+        library.begin_window(0);
+        Ok(())
+    })
+}
+
 fn read_catalog_window<
     D,
     T,

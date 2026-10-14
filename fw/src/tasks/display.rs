@@ -102,6 +102,10 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
         }
     }
     esp_println::println!("display: init complete");
+    // The controller is initialised; it needs it again only after a sleep
+    // powers it down. Boot used to initialise it twice before the first
+    // paint.
+    let mut panel_ready = true;
 
     // One-shot firmware self-update: if the card holds a pending image, flash it
     // into the inactive OTA slot and reboot into it before the reader starts.
@@ -234,7 +238,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                 }
                 let layout_ms = layout_start.elapsed().as_millis();
 
-                if !refresh_planner.screen_on() && refresh_planner.last_request().is_none() {
+                if !panel_ready {
                     esp_println::println!("display: wake init start");
                     if let Err(error) = display_flush::init_panel(&mut epd).await {
                         esp_println::println!("display: wake init failed: {:?}", error);
@@ -245,6 +249,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                     }
                     esp_println::println!("display: wake init complete");
                     prev_prestaged = false;
+                    panel_ready = true;
                 }
 
                 let mode = refresh_planner.mode_for(request);
@@ -394,6 +399,7 @@ pub async fn run(mut epd: Epd, mut sd_cs: Output<'static>) {
                 };
                 prev_prestaged = false;
                 let panel_slept = display_flush::sleep_panel(&mut epd).await.is_ok();
+                panel_ready = false;
                 let ok = panel_slept && sleep_frame_settled;
                 crate::wake_mark::set(ok);
                 if ok {
@@ -708,6 +714,12 @@ fn handle_storage_command(
                 // already shows the saved book; the Scanned default then
                 // sees an SD book active and leaves it alone.
                 restore_saved_state(epd, sd_cs, sd_library, state_restored);
+                // With nothing restored, the title page defaults to the first
+                // book; the cached load reads no list entries, so stage its
+                // record for the label.
+                if sd_library.active_index().is_none() && !sd_library.catalog_is_empty() {
+                    crate::library_sd::load_active_entry(epd, sd_cs, sd_library, 0);
+                }
                 let count = sd_library.catalog_count_u16();
                 send_library_event(&LibraryEvent::Scanned { count });
             } else {
