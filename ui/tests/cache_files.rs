@@ -41,7 +41,38 @@ mod sd_session {
 use embedded_sdmmc::{VolumeIdx, VolumeManager};
 use proto::cache::BookV2SectionRecord;
 use reader_cache_files::{BookIndexLoadResult, CacheLoadResult};
-use reader_store::ReaderStore;
+use reader_store::{ReaderStore, SectionTable};
+/// The index writer takes the resident table; tests describe sections as
+/// plain records.
+fn write_index<D, T, const ND: usize, const NF: usize, const NV: usize>(
+    root: &embedded_sdmmc::Directory<'_, D, T, ND, NF, NV>,
+    key: &str,
+    identity: (u32, u32),
+    total_pages: u32,
+    sections: &[BookV2SectionRecord],
+    store: &ReaderStore,
+    partial: bool,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: embedded_sdmmc::TimeSource,
+{
+    let mut table = SectionTable::new();
+    assert!(
+        table.set_records(sections),
+        "fixture sections are contiguous"
+    );
+    reader_cache_files::write_v2_book_index(
+        root,
+        key,
+        identity,
+        total_pages,
+        &table,
+        store,
+        partial,
+    )
+}
+
 const KEY: &str = "E0000001";
 const ID: (u32, u32) = (1234, 5678);
 
@@ -64,28 +95,24 @@ fn book_index_generations_roundtrip_and_preserve_the_old_bank() {
         reader_cache_files::prepare_book_replacement(&root, KEY),
         Some(0)
     );
-    assert!(reader_cache_files::write_v2_book_index(
-        &root, KEY, ID, 1, &sections, &store, false
-    ));
+    assert!(write_index(&root, KEY, ID, 1, &sections, &store, false));
     assert_eq!(
         reader_cache_files::load_v2_book_index(&root, KEY, ID, &mut store),
         BookIndexLoadResult::Hit
     );
     assert_eq!(
         reader_cache_files::prepare_book_replacement(&root, KEY),
-        Some(320)
+        Some(1024)
     );
-    sections[0].section = 320;
+    sections[0].section = 1024;
     sections[0].page_count = 2;
-    assert!(reader_cache_files::write_v2_book_index(
-        &root, KEY, ID, 2, &sections, &store, false
-    ));
+    assert!(write_index(&root, KEY, ID, 2, &sections, &store, false));
     assert_eq!(
         reader_cache_files::load_v2_book_index(&root, KEY, ID, &mut store),
         BookIndexLoadResult::Hit
     );
     assert_eq!(store.book_total_pages, 2);
-    assert_eq!(store.book_sections[0].section, 320);
+    assert_eq!(store.book_sections.iter().next().unwrap().section, 1024);
     assert_eq!(
         reader_cache_files::prepare_book_replacement(&root, KEY),
         Some(0)
@@ -112,15 +139,7 @@ fn seed_index(disk: &fat::Disk) {
         page_count: 1,
         partial: false,
     };
-    assert!(reader_cache_files::write_v2_book_index(
-        &root,
-        KEY,
-        ID,
-        1,
-        &[section],
-        &store,
-        false
-    ));
+    assert!(write_index(&root, KEY, ID, 1, &[section], &store, false));
 }
 
 #[test]
@@ -145,15 +164,7 @@ fn interrupted_index_writes_recover_a_complete_generation() {
                 partial: false,
             };
             disk.fail_after.set(Some(cut));
-            let _ = reader_cache_files::write_v2_book_index(
-                &root,
-                KEY,
-                ID,
-                2,
-                &[section],
-                &store,
-                false,
-            );
+            let _ = write_index(&root, KEY, ID, 2, &[section], &store, false);
         }
         disk.fail_after.set(None);
         let manager: VolumeManager<_, _, 8, 8, 1> =
@@ -196,15 +207,7 @@ fn read_failures_never_retire_or_truncate_the_active_index() {
                         page_count: 2,
                         partial: false,
                     };
-                    let _ = reader_cache_files::write_v2_book_index(
-                        &root,
-                        KEY,
-                        ID,
-                        2,
-                        &[section],
-                        &store,
-                        false,
-                    );
+                    let _ = write_index(&root, KEY, ID, 2, &[section], &store, false);
                 }
             }
             disk.fail_read_after.set(None);
@@ -312,9 +315,7 @@ fn spacing_reflow_matches_fresh_pagination_across_old_section_boundaries() {
             records.len() > 3,
             "fixture spans multiple old sections per chapter"
         );
-        assert!(reader_cache_files::write_v2_book_index(
-            &root, KEY, ID, total, &records, &store, false
-        ));
+        assert!(write_index(&root, KEY, ID, total, &records, &store, false));
         let mut scratch = vec![0u8; 24576];
         for spacing in [
             LineSpacing::Relaxed,
@@ -346,7 +347,7 @@ fn spacing_reflow_matches_fresh_pagination_across_old_section_boundaries() {
             );
             let mut actual = Vec::new();
             let mut expected = Vec::new();
-            let sections = store.book_sections[..store.book_section_count].to_vec();
+            let sections = store.book_sections.iter().collect::<Vec<_>>();
             for section in sections {
                 assert!(matches!(
                     reader_cache_files::load_v2_section_cache(
@@ -403,15 +404,7 @@ fn corrupted_new_generation_falls_back_for_loading_and_orphan_identity() {
         page_count: 2,
         partial: false,
     };
-    assert!(reader_cache_files::write_v2_book_index(
-        &root,
-        KEY,
-        ID,
-        2,
-        &[section],
-        &store,
-        false
-    ));
+    assert!(write_index(&root, KEY, ID, 2, &[section], &store, false));
     {
         let x = root.open_dir(proto::cache::CACHE_ROOT_DIR).unwrap();
         let c = x.open_dir(proto::cache::CACHE_V2_DIR).unwrap();
@@ -463,26 +456,18 @@ fn legacy_index_remains_readable_and_prefix_does_not_advertise_a_final_total() {
     assert_eq!(store.book_next_spine(), None);
     assert_eq!(
         reader_cache_files::prepare_book_replacement(&root, KEY),
-        Some(320)
+        Some(1024)
     );
     store.set_book_next_spine(Some(1));
     store.set_book_generated_toc(true);
     let section = BookV2SectionRecord {
-        section: 320,
+        section: 1024,
         spine: 0,
         start_page: 0,
         page_count: 1,
         partial: false,
     };
-    assert!(reader_cache_files::write_v2_book_index(
-        &root,
-        KEY,
-        ID,
-        1,
-        &[section],
-        &store,
-        false
-    ));
+    assert!(write_index(&root, KEY, ID, 1, &[section], &store, false));
     assert_eq!(
         reader_cache_files::load_v2_book_index(&root, KEY, ID, &mut store),
         BookIndexLoadResult::Hit
@@ -525,15 +510,7 @@ fn advisory_legacy_titles_do_not_override_generation_page_state() {
         page_count: 1,
         partial: false,
     };
-    assert!(reader_cache_files::write_v2_book_index(
-        &root,
-        KEY,
-        ID,
-        1,
-        &[section],
-        &store,
-        false
-    ));
+    assert!(write_index(&root, KEY, ID, 1, &[section], &store, false));
     // An old, still source-matching index can coexist with committed generations.
     {
         let xteink = root.open_dir(CACHE_ROOT_DIR).unwrap();
@@ -551,15 +528,7 @@ fn advisory_legacy_titles_do_not_override_generation_page_state() {
     }
     store.set_book_labels("Current title", "Author");
     section.page_count = 2;
-    assert!(reader_cache_files::write_v2_book_index(
-        &root,
-        KEY,
-        ID,
-        2,
-        &[section],
-        &store,
-        false
-    ));
+    assert!(write_index(&root, KEY, ID, 2, &[section], &store, false));
     let mut title = heapless::String::<64>::new();
     assert!(reader_cache_files::read_cached_book_title(
         &root, KEY, ID, &mut title
@@ -580,7 +549,7 @@ fn advisory_legacy_titles_do_not_override_generation_page_state() {
     assert_eq!(store.book_total_pages, 2);
     // A changed EPUB identity must skip the stale legacy metadata.
     let changed_id = (ID.0 + 1, ID.1 + 1);
-    assert!(reader_cache_files::write_v2_book_index(
+    assert!(write_index(
         &root,
         KEY,
         changed_id,
@@ -637,7 +606,7 @@ fn spacing_reflow_write_interruptions_preserve_a_readable_generation() {
             page_count: store.page_count as u16,
             partial: false,
         };
-        assert!(reader_cache_files::write_v2_book_index(
+        assert!(write_index(
             &root,
             KEY,
             ID,
@@ -715,7 +684,7 @@ fn spacing_reflow_write_interruptions_preserve_a_readable_generation() {
             reader_cache_files::load_v2_book_index(&root, KEY, ID, &mut store),
             BookIndexLoadResult::Hit
         );
-        let sections = store.book_sections[..store.book_section_count].to_vec();
+        let sections = store.book_sections.iter().collect::<Vec<_>>();
         let mut actual = Vec::new();
         for section in sections {
             assert!(
@@ -771,18 +740,10 @@ fn advisory_generation_titles_validate_source_without_reading_commit_footer() {
         partial: false,
     };
     store.set_book_labels("First source", "Author");
-    assert!(reader_cache_files::write_v2_book_index(
-        &root,
-        KEY,
-        ID,
-        1,
-        &[section],
-        &store,
-        false
-    ));
+    assert!(write_index(&root, KEY, ID, 1, &[section], &store, false));
     let second_id = (ID.0 + 1, ID.1 + 1);
     store.set_book_labels("Second source", "Author");
-    assert!(reader_cache_files::write_v2_book_index(
+    assert!(write_index(
         &root,
         KEY,
         second_id,
@@ -997,7 +958,7 @@ fn deleting_files_and_cache_directories_returns_every_cluster() {
         page_count: store.page_count as u16,
         partial: false,
     }];
-    assert!(reader_cache_files::write_v2_book_index(
+    assert!(write_index(
         &root,
         KEY,
         ID,
@@ -1047,9 +1008,7 @@ fn page_anchor_reads_the_old_pagination_only_after_a_layout_change() {
         record(2, 1, 22, 8),
         record(3, 2, 30, 5),
     ];
-    assert!(reader_cache_files::write_v2_book_index(
-        &root, KEY, ID, 35, &sections, &store, false
-    ));
+    assert!(write_index(&root, KEY, ID, 35, &sections, &store, false));
 
     // Same layout: page numbers still hold.
     let same = reader_cache_files::read_v2_page_anchor(&root, KEY, ID, &store, 20);
@@ -1104,13 +1063,48 @@ fn the_text_start_round_trips_through_the_book_index() {
         },
     ];
     store.set_text_start_spine(Some(2));
-    assert!(reader_cache_files::write_v2_book_index(
-        &root, KEY, ID, 10, &sections, &store, false
-    ));
+    assert!(write_index(&root, KEY, ID, 10, &sections, &store, false));
     let mut loaded = ReaderStore::new();
     assert_eq!(
         reader_cache_files::load_v2_book_index(&root, KEY, ID, &mut loaded),
         BookIndexLoadResult::Hit
     );
     assert_eq!(loaded.text_start_spine(), Some(2));
+}
+
+#[test]
+fn a_book_index_far_past_the_old_section_cap_round_trips() {
+    let disk = fat::Disk::new();
+    let manager: VolumeManager<_, _, 8, 8, 1> =
+        VolumeManager::new_with_limits(&disk, fat::Clock, 0);
+    let volume = manager.open_volume(VolumeIdx(0)).unwrap();
+    let root = volume.open_root_dir().unwrap();
+    // Second bank (ids from 1024), 700 sections: ids reach 1723.
+    let mut sections = Vec::new();
+    let mut start = 0;
+    for index in 0..700u16 {
+        sections.push(BookV2SectionRecord {
+            section: 1024 + index,
+            spine: index / 2,
+            start_page: start,
+            page_count: 3,
+            partial: false,
+        });
+        start += 3;
+    }
+    let store = ReaderStore::new();
+    assert!(write_index(&root, KEY, ID, start, &sections, &store, false));
+    let mut loaded = ReaderStore::new();
+    assert_eq!(
+        reader_cache_files::load_v2_book_index(&root, KEY, ID, &mut loaded),
+        BookIndexLoadResult::Hit
+    );
+    assert_eq!(loaded.book_sections.iter().collect::<Vec<_>>(), sections);
+    assert_eq!(loaded.book_total_pages, start);
+
+    // A damaged record clears the table rather than leaving half of it.
+    let mut broken = sections.clone();
+    broken[500].start_page += 1;
+    let mut table = SectionTable::new();
+    assert!(!table.set_records(&broken));
 }

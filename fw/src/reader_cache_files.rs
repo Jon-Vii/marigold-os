@@ -2,8 +2,8 @@
 mod book_generation;
 use crate::reader_layout;
 use crate::reader_store::{
-    page_fraction, PageAnchor, ReaderStore, EMPTY_BOOK_SECTION_RECORD, EMPTY_TOC_RECORD,
-    MAX_BOOK_SECTIONS, MAX_OVERVIEW_CHAPTERS, MAX_SD_TOC_ITEMS, MAX_SD_TOC_TEXT_BYTES,
+    page_fraction, PageAnchor, ReaderStore, SectionTable, EMPTY_TOC_RECORD, MAX_BOOK_SECTIONS,
+    MAX_OVERVIEW_CHAPTERS, MAX_SD_TOC_ITEMS, MAX_SD_TOC_TEXT_BYTES,
 };
 use display::font::FontStyle;
 use embedded_sdmmc::{Directory, File, Mode, TimeSource};
@@ -679,6 +679,13 @@ where
     }
 }
 
+/// A book index failed validation after its sections were loaded: drop
+/// them so nothing reads a half-checked table.
+fn invalid_index(library: &mut ReaderStore) -> BookIndexLoadResult {
+    library.book_sections.clear();
+    BookIndexLoadResult::Invalid
+}
+
 pub(crate) fn load_v2_book_index<
     D,
     T,
@@ -720,7 +727,12 @@ where
         {
             return BookIndexLoadResult::Invalid;
         }
-        let mut sections = [EMPTY_BOOK_SECTION_RECORD; MAX_BOOK_SECTIONS];
+        // Straight into the store's table: only a load the caller has just
+        // cleared the store for reaches here, and a failure clears it again.
+        // (A staging copy on the stack would be 12 bytes a section.)
+        let sections = &mut library.book_sections;
+        sections.clear();
+        let mut previous: Option<BookV2SectionRecord> = None;
         if !read_records_batched(
             file,
             BOOK_V2_SECTION_RECORD_BYTES,
@@ -729,18 +741,18 @@ where
                 let Ok(record) = decode_book_v2_section(bytes) else {
                     return false;
                 };
-                let expected_start = if index == 0 {
-                    0
-                } else {
-                    let previous = sections[index - 1];
-                    if record.spine < previous.spine
-                        || usize::from(record.section) / MAX_BOOK_SECTIONS
-                            != usize::from(previous.section) / MAX_BOOK_SECTIONS
-                        || record.section != previous.section + 1
-                    {
-                        return false;
+                let expected_start = match previous {
+                    None => 0,
+                    Some(previous) => {
+                        if record.spine < previous.spine
+                            || usize::from(record.section) / MAX_BOOK_SECTIONS
+                                != usize::from(previous.section) / MAX_BOOK_SECTIONS
+                            || record.section != previous.section + 1
+                        {
+                            return false;
+                        }
+                        previous.start_page + u32::from(previous.page_count)
                     }
-                    previous.start_page + u32::from(previous.page_count)
                 };
                 if record.page_count == 0
                     || usize::from(record.section) >= 2 * MAX_BOOK_SECTIONS
@@ -755,10 +767,11 @@ where
                 {
                     return false;
                 }
-                sections[index] = record;
-                true
+                previous = Some(record);
+                sections.push(record)
             },
         ) {
+            library.book_sections.clear();
             return BookIndexLoadResult::Invalid;
         }
         let mut toc = [EMPTY_TOC_RECORD; MAX_SD_TOC_ITEMS];
@@ -777,13 +790,13 @@ where
                 true
             },
         ) {
-            return BookIndexLoadResult::Invalid;
+            return invalid_index(library);
         }
         library.clear_toc();
         if header.toc_text_bytes > 0 {
             let text_len = header.toc_text_bytes as usize;
             if read_exact_file(file, &mut library.toc_text[..text_len]).is_err() {
-                return BookIndexLoadResult::Invalid;
+                return invalid_index(library);
             }
             library.toc_text_len = text_len;
             library.toc_count = header.toc_count as usize;
@@ -804,31 +817,27 @@ where
         if header.title_text_bytes > 0 {
             let title_len = header.title_text_bytes as usize;
             if read_exact_file(file, &mut title[..title_len]).is_err() {
-                return BookIndexLoadResult::Invalid;
+                return invalid_index(library);
             }
             let Ok(parsed_title) = core::str::from_utf8(&title[..title_len]) else {
-                return BookIndexLoadResult::Invalid;
+                return invalid_index(library);
             };
             title_str = parsed_title;
         }
         if header.author_text_bytes > 0 {
             let author_len = header.author_text_bytes as usize;
             if read_exact_file(file, &mut author[..author_len]).is_err() {
-                return BookIndexLoadResult::Invalid;
+                return invalid_index(library);
             }
             let Ok(parsed_author) = core::str::from_utf8(&author[..author_len]) else {
-                return BookIndexLoadResult::Invalid;
+                return invalid_index(library);
             };
             author_str = parsed_author;
         }
         if header.title_text_bytes > 0 || header.author_text_bytes > 0 {
             library.set_book_labels(title_str, author_str);
         }
-        library.set_book_index(
-            header.total_pages,
-            header.partial,
-            &sections[..header.section_count as usize],
-        );
+        library.commit_book_index(header.total_pages, header.partial);
         library.set_book_next_spine(header.next_spine);
         library.set_book_generated_toc(header.generated_toc);
         library.set_text_start_spine(header.text_start_spine);
@@ -1108,7 +1117,7 @@ pub(crate) fn write_v2_book_index<
     key: &str,
     source_identity: (u32, u32),
     total_pages: u32,
-    sections: &[BookV2SectionRecord],
+    sections: &SectionTable,
     library: &ReaderStore,
     partial: bool,
 ) -> bool
@@ -1116,7 +1125,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    if total_pages == 0 || sections.is_empty() || sections.len() > MAX_BOOK_SECTIONS {
+    if total_pages == 0 || sections.is_empty() {
         return false;
     }
     if ensure_v2_cache_dirs(root, key).is_err() {
@@ -1168,8 +1177,8 @@ where
             return None;
         }
         let mut record_bytes = [0u8; BOOK_V2_SECTION_RECORD_BYTES];
-        for section in sections {
-            if encode_book_v2_section(*section, &mut record_bytes).is_err()
+        for section in sections.iter() {
+            if encode_book_v2_section(section, &mut record_bytes).is_err()
                 || stage.push(&record_bytes).is_err()
             {
                 return None;
@@ -2201,17 +2210,20 @@ where
 {
     if library.book_next_spine().is_some()
         || library.book_cache_partial
-        || library.book_section_count == 0
+        || library.book_sections.is_empty()
     {
         return false;
     }
+    // The replacement is written into the store's table while the old one
+    // is read, and it can run longer (more sections) than the old, so the
+    // old table is read from a copy: 4 KB at most, compact as resident.
     let original_sections = library.book_sections;
-    let original_count = library.book_section_count;
     let Some(base) = prepare_book_replacement(root, key) else {
         return false;
     };
     library.book_cache_ready = false;
     library.clear_lines();
+    library.book_sections.clear();
     let mut count = 0usize;
     let mut pages = 0u32;
     let mut previous_spine = None;
@@ -2219,14 +2231,14 @@ where
         let Some(dir) = dir else {
             return false;
         };
-        for section in &original_sections[..original_count] {
+        for section in original_sections.iter() {
             if previous_spine.is_some_and(|spine| spine != section.spine)
                 && !flush_reflow_window(dir, identity, base, library, &mut count, &mut pages, false)
             {
                 return false;
             }
             previous_spine = Some(section.spine);
-            let Some(header) = read_reflow_source(dir, section, identity, library, scratch) else {
+            let Some(header) = read_reflow_source(dir, &section, identity, library, scratch) else {
                 return false;
             };
             let blocks_at =
@@ -2293,7 +2305,6 @@ where
     if !ok || count == 0 {
         return false;
     }
-    library.book_section_count = count;
     library.book_total_pages = pages;
     reader_layout::rebuild_toc_page_targets(library);
     library.chapter_page_count = 0;
@@ -2302,13 +2313,12 @@ where
         key,
         identity,
         pages,
-        &library.book_sections[..count],
+        &library.book_sections,
         library,
         false,
     ) {
         return false;
     }
-    library.book_section_count = count;
     library.book_total_pages = pages;
     library.book_cache_ready = true;
     library.book_cache_partial = false;
@@ -2386,13 +2396,15 @@ where
     if !ok {
         return false;
     }
-    library.book_sections[*count] = BookV2SectionRecord {
+    if !library.book_sections.push(BookV2SectionRecord {
         section: id,
         spine,
         start_page: *total,
         page_count: written_pages as u16,
         partial: false,
-    };
+    }) {
+        return false;
+    }
     *count += 1;
     *total += written_pages as u32;
     true

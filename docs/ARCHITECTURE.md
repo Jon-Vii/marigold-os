@@ -436,8 +436,13 @@ fills, where the text budget (16 KB) is the binding limit for prose, well ahead
 of the block (384) and page (96) caps. Sections are invisible while reading: the
 reader walks across them seamlessly, and the footer page-in-chapter counter
 aggregates every section sharing a spine. The book index holds up to
-`MAX_BOOK_SECTIONS` (320, on the order of 4,500 pages). This cap still applies
-to the active index. A capacity-limited book becomes terminal and `partial`;
+`MAX_BOOK_SECTIONS` (1,024 sections, on the order of 14,000 pages of prose;
+each spine item takes at least one, so it also bounds books of many short
+files). In RAM it is a `SectionTable` of 4 bytes a section, spine and page
+count, since ids run contiguously and each section starts where the last one
+ended; the card record keeps all 12 bytes. Builds append to the store's table in
+place, and index loads fill it directly, so there is one copy. This cap still
+applies to the active index. A capacity-limited book becomes terminal and `partial`;
 it has no continuation cursor. This differs from a resumable prefix, which has
 more source spines available and must not present its known pages as a final
 total.
@@ -512,7 +517,8 @@ bytes, so older indexes read as "unknown"). `BOOKA.BIN` and `BOOKB.BIN` add a ge
 footer written last. Loading verifies the newest committed body and can fall
 back to the older valid generation or legacy index.
 
-Section IDs use two banks, 0–319 and 320–639. A fresh build or spacing reflow
+Section IDs use two banks, 0–1023 and 1024–2047 (files `S000.BIN` to
+`S2047.BIN`). A fresh build or spacing reflow
 uses the opposite bank; before overwriting it, firmware retires older indexes
 that reference that bank, preserving the active generation. Continuation steps
 append unused IDs in the current bank. Thus an interrupted replacement cannot

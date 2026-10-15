@@ -26,11 +26,12 @@ pub(crate) const MAX_CUSTOM_FONT_NAME: usize = proto::font_pack::FONT_PACK_MAX_N
 pub(crate) const MAX_CUSTOM_FONT_FACES: usize = 12;
 // ~14 pages per 16 KB section at the default size, so 320 covers ~4,500
 // pages -- enough for very long books (e.g. HPMOR) to cache whole rather
-// than tripping book_partial partway. The two persistent arrays this sizes
-// (here and EPUB_BOOK_SECTIONS) live in static cells, not the stack; the
-// one stack-resident copy is on the shallow book-index load path, clear of
-// the deep EPUB-build watermark.
-pub(crate) const MAX_BOOK_SECTIONS: usize = 320;
+// than tripping book_partial partway. Every spine item takes at least one
+// section, so a book of many short files (essay collections, manuals split
+// per section) needs as many sections as it has items. The table is
+// resident at 4 bytes a section (`SectionTable`); the one stack copy is the
+// spacing reflow's, on the shallow book-index load path.
+pub(crate) const MAX_BOOK_SECTIONS: usize = 1024;
 const MAX_PUBLISHED_CHAPTER_EVENTS: usize = MAX_SD_CHAPTERS;
 // Titles only (hrefs/anchors are no longer stored), so 4 KB covers the full
 // 128-item TOC at ~32 bytes per title and the saved RAM widens the stack
@@ -66,13 +67,6 @@ pub(crate) const EMPTY_TOC_RECORD: TocRecord = TocRecord {
     level: 0,
     spine_index: -1,
 };
-pub(crate) const EMPTY_BOOK_SECTION_RECORD: BookV2SectionRecord = BookV2SectionRecord {
-    section: 0,
-    spine: 0,
-    start_page: 0,
-    page_count: 0,
-    partial: false,
-};
 
 /// A reading position that survives repagination. A type-settings or
 /// orientation change lays the book out again and moves every page number,
@@ -94,11 +88,7 @@ pub(crate) struct PageAnchor {
 impl PageAnchor {
     /// Pins `page` within one book's `sections` (reading order). The place
     /// is None when no section holds the page.
-    pub(crate) fn in_sections(
-        source: (u32, u32),
-        page: u32,
-        sections: &[BookV2SectionRecord],
-    ) -> Self {
+    pub(crate) fn in_sections(source: (u32, u32), page: u32, sections: &SectionTable) -> Self {
         let place = sections
             .iter()
             .find(|section| {
@@ -132,13 +122,141 @@ pub(crate) fn page_at_fraction(fraction: u16, pages: u32) -> u32 {
 }
 
 /// First page and page count of `spine` within one book's `sections`.
-fn spine_extent(sections: &[BookV2SectionRecord], spine: u16) -> Option<(u32, u32)> {
+fn spine_extent(sections: &SectionTable, spine: u16) -> Option<(u32, u32)> {
     let mut extent: Option<(u32, u32)> = None;
     for section in sections.iter().filter(|section| section.spine == spine) {
         let (_, pages) = extent.get_or_insert((section.start_page, 0));
         *pages += u32::from(section.page_count);
     }
     extent
+}
+
+/// One book's section index as held in RAM: 4 bytes a section instead of
+/// the card record's 12. Sections are numbered contiguously from `base` and
+/// each starts where the one before it ends (a book index is only accepted
+/// that way), so ids and start pages are derived rather than stored. Walking
+/// it in order yields full records; there are at most `MAX_BOOK_SECTIONS`.
+#[derive(Clone, Copy)]
+pub(crate) struct SectionTable {
+    base: u16,
+    start_page: u32,
+    end_page: u32,
+    len: usize,
+    entries: [SectionEntry; MAX_BOOK_SECTIONS],
+}
+
+/// A section's spine and page count; the top bit of `pages` marks a
+/// partial section.
+#[derive(Clone, Copy)]
+struct SectionEntry {
+    spine: u16,
+    pages: u16,
+}
+
+const SECTION_PARTIAL: u16 = 0x8000;
+
+impl SectionTable {
+    pub(crate) const fn new() -> Self {
+        Self {
+            base: 0,
+            start_page: 0,
+            end_page: 0,
+            len: 0,
+            entries: [SectionEntry { spine: 0, pages: 0 }; MAX_BOOK_SECTIONS],
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub(crate) fn is_full(&self) -> bool {
+        self.len == MAX_BOOK_SECTIONS
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.base = 0;
+        self.start_page = 0;
+        self.end_page = 0;
+        self.len = 0;
+    }
+
+    /// Id of the first section; later ones follow contiguously.
+    pub(crate) fn base(&self) -> u16 {
+        self.base
+    }
+
+    /// Appends the next section. False when the table is full or the record
+    /// does not continue it: the next id, starting on the next page.
+    pub(crate) fn push(&mut self, record: BookV2SectionRecord) -> bool {
+        if self.is_full() || record.page_count >= SECTION_PARTIAL {
+            return false;
+        }
+        if self.len == 0 {
+            self.base = record.section;
+            self.start_page = record.start_page;
+            self.end_page = record.start_page;
+        } else if usize::from(record.section) != usize::from(self.base) + self.len
+            || record.start_page != self.end_page
+        {
+            return false;
+        }
+        let Some(end) = self.end_page.checked_add(u32::from(record.page_count)) else {
+            return false;
+        };
+        self.entries[self.len] = SectionEntry {
+            spine: record.spine,
+            pages: record.page_count | if record.partial { SECTION_PARTIAL } else { 0 },
+        };
+        self.len += 1;
+        self.end_page = end;
+        true
+    }
+
+    /// Replaces the table with `records`, stopping at the first that does
+    /// not continue it. False if any was left out.
+    #[cfg(test)]
+    pub(crate) fn set_records(&mut self, records: &[BookV2SectionRecord]) -> bool {
+        self.clear();
+        records.iter().all(|record| self.push(*record))
+    }
+
+    /// The sections in reading order, as full records.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = BookV2SectionRecord> + Clone + '_ {
+        let base = self.base;
+        self.entries[..self.len].iter().enumerate().scan(
+            self.start_page,
+            move |start, (index, entry)| {
+                let page_count = entry.pages & !SECTION_PARTIAL;
+                let record = BookV2SectionRecord {
+                    section: base.wrapping_add(index as u16),
+                    spine: entry.spine,
+                    start_page: *start,
+                    page_count,
+                    partial: entry.pages & SECTION_PARTIAL != 0,
+                };
+                *start += u32::from(page_count);
+                Some(record)
+            },
+        )
+    }
+
+    pub(crate) fn last(&self) -> Option<BookV2SectionRecord> {
+        let index = self.len.checked_sub(1)?;
+        let entry = self.entries[index];
+        let page_count = entry.pages & !SECTION_PARTIAL;
+        Some(BookV2SectionRecord {
+            section: self.base.wrapping_add(index as u16),
+            spine: entry.spine,
+            start_page: self.end_page - u32::from(page_count),
+            page_count,
+            partial: entry.pages & SECTION_PARTIAL != 0,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -248,8 +366,7 @@ pub(crate) struct ReaderStore {
     pub(crate) book_cache_partial: bool,
     book_next_spine: Option<u16>,
     book_generated_toc: bool,
-    pub(crate) book_section_count: usize,
-    pub(crate) book_sections: [BookV2SectionRecord; MAX_BOOK_SECTIONS],
+    pub(crate) book_sections: SectionTable,
     /// Pin for the page a layout-changing load asked for, held across the
     /// rebuild's steps until that load completes (see `PageAnchor`).
     page_anchor: Option<PageAnchor>,
@@ -359,8 +476,7 @@ impl ReaderStore {
             book_cache_partial: false,
             book_next_spine: None,
             book_generated_toc: false,
-            book_section_count: 0,
-            book_sections: [EMPTY_BOOK_SECTION_RECORD; MAX_BOOK_SECTIONS],
+            book_sections: SectionTable::new(),
             page_anchor: None,
             text_start_spine: None,
             seek_text_start: None,
@@ -756,11 +872,8 @@ impl ReaderStore {
         self.current_section_page_count = 0;
         self.book_cache_ready = false;
         self.book_cache_partial = false;
-        self.book_section_count = 0;
+        self.book_sections.clear();
         self.text_start_spine = None;
-        for record in self.book_sections.iter_mut() {
-            *record = EMPTY_BOOK_SECTION_RECORD;
-        }
     }
 
     pub(crate) fn begin_book_load(&mut self) {
@@ -934,23 +1047,25 @@ impl ReaderStore {
         self.cached_spine = spine;
     }
 
+    /// Test fixture: install `sections` as the book's index.
+    #[cfg(test)]
     pub(crate) fn set_book_index(
         &mut self,
         total_pages: u32,
         partial: bool,
         sections: &[BookV2SectionRecord],
     ) {
+        let _ = self.book_sections.set_records(sections);
+        self.commit_book_index(total_pages, partial);
+    }
+
+    /// Adopt the resident section table (filled in place by an index load or
+    /// a build) as the book's index.
+    pub(crate) fn commit_book_index(&mut self, total_pages: u32, partial: bool) {
         self.book_next_spine = None;
         self.book_total_pages = total_pages.max(1);
         self.book_cache_ready = true;
         self.book_cache_partial = partial;
-        self.book_section_count = sections.len().min(self.book_sections.len());
-        for (index, record) in sections.iter().take(self.book_section_count).enumerate() {
-            self.book_sections[index] = *record;
-        }
-        for index in self.book_section_count..self.book_sections.len() {
-            self.book_sections[index] = EMPTY_BOOK_SECTION_RECORD;
-        }
     }
 
     pub(crate) fn book_generated_toc(&self) -> bool {
@@ -973,7 +1088,7 @@ impl ReaderStore {
     }
 
     pub(crate) fn known_page_for_spine(&self, spine: u16) -> Option<u32> {
-        self.book_sections[..self.book_section_count]
+        self.book_sections
             .iter()
             .find(|section| section.spine == spine)
             .map(|section| section.start_page)
@@ -1031,11 +1146,7 @@ impl ReaderStore {
     /// unless this request is already pinned.
     pub(crate) fn anchor_resident_page(&mut self, source: (u32, u32), page: u32) {
         if !self.anchors(source, page) {
-            self.page_anchor = Some(PageAnchor::in_sections(
-                source,
-                page,
-                &self.book_sections[..self.book_section_count],
-            ));
+            self.page_anchor = Some(PageAnchor::in_sections(source, page, &self.book_sections));
         }
     }
 
@@ -1086,7 +1197,7 @@ impl ReaderStore {
     /// its spine is laid out; a spine that laid out to no pages lands where
     /// the following text starts.
     fn page_for_place(&self, (spine, fraction): (u16, u16)) -> Option<u32> {
-        let sections = &self.book_sections[..self.book_section_count];
+        let sections = &self.book_sections;
         if let Some((start, pages)) = spine_extent(sections, spine) {
             return Some(start + page_at_fraction(fraction, pages));
         }
@@ -1141,8 +1252,6 @@ impl ReaderStore {
     pub(crate) fn section_for_global_page(&self, global_page: u32) -> Option<BookV2SectionRecord> {
         self.book_sections
             .iter()
-            .take(self.book_section_count)
-            .copied()
             .find(|section| {
                 let start = section.start_page;
                 let end = start.saturating_add(section.page_count.max(1) as u32);
@@ -1153,9 +1262,6 @@ impl ReaderStore {
                     return None;
                 }
                 self.book_sections
-                    .iter()
-                    .take(self.book_section_count)
-                    .copied()
                     .last()
                     .filter(|section| global_page >= section.start_page)
             })
@@ -1172,7 +1278,7 @@ impl ReaderStore {
         let spine = self.section_for_global_page(global_page)?.spine;
         let mut start = u32::MAX;
         let mut total = 0u32;
-        for section in self.book_sections.iter().take(self.book_section_count) {
+        for section in self.book_sections.iter() {
             if section.spine == spine {
                 start = start.min(section.start_page);
                 total = total.saturating_add(section.page_count.max(1) as u32);
@@ -1348,7 +1454,6 @@ impl ReaderStore {
     pub(crate) fn page_for_spine(&self, spine: u16) -> u32 {
         self.book_sections
             .iter()
-            .take(self.book_section_count)
             .find(|section| section.spine == spine)
             .map(|section| section.start_page)
             .unwrap_or_else(|| {
@@ -1501,7 +1606,7 @@ impl ReaderStore {
         } else if self.toc_count > 0 {
             self.toc_count
         } else {
-            self.book_section_count
+            self.book_sections.len()
         };
         count.min(u16::MAX as usize).max(1) as u16
     }
@@ -1725,11 +1830,12 @@ pub(crate) fn chapter_pages_for_event(store: &ReaderStore) -> [u16; MAX_SD_CHAPT
         pages[..count].copy_from_slice(&store.toc_page[..count]);
     } else {
         let count = store
-            .book_section_count
+            .book_sections
+            .len()
             .min(MAX_SD_TOC_ITEMS)
             .min(MAX_PUBLISHED_CHAPTER_EVENTS)
             .min(u8::MAX as usize);
-        for (page, section) in pages.iter_mut().zip(&store.book_sections[..count]) {
+        for (page, section) in pages.iter_mut().zip(store.book_sections.iter().take(count)) {
             *page = section.start_page.min(u16::MAX as u32) as u16;
         }
     }

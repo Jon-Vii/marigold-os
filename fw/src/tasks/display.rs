@@ -3,9 +3,7 @@ use crate::reader_cache::{
     self, ReaderCacheScratch, READER_COMPRESSED_SCRATCH, READER_CONTAINER_SCRATCH,
     READER_HEADER_SCRATCH, READER_OPF_SCRATCH, READER_TAIL_SCRATCH, READER_XHTML_SCRATCH,
 };
-use crate::reader_store::{
-    BookLoadStatus, ReaderStore, EMPTY_BOOK_SECTION_RECORD, MAX_BOOK_SECTIONS,
-};
+use crate::reader_store::{BookLoadStatus, ReaderStore};
 use crate::{
     DisplayCommand, DisplayEvent, LibraryEvent, PowerEvent, StorageCommand, DISPLAY_COMMANDS,
     DISPLAY_EVENTS, LATEST_READER_REQUEST_ID, LIBRARY_EVENTS, POWER_EVENTS, STORAGE_COMMANDS,
@@ -47,8 +45,6 @@ static EPUB_OPF: ConstStaticCell<[u8; READER_OPF_SCRATCH]> =
     ConstStaticCell::new([0; READER_OPF_SCRATCH]);
 static EPUB_XHTML: ConstStaticCell<[u8; READER_XHTML_SCRATCH]> =
     ConstStaticCell::new([0; READER_XHTML_SCRATCH]);
-static EPUB_BOOK_SECTIONS: ConstStaticCell<[proto::cache::BookV2SectionRecord; MAX_BOOK_SECTIONS]> =
-    ConstStaticCell::new([EMPTY_BOOK_SECTION_RECORD; MAX_BOOK_SECTIONS]);
 static EPUB_SCRATCH: static_cell::StaticCell<ReaderCacheScratch<'static>> =
     static_cell::StaticCell::new();
 
@@ -1168,7 +1164,6 @@ pub(crate) fn init_epub_scratch() -> &'static mut ReaderCacheScratch<'static> {
             EPUB_CONTAINER.take(),
             EPUB_OPF.take(),
             EPUB_XHTML.take(),
-            EPUB_BOOK_SECTIONS.take(),
         )
     })
 }

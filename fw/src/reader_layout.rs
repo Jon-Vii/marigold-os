@@ -127,7 +127,6 @@ pub(crate) fn rebuild_toc_page_targets(library: &mut ReaderStore) {
         let page = library
             .book_sections
             .iter()
-            .take(library.book_section_count)
             .find(|section| section.spine == spine)
             .map(|section| section.start_page as usize)
             .or_else(|| {

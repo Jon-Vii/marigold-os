@@ -336,3 +336,72 @@ fn a_text_start_waits_for_its_spine_and_ignores_a_deep_marker() {
     store.set_text_start_spine(Some(1));
     assert_eq!(store.requested_page(0, None), Some(0));
 }
+
+#[test]
+fn the_section_table_derives_ids_and_start_pages() {
+    let mut table = reader_store::SectionTable::new();
+    assert!(table.push(section(1024, 0, 0, 5)));
+    assert!(table.push(BookV2SectionRecord {
+        partial: true,
+        ..section(1025, 0, 5, 3)
+    }));
+    assert!(table.push(section(1026, 2, 8, 7)));
+    // A gap in ids or pages is not this book's next section.
+    assert!(!table.push(section(1028, 3, 15, 1)));
+    assert!(!table.push(section(1027, 3, 16, 1)));
+    assert_eq!(table.len(), 3);
+    let records: Vec<_> = table.iter().collect();
+    assert_eq!(
+        records,
+        [
+            section(1024, 0, 0, 5),
+            BookV2SectionRecord {
+                partial: true,
+                ..section(1025, 0, 5, 3)
+            },
+            section(1026, 2, 8, 7),
+        ]
+    );
+    assert_eq!(table.last(), Some(section(1026, 2, 8, 7)));
+}
+
+#[test]
+fn a_book_of_many_short_items_fits_well_past_the_old_section_cap() {
+    // An essay collection with 900 one- and two-page spine items: every item
+    // needs its own section, so the old 320-section table cut it short.
+    let mut sections = Vec::new();
+    let mut start = 0;
+    for spine in 0..900u16 {
+        let pages = 1 + spine % 2;
+        sections.push(section(spine, spine, start, pages));
+        start += u32::from(pages);
+    }
+    let mut store = ReaderStore::new();
+    store.set_book_index(start, false, &sections);
+    assert_eq!(store.book_sections.len(), 900);
+    assert_eq!(store.page_for_spine(899), sections[899].start_page);
+    assert_eq!(
+        store.section_for_global_page(start - 1),
+        Some(sections[899])
+    );
+    assert_eq!(
+        store.chapter_page_position(sections[451].start_page + 1),
+        Some((2, 2))
+    );
+
+    let mut table = reader_store::SectionTable::new();
+    for record in sections.iter().cycle().take(2000) {
+        let next = BookV2SectionRecord {
+            section: table.len() as u16,
+            start_page: table
+                .last()
+                .map_or(0, |last| last.start_page + u32::from(last.page_count)),
+            ..*record
+        };
+        if !table.push(next) {
+            break;
+        }
+    }
+    assert!(table.is_full());
+    assert_eq!(table.len(), reader_store::MAX_BOOK_SECTIONS);
+}

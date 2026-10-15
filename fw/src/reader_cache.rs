@@ -3,8 +3,7 @@ use crate::reader_cache_files;
 use crate::reader_cache_files::{BookIndexLoadResult, CacheLoadResult};
 use crate::reader_layout;
 use crate::reader_store::{
-    source_hash, BookLoadStatus, ReaderStore, EMPTY_BOOK_SECTION_RECORD, MAX_BOOK_SECTIONS,
-    MAX_READER_BLOCK_TEXT,
+    source_hash, BookLoadStatus, ReaderStore, MAX_BOOK_SECTIONS, MAX_READER_BLOCK_TEXT,
 };
 use crate::sd_session::{self, SdSessionError};
 use display::font::{fixed_ceil, fixed_round, FontFamily, FontStyle, TypeSettings};
@@ -48,7 +47,6 @@ pub(crate) struct ReaderCacheScratch<'a> {
     container: &'a mut [u8; READER_CONTAINER_SCRATCH],
     opf: &'a mut [u8; READER_OPF_SCRATCH],
     xhtml: &'a mut [u8; READER_XHTML_SCRATCH],
-    book_sections: &'a mut [BookV2SectionRecord; MAX_BOOK_SECTIONS],
     zip_inflate: ZipInflateScratch,
 }
 
@@ -123,7 +121,6 @@ impl<'a> ReaderCacheScratch<'a> {
         container: &'a mut [u8; READER_CONTAINER_SCRATCH],
         opf: &'a mut [u8; READER_OPF_SCRATCH],
         xhtml: &'a mut [u8; READER_XHTML_SCRATCH],
-        book_sections: &'a mut [BookV2SectionRecord; MAX_BOOK_SECTIONS],
     ) -> Self {
         Self {
             tail,
@@ -133,7 +130,6 @@ impl<'a> ReaderCacheScratch<'a> {
             container,
             opf,
             xhtml,
-            book_sections,
             zip_inflate: ZipInflateScratch::new(),
         }
     }
@@ -210,7 +206,7 @@ pub(crate) fn build_or_load_book_cache(
     // are reloaded and validated from their index.
     let empty_next = if library.loaded_index == Some(index)
         && library.reader_status() == BookLoadStatus::Loading
-        && library.book_section_count == 0
+        && library.book_sections.is_empty()
     {
         library.book_next_spine()
     } else {
@@ -688,7 +684,7 @@ where
             "bench: storage_reflow elapsed_ms={} pages={} sections={} key={}",
             started.elapsed().as_millis(),
             library.book_total_pages,
-            library.book_section_count,
+            library.book_sections.len(),
             cache_key
         );
         result = BookIndexLoadResult::Hit;
@@ -1024,7 +1020,6 @@ where
             container: scratch.container,
             opf: scratch.opf,
             xhtml: scratch.xhtml,
-            book_sections: scratch.book_sections,
             zip_inflate: &mut scratch.zip_inflate,
         },
     )
@@ -1037,7 +1032,6 @@ struct ZipBuildScratch<'a> {
     container: &'a mut [u8; READER_CONTAINER_SCRATCH],
     opf: &'a mut [u8; READER_OPF_SCRATCH],
     xhtml: &'a mut [u8; READER_XHTML_SCRATCH],
-    book_sections: &'a mut [BookV2SectionRecord; MAX_BOOK_SECTIONS],
     zip_inflate: &'a mut ZipInflateScratch,
 }
 
@@ -1070,12 +1064,12 @@ where
 {
     let resume_next = library.book_next_spine();
     let resumed_sections = if resume_next.is_some() {
-        library.book_section_count
+        library.book_sections.len()
     } else {
         0
     };
     let section_base = if resumed_sections > 0 {
-        (library.book_sections[0].section / MAX_BOOK_SECTIONS as u16) * MAX_BOOK_SECTIONS as u16
+        (library.book_sections.base() / MAX_BOOK_SECTIONS as u16) * MAX_BOOK_SECTIONS as u16
     } else {
         reader_cache_files::prepare_book_replacement(root, cache_key)
             .ok_or(ReaderCacheError::CacheWrite)?
@@ -1184,9 +1178,11 @@ where
     esp_println::println!("epub: stage BuildV2BookCache");
     let spine_started = Instant::now();
     let mut xhtml_path = String::<MAX_ENTRY_NAME_BYTES>::new();
-    scratch.book_sections.fill(EMPTY_BOOK_SECTION_RECORD);
-    let sections = &mut *scratch.book_sections;
-    sections[..resumed_sections].copy_from_slice(&library.book_sections[..resumed_sections]);
+    // Sections append to the store's table in place: a resumed build starts
+    // from the prefix its index load left there, a fresh one from empty.
+    if resumed_sections == 0 {
+        library.book_sections.clear();
+    }
     let mut section_count = resumed_sections;
     let mut total_pages = if resumed_sections > 0 {
         library.book_total_pages
@@ -1239,7 +1235,7 @@ where
                 break;
             }
             processed_spine = true;
-            if section_count >= sections.len() {
+            if library.book_sections.is_full() {
                 book_partial = true;
                 break;
             }
@@ -1275,7 +1271,6 @@ where
                 source_identity,
                 section_base,
                 font_metrics: &mut *font_metrics,
-                sections: &mut *sections,
                 section_count: &mut section_count,
                 total_pages: &mut total_pages,
                 book_partial: &mut book_partial,
@@ -1369,19 +1364,18 @@ where
         Ok::<(), ReaderCacheError>(())
     })?;
 
-    if section_count >= sections.len() && next_spine.is_some() {
+    if library.book_sections.is_full() && next_spine.is_some() {
         book_partial = true;
         next_spine = None;
     }
     library.set_book_next_spine(next_spine);
     if section_count > 0 && total_pages > 0 {
-        let sections_slice = &sections[..section_count];
         let wrote_index = reader_cache_files::write_v2_book_index(
             root,
             cache_key,
             source_identity,
             total_pages,
-            sections_slice,
+            &library.book_sections,
             library,
             book_partial,
         );
@@ -1394,7 +1388,7 @@ where
             return Err(ReaderCacheError::CacheWrite);
         }
 
-        library.set_book_index(total_pages, book_partial, sections_slice);
+        library.commit_book_index(total_pages, book_partial);
         library.set_book_next_spine(next_spine);
         let resolved_page = library.requested_page(requested_global_page, requested_spine);
         // During a distant-page/chapter request, leave a real committed prefix
@@ -1746,7 +1740,6 @@ struct LibraryBlockSink<
     source_identity: (u32, u32),
     section_base: u16,
     font_metrics: &'a mut crate::custom_font::MetricCache,
-    sections: &'a mut [BookV2SectionRecord; MAX_BOOK_SECTIONS],
     section_count: &'a mut usize,
     total_pages: &'a mut u32,
     book_partial: &'a mut bool,
@@ -1895,7 +1888,7 @@ where
             self.pages_dirty = true;
             return true;
         }
-        if *self.section_count >= self.sections.len() {
+        if self.library.book_sections.is_full() {
             *self.book_partial = true;
             self.stopped = true;
             return false;
@@ -1927,13 +1920,17 @@ where
             self.stopped = true;
             return false;
         }
-        self.sections[*self.section_count] = BookV2SectionRecord {
+        if !self.library.book_sections.push(BookV2SectionRecord {
             section: section_id,
             spine: self.spine_index,
             start_page: *self.total_pages,
             page_count: written_pages.min(u16::MAX as usize) as u16,
             partial,
-        };
+        }) {
+            *self.book_partial = true;
+            self.stopped = true;
+            return false;
+        }
         *self.total_pages = (*self.total_pages).saturating_add(written_pages as u32);
         *self.section_count += 1;
         self.pages_dirty = false;
