@@ -32,7 +32,8 @@ pub const CACHE_BOOK_FILE: &str = "BOOK.BIN";
 pub const CACHE_COVER_FILE: &str = "COVER.BIN";
 pub const CACHE_STATE_FILE: &str = "STATE.BIN";
 pub const CACHE_KEY_BYTES: usize = 8;
-pub const CACHE_SECTION_FILE_BYTES: usize = 8;
+/// Room for any 8.3 section name, `S65535.BIN` included.
+pub const CACHE_SECTION_FILE_BYTES: usize = 12;
 pub const BOOK_HEADER_BYTES: usize = 16;
 pub const SPINE_RECORD_BYTES: usize = 12;
 pub const TOC_RECORD_BYTES: usize = 24;
@@ -287,11 +288,23 @@ pub fn cache_key_for(source_path: &str, source_len: u32) -> String<CACHE_KEY_BYT
     out
 }
 
-pub fn section_file_name<const N: usize>(spine: u16, out: &mut String<N>) {
+/// `S007.BIN` for section 7, `S1234.BIN` from 1000 up: three digits keep
+/// every name earlier firmware wrote, and the 8.3 base has room for five.
+pub fn section_file_name<const N: usize>(section: u16, out: &mut String<N>) {
     out.clear();
     let _ = out.push('S');
-    push_dec3(out, spine);
+    if section >= 1000 {
+        push_dec_digit(out, section / 10_000);
+        push_dec_digit(out, section / 1000);
+    }
+    push_dec3(out, section % 1000);
     let _ = out.push_str(".BIN");
+}
+
+fn push_dec_digit<const N: usize>(out: &mut String<N>, value: u16) {
+    if value > 0 || !out.ends_with('S') {
+        let _ = out.push((b'0' + (value % 10) as u8) as char);
+    }
 }
 
 pub fn encode_book_header(header: BookCacheHeader, out: &mut [u8]) -> Result<usize, CacheError> {
@@ -1241,8 +1254,14 @@ mod tests {
         let mut name = String::<CACHE_SECTION_FILE_BYTES>::new();
         section_file_name(7, &mut name);
         assert_eq!(name.as_str(), "S007.BIN");
-        section_file_name(1234, &mut name);
+        section_file_name(999, &mut name);
         assert_eq!(name.as_str(), "S999.BIN");
+        section_file_name(1000, &mut name);
+        assert_eq!(name.as_str(), "S1000.BIN");
+        section_file_name(2047, &mut name);
+        assert_eq!(name.as_str(), "S2047.BIN");
+        section_file_name(u16::MAX, &mut name);
+        assert_eq!(name.as_str(), "S65535.BIN");
     }
 
     #[test]
