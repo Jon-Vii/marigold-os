@@ -36,6 +36,17 @@ CrossPoint firmware family:
 The app image is about 3.9 MB, so it fits `ota_0` with room to spare.
 `cargo run` now flashes against this table (see `.cargo/config.toml`).
 
+### Flash clock
+
+The second-stage bootloader sets how fast the chip reads its flash, and the
+firmware runs from flash through a 16 KB cache, so the clock shows in every
+cache miss: on the X4, 80 MHz instead of 40 MHz takes a cold book build from
+65 s to 52 s, most of it layout and parsing. `cargo run` and the
+`full-flash*.bin` images write a bootloader set to dual I/O at 80 MHz, as
+CrossPoint's is; espflash alone would write 40 MHz. Quad I/O is out: it needs
+GPIO12, the SD card's chip select. App-only installs (`0x10000`, the web
+flasher, SD updates) keep whatever bootloader the device already has.
+
 ### Why the stock bootloader accepts our image
 
 The X4 bootloader gates images on an eFuse block-revision range read from the

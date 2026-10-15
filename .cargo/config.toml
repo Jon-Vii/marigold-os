@@ -2,8 +2,10 @@
 # lands in app0/ota_0 at 0x10000 — the same slot the stock bootloader boots and
 # the release firmware.bin targets. --ignore-app-descriptor skips espflash's own
 # descriptor validator; our descriptor is still emitted at image offset 0x20.
+# The bootloader espflash writes runs the flash in dual I/O at 80 MHz, as
+# CrossPoint's does; espflash's default is 40 MHz (see docs/FLASHING.md).
 [target.riscv32imc-unknown-none-elf]
-runner = "espflash flash --monitor --ignore-app-descriptor --flash-size 16mb --partition-table partitions.csv"
+runner = "espflash flash --monitor --ignore-app-descriptor --flash-size 16mb --flash-mode dio --flash-freq 80mhz --partition-table partitions.csv"
 rustflags = [
   "-C", "link-arg=-Tlinkall.x",
   # Required to work with portable-atomic for CAS operations on single-core riscv32

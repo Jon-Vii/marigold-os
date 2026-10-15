@@ -112,7 +112,10 @@ For button calibration, raw ADC serial logging is behind `RAW_LOG_ENABLED` in
 
 Point-in-time X4 measurements. Firmware has changed since; re-measure before
 relying on a number. Later results are in
-`docs/plans/2026-09-12-reader-performance.md` and `docs/releases/`.
+`docs/plans/2026-09-12-reader-performance.md` and `docs/releases/`. Until
+October 15 2026 the bench X4 ran its flash at espflash's default 40 MHz; it
+now runs at 80 MHz (see `docs/FLASHING.md`), which makes CPU-bound work such
+as layout and book builds markedly faster than these numbers.
 
 ### June 10 2026: panel and page-turn baseline
 
