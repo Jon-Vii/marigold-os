@@ -5,16 +5,13 @@ use miniz_oxide::inflate::decompress_slice_iter_to_slice;
 use miniz_oxide::inflate::stream::{inflate, InflateState};
 use miniz_oxide::{DataFormat, MZError, MZFlush, MZStatus};
 
-// One spine item per chapter, so this bounds how many chapters a book can have.
-// Items are now `Span`-encoded (see `SpineItem`/`Span`), ~half the size of the
-// old `&str` form, so the spine and manifest tables hold far more chapters
-// within the same (tight) EPUB-open stack budget that the fat `&str` version
-// overflowed. 192 covers very long serials (HPMOR ~122 + matter); overflow sets
-// `spine_truncated` rather than silently dropping the tail. Manifest must
-// out-size the spine (it also carries cover/nav/ncx) and errors rather than
-// truncating, so keep it comfortably ahead. One value for firmware and host so
-// a host test exercises the same ceiling the device does.
-pub const MAX_SPINE_ITEMS: usize = 192;
+// Upper bound on spine items (one per chapter file). The spine lives in the OPF
+// arena, 8 bytes an item plus its href, not on the stack (see `Spine`), so in
+// practice the arena's size decides how many fit; this caps the slot table so
+// strings always keep room. A spine past either limit sets `spine_truncated`
+// rather than silently dropping the tail. One value for firmware and host so a
+// host test exercises the same ceiling the device does.
+pub const MAX_SPINE_ITEMS: usize = 1024;
 pub const MAX_ENTRY_NAME_BYTES: usize = 160;
 const ZIP_TAIL_READ_WINDOW: usize = 512;
 const ZIP_EOCD_MIN_BYTES: u32 = 22;
@@ -1481,7 +1478,63 @@ pub struct EpubPackage<'a> {
     /// spine (and the book) is clipped. Callers flag the book partial instead
     /// of silently dropping the tail chapters.
     pub spine_truncated: bool,
-    pub spine: Vec<SpineItem, MAX_SPINE_ITEMS>,
+    pub spine: Spine<'a>,
+}
+
+/// The package's spine, in reading order, as stored in the OPF arena: one
+/// `SPINE_SLOT_BYTES` slot per item at the arena's top (item 0 highest), each
+/// holding the item's href span and its interned media type and properties.
+#[derive(Clone, Copy)]
+pub struct Spine<'a> {
+    /// The arena up to its top; slot `i` ends `i * SPINE_SLOT_BYTES` below.
+    arena: &'a [u8],
+    len: usize,
+    interned: [Span; OPF_INTERNED_VALUES],
+}
+
+impl<'a> Spine<'a> {
+    const fn empty() -> Self {
+        Self {
+            arena: &[],
+            len: 0,
+            interned: [Span { off: 0, len: 0 }; OPF_INTERNED_VALUES],
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn get(&self, index: usize) -> Option<SpineItem> {
+        if index >= self.len {
+            return None;
+        }
+        let slot = SpineSlot::read(self.arena, index);
+        let interned = |value: u8| {
+            self.interned
+                .get(value as usize)
+                .copied()
+                .unwrap_or_default()
+        };
+        Some(SpineItem {
+            href: slot.href,
+            media_type: interned(slot.media_type),
+            properties: interned(slot.properties),
+        })
+    }
+
+    pub fn first(&self) -> Option<SpineItem> {
+        self.get(0)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = SpineItem> + Clone + 'a {
+        let spine = *self;
+        (0..spine.len).filter_map(move |index| spine.get(index))
+    }
 }
 
 impl<'a> EpubPackage<'a> {
@@ -1580,10 +1633,16 @@ pub fn parse_opf_streamed<'a, R>(
 where
     R: FnMut(&mut dyn FnMut(&[u8]) -> Result<(), EpubError>) -> Result<(), EpubError>,
 {
+    // Pass 1: one slot per itemref, in spine order, holding its idref's hash
+    // until the manifest item it names is found.
+    let top = arena.len().min(u16::MAX as usize);
+    let capacity = MAX_SPINE_ITEMS.min(top / (SPINE_SLOT_BYTES + SPINE_MIN_HREF_ROOM));
+    let mut slots = 0usize;
+    let mut spine_overflow = false;
     let mut tokenizer = StreamingXmlTokenizer::new();
-    let mut filter = SpineIdFilter::new();
     {
         let mut in_spine = false;
+        let arena = &mut *arena;
         replay(&mut |chunk| {
             tokenizer.feed(chunk, &mut |event| {
                 match event {
@@ -1591,7 +1650,12 @@ where
                     TokEvent::EndTag(tag) if tag_name_is(tag, "spine") => in_spine = false,
                     TokEvent::StartTag(tag) if in_spine && tag_name_is(tag, "itemref") => {
                         if let Some(idref) = attr_value(tag, "idref") {
-                            filter.insert(idref);
+                            if slots == capacity {
+                                spine_overflow = true;
+                            } else {
+                                SpineSlot::unresolved(id_hash48(idref)).write(arena, slots);
+                                slots += 1;
+                            }
                         }
                     }
                     _ => {}
@@ -1619,32 +1683,38 @@ where
         ncx_href: None,
         cover_href: None,
         spine_truncated: false,
-        spine: Vec::new(),
+        spine: Spine::empty(),
     };
 
     let summary = {
-        let mut collector = OpfCollector::new(arena, &filter);
+        let mut collector = OpfCollector::new(arena, slots);
         for fallback in [false, true] {
-            if fallback && !package.spine.is_empty() {
+            if fallback && collector.resolved_slots() > 0 {
                 break;
             }
             collector.begin_pass(fallback);
             tokenizer = StreamingXmlTokenizer::new();
             replay(&mut |chunk| {
                 tokenizer.feed(chunk, &mut |event| {
-                    collector.handle(event, &mut package.spine);
+                    collector.handle(event);
                     Ok::<(), EpubError>(())
                 })
             })?;
             tokenizer.finish(&mut |event| {
-                collector.handle(event, &mut package.spine);
+                collector.handle(event);
                 Ok::<(), EpubError>(())
             })?;
         }
+        collector.compact_slots();
         collector.summary()
     };
 
     let arena: &'a [u8] = arena;
+    package.spine = Spine {
+        arena: &arena[..top],
+        len: summary.slots,
+        interned: summary.interned,
+    };
     let text = core::str::from_utf8(&arena[..summary.len]).map_err(|_| EpubError::Utf8)?;
     package.opf_text = text;
     if let Some(title) = summary.title {
@@ -1668,40 +1738,94 @@ where
     } else {
         CoverStatus::Missing
     };
-    package.spine_truncated = filter.overflow || summary.lost;
+    package.spine_truncated = spine_overflow || summary.lost;
     Ok(package)
 }
 
-/// First-pass record of the spine's idrefs as FNV-1a hashes. A collision
-/// only keeps one extra manifest item; the spine itself resolves by
-/// comparing the real id strings.
-struct SpineIdFilter {
-    hashes: [u32; MAX_SPINE_ITEMS],
-    len: usize,
-    overflow: bool,
+/// Bytes a spine slot takes at the top of the OPF arena.
+const SPINE_SLOT_BYTES: usize = 8;
+/// Arena room kept per slot for its href, so a huge spine cannot crowd the
+/// strings out entirely: items past it are flagged lost instead.
+const SPINE_MIN_HREF_ROOM: usize = 16;
+/// Marks a slot whose manifest item has not been seen yet.
+const SLOT_UNRESOLVED: u8 = 0xFE;
+
+/// 48 bits of FNV-1a 64 over a manifest id. Pass 1 keeps the itemrefs' ids
+/// only as these; a manifest item claims every slot with its hash. Two of a
+/// book's ids sharing one is a ~1e-9 chance.
+fn id_hash48(id: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in id.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash & 0xFFFF_FFFF_FFFF
 }
 
-impl SpineIdFilter {
-    fn new() -> Self {
+/// One spine item's slot. Unresolved, its first six bytes are the idref's
+/// hash; resolved, the first four are the href span.
+#[derive(Clone, Copy)]
+struct SpineSlot {
+    hash: u64,
+    href: Span,
+    media_type: u8,
+    properties: u8,
+}
+
+impl SpineSlot {
+    fn unresolved(hash: u64) -> Self {
         Self {
-            hashes: [0; MAX_SPINE_ITEMS],
-            len: 0,
-            overflow: false,
+            hash,
+            href: Span::default(),
+            media_type: SLOT_UNRESOLVED,
+            properties: SLOT_UNRESOLVED,
         }
     }
 
-    fn insert(&mut self, id: &str) {
-        if self.len == self.hashes.len() {
-            self.overflow = true;
-            return;
-        }
-        self.hashes[self.len] = fnv1a_update(FNV_OFFSET, id.as_bytes());
-        self.len += 1;
+    fn is_resolved(&self) -> bool {
+        self.media_type != SLOT_UNRESOLVED
     }
 
-    fn contains(&self, id: &str) -> bool {
-        let hash = fnv1a_update(FNV_OFFSET, id.as_bytes());
-        self.hashes[..self.len].contains(&hash)
+    fn at(arena_top: usize, index: usize) -> usize {
+        arena_top - (index + 1) * SPINE_SLOT_BYTES
+    }
+
+    fn read(arena: &[u8], index: usize) -> Self {
+        let top = arena.len().min(u16::MAX as usize);
+        let at = Self::at(top, index);
+        let bytes = &arena[at..at + SPINE_SLOT_BYTES];
+        let media_type = bytes[6];
+        let word = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+        if media_type == SLOT_UNRESOLVED {
+            let mut hash = [0u8; 8];
+            hash[..6].copy_from_slice(&bytes[..6]);
+            Self::unresolved(u64::from_le_bytes(hash))
+        } else {
+            Self {
+                hash: 0,
+                href: Span {
+                    off: word(0),
+                    len: word(2),
+                },
+                media_type,
+                properties: bytes[7],
+            }
+        }
+    }
+
+    fn write(&self, arena: &mut [u8], index: usize) {
+        let top = arena.len().min(u16::MAX as usize);
+        let at = Self::at(top, index);
+        let bytes = &mut arena[at..at + SPINE_SLOT_BYTES];
+        if self.is_resolved() {
+            bytes[0..2].copy_from_slice(&self.href.off.to_le_bytes());
+            bytes[2..4].copy_from_slice(&self.href.len.to_le_bytes());
+            bytes[4..6].fill(0);
+        } else {
+            bytes[..6].copy_from_slice(&self.hash.to_le_bytes()[..6]);
+        }
+        bytes[6] = self.media_type;
+        bytes[7] = self.properties;
     }
 }
 
@@ -1714,6 +1838,8 @@ enum OpfCapture {
 
 struct OpfSummary {
     len: usize,
+    slots: usize,
+    interned: [Span; OPF_INTERNED_VALUES],
     title: Option<Span>,
     author: Option<Span>,
     text_reference: Option<Span>,
@@ -1726,56 +1852,20 @@ struct OpfSummary {
     lost: bool,
 }
 
-/// A kept manifest item, stored at the top of the arena (growing down) so
-/// the manifest table never sits on the stack. Strings grow up from the
-/// bottom; the two meet only when the arena is genuinely full.
-const OPF_ITEM_RECORD_BYTES: usize = 10;
+/// Strings grow up from the arena's bottom; the spine slots sit at its top.
+/// Media types and properties repeat across items, so each distinct value is
+/// stored once (up to this many) and slots refer to it by index.
+const OPF_INTERNED_VALUES: usize = 8;
 const OPF_NO_INTERNED: u8 = u8::MAX;
 
-#[derive(Clone, Copy)]
-struct OpfItemRecord {
-    id: Span,
-    href: Span,
-    media_type: u8,
-    properties: u8,
-}
-
-impl OpfItemRecord {
-    fn encode(&self, out: &mut [u8]) {
-        out[0..2].copy_from_slice(&self.id.off.to_le_bytes());
-        out[2..4].copy_from_slice(&self.id.len.to_le_bytes());
-        out[4..6].copy_from_slice(&self.href.off.to_le_bytes());
-        out[6..8].copy_from_slice(&self.href.len.to_le_bytes());
-        out[8] = self.media_type;
-        out[9] = self.properties;
-    }
-
-    fn decode(bytes: &[u8]) -> Self {
-        let word = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
-        Self {
-            id: Span {
-                off: word(0),
-                len: word(2),
-            },
-            href: Span {
-                off: word(4),
-                len: word(6),
-            },
-            media_type: bytes[8],
-            properties: bytes[9],
-        }
-    }
-}
-
 /// Second/third-pass state: copies the strings the package needs into the
-/// arena, keeps the manifest items the spine names as arena records, and
-/// resolves the spine against them.
-struct OpfCollector<'b, 'f> {
+/// arena and fills the spine slots pass 1 laid out, as the manifest items
+/// they name stream by.
+struct OpfCollector<'b> {
     arena: &'b mut [u8],
     len: usize,
-    /// Start of the record table at the top of the arena.
-    records_start: usize,
-    filter: &'f SpineIdFilter,
+    /// Spine slots in use; they occupy the arena's top.
+    slots: usize,
     fallback: bool,
     in_manifest: bool,
     in_spine: bool,
@@ -1792,18 +1882,16 @@ struct OpfCollector<'b, 'f> {
     cover: Option<Span>,
     image_cover: Option<Span>,
     any_cover: bool,
-    interned: Vec<Span, 8>,
+    interned: Vec<Span, OPF_INTERNED_VALUES>,
     lost: bool,
 }
 
-impl<'b, 'f> OpfCollector<'b, 'f> {
-    fn new(arena: &'b mut [u8], filter: &'f SpineIdFilter) -> Self {
-        let top = arena.len().min(u16::MAX as usize);
+impl<'b> OpfCollector<'b> {
+    fn new(arena: &'b mut [u8], slots: usize) -> Self {
         Self {
             arena,
             len: 0,
-            records_start: top,
-            filter,
+            slots,
             fallback: false,
             in_manifest: false,
             in_spine: false,
@@ -1827,6 +1915,10 @@ impl<'b, 'f> OpfCollector<'b, 'f> {
 
     fn begin_pass(&mut self, fallback: bool) {
         self.fallback = fallback;
+        if fallback {
+            // Nothing resolved: the spine is rebuilt in manifest order.
+            self.slots = 0;
+        }
         self.in_manifest = false;
         self.in_spine = false;
         self.in_guide = false;
@@ -1834,8 +1926,12 @@ impl<'b, 'f> OpfCollector<'b, 'f> {
     }
 
     fn summary(&self) -> OpfSummary {
+        let mut interned = [Span::default(); OPF_INTERNED_VALUES];
+        interned[..self.interned.len()].copy_from_slice(&self.interned);
         OpfSummary {
             len: self.len,
+            slots: self.slots,
+            interned,
             title: self.title,
             author: self.author,
             text_reference: self.text_reference,
@@ -1854,9 +1950,18 @@ impl<'b, 'f> OpfCollector<'b, 'f> {
         core::str::from_utf8(&self.arena[start..start + span.len as usize]).unwrap_or("")
     }
 
+    fn top(&self) -> usize {
+        self.arena.len().min(u16::MAX as usize)
+    }
+
+    /// Where the spine slots begin; strings must stay below it.
+    fn slots_start(&self) -> usize {
+        self.top() - self.slots * SPINE_SLOT_BYTES
+    }
+
     fn push(&mut self, text: &str) -> Option<Span> {
         let end = self.len + text.len();
-        if end > self.records_start {
+        if end > self.slots_start() {
             self.lost = true;
             return None;
         }
@@ -1890,34 +1995,39 @@ impl<'b, 'f> OpfCollector<'b, 'f> {
         Some((self.interned.len() - 1) as u8)
     }
 
-    fn interned_span(&self, index: u8) -> Span {
-        self.interned
-            .get(index as usize)
-            .copied()
-            .unwrap_or_default()
+    fn resolved_slots(&self) -> usize {
+        (0..self.slots)
+            .filter(|index| SpineSlot::read(self.arena, *index).is_resolved())
+            .count()
     }
 
-    fn record_count(&self) -> usize {
-        (self.arena.len().min(u16::MAX as usize) - self.records_start) / OPF_ITEM_RECORD_BYTES
+    /// Drops slots no manifest item filled (an itemref naming nothing),
+    /// keeping spine order.
+    fn compact_slots(&mut self) {
+        let mut kept = 0;
+        for index in 0..self.slots {
+            let slot = SpineSlot::read(self.arena, index);
+            if slot.is_resolved() {
+                slot.write(self.arena, kept);
+                kept += 1;
+            }
+        }
+        self.slots = kept;
     }
 
-    fn record(&self, index: usize) -> OpfItemRecord {
-        let at = self.arena.len().min(u16::MAX as usize) - (index + 1) * OPF_ITEM_RECORD_BYTES;
-        OpfItemRecord::decode(&self.arena[at..at + OPF_ITEM_RECORD_BYTES])
-    }
-
-    fn push_record(&mut self, record: OpfItemRecord) -> bool {
-        if self.records_start < self.len + OPF_ITEM_RECORD_BYTES {
+    /// Adds a resolved slot below the existing ones (the manifest-order
+    /// fallback), if the strings leave room.
+    fn push_slot(&mut self, slot: SpineSlot) -> bool {
+        if self.slots >= MAX_SPINE_ITEMS || self.slots_start() < self.len + SPINE_SLOT_BYTES {
             self.lost = true;
             return false;
         }
-        self.records_start -= OPF_ITEM_RECORD_BYTES;
-        let at = self.records_start;
-        record.encode(&mut self.arena[at..at + OPF_ITEM_RECORD_BYTES]);
+        self.slots += 1;
+        slot.write(self.arena, self.slots - 1);
         true
     }
 
-    fn handle(&mut self, event: TokEvent<'_>, spine: &mut Vec<SpineItem, MAX_SPINE_ITEMS>) {
+    fn handle(&mut self, event: TokEvent<'_>) {
         match event {
             TokEvent::StartTag(tag) => {
                 let self_closing = tag.ends_with('/');
@@ -1928,11 +2038,7 @@ impl<'b, 'f> OpfCollector<'b, 'f> {
                 } else if tag_name_is(tag, "guide") {
                     self.in_guide = !self_closing;
                 } else if self.in_manifest && tag_name_is(tag, "item") {
-                    self.handle_item(tag, spine);
-                } else if self.in_spine && tag_name_is(tag, "itemref") {
-                    if !self.fallback {
-                        self.handle_itemref(tag, spine);
-                    }
+                    self.handle_item(tag);
                 } else if self.in_guide && tag_name_is(tag, "reference") {
                     if !self.fallback {
                         self.handle_reference(tag);
@@ -1980,7 +2086,7 @@ impl<'b, 'f> OpfCollector<'b, 'f> {
         }
     }
 
-    fn handle_item(&mut self, tag: &str, spine: &mut Vec<SpineItem, MAX_SPINE_ITEMS>) {
+    fn handle_item(&mut self, tag: &str) {
         let Some(id) = attr_value(tag, "id") else {
             return;
         };
@@ -1993,10 +2099,6 @@ impl<'b, 'f> OpfCollector<'b, 'f> {
             if !manifest_item_is_reading_candidate(href, media_type, properties) {
                 return;
             }
-            if spine.is_full() {
-                self.lost = true;
-                return;
-            }
             let (Some(href), Some(media_type), Some(properties)) = (
                 self.push(href),
                 self.intern(media_type),
@@ -2004,10 +2106,11 @@ impl<'b, 'f> OpfCollector<'b, 'f> {
             ) else {
                 return;
             };
-            let _ = spine.push(SpineItem {
+            self.push_slot(SpineSlot {
+                hash: 0,
                 href,
-                media_type: self.interned_span(media_type),
-                properties: self.interned_span(properties),
+                media_type,
+                properties,
             });
             return;
         }
@@ -2038,44 +2141,36 @@ impl<'b, 'f> OpfCollector<'b, 'f> {
         {
             self.image_cover = self.push(href);
         }
-        if !self.filter.contains(id) {
-            return;
-        }
-        let (Some(id), Some(href), Some(media_type), Some(properties)) = (
-            self.push(id),
-            self.push(href),
-            self.intern(media_type),
-            self.intern(properties),
-        ) else {
-            return;
-        };
-        self.push_record(OpfItemRecord {
-            id,
-            href,
-            media_type,
-            properties,
-        });
-    }
-
-    fn handle_itemref(&mut self, tag: &str, spine: &mut Vec<SpineItem, MAX_SPINE_ITEMS>) {
-        let Some(idref) = attr_value(tag, "idref") else {
-            return;
-        };
-        let Some(record) = (0..self.record_count())
-            .map(|index| self.record(index))
-            .find(|record| self.text(record.id) == idref)
-        else {
-            return;
-        };
-        if spine
-            .push(SpineItem {
-                href: record.href,
-                media_type: self.interned_span(record.media_type),
-                properties: self.interned_span(record.properties),
-            })
-            .is_err()
-        {
-            self.lost = true;
+        // Fill every spine slot that names this item (a spine may list an
+        // item twice); its strings are stored once.
+        let hash = id_hash48(id);
+        let mut resolved: Option<SpineSlot> = None;
+        for index in 0..self.slots {
+            let slot = SpineSlot::read(self.arena, index);
+            if slot.is_resolved() || slot.hash != hash {
+                continue;
+            }
+            let fill = match resolved {
+                Some(fill) => fill,
+                None => {
+                    let (Some(href), Some(media_type), Some(properties)) = (
+                        self.push(href),
+                        self.intern(media_type),
+                        self.intern(properties),
+                    ) else {
+                        return;
+                    };
+                    let fill = SpineSlot {
+                        hash: 0,
+                        href,
+                        media_type,
+                        properties,
+                    };
+                    resolved = Some(fill);
+                    fill
+                }
+            };
+            fill.write(self.arena, index);
         }
     }
 
@@ -4554,7 +4649,10 @@ mod tests {
         assert_eq!(package.meta.cover_status, CoverStatus::Present);
         assert_eq!(package.cover_href, Some("images/cover.jpg"));
         assert_eq!(package.spine.len(), 1);
-        assert_eq!(package.spine[0].href.of(package.opf_text), "text/ch1.xhtml");
+        assert_eq!(
+            package.spine.get(0).unwrap().href.of(package.opf_text),
+            "text/ch1.xhtml"
+        );
     }
 
     struct RecordingSink {
@@ -5214,7 +5312,10 @@ mod tests {
         .expect("opf parses");
 
         assert_eq!(package.spine.len(), 1);
-        assert_eq!(package.spine[0].href.of(package.opf_text), "text/ch1.xhtml");
+        assert_eq!(
+            package.spine.get(0).unwrap().href.of(package.opf_text),
+            "text/ch1.xhtml"
+        );
         assert_eq!(package.text_reference_href, Some("text/start.xhtml"));
         assert_eq!(package.cover_page_href, Some("wrap0000.html"));
         assert_eq!(package.nav_href, Some("nav.xhtml"));
@@ -5247,7 +5348,10 @@ mod tests {
         .expect("opf parses");
 
         assert_eq!(package.spine.len(), 1);
-        assert_eq!(package.spine[0].href.of(package.opf_text), "text/ch1.xhtml");
+        assert_eq!(
+            package.spine.get(0).unwrap().href.of(package.opf_text),
+            "text/ch1.xhtml"
+        );
     }
 
     /// An OPF with `chapters` spine items plus `extra` manifest-only items
@@ -5308,11 +5412,11 @@ mod tests {
             assert_eq!(package.spine.len(), 150, "chunk {chunk}");
             assert!(!package.spine_truncated);
             assert_eq!(
-                package.spine[0].href.of(package.opf_text),
+                package.spine.get(0).unwrap().href.of(package.opf_text),
                 "text/chapter-0000.xhtml"
             );
             assert_eq!(
-                package.spine[149].href.of(package.opf_text),
+                package.spine.get(149).unwrap().href.of(package.opf_text),
                 "text/chapter-0149.xhtml"
             );
             assert_eq!(package.meta.title, "Pride & Prejudice \u{2014} \u{dc}ber");
@@ -5322,12 +5426,60 @@ mod tests {
     }
 
     #[test]
-    fn opf_spine_past_the_cap_is_flagged_truncated() {
-        let opf = large_opf(250, 0);
+    fn opf_spine_past_the_arena_is_flagged_truncated() {
+        let opf = large_opf(1500, 0);
         let mut arena = [0u8; 16_384];
         let package = parse_streamed_in_chunks(&opf, 512, &mut arena).expect("parses");
-        assert_eq!(package.spine.len(), MAX_SPINE_ITEMS);
+        assert!(package.spine.len() > 300 && package.spine.len() < 1500);
         assert!(package.spine_truncated);
+        // What was kept is the head of the spine, in order.
+        let last = package.spine.len() - 1;
+        assert_eq!(
+            package.spine.get(last).unwrap().href.of(package.opf_text),
+            std::format!("text/chapter-{last:04}.xhtml")
+        );
+    }
+
+    #[test]
+    fn a_spine_of_hundreds_of_items_fits_the_device_arena() {
+        // An essay collection: 600 items, each its own XHTML file, with
+        // bulky manifest ids and hundreds of images the spine never names.
+        let mut opf = std::string::String::from(
+            r#"<package><metadata><dc:title>Essays</dc:title></metadata><manifest>"#,
+        );
+        for index in 0..600 {
+            opf.push_str(&std::format!(
+                r#"<item id="essay-{index:04}-xhtml-content-document" href="text/essay-{index:04}.xhtml" media-type="application/xhtml+xml"/>"#
+            ));
+            opf.push_str(&std::format!(
+                r#"<item id="figure-{index:04}" href="images/figure-{index:04}.png" media-type="image/png"/>"#
+            ));
+        }
+        opf.push_str("</manifest><spine>");
+        for index in (0..600).rev() {
+            opf.push_str(&std::format!(
+                r#"<itemref idref="essay-{index:04}-xhtml-content-document"/>"#
+            ));
+        }
+        // A dangling itemref is skipped, as before.
+        opf.push_str(r#"<itemref idref="missing"/></spine></package>"#);
+        let mut arena = [0u8; 20 * 1024];
+        let package = parse_streamed_in_chunks(&opf, 777, &mut arena).expect("parses");
+        assert!(!package.spine_truncated);
+        assert_eq!(package.spine.len(), 600);
+        // Spine order, not manifest order.
+        let href = |index: usize| package.spine.get(index).unwrap().href.of(package.opf_text);
+        assert_eq!(href(0), "text/essay-0599.xhtml");
+        assert_eq!(href(599), "text/essay-0000.xhtml");
+        assert_eq!(
+            package
+                .spine
+                .get(3)
+                .unwrap()
+                .media_type
+                .of(package.opf_text),
+            "application/xhtml+xml"
+        );
     }
 
     #[test]

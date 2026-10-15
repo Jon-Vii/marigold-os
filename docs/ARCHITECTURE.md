@@ -375,12 +375,15 @@ and the host preview tool:
   whether compressed bytes come from random-access or forward-only storage.
 - `EpubPackage` for OPF metadata, nav/NCX/cover hrefs, and the spine.
   `parse_opf_streamed` reads the package document of any size in two
-  streamed passes (spine ids, then the manifest items they name) and copies
-  only the strings the package needs into a 16 KB arena; manifest records
-  live at the top of that arena rather than on the stack. Spine items are
-  offset+length spans into the arena. A spine past `MAX_SPINE_ITEMS` (192)
-  or an exhausted arena marks the package `spine_truncated`, and the book's
-  last page says it was cut short.
+  streamed passes and copies only the strings the package needs into a 16 KB
+  arena. The first pass lays out one 8-byte slot per spine itemref at the
+  arena's top, holding a 48-bit hash of its idref; the second fills each slot
+  in place as the manifest item with that id streams past (its href span and
+  interned media type and properties), so neither manifest ids nor a spine
+  table touch the stack. `EpubPackage::spine` is a `Spine` view over those
+  slots. A spine past `MAX_SPINE_ITEMS` (1,024), or one whose hrefs exhaust
+  the arena, marks the package `spine_truncated`, and the book's last page
+  says it was cut short.
 - `xhtml_blocks_to_sink` with `TextRole`, `FontStyle`, and `TextAlign` as the
   single XHTML extraction path feeding bounded block records.
 - `BookV2Header` with `BookV2SectionRecord`, and `SectionV2Header` with
