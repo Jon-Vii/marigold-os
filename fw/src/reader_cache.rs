@@ -2130,6 +2130,9 @@ fn push_styled_preview_fragment<
         first_word = false;
     }
 
+    // A run ending in a space owes the next run (the next styled span, or
+    // the next chunk the parser streams) that space.
+    sink.pending_space |= ends_with_space;
     if paragraph_end {
         flush_styled_preview_line(sink, true);
     }

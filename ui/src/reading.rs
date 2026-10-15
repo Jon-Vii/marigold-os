@@ -478,8 +478,9 @@ pub const READER_WRAP_SAFETY: i16 = 4;
 /// more than 192 spine items or 320 sections were cached cut short; rebuild
 /// them whole. v23: justified prose hyphenates (patterns for English, the
 /// book's soft hyphens and compound dashes everywhere), which moves line
-/// breaks throughout.
-const READER_LAYOUT_VERSION: u16 = 23;
+/// breaks throughout. v24: a v23 build lost the space at the start of
+/// some styled runs and parser chunks; retire those lines.
+const READER_LAYOUT_VERSION: u16 = 24;
 
 /// Panel-geometry salt folded into the version bits: wrap points and page
 /// heights depend on the page box, so pagination cached on one panel must
