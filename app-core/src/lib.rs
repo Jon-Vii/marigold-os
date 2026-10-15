@@ -545,13 +545,16 @@ pub enum LibraryEvent {
         page: Option<u32>,
     },
     /// Idle-time preparation grew the open book's readable prefix. Counts
-    /// only: the page on screen and any pending turn stay as they are.
+    /// only, without a repaint: the page on screen stays, though it may take
+    /// a new number (`renumbered`, from and to) once a chapter laid out
+    /// ahead of the rest is joined by the chapters before it.
     Prepared {
         book_id: u32,
         pages: u32,
         chapters: u16,
         chapter_pages: [u16; MAX_SD_CHAPTERS],
         complete: bool,
+        renumbered: Option<(u32, u32)>,
     },
     /// Loading failed without establishing EOF; the readable prefix remains valid.
     ReaderLoadFailed {
@@ -1165,12 +1168,18 @@ impl ReaderState {
                 chapters,
                 chapter_pages,
                 complete,
+                renumbered,
             } => {
                 if self.book_id == book_id {
                     self.sd_page_count = pages.max(1);
                     self.sd_complete = complete;
                     self.sd_chapter_count = chapters.max(1);
                     self.sd_chapter_pages = chapter_pages;
+                    if let Some((from, to)) = renumbered {
+                        if self.page == from {
+                            self.page = to;
+                        }
+                    }
                 }
             }
             LibraryEvent::ReaderLoadFailed { book_id, .. } => {
@@ -1941,6 +1950,7 @@ mod tests {
                     chapters: 2,
                     chapter_pages: [0; MAX_SD_CHAPTERS],
                     complete,
+                    renumbered: None,
                 },
             )
         };
@@ -1956,6 +1966,25 @@ mod tests {
         // Another book's preparation leaves this one alone.
         let other = prepared(state, ReaderSource::sd(1).book_id(), 20, true);
         assert_eq!((other.sd_page_count, other.sd_complete), (4, false));
+        let mut ahead = state;
+        ahead.page = 49_160;
+        let renumbered = |state: ReaderState, from| {
+            state.apply_library_event(
+                CTX,
+                LibraryEvent::Prepared {
+                    book_id: state.book_id,
+                    pages: 300,
+                    chapters: 2,
+                    chapter_pages: [0; MAX_SD_CHAPTERS],
+                    complete: false,
+                    renumbered: Some((from, 212)),
+                },
+            )
+        };
+        // The page on screen takes its real number; a reader who already
+        // moved on keeps theirs (the next reply renumbers it).
+        assert_eq!(renumbered(ahead, 49_160).page, 212);
+        assert_eq!(renumbered(ahead, 49_159).page, 49_160);
         assert_eq!(
             LibraryEvent::Prepared {
                 book_id: state.book_id,
@@ -1963,6 +1992,7 @@ mod tests {
                 chapters: 2,
                 chapter_pages: [0; MAX_SD_CHAPTERS],
                 complete: false,
+                renumbered: None,
             }
             .reader_request_id(),
             None

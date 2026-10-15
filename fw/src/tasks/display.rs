@@ -674,6 +674,9 @@ fn prepare_while_idle(
     );
     let pressed = BUTTON_PRESSES.load(Ordering::Relaxed) != presses;
     let grew = sd_library.book_next_spine() != next_spine;
+    // The page on screen may have been numbered provisionally; once the
+    // prefix reaches it, it takes its real number.
+    let shown = sd_library.settled_page(request.page);
     esp_println::println!(
         "bench: idle_prepare elapsed_ms={} grew={} pressed={} next_spine={:?} pages={} status={:?} t_ms={}",
         started.elapsed().as_millis(),
@@ -684,13 +687,14 @@ fn prepare_while_idle(
         sd_library.reader_status(),
         Instant::now().as_millis(),
     );
-    if grew && sd_library.reader_status() == BookLoadStatus::Ready {
+    if (grew || shown != request.page) && sd_library.reader_status() == BookLoadStatus::Ready {
         send_loaded_library_event(&LibraryEvent::Prepared {
             book_id: request.book_id,
             pages: sd_library.advertised_page_count(),
             chapters: sd_library.chapter_count_for_ui(),
             chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
             complete: sd_library.book_next_spine().is_none(),
+            renumbered: (shown != request.page).then_some((request.page, shown)),
         });
     }
     if !grew && !pressed {
@@ -993,6 +997,13 @@ fn handle_storage_command(
                 if let Some(page) = sd_library.requested_page(0, None) {
                     target_pages = page.min(u16::MAX as u32) as u16;
                 }
+            }
+            // A page numbered while its chapter was laid out ahead of the
+            // rest takes its real number once the rest has caught up.
+            if sd_library.loaded_index == Some(index as usize) {
+                target_pages = sd_library
+                    .settled_page(u32::from(target_pages))
+                    .min(u16::MAX as u32) as u16;
             }
             // The requested page is usually inside the section window that
             // is already loaded; answering from RAM keeps ordinary page
@@ -1396,7 +1407,7 @@ fn restore_saved_state(
     reader_cache::load_chapter_title(epd, sd_cs, usize::from(index), record.chapter, library);
     // The book's total page count, so the Home progress bar has a denominator
     // on wake before the book is opened (read from the cache index header).
-    let page_count = reader_cache::restore_book_page_count(epd, sd_cs, usize::from(index), library);
+    let page_count = restored_page_count(epd, sd_cs, usize::from(index), library, record.screen);
     send_required_library_event(&LibraryEvent::Restored {
         book_id: ReaderSource::sd(index).book_id(),
         chapter: record.chapter,
@@ -1410,6 +1421,24 @@ fn restore_saved_state(
         font_family: record.font_family,
         front_buttons: record.front_buttons,
     });
+}
+
+/// The saved book's page count for Home's progress, read from its index at
+/// restore. A provisional page (laid out ahead of the rest of the book) has
+/// no place in the total yet: 0 lets Home fall back rather than show it
+/// full.
+fn restored_page_count(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    index: usize,
+    library: &ReaderStore,
+    page: u32,
+) -> u32 {
+    if page >= crate::reader_store::PROVISIONAL_PAGE_FLOOR {
+        0
+    } else {
+        reader_cache::restore_book_page_count(epd, sd_cs, index, library)
+    }
 }
 
 fn sleep_request_from_saved_state(
@@ -1432,7 +1461,7 @@ fn sleep_request_from_saved_state(
     )?;
     crate::library_sd::load_active_entry(epd, sd_cs, library, usize::from(index));
     reader_cache::load_chapter_title(epd, sd_cs, usize::from(index), record.chapter, library);
-    let page_count = reader_cache::restore_book_page_count(epd, sd_cs, usize::from(index), library);
+    let page_count = restored_page_count(epd, sd_cs, usize::from(index), library, record.screen);
     Some(RenderRequest {
         kind: RenderKind::Page,
         view: AppView::Home,

@@ -3,7 +3,8 @@ mod book_generation;
 use crate::reader_layout;
 use crate::reader_store::{
     page_fraction, PageAnchor, ReaderStore, SectionTable, EMPTY_TOC_RECORD, MAX_BOOK_SECTIONS,
-    MAX_OVERVIEW_CHAPTERS, MAX_SD_TOC_ITEMS, MAX_SD_TOC_TEXT_BYTES,
+    MAX_OVERVIEW_CHAPTERS, MAX_SD_TOC_ITEMS, MAX_SD_TOC_TEXT_BYTES, MAX_SEED_SECTIONS,
+    PROVISIONAL_PAGE_BASE, PROVISIONAL_PAGE_FLOOR, SEED_SECTION_BASE,
 };
 use display::font::FontStyle;
 use embedded_sdmmc::{Directory, File, Mode, TimeSource};
@@ -632,44 +633,35 @@ where
         let header = decode_book_v2_header(&header_bytes).ok()?;
         let expected_config =
             reader_layout::reader_layout_config(library.type_settings(), library.portrait());
+        // A page numbered in the seed run, or in the stretch just before it.
+        let provisional = header.seed_first_spine.is_some() && page >= PROVISIONAL_PAGE_FLOOR;
         if header.font_config == expected_config
             || header.source_hash != source_identity.0
             || header.source_size != source_identity.1
-            || page >= header.total_pages
+            || (!provisional && page >= header.total_pages)
         {
             return None;
         }
-        // Records run in reading order with each spine's sections together,
-        // so the page's spine is whole once the next spine begins.
-        let (mut spine, mut start, mut pages) = (0u16, 0u32, 0u32);
-        let (mut started, mut found, mut corrupt) = (false, false, false);
-        read_records_batched(
+        let main = scan_page_place(
             file,
-            BOOK_V2_SECTION_RECORD_BYTES,
             header.section_count as usize,
-            |_, bytes| {
-                let Ok(record) = decode_book_v2_section(bytes) else {
-                    corrupt = true;
-                    return false;
-                };
-                if started && record.spine == spine {
-                    pages += u32::from(record.page_count);
-                } else if found {
-                    return false;
-                } else {
-                    (spine, start, pages) = (
-                        record.spine,
-                        record.start_page,
-                        u32::from(record.page_count),
-                    );
-                    started = true;
-                }
-                found |= page >= record.start_page
-                    && page - record.start_page < u32::from(record.page_count);
-                true
-            },
+            (!provisional).then_some(page),
         );
-        (found && !corrupt).then(|| (spine, page_fraction(page - start, pages)))
+        if !provisional {
+            return main;
+        }
+        // The seed's records follow the prefix's, just read past. A page
+        // before the run pins the run's start.
+        let place = scan_page_place(
+            file,
+            header.seed_section_count as usize,
+            Some(page.max(PROVISIONAL_PAGE_BASE)),
+        )?;
+        Some(if page < PROVISIONAL_PAGE_BASE {
+            (place.0, 0)
+        } else {
+            place
+        })
     })
     .flatten();
     PageAnchor {
@@ -679,11 +671,117 @@ where
     }
 }
 
+/// Reads the next `count` section records for `page`'s spine and how far
+/// through that spine's pages it sits; without a page, just reads past them.
+fn scan_page_place<D, T, const ND: usize, const NF: usize, const NV: usize>(
+    file: &File<'_, D, T, ND, NF, NV>,
+    count: usize,
+    page: Option<u32>,
+) -> Option<(u16, u16)>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    // Records run in reading order with each spine's sections together, so
+    // the page's spine is whole once the next spine begins.
+    let (mut spine, mut start, mut pages) = (0u16, 0u32, 0u32);
+    let (mut started, mut found, mut corrupt) = (false, false, false);
+    read_records_batched(file, BOOK_V2_SECTION_RECORD_BYTES, count, |_, bytes| {
+        let Ok(record) = decode_book_v2_section(bytes) else {
+            corrupt = true;
+            return false;
+        };
+        if started && record.spine == spine {
+            pages += u32::from(record.page_count);
+        } else if found {
+            return false;
+        } else {
+            (spine, start, pages) = (
+                record.spine,
+                record.start_page,
+                u32::from(record.page_count),
+            );
+            started = true;
+        }
+        found |= page.is_some_and(|page| {
+            page >= record.start_page && page - record.start_page < u32::from(record.page_count)
+        });
+        true
+    });
+    let page = page?;
+    (found && !corrupt).then(|| (spine, page_fraction(page - start, pages)))
+}
+
 /// A book index failed validation after its sections were loaded: drop
 /// them so nothing reads a half-checked table.
 fn invalid_index(library: &mut ReaderStore) -> BookIndexLoadResult {
     library.book_sections.clear();
+    library.seed.clear();
     BookIndexLoadResult::Invalid
+}
+
+/// Reads the seed run's records, which follow the prefix's, into the
+/// store: contiguous ids from a seed base and pages from
+/// `PROVISIONAL_PAGE_BASE`, spines in order within the run.
+fn read_seed_records<D, T, const ND: usize, const NF: usize, const NV: usize>(
+    file: &File<'_, D, T, ND, NF, NV>,
+    header: &BookV2Header,
+    library: &mut ReaderStore,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    library.seed.clear();
+    let Some(first) = header.seed_first_spine else {
+        return true;
+    };
+    let seed = &mut library.seed.sections;
+    let mut previous_spine = first;
+    let ok = read_records_batched(
+        file,
+        BOOK_V2_SECTION_RECORD_BYTES,
+        header.seed_section_count as usize,
+        |index, bytes| {
+            let Ok(record) = decode_book_v2_section(bytes) else {
+                return false;
+            };
+            if index == 0
+                && (record.section < SEED_SECTION_BASE
+                    || usize::from(record.section - SEED_SECTION_BASE) % MAX_SEED_SECTIONS != 0
+                    || record.start_page != PROVISIONAL_PAGE_BASE)
+            {
+                return false;
+            }
+            if record.page_count == 0
+                || record.spine < previous_spine
+                || record
+                    .start_page
+                    .checked_add(u32::from(record.page_count))
+                    .is_none_or(|end| end > u32::from(u16::MAX))
+            {
+                return false;
+            }
+            previous_spine = record.spine;
+            seed.push(record)
+        },
+    );
+    if !ok {
+        library.seed.clear();
+        return false;
+    }
+    library.seed.first_spine = Some(first);
+    library.seed.capped = header.seed_capped;
+    // The run goes on past its last laid-out spine; any it laid out empty
+    // after that are laid out again, to the same nothing.
+    library.seed.next_spine = (!header.seed_reaches_end).then(|| {
+        library
+            .seed
+            .sections
+            .last()
+            .map_or(first, |section| section.spine.saturating_add(1))
+    });
+    true
 }
 
 pub(crate) fn load_v2_book_index<
@@ -723,7 +821,12 @@ where
             || header.toc_text_bytes as usize > MAX_SD_TOC_TEXT_BYTES
             || header.title_text_bytes as usize > 64
             || header.author_text_bytes as usize > 64
-            || header.total_pages == 0
+            // Pages come from the prefix's sections; a seed run alone may
+            // hold all there is so far.
+            || (header.section_count == 0) != (header.total_pages == 0)
+            || (header.total_pages == 0 && header.seed_section_count == 0)
+            || header.seed_section_count as usize > MAX_SEED_SECTIONS
+            || (header.seed_first_spine.is_none() && header.seed_section_count != 0)
         {
             return BookIndexLoadResult::Invalid;
         }
@@ -773,6 +876,9 @@ where
         ) {
             library.book_sections.clear();
             return BookIndexLoadResult::Invalid;
+        }
+        if !read_seed_records(file, &header, library) {
+            return invalid_index(library);
         }
         let mut toc = [EMPTY_TOC_RECORD; MAX_SD_TOC_ITEMS];
         if !read_records_batched(
@@ -1125,7 +1231,10 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    if total_pages == 0 || sections.is_empty() {
+    let seed = &library.seed;
+    if (total_pages == 0) != sections.is_empty()
+        || (sections.is_empty() && seed.sections.is_empty())
+    {
         return false;
     }
     if ensure_v2_cache_dirs(root, key).is_err() {
@@ -1158,8 +1267,6 @@ where
                 .min(u32::MAX as usize) as u32,
             title_text_bytes,
             author_text_bytes,
-            viewport_width: 800,
-            viewport_height: 480,
             font_config: reader_layout::reader_layout_config(
                 library.type_settings(),
                 library.portrait(),
@@ -1167,6 +1274,10 @@ where
             custom_font_identity: library.custom_font_identity(),
             partial,
             text_start_spine: library.text_start_spine(),
+            seed_first_spine: seed.first_spine,
+            seed_section_count: seed.sections.len() as u16,
+            seed_reaches_end: seed.first_spine.is_some() && seed.next_spine.is_none(),
+            seed_capped: seed.capped,
         };
         let mut bytes = [0u8; BOOK_V2_HEADER_BYTES];
         if encode_book_v2_header(header, &mut bytes).is_err() {
@@ -1177,7 +1288,7 @@ where
             return None;
         }
         let mut record_bytes = [0u8; BOOK_V2_SECTION_RECORD_BYTES];
-        for section in sections.iter() {
+        for section in sections.iter().chain(seed.sections.iter()) {
             if encode_book_v2_section(section, &mut record_bytes).is_err()
                 || stage.push(&record_bytes).is_err()
             {
@@ -2179,7 +2290,7 @@ where
     let Ok(header) = decode_book_v2_header(&bytes) else {
         return Ok(None);
     };
-    if header.section_count == 0 {
+    if header.section_count == 0 && header.seed_section_count == 0 {
         return Ok(None);
     }
     let mut record = [0; BOOK_V2_SECTION_RECORD_BYTES];
@@ -2188,8 +2299,13 @@ where
         return Ok(None);
     };
     let first = usize::from(record.section);
-    Ok((first < MAX_BOOK_SECTIONS * 2)
-        .then_some((first / MAX_BOOK_SECTIONS * MAX_BOOK_SECTIONS) as u16))
+    if first < MAX_BOOK_SECTIONS * 2 {
+        return Ok(Some((first / MAX_BOOK_SECTIONS * MAX_BOOK_SECTIONS) as u16));
+    }
+    // Only a seed run so far: its ids say which bank the prefix will use.
+    let seed = first - usize::from(SEED_SECTION_BASE);
+    Ok((seed < 2 * MAX_SEED_SECTIONS)
+        .then_some((seed / MAX_SEED_SECTIONS * MAX_BOOK_SECTIONS) as u16))
 }
 
 /// Reflow prewrapped lines through the same page plan, joining old section
@@ -2224,6 +2340,9 @@ where
     library.book_cache_ready = false;
     library.clear_lines();
     library.book_sections.clear();
+    // New spacing, new pages: a seed run's provisional numbers no longer
+    // map onto them. Requests in flight were pinned before the reflow.
+    library.seed.clear();
     let mut count = 0usize;
     let mut pages = 0u32;
     let mut previous_spine = None;

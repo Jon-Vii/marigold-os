@@ -32,6 +32,25 @@ pub(crate) const MAX_CUSTOM_FONT_FACES: usize = 12;
 // resident at 4 bytes a section (`SectionTable`); the one stack copy is the
 // spacing reflow's, on the shallow book-index load path.
 pub(crate) const MAX_BOOK_SECTIONS: usize = 1024;
+/// Sections a seed run (see `SeedRun`) can hold: a long chapter or two.
+pub(crate) const MAX_SEED_SECTIONS: usize = 128;
+/// A seed run's pages are numbered from here until the prefix reaches them.
+/// Real pages stay far below (u16 page requests cap a book at 65,535 pages
+/// anyway), so any page from `PROVISIONAL_PAGE_FLOOR` up is provisional
+/// while a seed exists; the stretch below the base stands for the
+/// unprepared pages just before the seed.
+pub(crate) const PROVISIONAL_PAGE_FLOOR: u32 = 0x8000;
+pub(crate) const PROVISIONAL_PAGE_BASE: u32 = 0xC000;
+/// Seed section ids, clear of both section banks: a run of
+/// `MAX_SEED_SECTIONS` per bank, so a rebuild's seed never overwrites the
+/// sections the previous generation's index still names.
+pub(crate) const SEED_SECTION_BASE: u16 = (2 * MAX_BOOK_SECTIONS) as u16;
+
+/// Seed section ids for a book whose prefix sections live in `bank` (the
+/// id of a bank's first section).
+pub(crate) fn seed_section_base(bank: u16) -> u16 {
+    SEED_SECTION_BASE + (bank / MAX_BOOK_SECTIONS as u16) * MAX_SEED_SECTIONS as u16
+}
 const MAX_PUBLISHED_CHAPTER_EVENTS: usize = MAX_SD_CHAPTERS;
 // Titles only (hrefs/anchors are no longer stored), so 4 KB covers the full
 // 128-item TOC at ~32 bytes per title and the saved RAM widens the stack
@@ -88,7 +107,11 @@ pub(crate) struct PageAnchor {
 impl PageAnchor {
     /// Pins `page` within one book's `sections` (reading order). The place
     /// is None when no section holds the page.
-    pub(crate) fn in_sections(source: (u32, u32), page: u32, sections: &SectionTable) -> Self {
+    pub(crate) fn in_sections<const N: usize>(
+        source: (u32, u32),
+        page: u32,
+        sections: &SectionTable<N>,
+    ) -> Self {
         let place = sections
             .iter()
             .find(|section| {
@@ -122,7 +145,7 @@ pub(crate) fn page_at_fraction(fraction: u16, pages: u32) -> u32 {
 }
 
 /// First page and page count of `spine` within one book's `sections`.
-fn spine_extent(sections: &SectionTable, spine: u16) -> Option<(u32, u32)> {
+fn spine_extent<const N: usize>(sections: &SectionTable<N>, spine: u16) -> Option<(u32, u32)> {
     let mut extent: Option<(u32, u32)> = None;
     for section in sections.iter().filter(|section| section.spine == spine) {
         let (_, pages) = extent.get_or_insert((section.start_page, 0));
@@ -137,12 +160,12 @@ fn spine_extent(sections: &SectionTable, spine: u16) -> Option<(u32, u32)> {
 /// that way), so ids and start pages are derived rather than stored. Walking
 /// it in order yields full records; there are at most `MAX_BOOK_SECTIONS`.
 #[derive(Clone, Copy)]
-pub(crate) struct SectionTable {
+pub(crate) struct SectionTable<const N: usize = MAX_BOOK_SECTIONS> {
     base: u16,
     start_page: u32,
     end_page: u32,
     len: usize,
-    entries: [SectionEntry; MAX_BOOK_SECTIONS],
+    entries: [SectionEntry; N],
 }
 
 /// A section's spine and page count; the top bit of `pages` marks a
@@ -155,14 +178,14 @@ struct SectionEntry {
 
 const SECTION_PARTIAL: u16 = 0x8000;
 
-impl SectionTable {
+impl<const N: usize> SectionTable<N> {
     pub(crate) const fn new() -> Self {
         Self {
             base: 0,
             start_page: 0,
             end_page: 0,
             len: 0,
-            entries: [SectionEntry { spine: 0, pages: 0 }; MAX_BOOK_SECTIONS],
+            entries: [SectionEntry { spine: 0, pages: 0 }; N],
         }
     }
 
@@ -175,7 +198,7 @@ impl SectionTable {
     }
 
     pub(crate) fn is_full(&self) -> bool {
-        self.len == MAX_BOOK_SECTIONS
+        self.len == N
     }
 
     pub(crate) fn clear(&mut self) {
@@ -188,6 +211,39 @@ impl SectionTable {
     /// Id of the first section; later ones follow contiguously.
     pub(crate) fn base(&self) -> u16 {
         self.base
+    }
+
+    /// The page after the last section's.
+    pub(crate) fn end_page(&self) -> u32 {
+        self.end_page
+    }
+
+    /// The id and first page the next section takes, starting a table at
+    /// `base` and `start_page`.
+    pub(crate) fn next_slot(&self, base: u16, start_page: u32) -> (u16, u32) {
+        if self.len == 0 {
+            (base, start_page)
+        } else {
+            (self.base.wrapping_add(self.len as u16), self.end_page)
+        }
+    }
+
+    /// Drops every section from `len` on.
+    pub(crate) fn truncate(&mut self, len: usize) {
+        while self.len > len {
+            self.len -= 1;
+            self.end_page -= u32::from(self.entries[self.len].pages & !SECTION_PARTIAL);
+        }
+    }
+
+    /// The section holding `page`.
+    pub(crate) fn find_page(&self, page: u32) -> Option<BookV2SectionRecord> {
+        if page < self.start_page || page >= self.end_page {
+            return None;
+        }
+        self.iter().find(|section| {
+            page >= section.start_page && page - section.start_page < u32::from(section.page_count)
+        })
     }
 
     /// Appends the next section. False when the table is full or the record
@@ -256,6 +312,48 @@ impl SectionTable {
             page_count,
             partial: entry.pages & SECTION_PARTIAL != 0,
         })
+    }
+}
+
+/// Spines laid out ahead of the prefix, so a request deep into a book (a
+/// relaid book's saved place, a chapter jump) need not wait for every spine
+/// before it. Page numbers depend on every earlier spine, so the run's pages
+/// are numbered from `PROVISIONAL_PAGE_BASE` until the prefix lays the same
+/// spines out (layout is per spine, so they come out the same) and they take
+/// their real numbers. The run is kept with the index after that, so a
+/// provisional page saved or requested meanwhile still finds its place.
+/// One per generation of the book's cache: a new run would renumber the
+/// pages of the old.
+#[derive(Clone, Copy)]
+pub(crate) struct SeedRun {
+    /// The run's first spine; None when this generation has none.
+    pub(crate) first_spine: Option<u16>,
+    /// The next spine the run would lay out; None once it reaches the end of
+    /// the book.
+    pub(crate) next_spine: Option<u16>,
+    /// The run can take no more spines (its table filled).
+    pub(crate) capped: bool,
+    pub(crate) sections: SectionTable<MAX_SEED_SECTIONS>,
+}
+
+impl SeedRun {
+    pub(crate) const fn new() -> Self {
+        Self {
+            first_spine: None,
+            next_spine: None,
+            capped: false,
+            sections: SectionTable::new(),
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        *self = Self::new();
+    }
+
+    /// Whether the run has laid out `spine` (it may have come out empty).
+    pub(crate) fn laid_out(&self, spine: u16) -> bool {
+        self.first_spine
+            .is_some_and(|first| spine >= first && self.next_spine.is_none_or(|next| spine < next))
     }
 }
 
@@ -367,6 +465,7 @@ pub(crate) struct ReaderStore {
     book_next_spine: Option<u16>,
     book_generated_toc: bool,
     pub(crate) book_sections: SectionTable,
+    pub(crate) seed: SeedRun,
     /// Pin for the page a layout-changing load asked for, held across the
     /// rebuild's steps until that load completes (see `PageAnchor`).
     page_anchor: Option<PageAnchor>,
@@ -477,6 +576,7 @@ impl ReaderStore {
             book_next_spine: None,
             book_generated_toc: false,
             book_sections: SectionTable::new(),
+            seed: SeedRun::new(),
             page_anchor: None,
             text_start_spine: None,
             seek_text_start: None,
@@ -622,6 +722,7 @@ impl ReaderStore {
         self.page_count = 0;
         self.current_section_page_count = 0;
         self.book_next_spine = None;
+        self.seed.clear();
     }
 
     pub(crate) fn clear_catalog(&mut self) {
@@ -866,6 +967,7 @@ impl ReaderStore {
 
     pub(crate) fn clear_book_index(&mut self) {
         self.book_next_spine = None;
+        self.seed.clear();
         self.book_generated_toc = false;
         self.book_total_pages = 0;
         self.current_section_start_page = 0;
@@ -1060,7 +1162,12 @@ impl ReaderStore {
     /// a build) as the book's index.
     pub(crate) fn commit_book_index(&mut self, total_pages: u32, partial: bool) {
         self.book_next_spine = None;
-        self.book_total_pages = total_pages.max(1);
+        // A seed run can be all there is so far: no prefix pages yet.
+        self.book_total_pages = if self.book_sections.is_empty() {
+            0
+        } else {
+            total_pages.max(1)
+        };
         self.book_cache_ready = true;
         self.book_cache_partial = partial;
     }
@@ -1084,11 +1191,99 @@ impl ReaderStore {
         self.book_next_spine = next;
     }
 
+    /// Where `spine` starts, in the prefix or else (provisionally) in the
+    /// seed run.
     pub(crate) fn known_page_for_spine(&self, spine: u16) -> Option<u32> {
         self.book_sections
             .iter()
             .find(|section| section.spine == spine)
+            .or_else(|| {
+                self.seed
+                    .sections
+                    .iter()
+                    .find(|section| section.spine == spine)
+            })
             .map(|section| section.start_page)
+    }
+
+    /// Whether `spine` is still to be laid out: past the prefix and not in
+    /// the seed run.
+    fn spine_pending(&self, spine: u16) -> bool {
+        self.book_next_spine.is_some_and(|next| spine >= next) && !self.seed.laid_out(spine)
+    }
+
+    /// Whether `page` is numbered provisionally, in the seed run's range.
+    pub(crate) fn is_provisional(&self, page: u32) -> bool {
+        self.seed.first_spine.is_some() && page >= PROVISIONAL_PAGE_FLOOR
+    }
+
+    /// The number `page` goes by now: a provisional page whose spine the
+    /// prefix has since laid out takes its real number; any other page
+    /// keeps its own.
+    pub(crate) fn settled_page(&self, page: u32) -> u32 {
+        self.real_page_for_provisional(page).unwrap_or(page)
+    }
+
+    fn real_page_for_provisional(&self, page: u32) -> Option<u32> {
+        if !self.is_provisional(page) {
+            return None;
+        }
+        if page < PROVISIONAL_PAGE_BASE {
+            // Counted back from where the run starts: its first spine's
+            // start in the prefix, or the prefix's end once everything
+            // before that spine is laid out.
+            let first = self.seed.sections.iter().next()?.spine;
+            let start = spine_extent(&self.book_sections, first)
+                .map(|(start, _)| start)
+                .or_else(|| {
+                    self.book_next_spine
+                        .is_some_and(|next| next >= first)
+                        .then_some(self.book_total_pages)
+                })?;
+            return Some(start.saturating_sub(PROVISIONAL_PAGE_BASE - page));
+        }
+        let page = if self.seed.next_spine.is_none() {
+            // A run that reached the end of the book clamps like one.
+            page.min(self.seed.sections.end_page().checked_sub(1)?)
+        } else {
+            page
+        };
+        let holder = self.seed.sections.find_page(page)?;
+        let (seed_start, _) = spine_extent(&self.seed.sections, holder.spine)?;
+        let (start, pages) = spine_extent(&self.book_sections, holder.spine)?;
+        Some(start + (page - seed_start).min(pages.saturating_sub(1)))
+    }
+
+    /// `(spine, fraction)` for `page` in the prefix or the seed run.
+    fn place_of_page(&self, page: u32) -> Option<(u16, u16)> {
+        let page = self.settled_page(page);
+        let (sections_place, seed_place) = (
+            PageAnchor::in_sections((0, 0), page, &self.book_sections).place,
+            PageAnchor::in_sections((0, 0), page, &self.seed.sections).place,
+        );
+        sections_place.or(seed_place)
+    }
+
+    /// The spine a request needs laid out next, when it names one beyond
+    /// what is prepared: a chapter, the text start of a first open, the
+    /// pinned place of a relaid page, or a provisional page past the seed
+    /// run. None for a plain page number, which only the prefix can reach.
+    pub(crate) fn request_spine(&self, page: u32, spine: Option<u16>) -> Option<u16> {
+        if spine.is_some() {
+            return spine;
+        }
+        if let Some(start) = self.sought_text_start(page) {
+            return Some(start);
+        }
+        if let Some((spine, _)) = self.anchored_place(page) {
+            return Some(spine);
+        }
+        if self.is_provisional(page)
+            && page >= self.seed.sections.end_page().max(PROVISIONAL_PAGE_BASE)
+        {
+            return self.seed.next_spine;
+        }
+        None
     }
 
     pub(crate) fn requested_page(&self, page: u32, spine: Option<u16>) -> Option<u32> {
@@ -1096,7 +1291,7 @@ impl ReaderStore {
             if let Some(page) = self.known_page_for_spine(spine) {
                 return Some(page);
             }
-            if self.book_next_spine.is_some_and(|next| spine >= next) {
+            if self.spine_pending(spine) {
                 return None;
             }
         } else {
@@ -1110,7 +1305,7 @@ impl ReaderStore {
                     {
                         return Some(first);
                     }
-                    None if self.book_next_spine.is_some_and(|next| start >= next) => {
+                    None if self.spine_pending(start) => {
                         return None;
                     }
                     _ => {}
@@ -1119,6 +1314,18 @@ impl ReaderStore {
             if let Some(place) = self.anchored_place(page) {
                 return self.page_for_place(place);
             }
+        }
+        if self.is_provisional(page) {
+            if let Some(real) = self.real_page_for_provisional(page) {
+                return Some(real);
+            }
+            // Still only in the seed run, or not laid out yet.
+            let held = if self.seed.next_spine.is_none() {
+                page.min(self.seed.sections.end_page().saturating_sub(1))
+            } else {
+                page
+            };
+            return self.seed.sections.find_page(held).map(|_| held);
         }
         if page < self.book_total_pages {
             Some(page)
@@ -1143,7 +1350,11 @@ impl ReaderStore {
     /// unless this request is already pinned.
     pub(crate) fn anchor_resident_page(&mut self, source: (u32, u32), page: u32) {
         if !self.anchors(source, page) {
-            self.page_anchor = Some(PageAnchor::in_sections(source, page, &self.book_sections));
+            self.page_anchor = Some(PageAnchor {
+                source,
+                page,
+                place: self.place_of_page(page),
+            });
         }
     }
 
@@ -1195,10 +1406,21 @@ impl ReaderStore {
     /// the following text starts.
     fn page_for_place(&self, (spine, fraction): (u16, u16)) -> Option<u32> {
         let sections = &self.book_sections;
-        if let Some((start, pages)) = spine_extent(sections, spine) {
+        if let Some((start, pages)) =
+            spine_extent(sections, spine).or_else(|| spine_extent(&self.seed.sections, spine))
+        {
             return Some(start + page_at_fraction(fraction, pages));
         }
-        if self.book_next_spine.is_some_and(|next| spine >= next) {
+        if self.seed.laid_out(spine) && self.book_next_spine.is_some_and(|next| spine >= next) {
+            // Laid out empty in the seed run: the following text there.
+            return self
+                .seed
+                .sections
+                .iter()
+                .find(|section| section.spine > spine)
+                .map(|section| section.start_page);
+        }
+        if self.spine_pending(spine) {
             return None;
         }
         sections
@@ -1218,6 +1440,7 @@ impl ReaderStore {
     /// extend request needs no SD session at all. Partial sections keep
     /// going to SD so the bounded prefix can be regrown.
     pub(crate) fn covers_global_page(&self, index: usize, global_page: u32) -> bool {
+        let global_page = self.settled_page(global_page);
         self.loaded_index == Some(index)
             && matches!(self.reader_status, BookLoadStatus::Ready)
             && !self.text_holds_toc
@@ -1234,19 +1457,24 @@ impl ReaderStore {
     /// preparation or its loading plate. The section need not be resident,
     /// and the book need only be prepared as far as the page.
     pub(crate) fn has_prepared_page(&self, index: usize, global_page: u32) -> bool {
+        let global_page = self.settled_page(global_page);
         self.loaded_index == Some(index)
             && self.reader_status == BookLoadStatus::Ready
-            && global_page < self.book_total_pages
+            && (global_page < self.book_total_pages || self.is_provisional(global_page))
             && self.section_for_global_page(global_page).is_some()
     }
 
     pub(crate) fn local_page_for_global(&self, global_page: u32) -> usize {
-        global_page
+        self.settled_page(global_page)
             .saturating_sub(self.current_section_start_page)
             .min(self.current_section_page_count.saturating_sub(1) as u32) as usize
     }
 
     pub(crate) fn section_for_global_page(&self, global_page: u32) -> Option<BookV2SectionRecord> {
+        let global_page = self.settled_page(global_page);
+        if self.is_provisional(global_page) {
+            return self.seed.sections.find_page(global_page);
+        }
         self.book_sections
             .iter()
             .find(|section| {
@@ -1272,15 +1500,13 @@ impl ReaderStore {
     /// chunk boundary. Returns None when there is no book index to aggregate
     /// (single in-RAM section), letting the caller fall back.
     pub(crate) fn chapter_page_position(&self, global_page: u32) -> Option<(u32, u32)> {
+        let global_page = self.settled_page(global_page);
         let spine = self.section_for_global_page(global_page)?.spine;
-        let mut start = u32::MAX;
-        let mut total = 0u32;
-        for section in self.book_sections.iter() {
-            if section.spine == spine {
-                start = start.min(section.start_page);
-                total = total.saturating_add(section.page_count.max(1) as u32);
-            }
-        }
+        let (start, total) = if self.is_provisional(global_page) {
+            spine_extent(&self.seed.sections, spine)?
+        } else {
+            spine_extent(&self.book_sections, spine)?
+        };
         if total == 0 {
             return None;
         }
@@ -1335,10 +1561,16 @@ impl ReaderStore {
         if index >= self.toc_count {
             return None;
         }
+        // Unknown or provisional pages go unnumbered (0).
+        let page = u32::from(self.toc_page[index]);
         Some(TocItem {
             title: self.toc_title(index),
             level: self.toc[index].level.max(1),
-            page: u32::from(self.toc_page[index]) + 1,
+            page: if page >= PROVISIONAL_PAGE_FLOOR {
+                0
+            } else {
+                page + 1
+            },
         })
     }
 
@@ -1448,26 +1680,31 @@ impl ReaderStore {
 
     /// Global page a chapter starts on, computed from the section index by
     /// its spine -- so no resident chapter-page array is needed.
+    /// Where `spine` starts: in the prefix, else provisionally in the seed
+    /// run, else `u32::MAX` while it is still to come (0 in a finished book).
     pub(crate) fn page_for_spine(&self, spine: u16) -> u32 {
-        self.book_sections
-            .iter()
-            .find(|section| section.spine == spine)
-            .map(|section| section.start_page)
-            .unwrap_or_else(|| {
-                if self.book_next_spine.is_some() {
-                    u32::MAX
-                } else {
-                    0
-                }
-            })
+        self.known_page_for_spine(spine).unwrap_or_else(|| {
+            if self.book_next_spine.is_some() {
+                u32::MAX
+            } else {
+                0
+            }
+        })
     }
 
+    /// A chapter's page number for the overview, or 0 (shown without one)
+    /// while its page is unknown or only provisional.
     pub(crate) fn overview_page_at(&self, index: usize) -> u16 {
         let spine = self.overview_spine_at(index);
         if spine < 0 {
             return 0;
         }
-        self.page_for_spine(spine as u16).min(u16::MAX as u32) as u16
+        let page = self.page_for_spine(spine as u16);
+        if page >= PROVISIONAL_PAGE_FLOOR {
+            0
+        } else {
+            page as u16
+        }
     }
 
     /// The chapter a page falls in, over the full chapter-page map -- so it

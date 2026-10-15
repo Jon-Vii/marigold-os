@@ -42,6 +42,11 @@ pub(crate) mod sd_stats {
     pub(crate) static READ_BLOCKS: AtomicU32 = AtomicU32::new(0);
     pub(crate) static WRITE_CALLS: AtomicU32 = AtomicU32::new(0);
     pub(crate) static WRITE_BLOCKS: AtomicU32 = AtomicU32::new(0);
+    /// Wall time inside block reads and writes (bench builds only).
+    #[cfg(feature = "bench-serial")]
+    pub(crate) static READ_MICROS: AtomicU32 = AtomicU32::new(0);
+    #[cfg(feature = "bench-serial")]
+    pub(crate) static WRITE_MICROS: AtomicU32 = AtomicU32::new(0);
 
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub(crate) struct Snapshot {
@@ -71,6 +76,15 @@ pub(crate) mod sd_stats {
         }
     }
 
+    /// Reads and clears a counter (bench builds only; no atomic swap on
+    /// this core, so a concurrent bump can be lost).
+    #[cfg(feature = "bench-serial")]
+    pub(crate) fn take(counter: &AtomicU32) -> u32 {
+        let value = counter.load(Ordering::Relaxed);
+        counter.store(0, Ordering::Relaxed);
+        value
+    }
+
     pub(crate) fn bump(counter: &AtomicU32, amount: u32) {
         let value = counter.load(Ordering::Relaxed).wrapping_add(amount);
         counter.store(value, Ordering::Relaxed);
@@ -87,13 +101,26 @@ impl<B: BlockDevice> BlockDevice for CountingDevice<B> {
     fn read(&self, blocks: &mut [Block], start_block_idx: BlockIdx) -> Result<(), Self::Error> {
         sd_stats::bump(&sd_stats::READ_CALLS, 1);
         sd_stats::bump(&sd_stats::READ_BLOCKS, blocks.len() as u32);
-        self.0.read(blocks, start_block_idx)
+        #[cfg(feature = "bench-serial")]
+        let started = embassy_time::Instant::now();
+        let result = self.0.read(blocks, start_block_idx);
+        #[cfg(feature = "bench-serial")]
+        sd_stats::bump(&sd_stats::READ_MICROS, started.elapsed().as_micros() as u32);
+        result
     }
 
     fn write(&self, blocks: &[Block], start_block_idx: BlockIdx) -> Result<(), Self::Error> {
         sd_stats::bump(&sd_stats::WRITE_CALLS, 1);
         sd_stats::bump(&sd_stats::WRITE_BLOCKS, blocks.len() as u32);
-        self.0.write(blocks, start_block_idx)
+        #[cfg(feature = "bench-serial")]
+        let started = embassy_time::Instant::now();
+        let result = self.0.write(blocks, start_block_idx);
+        #[cfg(feature = "bench-serial")]
+        sd_stats::bump(
+            &sd_stats::WRITE_MICROS,
+            started.elapsed().as_micros() as u32,
+        );
+        result
     }
 
     fn num_blocks(&self) -> Result<BlockCount, Self::Error> {

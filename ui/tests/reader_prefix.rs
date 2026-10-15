@@ -344,7 +344,7 @@ fn a_text_start_waits_for_its_spine_and_ignores_a_deep_marker() {
 
 #[test]
 fn the_section_table_derives_ids_and_start_pages() {
-    let mut table = reader_store::SectionTable::new();
+    let mut table: reader_store::SectionTable = reader_store::SectionTable::new();
     assert!(table.push(section(1024, 0, 0, 5)));
     assert!(table.push(BookV2SectionRecord {
         partial: true,
@@ -394,7 +394,7 @@ fn a_book_of_many_short_items_fits_well_past_the_old_section_cap() {
         Some((2, 2))
     );
 
-    let mut table = reader_store::SectionTable::new();
+    let mut table: reader_store::SectionTable = reader_store::SectionTable::new();
     for record in sections.iter().cycle().take(2000) {
         let next = BookV2SectionRecord {
             section: table.len() as u16,
@@ -439,4 +439,127 @@ fn justification_stops_short_of_gaping_word_spaces() {
     assert_eq!(justify_extra(0, 370, right, 3, space), None);
     // Lines under two thirds of the measure never stretch.
     assert_eq!(justify_extra(0, 250, right, 40, space), None);
+}
+
+const SEED: u32 = reader_store::PROVISIONAL_PAGE_BASE;
+
+/// A prefix through spine 1 (pages 0..20), and spine 5 laid out ahead of
+/// it in a seed run: 12 provisional pages over two sections.
+fn seeded_store() -> ReaderStore {
+    let mut store = anchored_store();
+    store.set_book_index(20, false, &[section(0, 0, 0, 10), section(1, 1, 10, 10)]);
+    store.set_book_next_spine(Some(2));
+    store.seed.first_spine = Some(5);
+    store.seed.next_spine = Some(6);
+    assert!(store.seed.sections.push(section(2048, 5, SEED, 8)));
+    assert!(store.seed.sections.push(section(2049, 5, SEED + 8, 4)));
+    store
+}
+
+#[test]
+fn a_spine_laid_out_ahead_reads_provisionally_until_the_prefix_reaches_it() {
+    let mut store = seeded_store();
+    assert_eq!(store.requested_page(0, Some(5)), Some(SEED));
+    assert_eq!(store.requested_page(SEED + 9, None), Some(SEED + 9));
+    assert_eq!(
+        store.section_for_global_page(SEED + 9).map(|s| s.section),
+        Some(2049)
+    );
+    assert_eq!(store.chapter_page_position(SEED + 9), Some((10, 12)));
+    assert_eq!(store.page_for_spine(5), SEED);
+    assert_eq!(store.page_for_spine(3), u32::MAX);
+    // Past the run, or in the gap before it: still to be prepared, by the
+    // run and by the prefix respectively.
+    assert_eq!(store.requested_page(SEED + 12, None), None);
+    assert_eq!(store.request_spine(SEED + 12, None), Some(6));
+    assert_eq!(store.requested_page(SEED - 1, None), None);
+    assert_eq!(store.request_spine(SEED - 1, None), None);
+    assert_eq!(store.requested_page(0, Some(3)), None);
+    // Real pages are untouched.
+    assert_eq!(store.requested_page(15, None), Some(15));
+    assert_eq!(store.settled_page(15), 15);
+
+    // Once the prefix has laid out everything before the run, the pages
+    // just before it are real, though the run's own still wait for it.
+    store.set_book_index(
+        40,
+        false,
+        &[
+            section(0, 0, 0, 10),
+            section(1, 1, 10, 10),
+            section(2, 3, 20, 20),
+        ],
+    );
+    store.set_book_next_spine(Some(5));
+    assert_eq!(store.requested_page(SEED - 1, None), Some(39));
+    assert_eq!(store.requested_page(SEED + 9, None), Some(SEED + 9));
+
+    // The prefix lays out spines 2..5 (spine 5 the same as the run): the
+    // provisional pages take their real numbers, before and inside.
+    store.set_book_index(
+        52,
+        false,
+        &[
+            section(0, 0, 0, 10),
+            section(1, 1, 10, 10),
+            section(2, 3, 20, 20),
+            section(3, 5, 40, 8),
+            section(4, 5, 48, 4),
+        ],
+    );
+    store.set_book_next_spine(Some(6));
+    assert_eq!(store.settled_page(SEED + 9), 49);
+    assert_eq!(store.requested_page(SEED + 9, None), Some(49));
+    assert_eq!(store.settled_page(SEED - 1), 39);
+    assert_eq!(store.chapter_page_position(SEED + 9), Some((10, 12)));
+    assert_eq!(store.page_for_spine(5), 40);
+    assert_eq!(
+        store.section_for_global_page(SEED + 9).map(|s| s.section),
+        Some(4)
+    );
+}
+
+#[test]
+fn without_a_seed_run_high_pages_are_plain_pages() {
+    let mut store = ReaderStore::new();
+    store.set_book_index(4, false, &[section(0, 0, 0, 4)]);
+    assert!(!store.is_provisional(SEED + 1));
+    assert_eq!(store.settled_page(SEED + 1), SEED + 1);
+    assert_eq!(store.requested_page(SEED + 1, None), Some(3));
+}
+
+#[test]
+fn a_place_pinned_in_a_seed_run_lands_in_the_relaid_run() {
+    let mut store = seeded_store();
+    store.anchor_resident_page(ANCHOR_SOURCE, SEED + 9);
+    // Larger type: the prefix and run are laid out again from scratch.
+    store.set_book_index(14, false, &[section(0, 0, 0, 14)]);
+    store.set_book_next_spine(Some(1));
+    store.seed.clear();
+    assert_eq!(store.requested_page(SEED + 9, None), None);
+    assert_eq!(store.request_spine(SEED + 9, None), Some(5));
+    // Spine 5 is seeded again, now 16 pages: 9.5 of 12 is 12.67 of 16.
+    store.seed.first_spine = Some(5);
+    store.seed.next_spine = Some(6);
+    assert!(store.seed.sections.push(section(2048, 5, SEED, 10)));
+    assert!(store.seed.sections.push(section(2049, 5, SEED + 10, 6)));
+    assert_eq!(store.requested_page(SEED + 9, None), Some(SEED + 12));
+}
+
+#[test]
+fn a_seed_run_that_reached_the_end_clamps_like_a_book() {
+    let mut store = seeded_store();
+    store.seed.next_spine = None;
+    assert_eq!(store.requested_page(SEED + 40, None), Some(SEED + 11));
+}
+
+#[test]
+fn unknown_and_provisional_chapter_pages_go_unnumbered() {
+    let mut store = seeded_store();
+    assert!(store.push_toc_record("Two", 1, 1));
+    assert!(store.push_toc_record("Three", 1, 3));
+    assert!(store.push_toc_record("Five", 1, 5));
+    reader_layout::rebuild_toc_page_targets(&mut store);
+    let pages: Vec<u32> = (0..3).map(|i| store.toc_item(i).unwrap().page).collect();
+    assert_eq!(pages, [11, 0, 0]);
 }

@@ -428,42 +428,64 @@ board-I/O owner.
 ## SD-backed reader cache
 
 The SD reader shows a book as soon as its V2 cache reaches the requested
-page, and prepares the rest while the reader is idle. A cold open parses the
-package metadata and processes at most one eligible spine item per storage
-step, then commits its section files and updated book index. The loading plate
-stays up only until a committed prefix holds the requested page (or chapter, or
-the text start of a first open); the store is then Ready on that prefix. Page
-numbers are global, so a request deep into the book still prepares every spine
-before it: a resume at page 430 of 574 after a layout change waits about as
-long as a full build, while one at page 17 of 1,276 took 2.3 s of
-preparation (X4, October 2026).
+page, and prepares the rest while the reader is idle. Preparation runs in
+sessions: each opens the package once (ZIP, container, OPF) and lays out
+spine items one after another, writing section files as they fill, until the
+request is answered, a button is pressed, the book is done, or four seconds
+have passed. The book index (a few dozen block writes) is written as the
+session ends and every 1.5 s within it, so a press mid-spine loses at most
+the spines since. The loading plate stays up only until the cache
+holds the requested page (or chapter, or the text start of a first open);
+the store is then Ready.
 
-Each continuation closes its ZIP/FAT handles, retains only the request and a
-durable next-spine cursor, and reopens the package on the next step. The board
-I/O task yields between steps so queued navigation, sleep, and cancellation can
-run. A request generation rejects stale work and results after leaving the book
-or changing its layout. One spine is the work unit of a request: a large XHTML
-spine still blocks the shared I/O owner until its stream finishes.
+Between sessions the board I/O task keeps only the request and a durable
+next-spine cursor, and yields so queued navigation, sleep, and cancellation
+can run. A request generation rejects stale work and results after leaving
+the book or changing its layout. Within a session a request yields between
+spines on a button press; a large XHTML spine still blocks the shared I/O
+owner until its stream finishes.
 
-The rest of a Ready prefix is prepared by the display task when the reader is
+Page numbers are global, so every spine before a page fixes its number. A
+request that names a spine well ahead of the prepared prefix (a relaid
+book's pinned place, a chapter jump, a first open's text start) does not
+wait for them: when at least 64 KB of XHTML lies in between, that spine is
+laid out first into a seed run, whose pages are numbered provisionally from
+`PROVISIONAL_PAGE_BASE` (0xC000; any page from 0x8000 up is provisional
+while a run exists). The run's records follow the prefix's in the book
+index, its sections take ids past both banks, and it grows toward later
+requests. The prefix then catches up while the reader is idle; layout is
+per spine, so it lays the seeded spines out the same, and a provisional
+page takes its real number (`ReaderStore::settled_page`) once the prefix
+holds its spine. Requests, saved positions, the reader's page (renumbered by
+`LibraryEvent::Prepared`), and a later relayout's page pin all translate
+through the run, which stays in the index for that. One run per cache
+generation, since a second would renumber the first's pages; a spine behind
+the run waits for the prefix, and paging back across the run's start shows
+the loading plate until it arrives. Books with a generated (headings) TOC,
+whose entries follow spine order, are not seeded.
+
+The rest of a Ready cache is prepared by the display task when the reader is
 idle: no command for two seconds, the page on screen resident in the layout it
-was prepared for, and no sync session. Each idle step appends one spine and
-reads the page on screen back, then yields before the next. It gives way at
-the next paragraph, or after the OPF parse, once a button press moves
+was prepared for, and no sync session. Idle sessions extend the prefix, read
+the page on screen back, and yield before the next. They give way at the
+next paragraph, or after the OPF parse, once a button press moves
 `BUTTON_PRESSES` (the input producers count every press as they queue it, so
-the step sees a press the app task has not yet received). A step that gives
-way or fails commits nothing: the card still holds the prefix, and the step
-reloads the page on screen from it (about 65 ms), so the press is served
-promptly. A spine that fails is not retried until preparation moves on some
-other way. Growth reaches the app as `LibraryEvent::Prepared`, which updates
-page and chapter counts without a repaint. A reader who outpaces it reaches
-the prefix's end and gets a request step with the loading plate.
+the session sees a press the app task has not yet received). The spine in
+hand when a session gives way or fails is not committed: the card still
+holds what was, and the session reloads the page on screen from it (about
+65 ms), so the press is served promptly. On the X4 a cold build of a
+1,276-page book costs about 51 ms a page in sessions, against 61 ms with a
+package reopen and index write per spine (October 2026). A spine that fails is not retried
+until preparation moves on some other way. Growth reaches the app as
+`LibraryEvent::Prepared`, which updates page and chapter counts without a
+repaint. A reader who outpaces it reaches the prefix's end and gets a
+request session with the loading plate.
 
 While a next-spine cursor exists, the cached page count is a known prefix, not
 the book's total. An unresolved chapter target stays unresolved rather than
 aliasing page zero or the last cached section. Appending complete spines
 preserves earlier page numbers and chapter boundaries. Reopening can reuse the
-committed prefix after sleep or an interrupted later step.
+committed prefix (and seed run) after sleep or an interrupted session.
 
 The build covers every spine item from the first (navigation documents
 aside), front matter included. It also records where the main text starts:

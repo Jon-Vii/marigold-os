@@ -57,7 +57,7 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: embedded_sdmmc::TimeSource,
 {
-    let mut table = SectionTable::new();
+    let mut table: SectionTable = SectionTable::new();
     assert!(
         table.set_records(sections),
         "fixture sections are contiguous"
@@ -1105,6 +1105,150 @@ fn a_book_index_far_past_the_old_section_cap_round_trips() {
     // A damaged record clears the table rather than leaving half of it.
     let mut broken = sections.clone();
     broken[500].start_page += 1;
-    let mut table = SectionTable::new();
+    let mut table: SectionTable = SectionTable::new();
     assert!(!table.set_records(&broken));
+}
+
+fn record(section: u16, spine: u16, start_page: u32, page_count: u16) -> BookV2SectionRecord {
+    BookV2SectionRecord {
+        section,
+        spine,
+        start_page,
+        page_count,
+        partial: false,
+    }
+}
+
+const SEED: u32 = reader_store::PROVISIONAL_PAGE_BASE;
+
+/// Spine 5 laid out ahead in a seed run: 12 provisional pages.
+fn seed_spine_five(store: &mut ReaderStore, first_id: u16) {
+    store.seed.first_spine = Some(5);
+    store.seed.next_spine = Some(6);
+    assert!(store.seed.sections.push(record(first_id, 5, SEED, 8)));
+    assert!(store
+        .seed
+        .sections
+        .push(record(first_id + 1, 5, SEED + 8, 4)));
+}
+
+#[test]
+fn a_seed_run_round_trips_with_and_without_a_prefix() {
+    let disk = fat::Disk::new();
+    let manager: VolumeManager<_, _, 8, 8, 1> =
+        VolumeManager::new_with_limits(&disk, fat::Clock, 0);
+    let volume = manager.open_volume(VolumeIdx(0)).unwrap();
+    let root = volume.open_root_dir().unwrap();
+
+    // Nothing before the run laid out yet: the index holds only the run.
+    let mut store = ReaderStore::new();
+    store.set_book_next_spine(Some(0));
+    seed_spine_five(&mut store, 2048);
+    assert!(write_index(&root, KEY, ID, 0, &[], &store, false));
+    let mut loaded = ReaderStore::new();
+    assert_eq!(
+        reader_cache_files::load_v2_book_index(&root, KEY, ID, &mut loaded),
+        BookIndexLoadResult::Hit
+    );
+    assert_eq!(loaded.book_total_pages, 0);
+    assert_eq!(loaded.book_next_spine(), Some(0));
+    assert_eq!(
+        (loaded.seed.first_spine, loaded.seed.next_spine),
+        (Some(5), Some(6))
+    );
+    assert_eq!(loaded.seed.sections.len(), 2);
+    assert_eq!(loaded.requested_page(SEED + 9, None), Some(SEED + 9));
+    assert_eq!(loaded.requested_page(0, None), None);
+    // The run's ids name its bank, so a replacement keeps it as the active
+    // generation and builds into the other.
+    assert_eq!(
+        reader_cache_files::prepare_book_replacement(&root, KEY),
+        Some(1024)
+    );
+    assert_eq!(
+        reader_cache_files::load_v2_book_index(&root, KEY, ID, &mut loaded),
+        BookIndexLoadResult::Hit
+    );
+
+    // With a prefix ahead of it, both tables come back.
+    let mut store = ReaderStore::new();
+    store.set_book_next_spine(Some(1));
+    seed_spine_five(&mut store, 2048);
+    assert!(write_index(
+        &root,
+        KEY,
+        ID,
+        10,
+        &[record(0, 0, 0, 10)],
+        &store,
+        false
+    ));
+    let mut loaded = ReaderStore::new();
+    assert_eq!(
+        reader_cache_files::load_v2_book_index(&root, KEY, ID, &mut loaded),
+        BookIndexLoadResult::Hit
+    );
+    assert_eq!(loaded.book_total_pages, 10);
+    assert_eq!(loaded.seed.sections.len(), 2);
+    assert_eq!(loaded.page_for_spine(5), SEED);
+
+    // A run that does not start at the provisional base is refused.
+    let mut store = ReaderStore::new();
+    store.set_book_next_spine(Some(1));
+    store.seed.first_spine = Some(5);
+    store.seed.next_spine = Some(6);
+    assert!(store.seed.sections.push(record(2048, 5, SEED + 1, 8)));
+    assert!(write_index(
+        &root,
+        KEY,
+        ID,
+        10,
+        &[record(0, 0, 0, 10)],
+        &store,
+        false
+    ));
+    assert_eq!(
+        reader_cache_files::load_v2_book_index(&root, KEY, ID, &mut loaded),
+        BookIndexLoadResult::Invalid
+    );
+    assert!(loaded.seed.first_spine.is_none());
+}
+
+#[test]
+fn a_provisional_page_pins_its_place_in_the_old_seed_run() {
+    use display::font::{FontSize, TypeSettings};
+    let disk = fat::Disk::new();
+    let manager: VolumeManager<_, _, 8, 8, 1> =
+        VolumeManager::new_with_limits(&disk, fat::Clock, 0);
+    let volume = manager.open_volume(VolumeIdx(0)).unwrap();
+    let root = volume.open_root_dir().unwrap();
+    let mut store = ReaderStore::new();
+    store.set_book_next_spine(Some(1));
+    seed_spine_five(&mut store, 2048);
+    assert!(write_index(
+        &root,
+        KEY,
+        ID,
+        10,
+        &[record(0, 0, 0, 10)],
+        &store,
+        false
+    ));
+    store.set_layout(
+        TypeSettings {
+            size: FontSize::Large,
+            ..TypeSettings::DEFAULT
+        },
+        false,
+    );
+    let anchor = |page| reader_cache_files::read_v2_page_anchor(&root, KEY, ID, &store, page).place;
+    assert_eq!(
+        anchor(SEED + 9),
+        Some((5, reader_store::page_fraction(9, 12)))
+    );
+    // The stretch before the run pins the run's start; past it, nothing.
+    assert_eq!(anchor(SEED - 1), Some((5, 0)));
+    assert_eq!(anchor(SEED + 12), None);
+    // Prefix pages pin as before.
+    assert_eq!(anchor(5), Some((0, reader_store::page_fraction(5, 10))));
 }

@@ -22,7 +22,12 @@ pub const CACHE_VERSION: u16 = 1;
 // Bumped 25 -> 26 when custom font identity joined v2 book/section headers.
 // A custom pack replacement can keep the same FontFamily::Custom setting while
 // changing metrics, so the cache key needs the pack hash too.
-pub const CACHE_V2_VERSION: u16 = 26;
+//
+// Bumped 26 -> 27 when the book header's unused viewport bytes began to
+// describe the seed run (spines laid out ahead of the prefix), whose records
+// follow the prefix's. A v26 index reads as having no run, so its pages can
+// still pin a reader's place across a relayout.
+pub const CACHE_V2_VERSION: u16 = 27;
 const CACHE_V2_COMPAT_VERSION: u16 = 26;
 pub const CACHE_ROOT_DIR: &str = "XTEINK";
 pub const CACHE_DIR: &str = "CACHE";
@@ -151,8 +156,6 @@ pub struct BookV2Header {
     pub toc_text_bytes: u32,
     pub title_text_bytes: u32,
     pub author_text_bytes: u32,
-    pub viewport_width: u16,
-    pub viewport_height: u16,
     pub font_config: u16,
     pub custom_font_identity: u64,
     pub partial: bool,
@@ -160,6 +163,14 @@ pub struct BookV2Header {
     /// and other front matter), when the book says or the builder could
     /// tell. A book without a saved place first opens there.
     pub text_start_spine: Option<u16>,
+    /// First spine of the seed run, laid out ahead of the prefix with
+    /// provisionally numbered pages; its records follow the prefix's.
+    pub seed_first_spine: Option<u16>,
+    pub seed_section_count: u16,
+    /// The seed run reached the end of the book.
+    pub seed_reaches_end: bool,
+    /// The seed run could not hold its next spine and grows no further.
+    pub seed_capped: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -269,7 +280,8 @@ pub fn section_v2_cache_size(header: SectionV2Header) -> usize {
 
 pub fn book_v2_cache_size(header: BookV2Header) -> usize {
     BOOK_V2_HEADER_BYTES
-        + header.section_count as usize * BOOK_V2_SECTION_RECORD_BYTES
+        + (header.section_count as usize + header.seed_section_count as usize)
+            * BOOK_V2_SECTION_RECORD_BYTES
         + header.toc_count as usize * TOC_RECORD_BYTES
         + header.toc_text_bytes as usize
         + header.title_text_bytes as usize
@@ -500,7 +512,10 @@ pub fn encode_book_v2_header(header: BookV2Header, out: &mut [u8]) -> Result<usi
     write_u32(out, 0, CACHE_MAGIC);
     write_u16(out, 4, CACHE_V2_VERSION);
     out[6] = header.partial as u8;
-    out[7] = u8::from(header.next_spine.is_some()) | (u8::from(header.generated_toc) << 1);
+    out[7] = u8::from(header.next_spine.is_some())
+        | (u8::from(header.generated_toc) << 1)
+        | (u8::from(header.seed_reaches_end) << 2)
+        | (u8::from(header.seed_capped) << 3);
     write_u32(out, 8, header.source_hash);
     write_u32(out, 12, header.source_size);
     write_u32(out, 16, header.total_pages);
@@ -508,8 +523,15 @@ pub fn encode_book_v2_header(header: BookV2Header, out: &mut [u8]) -> Result<usi
     write_u16(out, 22, header.spine_count);
     write_u16(out, 24, header.toc_count);
     write_u16(out, 26, header.next_spine.unwrap_or(0));
-    write_u16(out, 28, header.viewport_width);
-    write_u16(out, 30, header.viewport_height);
+    // Formerly the (constant) viewport size.
+    write_u16(
+        out,
+        28,
+        header
+            .seed_first_spine
+            .map_or(0, |spine| spine.saturating_add(1)),
+    );
+    write_u16(out, 30, header.seed_section_count);
     write_u16(out, 32, header.font_config);
     // Formerly reserved zero, so older indexes read as "start unknown".
     write_u16(
@@ -531,9 +553,12 @@ pub fn decode_book_v2_header(input: &[u8]) -> Result<BookV2Header, CacheError> {
     if read_u32(input, 0)? != CACHE_MAGIC {
         return Err(CacheError::BadMagic);
     }
-    if !valid_cache_v2_version(read_u16(input, 4)?) {
+    let version = read_u16(input, 4)?;
+    if !valid_cache_v2_version(version) {
         return Err(CacheError::BadVersion);
     }
+    // Before v27 these bytes held the viewport size, and no index had a run.
+    let seeded = version >= 27 && read_u16(input, 28)? != 0;
     Ok(BookV2Header {
         next_spine: if input[7] & 1 != 0 {
             Some(read_u16(input, 26)?)
@@ -551,11 +576,17 @@ pub fn decode_book_v2_header(input: &[u8]) -> Result<BookV2Header, CacheError> {
         toc_text_bytes: read_u32(input, 36)?,
         title_text_bytes: read_u32(input, 40)?,
         author_text_bytes: read_u32(input, 44)?,
-        viewport_width: read_u16(input, 28)?,
-        viewport_height: read_u16(input, 30)?,
         font_config: read_u16(input, 32)?,
         custom_font_identity: read_u64(input, 48)?,
         text_start_spine: read_u16(input, 34)?.checked_sub(1),
+        seed_first_spine: if seeded {
+            read_u16(input, 28)?.checked_sub(1)
+        } else {
+            None
+        },
+        seed_section_count: if seeded { read_u16(input, 30)? } else { 0 },
+        seed_reaches_end: seeded && input[7] & 4 != 0,
+        seed_capped: seeded && input[7] & 8 != 0,
     })
 }
 
@@ -1185,12 +1216,14 @@ mod tests {
             toc_text_bytes: 128,
             title_text_bytes: 20,
             author_text_bytes: 18,
-            viewport_width: 800,
-            viewport_height: 480,
             font_config: 1,
             custom_font_identity: 0x8877_6655_4433_2211,
             partial: true,
             text_start_spine: Some(3),
+            seed_first_spine: Some(5),
+            seed_section_count: 3,
+            seed_reaches_end: false,
+            seed_capped: true,
         };
         let section = BookV2SectionRecord {
             section: 1,
@@ -1215,6 +1248,15 @@ mod tests {
         let old = decode_book_v2_header(&legacy).unwrap();
         assert_eq!(old.next_spine, None);
         assert_eq!(old.text_start_spine, None);
+        // A v26 index held the viewport size where the run is described:
+        // it reads as having none.
+        let mut v26 = header_bytes;
+        v26[4..6].copy_from_slice(&26u16.to_le_bytes());
+        v26[28..32].copy_from_slice(&[0x20, 0x03, 0xe0, 0x01]);
+        let v26 = decode_book_v2_header(&v26).unwrap();
+        assert_eq!((v26.seed_first_spine, v26.seed_section_count), (None, 0));
+        assert!(!v26.seed_capped && !v26.seed_reaches_end);
+        assert_eq!(v26.total_pages, header.total_pages);
         assert!(!old.generated_toc);
         assert!(old.partial);
         assert_eq!(old.total_pages, header.total_pages);
@@ -1222,7 +1264,7 @@ mod tests {
         assert_eq!(
             book_v2_cache_size(header),
             BOOK_V2_HEADER_BYTES
-                + BOOK_V2_SECTION_RECORD_BYTES * 2
+                + BOOK_V2_SECTION_RECORD_BYTES * (2 + 3)
                 + TOC_RECORD_BYTES * 4
                 + 128
                 + 20

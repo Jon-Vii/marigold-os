@@ -91,8 +91,10 @@ pub async fn run() {
             let previous_persisted = state.persisted();
             state = state.apply_library_event(ctx, event);
             let resolved_position = resolve_open_position(&event, &state, &mut unresolved_position);
-            if matches!(event, crate::LibraryEvent::PrefixLoaded { .. })
-                && unresolved_position != Some(state.book_id)
+            if matches!(
+                event,
+                crate::LibraryEvent::PrefixLoaded { .. } | crate::LibraryEvent::Prepared { .. }
+            ) && unresolved_position != Some(state.book_id)
                 && (resolved_position || previous_persisted != state.persisted())
             {
                 queue_progress(

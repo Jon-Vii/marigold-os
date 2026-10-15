@@ -20,7 +20,14 @@ pub(crate) struct ReaderPagePlan {
 impl ReaderPagePlan {
     pub(crate) fn new(sd_library: &ReaderStore, requested_page: u32) -> Self {
         let page_count = reader_page_count(sd_library);
-        let requested_page = sd_library.local_page_for_global(requested_page.min(page_count - 1));
+        let requested_page = sd_library.settled_page(requested_page);
+        // A provisional page lies past the prefix's count by design.
+        let requested_page = if sd_library.is_provisional(requested_page) {
+            requested_page
+        } else {
+            requested_page.min(page_count - 1)
+        };
+        let requested_page = sd_library.local_page_for_global(requested_page);
         let page = reader_page_at(sd_library, requested_page);
         Self { page_count, page }
     }
@@ -125,10 +132,8 @@ pub(crate) fn rebuild_toc_page_targets(library: &mut ReaderStore) {
         }
         let spine = spine_index as u16;
         let page = library
-            .book_sections
-            .iter()
-            .find(|section| section.spine == spine)
-            .map(|section| section.start_page as usize)
+            .known_page_for_spine(spine)
+            .map(|page| page as usize)
             .or_else(|| {
                 library
                     .page_spine

@@ -4,6 +4,7 @@ use crate::reader_cache_files::{BookIndexLoadResult, CacheLoadResult};
 use crate::reader_layout;
 use crate::reader_store::{
     source_hash, BookLoadStatus, ReaderStore, MAX_BOOK_SECTIONS, MAX_READER_BLOCK_TEXT,
+    MAX_READER_PAGES, MAX_SEED_SECTIONS,
 };
 use crate::sd_session::{self, SdSessionError};
 use display::font::{fixed_ceil, fixed_round, FontFamily, FontStyle, TypeSettings};
@@ -1131,18 +1132,21 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    // An index from this generation is resident: a resumed build. Its
+    // prefix cursor is where the prefix goes on; with nothing laid out yet
+    // the build starts at the first spine.
     let resume_next = library.book_next_spine();
-    let resumed_sections = if resume_next.is_some() {
-        library.book_sections.len()
-    } else {
-        0
-    };
-    let section_base = if resumed_sections > 0 {
+    let resuming = !library.book_sections.is_empty() || !library.seed.sections.is_empty();
+    let section_base = if !library.book_sections.is_empty() {
         (library.book_sections.base() / MAX_BOOK_SECTIONS as u16) * MAX_BOOK_SECTIONS as u16
+    } else if let Some(first) = library.seed.sections.iter().next() {
+        let seed = first.section - crate::reader_store::SEED_SECTION_BASE;
+        (seed / MAX_SEED_SECTIONS as u16) * MAX_BOOK_SECTIONS as u16
     } else {
         reader_cache_files::prepare_book_replacement(root, cache_key)
             .ok_or(ReaderCacheError::CacheWrite)?
     };
+    let seed_base = crate::reader_store::seed_section_base(section_base);
     let io_start = crate::sd_session::sd_stats::snapshot();
     let mut section_write_micros: u64 = 0;
     esp_println::println!("epub: stage ParseContainerAndOpf");
@@ -1198,13 +1202,13 @@ where
     }
     library.set_book_labels(package.meta.title, package.meta.author);
     library.clear_cover();
-    if resumed_sections == 0 {
+    if !resuming {
         // Found afresh below: the OPF guide's text reference, else the nav's
         // bodymatter landmark (recorded while the TOC streams), else a guess.
         // A resumed build keeps the start its prefix index recorded.
         library.set_text_start_spine(None);
     }
-    if resumed_sections > 0 {
+    if resuming {
         // The prefix index and existing TOC sidecar remain authoritative.
     } else if zip.is_forward_only() {
         library.clear_toc();
@@ -1249,31 +1253,20 @@ where
 
     esp_println::println!("epub: stage BuildV2BookCache");
     let spine_started = Instant::now();
-    let mut xhtml_path = String::<MAX_ENTRY_NAME_BYTES>::new();
-    // Sections append to the store's table in place: a resumed build starts
-    // from the prefix its index load left there, a fresh one from empty.
-    if resumed_sections == 0 {
+    if !resuming {
         library.book_sections.clear();
+        library.seed.clear();
     }
-    let mut section_count = resumed_sections;
-    let mut total_pages = if resumed_sections > 0 {
-        library.book_total_pages
-    } else {
-        0
-    };
-    let mut saw_spine = false;
     // A spine clipped at MAX_SPINE_ITEMS means the tail chapters were dropped at
     // parse, so the book is partial even if every kept section caches cleanly.
-    let mut book_partial =
-        package.spine_truncated || (resumed_sections > 0 && library.book_cache_partial);
-    let visible_page_capacity = library.page_capacity().max(1);
-    let generate_toc_from_headings = if resumed_sections > 0 {
+    let mut book_partial = package.spine_truncated || (resuming && library.book_cache_partial);
+    let generate_toc_from_headings = if resuming {
         library.book_generated_toc()
     } else {
         library.toc_count() == 0
     };
     library.set_book_generated_toc(generate_toc_from_headings);
-    if resumed_sections == 0 {
+    if !resuming {
         let guide_start = package.text_reference_href.and_then(|href| {
             package
                 .spine
@@ -1289,254 +1282,576 @@ where
     // Front matter is part of the book: a first open lands at the text start
     // (see ReaderStore::requested_page), and paging back or the Contents
     // still reach the cover, title, and foreword pages.
-    let start_spine_index = resume_next.map(usize::from).unwrap_or(0);
-    let mut next_spine = None;
-    let mut processed_spine = false;
-    // Each call processes at most one spine. No ZIP/parser/FAT borrow survives
-    // the return to the display task, which handles input/render/sleep first.
-    // The SECTIONS directory stays open for the whole spine walk; every
-    // section flush is one file open instead of a four-level dir walk.
-    reader_cache_files::with_v2_sections_dir(root, cache_key, |sections_dir| {
-        for (spine_index, spine) in package.spine.iter().enumerate().filter(|(index, item)| {
-            *index >= start_spine_index
-                && !item.href.is_empty()
-                && !spine_item_is_navigation(item, &package)
-        }) {
-            if processed_spine {
-                next_spine = Some(spine_index as u16);
-                break;
+    let mut prefix_next = next_eligible_spine(&package, resume_next.map_or(0, usize::from));
+    let mut spine_scratch = SpineScratch {
+        header: &mut *scratch.header,
+        name: &mut *scratch.name,
+        compressed: &mut *scratch.compressed,
+        xhtml: &mut *scratch.xhtml,
+        zip_inflate: &mut *scratch.zip_inflate,
+    };
+    // One session lays out spines until the request is answered, a button
+    // is pressed, the budget is spent, or the book is done, committing the
+    // index after each: no ZIP, OPF, or index reload between spines, and
+    // stopping anywhere loses at most the spine in hand.
+    let presses = crate::BUTTON_PRESSES.load(core::sync::atomic::Ordering::Relaxed);
+    let mut last_commit = Instant::now();
+    let mut spines_laid = 0usize;
+    let mut saw_spine = resuming;
+    while let Some((spine_index, run)) = session_target(
+        &mut zip,
+        &package,
+        opf_path,
+        library,
+        preparation,
+        requested_global_page,
+        requested_spine,
+        prefix_next,
+        generate_toc_from_headings,
+        &mut spine_scratch,
+    ) {
+        saw_spine = true;
+        let run_base = match run {
+            SpineRun::Prefix => section_base,
+            SpineRun::Seed => seed_base,
+        };
+        if run == SpineRun::Seed && library.seed.first_spine.is_none() {
+            library.seed.first_spine = Some(spine_index as u16);
+            esp_println::println!("epub: laying out spine {} ahead of the prefix", spine_index);
+        }
+        let seed_len = library.seed.sections.len();
+        let outcome = lay_out_spine(
+            &mut zip,
+            root,
+            source_identity,
+            &package,
+            opf_path,
+            spine_index,
+            run,
+            run_base,
+            library,
+            font_metrics,
+            preparation,
+            generate_toc_from_headings && run == SpineRun::Prefix,
+            &mut book_partial,
+            &mut section_write_micros,
+            &mut spine_scratch,
+        )?;
+        spines_laid += 1;
+        let after = next_eligible_spine(&package, spine_index + 1);
+        match run {
+            SpineRun::Prefix => prefix_next = after,
+            SpineRun::Seed if outcome == SpineOutcome::RunFull => {
+                // A run that cannot hold the spine stops growing (even an
+                // empty one: the spine would never fit); the prefix will
+                // reach the rest.
+                library.seed.sections.truncate(seed_len);
+                library.seed.capped = true;
+                library.seed.next_spine = Some(spine_index as u16);
             }
-            processed_spine = true;
-            if library.book_sections.is_full() {
-                book_partial = true;
-                break;
-            }
-            saw_spine = true;
-            library.clear_lines();
-            resolve_epub_href(opf_path, spine.href.of(package.opf_text), &mut xhtml_path)?;
-            esp_println::println!("epub: find spine {}", xhtml_path.as_str());
-            let xhtml_entry = match zip.find_entry(&xhtml_path, scratch.header, scratch.name) {
-                Ok(entry) => entry,
-                Err(proto::epub::ZipError::Io) => return Err(proto::epub::ZipError::Io.into()),
-                Err(err) => {
-                    // A dangling spine reference names no content to lose;
-                    // skip it (a retryable storage fault returned above).
-                    esp_println::println!(
-                        "epub: spine {} not found ({:?}); skipping it",
-                        xhtml_path.as_str(),
-                        err
-                    );
-                    continue;
+            SpineRun::Seed => library.seed.next_spine = after.map(|spine| spine as u16),
+        }
+        note_book_progress(library, prefix_next, &mut book_partial);
+        let stop = prefix_next.is_none()
+            || match preparation {
+                Preparation::Request => {
+                    library
+                        .requested_page(requested_global_page, requested_spine)
+                        .is_some()
+                        || crate::BUTTON_PRESSES.load(core::sync::atomic::Ordering::Relaxed)
+                            != presses
                 }
-            };
-            esp_println::println!(
-                "epub: spine {} compressed={} uncompressed={}",
-                xhtml_path.as_str(),
-                xhtml_entry.compressed_size,
-                xhtml_entry.uncompressed_size
-            );
-            let type_settings = library.type_settings();
-            let mut sink = LibraryBlockSink {
-                library,
-                root,
-                sections_dir,
-                source_identity,
-                section_base,
-                font_metrics: &mut *font_metrics,
-                section_count: &mut section_count,
-                total_pages: &mut total_pages,
-                book_partial: &mut book_partial,
-                write_micros: &mut section_write_micros,
-                spine_index: spine_index.min(u16::MAX as usize) as u16,
-                line: String::new(),
-                line_ink: LineInkCursor::new(type_settings, FontStyle::Regular),
-                line_role: TextRole::Body,
-                line_align: TextAlign::Justify,
-                line_style: FontStyle::Regular,
-                pending_space: false,
-                dropping_paragraph: false,
-                hyphenation: package
-                    .language
-                    .map(Hyphenation::for_language)
-                    .unwrap_or_default(),
-                hyphen_run: 0,
-                line_hyphenated: false,
-                stopped: false,
-                preparation,
-                interrupted: false,
-                target_pages: visible_page_capacity,
-                generate_toc_from_headings,
-                generated_toc_for_spine: false,
-                pages_dirty: true,
-                write_failed: false,
-            };
-            // Stream the whole member through the resumable block parser in
-            // bounded windows: spine XHTML of any size decodes completely, with
-            // no 24 KB prefix truncation. The parser's in-body assumption is
-            // sniffed from the first decoded window, mirroring the
-            // whole-document contains() check.
-            let mut tokenizer = StreamingXmlTokenizer::new();
-            let mut parser: Option<XhtmlBlockStreamParser> = None;
-            let mut parse_error: Option<XhtmlError> = None;
-            let read_result = zip.read_entry_to_sink(
-                xhtml_entry,
-                scratch.compressed,
-                scratch.xhtml,
-                &mut *scratch.zip_inflate,
-                &mut |chunk| {
-                    let parser = parser.get_or_insert_with(|| {
-                        let has_body =
-                            bytes_contain(chunk, b"<body") || bytes_contain(chunk, b":body");
-                        XhtmlBlockStreamParser::new(!has_body)
-                    });
-                    tokenizer
-                        .feed_xhtml_blocks(chunk, parser, None, &mut sink)
-                        .map_err(|err| {
-                            parse_error = Some(err);
-                            proto::epub::ZipError::Inflate
-                        })
-                },
-            );
-            if sink.interrupted {
-                return Err(ReaderCacheError::Interrupted);
+                Preparation::Idle { .. } => preparation.gives_way(),
             }
-            match read_result {
-                Ok(()) => {
-                    if let Some(parser) = parser.as_mut() {
-                        if let Err(err) = tokenizer.finish_xhtml_blocks(parser, &mut sink) {
-                            if sink.interrupted {
-                                return Err(ReaderCacheError::Interrupted);
-                            }
-                            if !sink.stopped {
-                                return Err(err.into());
-                            }
+            || spine_started.elapsed().as_millis() >= SESSION_BUDGET_MS;
+        // Each index write costs a few dozen block writes, so a session
+        // writes it as it ends and otherwise only every so often: a press
+        // mid-spine loses at most the spines since.
+        if stop || last_commit.elapsed().as_millis() >= COMMIT_INTERVAL_MS {
+            write_book_progress(
+                root,
+                cache_key,
+                source_identity,
+                library,
+                book_partial,
+                generate_toc_from_headings,
+                &mut *spine_scratch.xhtml,
+            )?;
+            last_commit = Instant::now();
+        }
+        if stop {
+            break;
+        }
+    }
+    if library.book_sections.is_full() && prefix_next.is_some() {
+        book_partial = true;
+    }
+
+    let resolved_page = library.requested_page(requested_global_page, requested_spine);
+    // An unanswered request still leaves a real committed prefix resident
+    // while the task schedules the next session.
+    let loaded_page = resolved_page.or_else(|| (!library.book_sections.is_empty()).then_some(0));
+    let Some(loaded_page) = loaded_page else {
+        reader_layout::rebuild_toc_page_targets(library);
+        return if prefix_next.is_some() || !library.seed.sections.is_empty() {
+            Ok(BookLoadStatus::Loading)
+        } else if saw_spine {
+            Err(ReaderCacheError::NoBodyText)
+        } else {
+            Err(ReaderCacheError::MissingSpine)
+        };
+    };
+    match reader_cache_files::load_v2_section_by_global_page(
+        root,
+        cache_key,
+        source_identity,
+        loaded_page,
+        library,
+    ) {
+        CacheLoadResult::Hit { .. } => {}
+        _ => return Err(ReaderCacheError::CacheRead),
+    }
+    reader_layout::rebuild_toc_page_targets(library);
+    refresh_chapter_tracking(root, cache_key, source_identity, loaded_page, library);
+    let cover = reader_cache_files::load_v2_cover_cache(root, cache_key, library);
+    esp_println::println!("epub: stage PublishLoaded");
+    esp_println::println!(
+        "epub: book cache session ready after {} ms (pages={} sections={} seed_sections={} partial={} cover={:?} key {} next_spine={:?})",
+        open_started.elapsed().as_millis(),
+        library.book_total_pages,
+        library.book_sections.len(),
+        library.seed.sections.len(),
+        book_partial,
+        cover,
+        cache_key,
+        library.book_next_spine()
+    );
+    let io = crate::sd_session::sd_stats::snapshot().since(io_start);
+    esp_println::println!(
+        "bench: storage_build elapsed_ms={} spine_ms={} write_ms={} spines={} sections={} seed_sections={} pages={} rd_calls={} rd_blocks={} wr_calls={} wr_blocks={} key={} complete={}",
+        open_started.elapsed().as_millis(),
+        spine_started.elapsed().as_millis(),
+        section_write_micros / 1000,
+        spines_laid,
+        library.book_sections.len(),
+        library.seed.sections.len(),
+        library.book_total_pages,
+        io.read_calls,
+        io.read_blocks,
+        io.write_calls,
+        io.write_blocks,
+        cache_key,
+        library.book_next_spine().is_none()
+    );
+    #[cfg(feature = "bench-serial")]
+    esp_println::println!(
+        "bench: hyphenation lookups={} lookup_ms={}",
+        HYPHEN_LOOKUPS.swap(0, portable_atomic::Ordering::Relaxed),
+        HYPHEN_LOOKUP_MICROS.swap(0, portable_atomic::Ordering::Relaxed) / 1000,
+    );
+    #[cfg(feature = "bench-serial")]
+    esp_println::println!(
+        "bench: build_profile spine_reads_ms={} feeds_ms={} paragraphs_ms={} lines_ms={} pages_ms={} commits_ms={} sd_read_ms={} sd_write_ms={} section_write_reads={}",
+        build_profile::take_ms(&build_profile::SPINE_READS),
+        build_profile::take_ms(&build_profile::FEEDS),
+        build_profile::take_ms(&build_profile::PARAGRAPHS),
+        build_profile::take_ms(&build_profile::LINES),
+        build_profile::take_ms(&build_profile::PAGES),
+        build_profile::take_ms(&build_profile::COMMITS),
+        crate::sd_session::sd_stats::take(&crate::sd_session::sd_stats::READ_MICROS) / 1000,
+        crate::sd_session::sd_stats::take(&crate::sd_session::sd_stats::WRITE_MICROS) / 1000,
+        build_profile::SECTION_WRITE_READS.swap(0, portable_atomic::Ordering::Relaxed),
+    );
+    Ok(if resolved_page.is_some() {
+        BookLoadStatus::Ready
+    } else {
+        BookLoadStatus::Loading
+    })
+}
+
+/// How long one build session lays out spines before handing the task
+/// back. The session commits as it ends, so ending it loses nothing; the
+/// budget bounds how long progress writes and sleep wait.
+const SESSION_BUDGET_MS: u64 = 4000;
+/// Within a session, how often the book index is written.
+const COMMIT_INTERVAL_MS: u64 = 1500;
+
+/// A seed run is started only past at least this much XHTML: below it,
+/// laying out the gap in order costs about what the seed would save.
+const SEED_MIN_GAP_BYTES: u32 = 64 * 1024;
+/// Nor on a spine bigger than this (some 800 pages), which could outgrow
+/// the run's table and be laid out for nothing.
+const SEED_MAX_SPINE_BYTES: u32 = 2 * 1024 * 1024;
+
+/// Which section table a spine's sections join.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpineRun {
+    Prefix,
+    Seed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpineOutcome {
+    Laid,
+    /// The spine names no member to read.
+    Skipped,
+    /// The seed run filled before the spine was through.
+    RunFull,
+}
+
+struct SpineScratch<'a> {
+    header: &'a mut [u8; READER_HEADER_SCRATCH],
+    name: &'a mut [u8; MAX_ENTRY_NAME_BYTES],
+    compressed: &'a mut [u8; READER_COMPRESSED_SCRATCH],
+    xhtml: &'a mut [u8; READER_XHTML_SCRATCH],
+    zip_inflate: &'a mut ZipInflateScratch,
+}
+
+/// First spine at or after `from` that holds content to lay out.
+fn next_eligible_spine(package: &proto::epub::EpubPackage<'_>, from: usize) -> Option<usize> {
+    package
+        .spine
+        .iter()
+        .enumerate()
+        .skip(from)
+        .find(|(_, item)| !item.href.is_empty() && !spine_item_is_navigation(item, package))
+        .map(|(index, _)| index)
+}
+
+/// The spine a session lays out next, and into which run, or None when it
+/// is done. Idle sessions extend the prefix (re-laying any seeded spines
+/// it reaches, which come out the same). A request extends the prefix too,
+/// unless it names a spine well ahead of it: then that spine is laid out
+/// first, into a seed run with provisionally numbered pages, and the run
+/// grows toward the request from there.
+#[allow(clippy::too_many_arguments)]
+fn session_target<Z: EpubZipOps>(
+    zip: &mut Z,
+    package: &proto::epub::EpubPackage<'_>,
+    opf_path: &str,
+    library: &ReaderStore,
+    preparation: Preparation,
+    requested_page: u32,
+    requested_spine: Option<u16>,
+    prefix_next: Option<usize>,
+    generated_toc: bool,
+    scratch: &mut SpineScratch<'_>,
+) -> Option<(usize, SpineRun)> {
+    let prefix = prefix_next?;
+    if preparation != Preparation::Request {
+        return Some((prefix, SpineRun::Prefix));
+    }
+    let Some(wanted) = library.request_spine(requested_page, requested_spine) else {
+        return Some((prefix, SpineRun::Prefix));
+    };
+    let Some(wanted) = next_eligible_spine(package, usize::from(wanted)) else {
+        return Some((prefix, SpineRun::Prefix));
+    };
+    if wanted <= prefix {
+        return Some((prefix, SpineRun::Prefix));
+    }
+    let seed = &library.seed;
+    match seed.first_spine {
+        // Grow the run toward the request; one behind the run waits for
+        // the prefix, as a second run would renumber the first's pages.
+        Some(first) if wanted >= usize::from(first) && !seed.capped => seed
+            .next_spine
+            .and_then(|next| next_eligible_spine(package, usize::from(next)))
+            .map(|next| (next, SpineRun::Seed))
+            .or(Some((prefix, SpineRun::Prefix))),
+        Some(_) => Some((prefix, SpineRun::Prefix)),
+        None if !generated_toc
+            && !zip.is_forward_only()
+            && library.book_total_pages < crate::reader_store::PROVISIONAL_PAGE_FLOOR / 2
+            && gap_worth_seeding(zip, package, opf_path, prefix, wanted, scratch) =>
+        {
+            Some((wanted, SpineRun::Seed))
+        }
+        None => Some((prefix, SpineRun::Prefix)),
+    }
+}
+
+/// Whether seeding spine `to` is worth it: the spines in `from..to` hold at
+/// least `SEED_MIN_GAP_BYTES` of XHTML and `to` itself fits a run. Reads
+/// only their ZIP sizes.
+fn gap_worth_seeding<Z: EpubZipOps>(
+    zip: &mut Z,
+    package: &proto::epub::EpubPackage<'_>,
+    opf_path: &str,
+    from: usize,
+    to: usize,
+    scratch: &mut SpineScratch<'_>,
+) -> bool {
+    let mut path = String::<MAX_ENTRY_NAME_BYTES>::new();
+    let mut size = |zip: &mut Z, item: proto::epub::SpineItem| -> Option<u32> {
+        if item.href.is_empty() || spine_item_is_navigation(&item, package) {
+            return None;
+        }
+        resolve_epub_href(opf_path, item.href.of(package.opf_text), &mut path).ok()?;
+        zip.find_entry(&path, scratch.header, scratch.name)
+            .ok()
+            .map(|entry| entry.uncompressed_size)
+    };
+    if package
+        .spine
+        .get(to)
+        .and_then(|item| size(zip, item))
+        .is_none_or(|bytes| bytes > SEED_MAX_SPINE_BYTES)
+    {
+        return false;
+    }
+    let mut bytes = 0u32;
+    for item in package.spine.iter().take(to).skip(from) {
+        bytes = bytes.saturating_add(size(zip, item).unwrap_or(0));
+        if bytes >= SEED_MIN_GAP_BYTES {
+            return true;
+        }
+    }
+    false
+}
+
+/// Bring the store's book state up to what the session has laid out: the
+/// prefix's cursor and page total, and a full table ending it partial.
+fn note_book_progress(
+    library: &mut ReaderStore,
+    prefix_next: Option<usize>,
+    book_partial: &mut bool,
+) {
+    let mut next_spine = prefix_next.map(|spine| spine.min(u16::MAX as usize) as u16);
+    if library.book_sections.is_full() && next_spine.is_some() {
+        *book_partial = true;
+        next_spine = None;
+    }
+    let total_pages = library.book_sections.end_page();
+    library.commit_book_index(total_pages, *book_partial);
+    library.set_book_next_spine(next_spine);
+    // Chapter starts move with every spine laid out, seeded ones included
+    // (which leave the prefix cursor where it was): reread the map.
+    library.chapter_page_count = 0;
+}
+
+/// Write the book index for what the store holds: the prefix (with its
+/// cursor) and any seed run. Nothing before the first section: the cursor
+/// rides along in RAM until then.
+fn write_book_progress<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    cache_key: &str,
+    source_identity: (u32, u32),
+    library: &ReaderStore,
+    book_partial: bool,
+    generated_toc: bool,
+    scratch: &mut [u8],
+) -> Result<(), ReaderCacheError>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if library.book_sections.is_empty() && library.seed.sections.is_empty() {
+        return Ok(());
+    }
+    #[cfg(feature = "bench-serial")]
+    let _span = build_profile::Span::new(&build_profile::COMMITS);
+    if !reader_cache_files::write_v2_book_index(
+        root,
+        cache_key,
+        source_identity,
+        library.book_sections.end_page(),
+        &library.book_sections,
+        library,
+        book_partial,
+    ) {
+        return Err(ReaderCacheError::CacheWrite);
+    }
+    if generated_toc && !write_generated_toc(root, cache_key, source_identity, library, scratch) {
+        return Err(ReaderCacheError::CacheWrite);
+    }
+    Ok(())
+}
+
+/// Lay out one spine into `run`'s table, writing its sections as they fill.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn lay_out_spine<Z, D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+    zip: &mut Z,
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    source_identity: (u32, u32),
+    package: &proto::epub::EpubPackage<'_>,
+    opf_path: &str,
+    spine_index: usize,
+    run: SpineRun,
+    section_base: u16,
+    library: &mut ReaderStore,
+    font_metrics: &mut crate::custom_font::MetricCache,
+    preparation: Preparation,
+    generate_toc_from_headings: bool,
+    book_partial: &mut bool,
+    write_micros: &mut u64,
+    scratch: &mut SpineScratch<'_>,
+) -> Result<SpineOutcome, ReaderCacheError>
+where
+    Z: EpubZipOps,
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let Some(spine) = package.spine.get(spine_index) else {
+        return Ok(SpineOutcome::Skipped);
+    };
+    let cache_key = library.cache_key.clone();
+    library.clear_lines();
+    let mut xhtml_path = String::<MAX_ENTRY_NAME_BYTES>::new();
+    resolve_epub_href(opf_path, spine.href.of(package.opf_text), &mut xhtml_path)?;
+    esp_println::println!("epub: find spine {}", xhtml_path.as_str());
+    let xhtml_entry = match zip.find_entry(&xhtml_path, scratch.header, scratch.name) {
+        Ok(entry) => entry,
+        Err(proto::epub::ZipError::Io) => return Err(proto::epub::ZipError::Io.into()),
+        Err(err) => {
+            // A dangling spine reference names no content to lose; skip it
+            // (a retryable storage fault returned above).
+            esp_println::println!(
+                "epub: spine {} not found ({:?}); skipping it",
+                xhtml_path.as_str(),
+                err
+            );
+            return Ok(SpineOutcome::Skipped);
+        }
+    };
+    esp_println::println!(
+        "epub: spine {} compressed={} uncompressed={}",
+        xhtml_path.as_str(),
+        xhtml_entry.compressed_size,
+        xhtml_entry.uncompressed_size
+    );
+    let visible_page_capacity = library.page_capacity().max(1);
+    reader_cache_files::with_v2_sections_dir(root, cache_key.as_str(), |sections_dir| {
+        let type_settings = library.type_settings();
+        let mut sink = LibraryBlockSink {
+            library: &mut *library,
+            root,
+            sections_dir,
+            source_identity,
+            section_base,
+            run,
+            run_full: false,
+            font_metrics: &mut *font_metrics,
+            book_partial: &mut *book_partial,
+            write_micros: &mut *write_micros,
+            spine_index: spine_index.min(u16::MAX as usize) as u16,
+            line: String::new(),
+            line_ink: LineInkCursor::new(type_settings, FontStyle::Regular),
+            line_role: TextRole::Body,
+            line_align: TextAlign::Justify,
+            line_style: FontStyle::Regular,
+            pending_space: false,
+            dropping_paragraph: false,
+            hyphenation: package
+                .language
+                .map(Hyphenation::for_language)
+                .unwrap_or_default(),
+            hyphen_run: 0,
+            line_hyphenated: false,
+            stopped: false,
+            preparation,
+            interrupted: false,
+            target_pages: visible_page_capacity,
+            generate_toc_from_headings,
+            generated_toc_for_spine: false,
+            pages_dirty: true,
+            write_failed: false,
+        };
+        // Stream the whole member through the resumable block parser in
+        // bounded windows: spine XHTML of any size decodes completely, with
+        // no 24 KB prefix truncation. The parser's in-body assumption is
+        // sniffed from the first decoded window, mirroring the
+        // whole-document contains() check.
+        let mut tokenizer = StreamingXmlTokenizer::new();
+        let mut parser: Option<XhtmlBlockStreamParser> = None;
+        let mut parse_error: Option<XhtmlError> = None;
+        #[cfg(feature = "bench-serial")]
+        let spine_span = build_profile::Span::new(&build_profile::SPINE_READS);
+        let read_result = zip.read_entry_to_sink(
+            xhtml_entry,
+            &mut *scratch.compressed,
+            &mut *scratch.xhtml,
+            &mut *scratch.zip_inflate,
+            &mut |chunk| {
+                #[cfg(feature = "bench-serial")]
+                let _span = build_profile::Span::new(&build_profile::FEEDS);
+                let parser = parser.get_or_insert_with(|| {
+                    let has_body = bytes_contain(chunk, b"<body") || bytes_contain(chunk, b":body");
+                    XhtmlBlockStreamParser::new(!has_body)
+                });
+                tokenizer
+                    .feed_xhtml_blocks(chunk, parser, None, &mut sink)
+                    .map_err(|err| {
+                        parse_error = Some(err);
+                        proto::epub::ZipError::Inflate
+                    })
+            },
+        );
+        #[cfg(feature = "bench-serial")]
+        drop(spine_span);
+        if sink.interrupted {
+            return Err(ReaderCacheError::Interrupted);
+        }
+        match read_result {
+            Ok(()) => {
+                if let Some(parser) = parser.as_mut() {
+                    if let Err(err) = tokenizer.finish_xhtml_blocks(parser, &mut sink) {
+                        if sink.interrupted {
+                            return Err(ReaderCacheError::Interrupted);
+                        }
+                        if !sink.stopped {
+                            return Err(err.into());
                         }
                     }
                 }
-                Err(_) if parse_error.is_some() => {
-                    let err = parse_error.take().expect("parse error recorded");
-                    if sink.stopped {
-                        esp_println::println!(
-                            "epub: bounded open stopped at spine {} after {} section(s): {:?}",
-                            spine_index,
-                            *sink.section_count,
-                            err
-                        );
-                    } else {
-                        return Err(err.into());
-                    }
-                }
-                // A storage fault is worth retrying, so it still fails the
-                // step. Anything else is a damaged member: keep what parsed,
-                // mark the book partial, and carry on with the next chapter
-                // rather than refusing to open the whole book.
-                Err(proto::epub::ZipError::Io) => {
-                    return Err(proto::epub::ZipError::Io.into());
-                }
-                Err(err) => {
+            }
+            Err(_) if parse_error.is_some() => {
+                let err = parse_error.take().expect("parse error recorded");
+                if sink.stopped {
                     esp_println::println!(
-                        "epub: spine {} unreadable ({:?}); skipping it",
-                        xhtml_path.as_str(),
+                        "epub: bounded open stopped at spine {}: {:?}",
+                        spine_index,
                         err
                     );
-                    *sink.book_partial = true;
+                } else {
+                    return Err(err.into());
                 }
             }
-            sink.finish_spine(false);
-            if sink.write_failed {
-                return Err(ReaderCacheError::CacheWrite);
+            // A storage fault is worth retrying, so it still fails the
+            // step. Anything else is a damaged member: keep what parsed,
+            // mark the book partial, and carry on with the next chapter
+            // rather than refusing to open the whole book.
+            Err(proto::epub::ZipError::Io) => {
+                return Err(proto::epub::ZipError::Io.into());
+            }
+            Err(err) => {
+                esp_println::println!(
+                    "epub: spine {} unreadable ({:?}); skipping it",
+                    xhtml_path.as_str(),
+                    err
+                );
+                *sink.book_partial = true;
             }
         }
-        Ok::<(), ReaderCacheError>(())
-    })?;
-
-    if library.book_sections.is_full() && next_spine.is_some() {
-        book_partial = true;
-        next_spine = None;
-    }
-    library.set_book_next_spine(next_spine);
-    if section_count > 0 && total_pages > 0 {
-        let wrote_index = reader_cache_files::write_v2_book_index(
-            root,
-            cache_key,
-            source_identity,
-            total_pages,
-            &library.book_sections,
-            library,
-            book_partial,
-        );
-        if !wrote_index {
+        if !sink.run_full {
+            sink.finish_spine(false);
+        }
+        if sink.write_failed {
             return Err(ReaderCacheError::CacheWrite);
         }
-        if generate_toc_from_headings
-            && !write_generated_toc(root, cache_key, source_identity, library, scratch.xhtml)
-        {
-            return Err(ReaderCacheError::CacheWrite);
-        }
-
-        library.commit_book_index(total_pages, book_partial);
-        library.set_book_next_spine(next_spine);
-        let resolved_page = library.requested_page(requested_global_page, requested_spine);
-        // During a distant-page/chapter request, leave a real committed prefix
-        // resident while the task schedules the next independent spine step.
-        let loaded_page = resolved_page.unwrap_or(0);
-        match reader_cache_files::load_v2_section_by_global_page(
-            root,
-            cache_key,
-            source_identity,
-            loaded_page,
-            library,
-        ) {
-            CacheLoadResult::Hit { .. } => {}
-            _ => return Err(ReaderCacheError::CacheRead),
-        }
-        reader_layout::rebuild_toc_page_targets(library);
-        refresh_chapter_tracking(root, cache_key, source_identity, loaded_page, library);
-        let cover = reader_cache_files::load_v2_cover_cache(root, cache_key, library);
-        esp_println::println!("epub: stage PublishLoaded");
-        esp_println::println!(
-            "epub: book cache step ready after {} ms (pages={} sections={} partial={} cover={:?} key {} next_spine={:?})",
-            open_started.elapsed().as_millis(),
-            total_pages,
-            section_count,
-            book_partial,
-            cover,
-            cache_key,
-            next_spine
-        );
-        let io = crate::sd_session::sd_stats::snapshot().since(io_start);
-        esp_println::println!(
-            "bench: storage_build elapsed_ms={} spine_ms={} write_ms={} sections={} pages={} rd_calls={} rd_blocks={} wr_calls={} wr_blocks={} key={} complete={}",
-            open_started.elapsed().as_millis(),
-            spine_started.elapsed().as_millis(),
-            section_write_micros / 1000,
-            section_count,
-            total_pages,
-            io.read_calls,
-            io.read_blocks,
-            io.write_calls,
-            io.write_blocks,
-            cache_key,
-            next_spine.is_none()
-        );
-        #[cfg(feature = "bench-serial")]
-        esp_println::println!(
-            "bench: hyphenation lookups={} lookup_ms={}",
-            HYPHEN_LOOKUPS.swap(0, portable_atomic::Ordering::Relaxed),
-            HYPHEN_LOOKUP_MICROS.swap(0, portable_atomic::Ordering::Relaxed) / 1000,
-        );
-        Ok(if resolved_page.is_some() {
-            BookLoadStatus::Ready
+        Ok(if sink.run_full {
+            SpineOutcome::RunFull
         } else {
-            BookLoadStatus::Loading
+            SpineOutcome::Laid
         })
-    } else if next_spine.is_some() {
-        Ok(BookLoadStatus::Loading)
-    } else if saw_spine {
-        Err(ReaderCacheError::NoBodyText)
-    } else {
-        Err(ReaderCacheError::MissingSpine)
-    }
+    })
 }
 
 fn spine_item_is_navigation(
@@ -1834,10 +2149,13 @@ struct LibraryBlockSink<
     /// writes then fail per section and the book publishes as partial.
     sections_dir: Option<&'r Directory<'r, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>,
     source_identity: (u32, u32),
+    /// Id the run's first section takes.
     section_base: u16,
+    /// The table this spine's sections join.
+    run: SpineRun,
+    /// The run's table filled before the spine was through.
+    run_full: bool,
     font_metrics: &'a mut crate::custom_font::MetricCache,
-    section_count: &'a mut usize,
-    total_pages: &'a mut u32,
     book_partial: &'a mut bool,
     /// Accumulated wall time spent writing section files, for the
     /// `bench: storage_build` line.
@@ -1978,6 +2296,8 @@ where
 
     fn rebuild_pages_if_dirty(&mut self) {
         if self.pages_dirty {
+            #[cfg(feature = "bench-serial")]
+            let _span = build_profile::Span::new(&build_profile::PAGES);
             reader_layout::extend_page_index(self.library);
             self.pages_dirty = false;
         }
@@ -1995,8 +2315,28 @@ where
             self.pages_dirty = true;
             return true;
         }
-        if self.library.book_sections.is_full() {
-            *self.book_partial = true;
+        let (section_id, start_page, full) = match self.run {
+            SpineRun::Prefix => {
+                let table = &self.library.book_sections;
+                let (id, start) = table.next_slot(self.section_base, 0);
+                (id, start, table.is_full())
+            }
+            SpineRun::Seed => {
+                let table = &self.library.seed.sections;
+                let (id, start) = table.next_slot(
+                    self.section_base,
+                    crate::reader_store::PROVISIONAL_PAGE_BASE,
+                );
+                // Provisional pages must stay u16 page requests.
+                let room = start + MAX_READER_PAGES as u32 <= u32::from(u16::MAX);
+                (id, start, table.is_full() || !room)
+            }
+        };
+        if full {
+            match self.run {
+                SpineRun::Prefix => *self.book_partial = true,
+                SpineRun::Seed => self.run_full = true,
+            }
             self.stopped = true;
             return false;
         }
@@ -2006,8 +2346,9 @@ where
 
         self.library.set_cached_spine(self.spine_index);
         self.library.set_section_partial(partial);
-        let section_id = self.section_base + (*self.section_count) as u16;
         let write_started = Instant::now();
+        #[cfg(feature = "bench-serial")]
+        let reads_before = crate::sd_session::sd_stats::snapshot().read_blocks;
         let mut written_pages = 0;
         let wrote = reader_layout::flush_page_window(self.library, carry_incomplete, |window| {
             written_pages = window.page_count;
@@ -2022,24 +2363,37 @@ where
             }
         });
         *self.write_micros += write_started.elapsed().as_micros();
+        #[cfg(feature = "bench-serial")]
+        build_profile::SECTION_WRITE_READS.fetch_add(
+            crate::sd_session::sd_stats::snapshot()
+                .read_blocks
+                .wrapping_sub(reads_before),
+            portable_atomic::Ordering::Relaxed,
+        );
         if !wrote {
             self.write_failed = true;
             self.stopped = true;
             return false;
         }
-        if !self.library.book_sections.push(BookV2SectionRecord {
+        let record = BookV2SectionRecord {
             section: section_id,
             spine: self.spine_index,
-            start_page: *self.total_pages,
+            start_page,
             page_count: written_pages.min(u16::MAX as usize) as u16,
             partial,
-        }) {
-            *self.book_partial = true;
+        };
+        let pushed = match self.run {
+            SpineRun::Prefix => self.library.book_sections.push(record),
+            SpineRun::Seed => self.library.seed.sections.push(record),
+        };
+        if !pushed {
+            match self.run {
+                SpineRun::Prefix => *self.book_partial = true,
+                SpineRun::Seed => self.run_full = true,
+            }
             self.stopped = true;
             return false;
         }
-        *self.total_pages = (*self.total_pages).saturating_add(written_pages as u32);
-        *self.section_count += 1;
         self.pages_dirty = false;
         true
     }
@@ -2073,6 +2427,8 @@ where
         align: TextAlign,
         paragraph_end: bool,
     ) -> Result<(), XhtmlError> {
+        #[cfg(feature = "bench-serial")]
+        let _span = build_profile::Span::new(&build_profile::PARAGRAPHS);
         if self.stopped || self.interrupted {
             return Err(XhtmlError::TooManyRuns);
         }
@@ -2238,6 +2594,42 @@ fn push_styled_preview_fragment<
 /// Character boundaries measured for one word at a line end; a head never
 /// holds more letters than a line does.
 const HEAD_WIDTH_SLOTS: usize = 64;
+
+/// Where build time goes, for the bench: each span adds its wall time to a
+/// counter (spans nest: a paragraph's time includes its lines' and pages').
+#[cfg(feature = "bench-serial")]
+mod build_profile {
+    use portable_atomic::{AtomicU32, Ordering};
+    pub(super) static PARAGRAPHS: AtomicU32 = AtomicU32::new(0);
+    pub(super) static LINES: AtomicU32 = AtomicU32::new(0);
+    pub(super) static PAGES: AtomicU32 = AtomicU32::new(0);
+    pub(super) static COMMITS: AtomicU32 = AtomicU32::new(0);
+    /// A spine's whole read: inflating, parsing, and laying out.
+    pub(super) static SPINE_READS: AtomicU32 = AtomicU32::new(0);
+    /// Parsing and laying out, fed inflated windows.
+    pub(super) static FEEDS: AtomicU32 = AtomicU32::new(0);
+    /// Block reads made while writing sections (FAT and partial blocks).
+    pub(super) static SECTION_WRITE_READS: AtomicU32 = AtomicU32::new(0);
+
+    pub(super) struct Span(&'static AtomicU32, embassy_time::Instant);
+
+    impl Span {
+        pub(super) fn new(counter: &'static AtomicU32) -> Self {
+            Self(counter, embassy_time::Instant::now())
+        }
+    }
+
+    impl Drop for Span {
+        fn drop(&mut self) {
+            self.0
+                .fetch_add(self.1.elapsed().as_micros() as u32, Ordering::Relaxed);
+        }
+    }
+
+    pub(super) fn take_ms(counter: &AtomicU32) -> u32 {
+        counter.swap(0, Ordering::Relaxed) / 1000
+    }
+}
 
 #[cfg(feature = "bench-serial")]
 static HYPHEN_LOOKUPS: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
@@ -2548,6 +2940,8 @@ fn flush_styled_preview_line<
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    #[cfg(feature = "bench-serial")]
+    let _span = build_profile::Span::new(&build_profile::LINES);
     if sink.line.is_empty() {
         if paragraph_end {
             sink.hyphen_run = 0;
