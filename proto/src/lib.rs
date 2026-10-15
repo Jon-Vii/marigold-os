@@ -6,6 +6,7 @@ pub mod cache;
 pub mod captive;
 pub mod epub;
 pub mod font_pack;
+pub mod hyphen;
 pub mod ota;
 pub mod storage;
 pub mod text;
