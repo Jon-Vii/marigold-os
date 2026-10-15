@@ -97,7 +97,16 @@ pub fn word_breaks(
         }
         pattern_breaks(word, segment_start, word.len(), out);
     }
-    out.sort_unstable_by_key(|item| item.head_end);
+    // Dash breaks come first, then each part's pattern breaks: a short
+    // insertion sort puts them in order without the library sort's frame,
+    // which would sit on the EPUB build's stack.
+    for index in 1..out.len() {
+        let mut at = index;
+        while at > 0 && out[at - 1].head_end > out[at].head_end {
+            out.swap(at - 1, at);
+            at -= 1;
+        }
+    }
 }
 
 /// Pattern breaks inside `word[start..end]`, one dash-free part: its

@@ -476,8 +476,10 @@ pub const READER_WRAP_SAFETY: i16 = 4;
 /// v21: front matter before the text start is built into the book (it used
 /// to be dropped), which moves every page number after it. v22: books of
 /// more than 192 spine items or 320 sections were cached cut short; rebuild
-/// them whole.
-const READER_LAYOUT_VERSION: u16 = 22;
+/// them whole. v23: justified prose hyphenates (patterns for English, the
+/// book's soft hyphens and compound dashes everywhere), which moves line
+/// breaks throughout.
+const READER_LAYOUT_VERSION: u16 = 23;
 
 /// Panel-geometry salt folded into the version bits: wrap points and page
 /// heights depend on the page box, so pagination cached on one panel must
@@ -846,14 +848,58 @@ pub fn draw_styled_line(
     cursor_x
 }
 
+/// Lines in a row that may end in a hyphen before the line builder holds
+/// out for a looser line instead (a "ladder" of hyphens down the margin).
+pub const MAX_HYPHEN_RUN: u8 = 2;
+
+/// Whether the word that no longer fits a justified line should be split
+/// rather than moved whole to the next line. `slack` is the width the line
+/// has left without it, `gaps` its inter-word spaces, `space` a normal word
+/// space, and `run` how many lines in a row already end in a hyphen.
+///
+/// Moving the word is preferred while it costs each gap at most half a
+/// space; past that, the line would look loose and a break is worth a
+/// hyphen. After `MAX_HYPHEN_RUN` hyphenated lines in a row it takes a
+/// gap doubling to justify another. A line holding a single word cannot
+/// stretch at all, so it always tries.
+pub fn worth_hyphenating(slack: i16, gaps: usize, space: i16, run: u8) -> bool {
+    if gaps == 0 {
+        return true;
+    }
+    let slack = i32::from(slack);
+    let spaces = gaps as i32 * i32::from(space.max(1));
+    if run >= MAX_HYPHEN_RUN {
+        slack > spaces
+    } else {
+        slack * 2 > spaces
+    }
+}
+
+/// A normal word space in the reading face, for the spacing rules above.
+pub fn word_space_width(settings: TypeSettings, style: FontStyle) -> i16 {
+    measure_text(body_font(settings, style), " ") as i16
+}
+
 /// Extra width to spread across a justified line's inter-word gaps, or
-/// `None` when it should keep natural spacing: no gaps, nothing to add, or
-/// a line so short (under two thirds of the measure) that stretching it
-/// would open rivers -- typically a line cut short by an unbreakable word.
-pub fn justify_extra(x: i16, natural_width: i16, right: i16, gaps: usize) -> Option<i16> {
+/// `None` when it should keep natural spacing: no gaps, nothing to add, a
+/// line so short (under two thirds of the measure) that stretching it
+/// would open rivers, or one whose gaps would each grow by more than one
+/// and a half spaces -- typically a line cut short by a word that could
+/// not be broken.
+pub fn justify_extra(
+    x: i16,
+    natural_width: i16,
+    right: i16,
+    gaps: usize,
+    space: i16,
+) -> Option<i16> {
     let target = right - READER_WRAP_SAFETY;
     let extra = target - (x + natural_width);
-    if gaps == 0 || extra <= 0 || extra * 3 > target - x {
+    if gaps == 0
+        || extra <= 0
+        || extra * 3 > target - x
+        || i32::from(extra) * 2 > gaps as i32 * i32::from(space) * 3
+    {
         return None;
     }
     Some(extra)
@@ -922,7 +968,8 @@ pub fn draw_justified_styled_line(
 ) -> i16 {
     let gaps = justify_gap_count(text);
     let natural = styled_text_ink_width(text, settings, default_style);
-    let Some(extra) = justify_extra(x, natural, right, gaps) else {
+    let space = word_space_width(settings, default_style);
+    let Some(extra) = justify_extra(x, natural, right, gaps, space) else {
         return draw_styled_line(fb, settings, text, x, baseline_y, default_style);
     };
     let per_gap = extra / gaps as i16;

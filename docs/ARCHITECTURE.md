@@ -386,11 +386,29 @@ and the host preview tool:
   says it was cut short.
 - `xhtml_blocks_to_sink` with `TextRole`, `FontStyle`, and `TextAlign` as the
   single XHTML extraction path feeding bounded block records.
+- `hyphen::word_breaks` for where a word may break at a line end: the book's
+  soft hyphens (the only breaks when present), dashes already in a compound,
+  and for English (`dc:language` `en*`), Liang's algorithm over the US English
+  TeX patterns (hyph-utf8, generated into flash by
+  `tools/generate_hyphenation.py`). Two letters stay before a pattern break and
+  three after; short words, acronyms, and words with digits or accents stay
+  whole.
 - `BookV2Header` with `BookV2SectionRecord`, and `SectionV2Header` with
   `PageRecord`, `BlockRecord`, and `TocRecord`, for the bounded binary cache
   records the firmware reads and writes. The earlier `BookCacheHeader`,
   `SectionHeader`, `PageCacheHeader`, `LineRecord`, and `WordRecord` remain in
   `proto::cache` only for the disabled V1 migration path.
+
+The firmware's line builder wraps greedily at word spaces. When a word no
+longer fits a justified body line, `ui::reading::worth_hyphenating` decides
+whether moving it would leave the line loose (each gap growing by more than
+half a space; after two hyphenated lines in a row, by more than a whole
+space), and if so the line takes the longest head of the word that fits,
+with a hyphen. A paragraph's last word is never split, and a word wider than
+a whole line breaks wherever it can. At draw time, `justify_extra` leaves a
+line at natural spacing rather than open gaps past one and a half spaces, as
+well as lines under two thirds of the measure. Soft hyphens survive
+normalisation as break hints and are stripped from stored lines.
 
 The firmware still ships one built-in catalog entry as a fallback, but the
 board I/O task owns the shared SPI bus while it scans FAT16/FAT32

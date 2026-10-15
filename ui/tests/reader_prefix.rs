@@ -405,3 +405,33 @@ fn a_book_of_many_short_items_fits_well_past_the_old_section_cap() {
     assert!(table.is_full());
     assert_eq!(table.len(), reader_store::MAX_BOOK_SECTIONS);
 }
+
+#[test]
+fn a_line_is_hyphenated_only_once_moving_the_word_would_leave_it_loose() {
+    use ui::reading::{worth_hyphenating, MAX_HYPHEN_RUN};
+    let space = 6;
+    // Ten gaps absorbing 20 px is 2 px each: move the word, no hyphen.
+    assert!(!worth_hyphenating(20, 10, space, 0));
+    // 40 px over ten gaps is 4 px each, over half a space: hyphenate.
+    assert!(worth_hyphenating(40, 10, space, 0));
+    // A narrow portrait line with four gaps loosens much sooner.
+    assert!(worth_hyphenating(16, 4, space, 0));
+    // After a ladder of hyphens it takes a doubled gap to add another.
+    assert!(!worth_hyphenating(40, 10, space, MAX_HYPHEN_RUN));
+    assert!(worth_hyphenating(70, 10, space, MAX_HYPHEN_RUN));
+    // A lone word on its line cannot stretch, so it always tries.
+    assert!(worth_hyphenating(1, 0, space, MAX_HYPHEN_RUN));
+}
+
+#[test]
+fn justification_stops_short_of_gaping_word_spaces() {
+    use ui::reading::{justify_extra, READER_WRAP_SAFETY};
+    let space = 6;
+    let right = 400 + READER_WRAP_SAFETY;
+    // 30 px over six gaps (5 each, under 1.5 spaces) stretches.
+    assert_eq!(justify_extra(0, 370, right, 6, space), Some(30));
+    // The same 30 px over three gaps (10 each) would gape: natural spacing.
+    assert_eq!(justify_extra(0, 370, right, 3, space), None);
+    // Lines under two thirds of the measure never stretch.
+    assert_eq!(justify_extra(0, 250, right, 40, space), None);
+}

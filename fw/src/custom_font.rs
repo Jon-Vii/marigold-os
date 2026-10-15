@@ -442,7 +442,10 @@ where
     ) -> Option<i16> {
         let gaps = ui::reading::justify_gap_count(text);
         let natural = self.styled_ink_width(text, size, weight, default_style);
-        let Some(extra) = ui::reading::justify_extra(x, natural, right, gaps) else {
+        let space = self
+            .styled_ink_width(" x", size, weight, default_style)
+            .saturating_sub(self.styled_ink_width("x", size, weight, default_style));
+        let Some(extra) = ui::reading::justify_extra(x, natural, right, gaps, space) else {
             return self.draw_styled_line(fb, text, size, weight, default_style, x, baseline_y);
         };
         let per_gap = extra / gaps as i16;

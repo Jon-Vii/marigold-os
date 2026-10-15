@@ -19,6 +19,7 @@ use proto::epub::{
     NcxStreamParser, ReadAt, StreamingXmlTokenizer, TocError, XhtmlBlockSink,
     XhtmlBlockStreamParser, XhtmlError, ZipInflateScratch, ZipStream, MAX_ENTRY_NAME_BYTES,
 };
+use proto::hyphen::{word_breaks, Hyphenation, WordBreak, MAX_WORD_BREAKS};
 use proto::text::{TextAlign, TextRole};
 use ui::reading::StyledInkCursor;
 
@@ -1283,6 +1284,12 @@ where
                 line_style: FontStyle::Regular,
                 pending_space: false,
                 dropping_paragraph: false,
+                hyphenation: package
+                    .language
+                    .map(Hyphenation::for_language)
+                    .unwrap_or_default(),
+                hyphen_run: 0,
+                line_hyphenated: false,
                 stopped: false,
                 target_pages: visible_page_capacity,
                 generate_toc_from_headings,
@@ -1757,6 +1764,13 @@ struct LibraryBlockSink<
     line_style: FontStyle,
     pending_space: bool,
     dropping_paragraph: bool,
+    /// Patterns for the book's language; soft hyphens and dashes break in
+    /// any language.
+    hyphenation: Hyphenation,
+    /// Lines in a row that ended in a hyphen, and whether the line in
+    /// progress will.
+    hyphen_run: u8,
+    line_hyphenated: bool,
     stopped: bool,
     target_pages: usize,
     generate_toc_from_headings: bool,
@@ -2080,75 +2094,231 @@ fn push_styled_preview_fragment<
         sink.line_style = FontStyle::Regular;
     }
 
+    // Hyphenation fills justified prose lines; headings, centred and ragged
+    // text break only where a word is wider than the whole line.
+    let justified_body = matches!(role, TextRole::Body) && align == TextAlign::Justify;
     let mut first_word = true;
     // ASCII whitespace only: a no-break space joins its neighbours into one
     // unbreakable word.
-    for word in normalized.split_ascii_whitespace() {
+    let mut words = normalized.split_ascii_whitespace().peekable();
+    while let Some(word) = words.next() {
         let attach = is_leading_punctuation_word(word) && !sink.line.is_empty();
-        let leading_space = !sink.line.is_empty()
+        let mut leading_space = !sink.line.is_empty()
             && !attach
             && (sink.pending_space || !first_word || starts_with_space);
-        let kept_len = sink.line.len();
-        let kept_ink = sink.line_ink;
-        let line_was_empty = sink.line.is_empty();
-        if append_styled_word(&mut sink.line, word, style, sink.line_style, leading_space).is_err()
-        {
-            sink.line.truncate(kept_len);
-            flush_styled_preview_line(sink, false);
-            let _ = append_styled_word(&mut sink.line, word, style, sink.line_style, false);
-            let mut measure = String::<MAX_READER_BLOCK_TEXT>::new();
-            let _ = measure.push_str(sink.line.as_str());
-            sink.push_line_ink_str(measure.as_str());
-            sink.line_role = role;
-            sink.line_align = align;
-            sink.line_style = style;
-            sink.pending_space = false;
-            first_word = false;
-            continue;
-        }
-        let mut measure = String::<MAX_READER_BLOCK_TEXT>::new();
-        let _ = measure.push_str(&sink.line[kept_len..]);
-        sink.push_line_ink_str(measure.as_str());
-
-        // The line in progress opens a paragraph while no line of it has
-        // flushed yet: the previous block still closes a paragraph. Once the
-        // first line flushes (as a non-end block) this goes false and the
-        // continuation lines wrap at the full width.
-        let opens_paragraph = sink.library.block_count == 0
-            || sink
-                .library
-                .block_paragraph_end
-                .get(sink.library.block_count.wrapping_sub(1))
-                .copied()
-                .unwrap_or(true);
-        let x_eff = if opens_paragraph { x + indent } else { x };
-        if !line_was_empty
-            && sink.line_ink_width() + x_eff + reader_layout::READER_WRAP_SAFETY > max_x
-        {
-            sink.line.truncate(kept_len);
-            sink.line_ink = kept_ink;
-            flush_styled_preview_line(sink, false);
-            let _ = append_styled_word(&mut sink.line, word, style, sink.line_style, false);
-            let mut measure = String::<MAX_READER_BLOCK_TEXT>::new();
-            let _ = measure.push_str(sink.line.as_str());
-            sink.push_line_ink_str(measure.as_str());
-            sink.line_role = role;
-            sink.line_align = align;
-            sink.line_style = style;
-            sink.pending_space = false;
-        } else {
-            sink.line_role = role;
-            sink.line_align = align;
-            sink.line_style = style;
-            sink.pending_space = false;
+        // A paragraph's last word is never split: its tail would sit alone
+        // on the last line.
+        let may_hyphenate = justified_body && !(paragraph_end && words.peek().is_none());
+        let mut piece = word;
+        while let Placement::Continue(rest) = place_word_piece(
+            sink,
+            piece,
+            WordPlacement {
+                style,
+                role,
+                align,
+                leading_space,
+                may_hyphenate,
+                x,
+                indent,
+                max_x,
+            },
+        ) {
+            piece = rest;
+            leading_space = false;
         }
         first_word = false;
     }
 
-    sink.pending_space |= ends_with_space;
     if paragraph_end {
         flush_styled_preview_line(sink, true);
     }
+}
+
+/// Where a word piece went: onto the current line, or (its tail, or the
+/// whole piece after a line break) still waiting for the next line.
+enum Placement<'w> {
+    Done,
+    Continue(&'w str),
+}
+
+#[derive(Clone, Copy)]
+struct WordPlacement {
+    style: FontStyle,
+    role: TextRole,
+    align: TextAlign,
+    leading_space: bool,
+    may_hyphenate: bool,
+    x: i16,
+    indent: i16,
+    max_x: i16,
+}
+
+/// Puts `piece` (a word, or the tail of one split at the last line end) on
+/// the line. When it does not fit, a line worth hyphenating takes the
+/// longest head of it that does; otherwise the line flushes and the piece
+/// waits for the next. A piece wider than a whole line breaks wherever it
+/// can, and overflows only when it cannot. Out of line: its temporaries
+/// must not ride the EPUB build's deepest frame.
+#[inline(never)]
+fn place_word_piece<
+    'w,
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    sink: &mut LibraryBlockSink<'_, '_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    piece: &'w str,
+    placement: WordPlacement,
+) -> Placement<'w>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let WordPlacement {
+        style,
+        role,
+        align,
+        leading_space,
+        may_hyphenate,
+        x,
+        indent,
+        max_x,
+    } = placement;
+    let kept_len = sink.line.len();
+    let kept_ink = sink.line_ink;
+    let line_was_empty = sink.line.is_empty();
+    if append_styled_word(&mut sink.line, piece, style, sink.line_style, leading_space).is_err() {
+        // The line's text buffer is full: the piece starts the next line.
+        sink.line.truncate(kept_len);
+        flush_styled_preview_line(sink, false);
+        if line_was_empty {
+            return Placement::Done;
+        }
+        return Placement::Continue(piece);
+    }
+    let mut measure = String::<MAX_READER_BLOCK_TEXT>::new();
+    let _ = measure.push_str(&sink.line[kept_len..]);
+    sink.push_line_ink_str(measure.as_str());
+
+    // The line in progress opens a paragraph while no line of it has
+    // flushed yet: the previous block still closes a paragraph. Once the
+    // first line flushes (as a non-end block) this goes false and the
+    // continuation lines wrap at the full width.
+    let opens_paragraph = sink.library.block_count == 0
+        || sink
+            .library
+            .block_paragraph_end
+            .get(sink.library.block_count.wrapping_sub(1))
+            .copied()
+            .unwrap_or(true);
+    let x_eff = if opens_paragraph { x + indent } else { x };
+    let limit = max_x - reader_layout::READER_WRAP_SAFETY;
+    if sink.line_ink_width() + x_eff <= limit {
+        sink.line_role = role;
+        sink.line_align = align;
+        sink.line_style = style;
+        sink.pending_space = false;
+        return Placement::Done;
+    }
+
+    let worth_splitting = line_was_empty || {
+        let kept_width = match kept_ink {
+            LineInkCursor::BuiltIn(cursor) => cursor.width(),
+            LineInkCursor::Custom(cursor) => cursor.width(),
+        };
+        let space = ui::reading::word_space_width(sink.library.type_settings(), style);
+        may_hyphenate
+            && ui::reading::worth_hyphenating(
+                limit - (x_eff + kept_width),
+                ui::reading::justify_gap_count(&sink.line[..kept_len]),
+                space,
+                sink.hyphen_run,
+            )
+    };
+    sink.line.truncate(kept_len);
+    sink.line_ink = kept_ink;
+    if worth_splitting {
+        if let Some(rest) = split_word_at_line_end(sink, piece, kept_len, placement, x_eff, limit) {
+            return Placement::Continue(rest);
+        }
+    }
+    if line_was_empty {
+        // Wider than any line and unbreakable: it overflows, as before.
+        let _ = append_styled_word(&mut sink.line, piece, style, sink.line_style, leading_space);
+        measure.clear();
+        let _ = measure.push_str(sink.line.as_str());
+        sink.push_line_ink_str(measure.as_str());
+        sink.line_role = role;
+        sink.line_align = align;
+        sink.line_style = style;
+        sink.pending_space = false;
+        return Placement::Done;
+    }
+    flush_styled_preview_line(sink, false);
+    Placement::Continue(piece)
+}
+
+/// Ends the line with the longest head of `piece` that fits before `limit`
+/// (plus its hyphen), flushes it, and returns where the piece resumes.
+/// None, with the line as it was, when no break fits.
+#[inline(never)]
+fn split_word_at_line_end<
+    'w,
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    sink: &mut LibraryBlockSink<'_, '_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    piece: &'w str,
+    kept_len: usize,
+    placement: WordPlacement,
+    x_eff: i16,
+    limit: i16,
+) -> Option<&'w str>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let mut breaks = heapless::Vec::<WordBreak, MAX_WORD_BREAKS>::new();
+    word_breaks(piece, sink.hyphenation, &mut breaks);
+    let kept_ink = sink.line_ink;
+    let mut measure = String::<MAX_READER_BLOCK_TEXT>::new();
+    for item in breaks.iter().rev() {
+        sink.line.truncate(kept_len);
+        sink.line_ink = kept_ink;
+        if append_styled_word(
+            &mut sink.line,
+            &piece[..item.head_end],
+            placement.style,
+            sink.line_style,
+            placement.leading_space,
+        )
+        .is_err()
+            || (item.hyphen && sink.line.push('-').is_err())
+        {
+            continue;
+        }
+        measure.clear();
+        let _ = measure.push_str(&sink.line[kept_len..]);
+        sink.push_line_ink_str(measure.as_str());
+        if sink.line_ink_width() + x_eff <= limit {
+            sink.line_role = placement.role;
+            sink.line_align = placement.align;
+            sink.line_style = placement.style;
+            sink.pending_space = false;
+            sink.line_hyphenated = item.hyphen;
+            flush_styled_preview_line(sink, false);
+            return Some(&piece[item.tail_start..]);
+        }
+    }
+    sink.line.truncate(kept_len);
+    sink.line_ink = kept_ink;
+    None
 }
 
 fn append_styled_word<const N: usize>(
@@ -2172,7 +2342,12 @@ fn append_styled_word<const N: usize>(
     if style != current_style {
         append_style_marker(line, style)?;
     }
-    line.push_str(word).map_err(|_| ())
+    // Soft hyphens only mark where a word may break; the fonts would draw
+    // them, so they never reach a stored line.
+    for ch in word.chars().filter(|ch| *ch != SOFT_HYPHEN) {
+        line.push(ch).map_err(|_| ())?;
+    }
+    Ok(())
 }
 
 fn append_style_marker<const N: usize>(line: &mut String<N>, style: FontStyle) -> Result<(), ()> {
@@ -2196,6 +2371,7 @@ fn flush_styled_preview_line<
 {
     if sink.line.is_empty() {
         if paragraph_end {
+            sink.hyphen_run = 0;
             sink.library.mark_last_block_paragraph_end();
             // Height-only change: the trailing paragraph gap moved without
             // block_count moving, so the page index is stale all the same.
@@ -2253,6 +2429,12 @@ fn flush_styled_preview_line<
         );
     }
     sink.pages_dirty = true;
+    sink.hyphen_run = if sink.line_hyphenated && !paragraph_end {
+        sink.hyphen_run.saturating_add(1)
+    } else {
+        0
+    };
+    sink.line_hyphenated = false;
     sink.line.clear();
     sink.reset_line_ink();
     sink.line_style = FontStyle::Regular;
@@ -2345,6 +2527,11 @@ fn push_normalized<const N: usize>(text: &str, out: &mut String<N>) {
                 break;
             }
             previous_space = true;
+        } else if ch == SOFT_HYPHEN {
+            // Kept inside words as a break hint; stripped when stored.
+            if out.push(ch).is_err() {
+                break;
+            }
         } else if is_invisible_format_char(ch) {
             continue;
         } else if push_normalized_char(ch, out).is_err() {
@@ -2354,6 +2541,8 @@ fn push_normalized<const N: usize>(text: &str, out: &mut String<N>) {
         }
     }
 }
+
+const SOFT_HYPHEN: char = '\u{00AD}';
 
 /// Characters with no glyph and no width: soft hyphen, zero-width
 /// space/joiners, word joiner, byte-order mark. Without this they render as
