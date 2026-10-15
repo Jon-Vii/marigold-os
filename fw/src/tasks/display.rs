@@ -1,12 +1,13 @@
 use crate::display_flush::{self, Epd};
 use crate::reader_cache::{
-    self, ReaderCacheScratch, READER_COMPRESSED_SCRATCH, READER_CONTAINER_SCRATCH,
+    self, Preparation, ReaderCacheScratch, READER_COMPRESSED_SCRATCH, READER_CONTAINER_SCRATCH,
     READER_HEADER_SCRATCH, READER_OPF_SCRATCH, READER_TAIL_SCRATCH, READER_XHTML_SCRATCH,
 };
 use crate::reader_store::{BookLoadStatus, ReaderStore};
 use crate::{
-    DisplayCommand, DisplayEvent, LibraryEvent, PowerEvent, StorageCommand, DISPLAY_COMMANDS,
-    DISPLAY_EVENTS, LATEST_READER_REQUEST_ID, LIBRARY_EVENTS, POWER_EVENTS, STORAGE_COMMANDS,
+    DisplayCommand, DisplayEvent, LibraryEvent, PowerEvent, StorageCommand, BUTTON_PRESSES,
+    DISPLAY_COMMANDS, DISPLAY_EVENTS, LATEST_READER_REQUEST_ID, LIBRARY_EVENTS, POWER_EVENTS,
+    STORAGE_COMMANDS,
 };
 use app_core::{
     display_orientation_from_u8, refresh_policy_from_u8, AppView, DisplayOrientation, ReaderSource,
@@ -17,7 +18,7 @@ use display::epd::RefreshMode;
 use display::fb::Framebuffer;
 use display::BAND_BYTES;
 use embassy_futures::select::{select, Either};
-use embassy_time::Instant;
+use embassy_time::{Duration, Instant};
 use esp_hal::gpio::Output;
 use hal_ext::nvm::AppStateRecord;
 use static_cell::ConstStaticCell;
@@ -30,6 +31,10 @@ const PROGRESS_WRITE_MIN_SECS: u64 = 15;
 /// Spacing between retries of a position write that failed (card pulled or
 /// a transient fault), so a missing card cannot spin the task.
 const PROGRESS_RETRY_SECS: u64 = 30;
+/// How long the reader must leave the device alone before the rest of an
+/// open book is prepared. Steps give way to a press anyway; the wait keeps
+/// a quick run of page turns from paying for one that was just started.
+const IDLE_PREPARATION_DELAY: Duration = Duration::from_millis(2000);
 
 static EPUB_TAIL: ConstStaticCell<[u8; READER_TAIL_SCRATCH]> =
     ConstStaticCell::new([0; READER_TAIL_SCRATCH]);
@@ -152,7 +157,20 @@ pub async fn run(
     // A loading plate can have the same request as its eventual page. Keep
     // this bit separate so a RAM reply only skips a proven body-page redraw.
     let mut last_reader_render_ready = false;
+    let mut idle = IdlePreparation::new();
     loop {
+        let idle_at = idle
+            .target(
+                sd_library,
+                refresh_planner.last_request(),
+                last_reader_render_ready,
+                &sync_session,
+            )
+            .map(|_| idle.at);
+        let wake = match (progress.deadline(), idle_at) {
+            (Some(progress_at), Some(idle_at)) => Some(progress_at.min(idle_at)),
+            (progress_at, idle_at) => progress_at.or(idle_at),
+        };
         let incoming = if pending_reader.is_some() {
             match select(
                 select(DISPLAY_COMMANDS.receive(), STORAGE_COMMANDS.receive()),
@@ -163,7 +181,7 @@ pub async fn run(
                 Either::First(command) => Some(command),
                 Either::Second(()) => Some(Either::Second(pending_reader.take().unwrap())),
             }
-        } else if let Some(due) = progress.deadline() {
+        } else if let Some(due) = wake {
             match select(
                 select(DISPLAY_COMMANDS.receive(), STORAGE_COMMANDS.receive()),
                 embassy_time::Timer::at(due),
@@ -177,11 +195,29 @@ pub async fn run(
             Some(select(DISPLAY_COMMANDS.receive(), STORAGE_COMMANDS.receive()).await)
         };
         let Some(incoming) = incoming else {
+            let now = Instant::now();
             // A coalesced position's write window ended with no further
             // page turn: land it now rather than waiting for the next one.
-            progress.flush(&mut epd, &mut sd_cs, sd_library);
+            if progress.deadline().is_some_and(|due| due <= now) {
+                progress.flush(&mut epd, &mut sd_cs, sd_library);
+            }
+            if idle_at.is_some_and(|at| at <= now) {
+                prepare_while_idle(
+                    &mut epd,
+                    &mut sd_cs,
+                    sd_library,
+                    font_metrics,
+                    &mut epub_scratch,
+                    refresh_planner.last_request(),
+                    &mut last_reader_render_ready,
+                    &sync_session,
+                    &mut idle,
+                );
+            }
             continue;
         };
+        // Any command means the reader is active again.
+        idle.rearm(IDLE_PREPARATION_DELAY);
         match incoming {
             Either::First(DisplayCommand::Render(request)) => {
                 if pending_reader.is_some_and(|command| !pending_reader_matches(command, request)) {
@@ -543,6 +579,134 @@ pub(crate) fn pending_reader_matches(command: StorageCommand, request: RenderReq
         && app_core::is_portrait(request.orientation) == portrait
 }
 
+/// Idle-time preparation of the rest of the open book: when it may next
+/// run, the button-press count it was armed at (a press since then means
+/// the reader is back), and a spine that failed, not retried until the
+/// book's preparation moves on some other way.
+struct IdlePreparation {
+    at: Instant,
+    presses: u32,
+    failed: Option<(usize, u16)>,
+}
+
+impl IdlePreparation {
+    fn new() -> Self {
+        Self {
+            at: Instant::now() + IDLE_PREPARATION_DELAY,
+            presses: BUTTON_PRESSES.load(Ordering::Relaxed),
+            failed: None,
+        }
+    }
+
+    fn rearm(&mut self, delay: Duration) {
+        self.at = Instant::now() + delay;
+        self.presses = BUTTON_PRESSES.load(Ordering::Relaxed);
+    }
+
+    /// The page on screen and its book, while that book is only partly
+    /// prepared and nothing else needs the card: the reader is on a resident
+    /// page of it in the layout it was prepared for, and no sync session
+    /// holds the scratch.
+    fn target(
+        &self,
+        sd_library: &ReaderStore,
+        last_request: Option<RenderRequest>,
+        last_reader_render_ready: bool,
+        sync_session: &SyncSession,
+    ) -> Option<(RenderRequest, usize)> {
+        let request = last_request?;
+        let index = ReaderSource::from_book_id(request.book_id).sd_index()? as usize;
+        let next_spine = sd_library.book_next_spine()?;
+        (last_reader_render_ready
+            && !sync_session.active()
+            && sd_library.loaded_index == Some(index)
+            && sd_library.reader_status() == BookLoadStatus::Ready
+            && self.failed != Some((index, next_spine)))
+        .then_some((request, index))
+    }
+}
+
+/// Prepare the open book's next spine while the reader is idle, leaving the
+/// page on screen resident, and tell the app how far the book now reaches.
+/// Then arm the next step: after a yield to the other tasks, or once the
+/// reader is idle again if a press came in. Out of line, so the task loop's
+/// poll frame stays small.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn prepare_while_idle(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    sd_library: &mut ReaderStore,
+    font_metrics: &mut crate::custom_font::MetricCache,
+    epub_scratch: &mut Option<&'static mut ReaderCacheScratch<'static>>,
+    last_request: Option<RenderRequest>,
+    last_reader_render_ready: &mut bool,
+    sync_session: &SyncSession,
+    idle: &mut IdlePreparation,
+) {
+    let Some((request, index)) = idle.target(
+        sd_library,
+        last_request,
+        *last_reader_render_ready,
+        sync_session,
+    ) else {
+        return;
+    };
+    let presses = idle.presses;
+    if BUTTON_PRESSES.load(Ordering::Relaxed) != presses {
+        idle.rearm(IDLE_PREPARATION_DELAY);
+        return;
+    }
+    let started = Instant::now();
+    let next_spine = sd_library.book_next_spine();
+    let scratch = ensure_epub_scratch(epub_scratch);
+    reader_cache::build_or_load_book_cache(
+        epd,
+        sd_cs,
+        sd_library,
+        index,
+        request.chapter,
+        request.page as usize,
+        None,
+        scratch,
+        font_metrics,
+        Preparation::Idle { presses },
+    );
+    let pressed = BUTTON_PRESSES.load(Ordering::Relaxed) != presses;
+    let grew = sd_library.book_next_spine() != next_spine;
+    esp_println::println!(
+        "bench: idle_prepare elapsed_ms={} grew={} pressed={} next_spine={:?} pages={} status={:?} t_ms={}",
+        started.elapsed().as_millis(),
+        grew,
+        pressed,
+        sd_library.book_next_spine(),
+        sd_library.advertised_page_count(),
+        sd_library.reader_status(),
+        Instant::now().as_millis(),
+    );
+    if grew && sd_library.reader_status() == BookLoadStatus::Ready {
+        send_loaded_library_event(&LibraryEvent::Prepared {
+            book_id: request.book_id,
+            pages: sd_library.advertised_page_count(),
+            chapters: sd_library.chapter_count_for_ui(),
+            chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
+            complete: sd_library.book_next_spine().is_none(),
+        });
+    }
+    if !grew && !pressed {
+        idle.failed = next_spine.map(|spine| (index, spine));
+    }
+    // The page on screen is read back after every step; say whether it is
+    // still resident for the next request.
+    *last_reader_render_ready = sd_library.covers_global_page(index, request.page);
+    crate::stack_probe::report("idle");
+    idle.rearm(if pressed {
+        IDLE_PREPARATION_DELAY
+    } else {
+        Duration::from_millis(1)
+    });
+}
+
 fn send_library_event(event: &LibraryEvent) {
     if LIBRARY_EVENTS.try_send(*event).is_err() {
         esp_println::println!("display: library event queue full");
@@ -893,6 +1057,7 @@ fn handle_storage_command(
                 None,
                 scratch,
                 font_metrics,
+                Preparation::Request,
             );
             if request_id != LATEST_READER_REQUEST_ID.load(Ordering::Relaxed) {
                 return;
@@ -1025,6 +1190,7 @@ fn handle_storage_command(
                 requested_spine,
                 scratch,
                 font_metrics,
+                Preparation::Request,
             );
             if request_id != LATEST_READER_REQUEST_ID.load(Ordering::Relaxed) {
                 return;

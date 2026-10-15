@@ -181,6 +181,30 @@ pub(crate) fn dismantle_scratch(
     }
 }
 
+/// What a call to `build_or_load_book_cache` is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Preparation {
+    /// A reader request: answer it as soon as the prepared prefix holds
+    /// its page, preparing one more spine per call until it does.
+    Request,
+    /// Idle-time growth of the open book: prepare its next spine, keep the
+    /// requested page (the one on screen) resident, and give way the moment
+    /// a button press lands after `presses` was read from
+    /// `crate::BUTTON_PRESSES`.
+    Idle { presses: u32 },
+}
+
+impl Preparation {
+    fn gives_way(self) -> bool {
+        match self {
+            Self::Request => false,
+            Self::Idle { presses } => {
+                crate::BUTTON_PRESSES.load(core::sync::atomic::Ordering::Relaxed) != presses
+            }
+        }
+    }
+}
+
 /// Kept out of line: the storage dispatcher's frame must stay small, and the
 /// EPUB open path below already runs close to the 30 KB stack region.
 #[inline(never)]
@@ -195,6 +219,7 @@ pub(crate) fn build_or_load_book_cache(
     requested_spine: Option<u16>,
     scratch: &mut ReaderCacheScratch<'_>,
     font_metrics: &mut crate::custom_font::MetricCache,
+    preparation: Preparation,
 ) {
     esp_println::println!(
         "epub: cache open index {} chapter {} target {}",
@@ -232,6 +257,7 @@ pub(crate) fn build_or_load_book_cache(
             requested_spine,
             scratch,
             font_metrics,
+            preparation,
         )
     })
     .unwrap_or_else(|err| {
@@ -261,6 +287,7 @@ pub(crate) fn build_or_load_book_cache_from_root<
     requested_spine: Option<u16>,
     scratch: &mut ReaderCacheScratch<'_>,
     font_metrics: &mut crate::custom_font::MetricCache,
+    preparation: Preparation,
 ) -> BookLoadStatus
 where
     D: embedded_sdmmc::BlockDevice,
@@ -300,15 +327,20 @@ where
         Instant::now(),
         "fast",
         scratch.xhtml,
+        preparation,
     ) {
         return BookLoadStatus::Ready;
     }
     // Preparation follows. If the type settings or orientation changed since
     // the on-card pages were laid out, pin the requested page in them now,
     // before the rebuild replaces them. Once per request: later steps of the
-    // same rebuild keep the pin rather than re-reading the index.
+    // same rebuild keep the pin rather than re-reading the index. An idle
+    // step only appends, so its page keeps its number.
     let target_page = target_pages as u32;
-    if requested_spine.is_none() && !library.anchors(source_identity, target_page) {
+    if preparation == Preparation::Request
+        && requested_spine.is_none()
+        && !library.anchors(source_identity, target_page)
+    {
         let anchor = reader_cache_files::read_v2_page_anchor(
             root,
             cache_key.as_str(),
@@ -319,8 +351,8 @@ where
         library.set_page_anchor(Some(anchor));
     }
 
-    if in_books_dir {
-        let load_result = match root.open_dir("BOOKS") {
+    let load_result = if in_books_dir {
+        match root.open_dir("BOOKS") {
             Ok(books) => match books.open_file_in_dir(open_name.as_str(), Mode::ReadOnly) {
                 Ok(file) => Some(build_or_load_epub_cache_from_file(
                     file,
@@ -332,6 +364,7 @@ where
                     library,
                     scratch,
                     font_metrics,
+                    preparation,
                 )),
                 Err(err) => {
                     esp_println::println!("epub: open file failed: {:?}", err);
@@ -344,10 +377,9 @@ where
                 set_preview_error(library, "BOOKS DIR");
                 None
             }
-        };
-        status_for_load_result(load_result, library)
+        }
     } else {
-        let load_result = match root.open_file_in_dir(open_name.as_str(), Mode::ReadOnly) {
+        match root.open_file_in_dir(open_name.as_str(), Mode::ReadOnly) {
             Ok(file) => Some(build_or_load_epub_cache_from_file(
                 file,
                 root,
@@ -358,15 +390,43 @@ where
                 library,
                 scratch,
                 font_metrics,
+                preparation,
             )),
             Err(err) => {
                 esp_println::println!("epub: open file failed: {:?}", err);
                 set_preview_error(library, "FILE");
                 None
             }
-        };
-        status_for_load_result(load_result, library)
+        }
+    };
+    if let (Preparation::Idle { .. }, Some(Err(err))) = (preparation, load_result) {
+        // Nothing reached the index, so the card still holds the prefix as
+        // it stood: read the page on screen back from it. A failed step
+        // costs only the spine it was on, never the reader's page.
+        if err == ReaderCacheError::Interrupted {
+            esp_println::println!("epub: idle preparation gave way to a button press");
+        } else {
+            esp_println::println!("epub: idle preparation failed: {:?}", err);
+        }
+        library.begin_book_load();
+        if try_load_v2_book_cache(
+            root,
+            cache_key.as_str(),
+            source_identity,
+            target_page,
+            None,
+            library,
+            Instant::now(),
+            "resume",
+            scratch.xhtml,
+            Preparation::Request,
+        ) {
+            return BookLoadStatus::Ready;
+        }
+        set_preview_error(library, "CACHE READ");
+        return BookLoadStatus::Error;
     }
+    status_for_load_result(load_result, library)
 }
 
 #[inline(never)]
@@ -659,6 +719,7 @@ fn try_load_v2_book_cache<
     started: Instant,
     label: &str,
     reflow_scratch: &mut [u8],
+    preparation: Preparation,
 ) -> bool
 where
     D: embedded_sdmmc::BlockDevice,
@@ -692,10 +753,13 @@ where
     }
     match result {
         BookIndexLoadResult::Hit => {
-            // A durable prefix is a resume point for preparation, not a ready
-            // book. Returning a cache hit here would keep replaying that prefix
-            // without ever appending its remaining spines.
-            if library.book_next_spine().is_some() {
+            // A durable prefix is where preparation resumes. It answers a
+            // request whose page it already holds; anything else, and every
+            // idle-time step, goes on to append the next spine.
+            let requested = library.requested_page(requested_global_page, requested_spine);
+            if library.book_next_spine().is_some()
+                && (preparation != Preparation::Request || requested.is_none())
+            {
                 return false;
             }
             // BOOK is the commit record. Reconstruct a generated TOC sidecar
@@ -706,9 +770,7 @@ where
             {
                 return false;
             }
-            let Some(requested_global_page) =
-                library.requested_page(requested_global_page, requested_spine)
-            else {
+            let Some(requested_global_page) = requested else {
                 return false;
             };
             match reader_cache_files::load_v2_section_by_global_page(
@@ -877,11 +939,11 @@ fn set_preview_error(library: &mut ReaderStore, message: &str) {
 }
 
 fn status_for_load_result(
-    result: Option<Result<(), ReaderCacheError>>,
+    result: Option<Result<BookLoadStatus, ReaderCacheError>>,
     library: &mut ReaderStore,
 ) -> BookLoadStatus {
     match result {
-        Some(Ok(())) => BookLoadStatus::Ready,
+        Some(Ok(status)) => status,
         Some(Err(err)) => {
             esp_println::println!("epub: load failed: {:?}", err);
             set_preview_error_from_error(library, err);
@@ -922,6 +984,7 @@ fn set_preview_error_from_error(library: &mut ReaderStore, error: ReaderCacheErr
         ReaderCacheError::CacheWrite => "CACHE WRITE",
         ReaderCacheError::CacheRead => "CACHE READ",
         ReaderCacheError::EntryNameTooLong => "PATH LONG",
+        ReaderCacheError::Interrupted => "INTERRUPTED",
     };
     set_preview_error(library, message);
 }
@@ -938,6 +1001,8 @@ enum ReaderCacheError {
     CacheWrite,
     CacheRead,
     EntryNameTooLong,
+    /// An idle-time step gave way to a button press before committing.
+    Interrupted,
 }
 
 impl From<proto::epub::ZipError> for ReaderCacheError {
@@ -976,7 +1041,8 @@ fn build_or_load_epub_cache_from_file<
     library: &mut ReaderStore,
     scratch: &mut ReaderCacheScratch<'_>,
     font_metrics: &mut crate::custom_font::MetricCache,
-) -> Result<(), ReaderCacheError>
+    preparation: Preparation,
+) -> Result<BookLoadStatus, ReaderCacheError>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
@@ -1014,6 +1080,7 @@ where
         open_started,
         library,
         font_metrics,
+        preparation,
         ZipBuildScratch {
             header: scratch.header,
             name: scratch.name,
@@ -1056,8 +1123,9 @@ fn build_or_load_epub_cache_from_zip<
     open_started: Instant,
     library: &mut ReaderStore,
     font_metrics: &mut crate::custom_font::MetricCache,
+    preparation: Preparation,
     scratch: ZipBuildScratch<'_>,
-) -> Result<(), ReaderCacheError>
+) -> Result<BookLoadStatus, ReaderCacheError>
 where
     Z: EpubZipOps,
     D: embedded_sdmmc::BlockDevice,
@@ -1125,6 +1193,9 @@ where
         package.opf_text.len()
     );
 
+    if preparation.gives_way() {
+        return Err(ReaderCacheError::Interrupted);
+    }
     library.set_book_labels(package.meta.title, package.meta.author);
     library.clear_cover();
     if resumed_sections == 0 {
@@ -1291,6 +1362,8 @@ where
                 hyphen_run: 0,
                 line_hyphenated: false,
                 stopped: false,
+                preparation,
+                interrupted: false,
                 target_pages: visible_page_capacity,
                 generate_toc_from_headings,
                 generated_toc_for_spine: false,
@@ -1324,10 +1397,16 @@ where
                         })
                 },
             );
+            if sink.interrupted {
+                return Err(ReaderCacheError::Interrupted);
+            }
             match read_result {
                 Ok(()) => {
                     if let Some(parser) = parser.as_mut() {
                         if let Err(err) = tokenizer.finish_xhtml_blocks(parser, &mut sink) {
+                            if sink.interrupted {
+                                return Err(ReaderCacheError::Interrupted);
+                            }
                             if !sink.stopped {
                                 return Err(err.into());
                             }
@@ -1446,9 +1525,13 @@ where
             HYPHEN_LOOKUPS.swap(0, portable_atomic::Ordering::Relaxed),
             HYPHEN_LOOKUP_MICROS.swap(0, portable_atomic::Ordering::Relaxed) / 1000,
         );
-        Ok(())
+        Ok(if resolved_page.is_some() {
+            BookLoadStatus::Ready
+        } else {
+            BookLoadStatus::Loading
+        })
     } else if next_spine.is_some() {
-        Ok(())
+        Ok(BookLoadStatus::Loading)
     } else if saw_spine {
         Err(ReaderCacheError::NoBodyText)
     } else {
@@ -1778,6 +1861,10 @@ struct LibraryBlockSink<
     hyphen_run: u8,
     line_hyphenated: bool,
     stopped: bool,
+    /// An idle-time step stops at the next block once a button is pressed,
+    /// and says so here: unlike `stopped`, nothing it built is kept.
+    preparation: Preparation,
+    interrupted: bool,
     target_pages: usize,
     generate_toc_from_headings: bool,
     generated_toc_for_spine: bool,
@@ -1986,7 +2073,11 @@ where
         align: TextAlign,
         paragraph_end: bool,
     ) -> Result<(), XhtmlError> {
-        if self.stopped {
+        if self.stopped || self.interrupted {
+            return Err(XhtmlError::TooManyRuns);
+        }
+        if self.preparation.gives_way() {
+            self.interrupted = true;
             return Err(XhtmlError::TooManyRuns);
         }
         self.flush_if_full();

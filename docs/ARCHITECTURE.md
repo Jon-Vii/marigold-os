@@ -216,7 +216,8 @@ FAT, open EPUBs, build caches, or write progress. Open/extend requests whose
 page already sits inside the loaded section window are answered from RAM
 without an SD session. Page turns keep the current panel image until the
 storage reply, then render the requested page once. A section already present
-in the completed book index needs only a cache read and never a loading plate.
+in the book index, complete or a prepared prefix, needs only a cache read and
+never a loading plate.
 Reading-progress writes are coalesced: same-book page turns land at most one
 alternating STATEA/STATEB generation per 15 s, and a coalesced position is
 written when its window ends even without another page turn, so a battery
@@ -409,7 +410,9 @@ with a hyphen. The word is measured glyph by glyph first (those tables stay
 cached, as every word is measured), and the patterns, which are cold by the
 time a line ends, are consulted only if a two-letter head fits, and only for
 the head that does. On X4 that keeps hyphenation to about a fifth more time
-on a cold book build (Death in Venice: 18.9 s without, 24.6 s with). A paragraph's last word is never split, and a word wider than
+on a cold book build (Death in Venice: 18.9 s without, 24.6 s with), most of
+which idle-time preparation (see the reader cache) keeps off the open. A
+paragraph's last word is never split, and a word wider than
 a whole line breaks wherever it can. At draw time, `justify_extra` leaves a
 line at natural spacing rather than open gaps past one and a half spaces, as
 well as lines under two thirds of the measure. Soft hyphens survive
@@ -424,28 +427,43 @@ board-I/O owner.
 
 ## SD-backed reader cache
 
-The SD reader prepares its complete V2 cache before displaying a book. A cold open parses the
+The SD reader shows a book as soon as its V2 cache reaches the requested
+page, and prepares the rest while the reader is idle. A cold open parses the
 package metadata and processes at most one eligible spine item per storage
 step, then commits its section files and updated book index. The loading plate
-stays visible until the cache reaches its terminal end, even if the requested
-page is already available. This keeps EPUB preparation out of subsequent page
-turns. Completed caches retain the fast open path; interrupted caches and
-prefixes from the original v0.5.0 resume preparation before reading starts.
+stays up only until a committed prefix holds the requested page (or chapter, or
+the text start of a first open); the store is then Ready on that prefix. Page
+numbers are global, so a request deep into the book still prepares every spine
+before it: a resume at page 430 of 574 after a layout change waits about as
+long as a full build, while one at page 17 of 1,276 took 2.3 s of
+preparation (X4, October 2026).
 
 Each continuation closes its ZIP/FAT handles, retains only the request and a
 durable next-spine cursor, and reopens the package on the next step. The board
 I/O task yields between steps so queued navigation, sleep, and cancellation can
 run. A request generation rejects stale work and results after leaving the book
-or changing its layout. One spine is the work unit, not a bounded wall-clock
-interval: a large XHTML spine can still block the shared I/O owner until its
-stream finishes. Cancellation does not interrupt that stream mid-spine.
+or changing its layout. One spine is the work unit of a request: a large XHTML
+spine still blocks the shared I/O owner until its stream finishes.
+
+The rest of a Ready prefix is prepared by the display task when the reader is
+idle: no command for two seconds, the page on screen resident in the layout it
+was prepared for, and no sync session. Each idle step appends one spine and
+reads the page on screen back, then yields before the next. It gives way at
+the next paragraph, or after the OPF parse, once a button press moves
+`BUTTON_PRESSES` (the input producers count every press as they queue it, so
+the step sees a press the app task has not yet received). A step that gives
+way or fails commits nothing: the card still holds the prefix, and the step
+reloads the page on screen from it (about 65 ms), so the press is served
+promptly. A spine that fails is not retried until preparation moves on some
+other way. Growth reaches the app as `LibraryEvent::Prepared`, which updates
+page and chapter counts without a repaint. A reader who outpaces it reaches
+the prefix's end and gets a request step with the loading plate.
 
 While a next-spine cursor exists, the cached page count is a known prefix, not
-the book's total, and the reader store remains Loading. An unresolved chapter
-target stays unresolved rather than aliasing page zero or the last cached
-section. Appending complete spines preserves earlier page numbers and chapter
-boundaries. Reopening can reuse the committed prefix after sleep or an
-interrupted later step.
+the book's total. An unresolved chapter target stays unresolved rather than
+aliasing page zero or the last cached section. Appending complete spines
+preserves earlier page numbers and chapter boundaries. Reopening can reuse the
+committed prefix after sleep or an interrupted later step.
 
 The build covers every spine item from the first (navigation documents
 aside), front matter included. It also records where the main text starts:

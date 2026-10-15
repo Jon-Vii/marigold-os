@@ -42,6 +42,7 @@ pub async fn run(usb: USB_DEVICE<'static>) {
             let status = if INPUT_EVENTS.try_send(InputEvent::button(button)).is_err() {
                 "queue_full"
             } else {
+                crate::note_button_press();
                 // InputEvent::button uses the host-test battery sample (77%).
                 // Identify injected input explicitly in timing/battery traces.
                 esp_println::println!(

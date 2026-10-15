@@ -887,14 +887,11 @@ impl ReaderStore {
         self.clear_book_index();
     }
 
+    /// `Ready` means the requested page is readable, which a prepared
+    /// prefix can already be: the rest of the book is prepared while the
+    /// reader is idle (see the display task), and `book_next_spine` says
+    /// where that resumes.
     pub(crate) fn finish_book_load(&mut self, index: usize, chapter: u16, status: BookLoadStatus) {
-        // Commit progress between spines, but finish preparation before exposing
-        // any page. Otherwise ordinary forward turns pay for later EPUB builds.
-        let status = if status == BookLoadStatus::Ready && self.book_next_spine.is_some() {
-            BookLoadStatus::Loading
-        } else {
-            status
-        };
         if matches!(status, BookLoadStatus::Ready) {
             self.set_current_index(index);
         }
@@ -1234,11 +1231,11 @@ impl ReaderStore {
     }
 
     /// Whether a short section-cache read can satisfy the page, without EPUB
-    /// preparation or its loading plate. The section need not be resident.
+    /// preparation or its loading plate. The section need not be resident,
+    /// and the book need only be prepared as far as the page.
     pub(crate) fn has_prepared_page(&self, index: usize, global_page: u32) -> bool {
         self.loaded_index == Some(index)
             && self.reader_status == BookLoadStatus::Ready
-            && self.book_next_spine.is_none()
             && global_page < self.book_total_pages
             && self.section_for_global_page(global_page).is_some()
     }

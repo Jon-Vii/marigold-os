@@ -209,6 +209,21 @@ pub static INPUT_EVENTS: Channel<CriticalSectionRawMutex, InputEvent, 8> = Chann
 pub static INPUT_START: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
 pub static INPUT_ENABLED: AtomicBool = AtomicBool::new(false);
 pub static LATEST_READER_REQUEST_ID: AtomicU32 = AtomicU32::new(0);
+/// Moves on every button press queued on `INPUT_EVENTS` (battery samples
+/// carry none), so work running on the display task can see a press the
+/// app task has not yet been able to receive and give way to it.
+pub static BUTTON_PRESSES: AtomicU32 = AtomicU32::new(0);
+
+/// Count a button press for `BUTTON_PRESSES`; every producer of button
+/// events calls this as it queues one. Readers only compare against an
+/// earlier value, so two writers racing still move the count.
+pub fn note_button_press() {
+    let presses = BUTTON_PRESSES.load(core::sync::atomic::Ordering::Relaxed);
+    BUTTON_PRESSES.store(
+        presses.wrapping_add(1),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
 pub static DISPLAY_COMMANDS: Channel<CriticalSectionRawMutex, DisplayCommand, 4> = Channel::new();
 pub static DISPLAY_EVENTS: Channel<CriticalSectionRawMutex, DisplayEvent, 16> = Channel::new();
 pub static LIBRARY_EVENTS: Channel<CriticalSectionRawMutex, LibraryEvent, 8> = Channel::new();

@@ -272,6 +272,9 @@ fn stable_percent(reported: &mut Option<u8>, raw: u8) -> u8 {
 }
 
 fn emit(button: Option<Button>, sample: RawSample, battery_mv: u16, battery_percent: u8) {
+    if button.is_some() {
+        crate::note_button_press();
+    }
     let event = InputEvent::Sample {
         button,
         aux_raw: sample.aux,

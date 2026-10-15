@@ -544,6 +544,15 @@ pub enum LibraryEvent {
         /// The resolved requested page, or None for progress without a page change.
         page: Option<u32>,
     },
+    /// Idle-time preparation grew the open book's readable prefix. Counts
+    /// only: the page on screen and any pending turn stay as they are.
+    Prepared {
+        book_id: u32,
+        pages: u32,
+        chapters: u16,
+        chapter_pages: [u16; MAX_SD_CHAPTERS],
+        complete: bool,
+    },
     /// Loading failed without establishing EOF; the readable prefix remains valid.
     ReaderLoadFailed {
         request_id: u32,
@@ -1148,6 +1157,20 @@ impl ReaderState {
                         self.page = self.page.min(last_page);
                     }
                     self.dirty = Rect::FULL;
+                }
+            }
+            LibraryEvent::Prepared {
+                book_id,
+                pages,
+                chapters,
+                chapter_pages,
+                complete,
+            } => {
+                if self.book_id == book_id {
+                    self.sd_page_count = pages.max(1);
+                    self.sd_complete = complete;
+                    self.sd_chapter_count = chapters.max(1);
+                    self.sd_chapter_pages = chapter_pages;
                 }
             }
             LibraryEvent::ReaderLoadFailed { book_id, .. } => {
@@ -1899,6 +1922,51 @@ mod tests {
                 page,
             },
         )
+    }
+
+    #[test]
+    fn idle_preparation_grows_the_book_without_moving_the_reader() {
+        let mut state = ReaderState::boot();
+        state.view = AppView::Reading;
+        state.book_id = ReaderSource::sd(0).book_id();
+        state.page = 3;
+        state.sd_page_count = 4;
+        state.sd_complete = false;
+        let prepared = |state: ReaderState, book_id, pages, complete| {
+            state.apply_library_event(
+                CTX,
+                LibraryEvent::Prepared {
+                    book_id,
+                    pages,
+                    chapters: 2,
+                    chapter_pages: [0; MAX_SD_CHAPTERS],
+                    complete,
+                },
+            )
+        };
+        let grown = prepared(state, state.book_id, 9, false);
+        assert_eq!(grown.page, 3);
+        assert_eq!(grown.dirty, state.dirty);
+        assert_eq!(grown.sd_chapter_count, 2);
+        // The next turn is now inside the prefix: no pending load.
+        let turned = press(grown, Button::Next);
+        assert_eq!((turned.page, turned.pending_page), (4, None));
+        let done = prepared(grown, state.book_id, 20, true);
+        assert_eq!(done.render_request(RenderKind::Page).page_count, 20);
+        // Another book's preparation leaves this one alone.
+        let other = prepared(state, ReaderSource::sd(1).book_id(), 20, true);
+        assert_eq!((other.sd_page_count, other.sd_complete), (4, false));
+        assert_eq!(
+            LibraryEvent::Prepared {
+                book_id: state.book_id,
+                pages: 9,
+                chapters: 2,
+                chapter_pages: [0; MAX_SD_CHAPTERS],
+                complete: false,
+            }
+            .reader_request_id(),
+            None
+        );
     }
 
     #[test]

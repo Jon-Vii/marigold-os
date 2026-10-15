@@ -12,19 +12,22 @@ use proto::cache::BookV2SectionRecord;
 use reader_store::{BookLoadStatus, ReaderStore};
 
 #[test]
-fn book_open_waits_for_all_spines_even_when_the_requested_page_is_cached() {
+fn a_prefix_that_holds_the_requested_page_is_ready_before_the_rest() {
     let mut store = ReaderStore::new();
     let sections = [section(0, 0, 0, 7), section(1, 1, 7, 5)];
     store.set_book_index(7, false, &sections[..1]);
     store.set_book_next_spine(Some(1));
     store.set_current_section_range(0, 7);
     store.page_count = 7;
-    // The requested page is available after the first spine, but publishing
-    // it now defers the next spine's preparation until a forward page turn.
+    // The first spine holds the page: show it, and prepare the rest while
+    // the reader is idle.
     assert_eq!(store.requested_page(0, None), Some(0));
     store.finish_book_load(0, 0, BookLoadStatus::Ready);
-    assert_eq!(store.reader_status(), BookLoadStatus::Loading);
-    assert!(!store.covers_global_page(0, 0));
+    assert_eq!(store.reader_status(), BookLoadStatus::Ready);
+    assert!(store.covers_global_page(0, 0));
+    // Pages past the prefix still need preparation.
+    assert_eq!(store.requested_page(7, None), None);
+    assert!(!store.has_prepared_page(0, 7));
 
     store.set_book_index(12, false, &sections);
     store.set_book_next_spine(None);
@@ -72,9 +75,11 @@ fn prepared_sections_do_not_need_a_loading_plate_when_the_ram_window_changes() {
     assert!(store.has_prepared_page(0, 7));
     assert!(!store.has_prepared_page(1, 7));
     assert!(!store.has_prepared_page(0, 12));
+    // A book still being prepared serves the pages it has.
     store.set_book_next_spine(Some(2));
     store.finish_book_load(0, 0, BookLoadStatus::Ready);
-    assert!(!store.has_prepared_page(0, 7));
+    assert!(store.has_prepared_page(0, 7));
+    assert!(!store.has_prepared_page(0, 12));
 }
 
 #[test]

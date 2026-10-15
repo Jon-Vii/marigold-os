@@ -415,6 +415,8 @@ fn library_event_affects_view(state: &ReaderState, event: &crate::LibraryEvent) 
                     || state.view == AppView::Chapters
                     || (state.view == AppView::Reading && page.is_some()))
         }
+        // Idle-time growth changes nothing on the page being read.
+        crate::LibraryEvent::Prepared { .. } => false,
         crate::LibraryEvent::ReaderLoadFailed { book_id, .. } => {
             state.book_id == book_id && state.view == AppView::Reading
         }
