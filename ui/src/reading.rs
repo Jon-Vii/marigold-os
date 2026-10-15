@@ -474,8 +474,10 @@ pub const READER_WRAP_SAFETY: i16 = 4;
 /// survive, scene breaks (`<hr>`) render, comments no longer swallow text,
 /// and lines no longer break early at section seams. Rebuild every book.
 /// v21: front matter before the text start is built into the book (it used
-/// to be dropped), which moves every page number after it.
-const READER_LAYOUT_VERSION: u16 = 21;
+/// to be dropped), which moves every page number after it. v22: books of
+/// more than 192 spine items or 320 sections were cached cut short; rebuild
+/// them whole.
+const READER_LAYOUT_VERSION: u16 = 22;
 
 /// Panel-geometry salt folded into the version bits: wrap points and page
 /// heights depend on the page box, so pagination cached on one panel must
