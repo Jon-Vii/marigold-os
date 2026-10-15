@@ -390,7 +390,8 @@ and the host preview tool:
   soft hyphens (the only breaks when present), dashes already in a compound,
   and for English (`dc:language` `en*`), Liang's algorithm over the US English
   TeX patterns (hyph-utf8, generated into flash by
-  `tools/generate_hyphenation.py`). Two letters stay before a pattern break and
+  `tools/generate_hyphenation.py` as a trie whose first two levels are direct
+  tables). Two letters stay before a pattern break and
   three after; short words, acronyms, and words with digits or accents stay
   whole.
 - `BookV2Header` with `BookV2SectionRecord`, and `SectionV2Header` with
@@ -404,7 +405,11 @@ longer fits a justified body line, `ui::reading::worth_hyphenating` decides
 whether moving it would leave the line loose (each gap growing by more than
 half a space; after two hyphenated lines in a row, by more than a whole
 space), and if so the line takes the longest head of the word that fits,
-with a hyphen. A paragraph's last word is never split, and a word wider than
+with a hyphen. The word is measured glyph by glyph first (those tables stay
+cached, as every word is measured), and the patterns, which are cold by the
+time a line ends, are consulted only if a two-letter head fits, and only for
+the head that does. On X4 that keeps hyphenation to about a fifth more time
+on a cold book build (Death in Venice: 18.9 s without, 24.6 s with). A paragraph's last word is never split, and a word wider than
 a whole line breaks wherever it can. At draw time, `justify_extra` leaves a
 line at natural spacing rather than open gaps past one and a half spaces, as
 well as lines under two thirds of the measure. Soft hyphens survive

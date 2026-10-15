@@ -9,10 +9,11 @@ Emits proto/src/hyphen_en_us_generated.rs from Liang/TeX patterns in the
 hyph-utf8 project (hyphenation/tex-hyphen), pinned to one commit and checked
 against known SHA-256 digests, so a regeneration is byte-reproducible.
 
-Patterns become three flash tables: every pattern's letters concatenated in
-sorted order (KEYS), where each starts (KEY_STARTS), and its inter-letter
-values as ASCII digits (VALUES; pattern i's run starts at KEY_STARTS[i] + i,
-one more value than letters). The exception list maps whole words to the
+Patterns become a trie in flash, nodes in breadth-first order so each node's
+children are contiguous. Each node is three u16s side by side (first child,
+where its pattern's values start, letter and child count), so a lookup
+touches one flash cache line per node; the values are ASCII digits (VALUES,
+one more than the pattern's letters). The exception list maps whole words to the
 words hyphenated by hand.
 
 The patterns' licence asks that the copyright notice and licence text be
@@ -90,11 +91,40 @@ def main() -> None:
         sys.exit("duplicate pattern keys")
     if any(set(key) - set(".abcdefghijklmnopqrstuvwxyz") for key in keys):
         sys.exit("unexpected pattern characters")
-    starts = [0]
-    for key in keys:
-        starts.append(starts[-1] + len(key))
-    if starts[-1] > 0xFFFF:
-        sys.exit("KEYS outgrew u16 offsets")
+    # A trie over the pattern letters, nodes in breadth-first order so each
+    # node's children sit together (sorted by letter): a lookup walks one
+    # letter at a time instead of searching every pattern per substring.
+    trie = {"": None}
+    for index, key in enumerate(keys):
+        for depth in range(1, len(key) + 1):
+            trie.setdefault(key[:depth], None)
+        trie[key] = index
+    order = [""]
+    children = {}
+    for prefix in order:
+        kids = sorted(k for k in trie if len(k) == len(prefix) + 1 and k.startswith(prefix))
+        children[prefix] = kids
+        order.extend(kids)
+    if len(order) > 0xFFFF:
+        sys.exit("trie outgrew u16 node indices")
+    node_of = {prefix: i for i, prefix in enumerate(order)}
+    value_starts = []
+    at = 0
+    for _, values in patterns:
+        value_starts.append(at)
+        at += len(values)
+    if at > 0xFFFF:
+        sys.exit("VALUES outgrew u16 offsets")
+    first_child = []
+    child_count = []
+    value_at = []
+    for prefix in order:
+        kids = children[prefix]
+        first_child.append(node_of[kids[0]] if kids else 0)
+        child_count.append(len(kids))
+        pattern = trie[prefix]
+        value_at.append(0xFFFF if pattern is None else value_starts[pattern])
+    letters = "".join(prefix[-1] if prefix else "." for prefix in order)
 
     exceptions = sorted(
         line.strip() for line in fetch("hyph-en-us.hyp.txt").splitlines() if line.strip()
@@ -109,23 +139,40 @@ def main() -> None:
     out.append("//")
     out.append(NOTICE)
     out.append("")
-    out.append(f"pub(crate) const PATTERN_COUNT: usize = {len(keys)};")
-    out.append(f"pub(crate) const MAX_PATTERN_LEN: usize = {max(len(k) for k in keys)};")
+    out.append("/// Marks a trie node where no pattern ends.")
+    out.append("pub(crate) const NO_VALUES: u16 = 0xFFFF;")
     out.append("")
-    out.append("/// Every pattern's letters (`.` marks a word edge), in sorted order.")
-    out.append("pub(crate) static KEYS: &[u8] = b\"\\")
-    for line in chunks("".join(keys), 96):
-        out.append(f"{line}\\")
-    out.append("\";")
+    out.append("/// The trie, three `u16`s a node so one node's fields share a flash cache")
+    out.append("/// line: first child (children are contiguous), where the values of the")
+    out.append("/// pattern ending there start in `VALUES` (or `NO_VALUES`), and the")
+    out.append("/// node's letter (high byte; `.` marks a word edge) with its child count.")
+    out.append("/// Node 0 is the root.")
+    flat = []
+    for i in range(len(order)):
+        flat += [first_child[i], value_at[i], (ord(letters[i]) << 8) | child_count[i]]
+    out.append(f"pub(crate) static NODES: [u16; {len(flat)}] = [")
+    for row in chunks(flat, 15):
+        out.append("    " + ", ".join(str(v) for v in row) + ",")
+    out.append("];")
     out.append("")
-    out.append("/// Where each pattern's letters start in `KEYS`; the last entry ends the last.")
-    out.append(f"pub(crate) static KEY_STARTS: [u16; {len(starts)}] = [")
-    for row in chunks(starts, 16):
+    alphabet = ".abcdefghijklmnopqrstuvwxyz"
+    first_node = [node_of.get(a, 0) for a in alphabet]
+    pair_node = [node_of.get(a + b, 0) for a in alphabet for b in alphabet]
+    out.append("/// Trie node for each first letter (`.`, then `a`..`z`); 0 means none.")
+    out.append(f"pub(crate) static FIRST_LETTER: [u16; {len(first_node)}] = [")
+    for row in chunks(first_node, 14):
+        out.append("    " + ", ".join(str(v) for v in row) + ",")
+    out.append("];")
+    out.append("")
+    out.append("/// Trie node for each first two letters, row-major in the same order;")
+    out.append("/// 0 means none. Skips the two widest child scans of every walk.")
+    out.append(f"pub(crate) static FIRST_TWO_LETTERS: [u16; {len(pair_node)}] = [")
+    for row in chunks(pair_node, 16):
         out.append("    " + ", ".join(str(v) for v in row) + ",")
     out.append("];")
     out.append("")
     out.append("/// Each pattern's inter-letter values as ASCII digits, one more than its")
-    out.append("/// letters; pattern `i`'s run starts at `KEY_STARTS[i] + i`.")
+    out.append("/// letters.")
     out.append("pub(crate) static VALUES: &[u8] = b\"\\")
     for line in chunks("".join(values for _, values in patterns), 96):
         out.append(f"{line}\\")

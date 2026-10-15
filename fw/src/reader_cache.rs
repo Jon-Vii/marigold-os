@@ -1440,6 +1440,12 @@ where
             cache_key,
             next_spine.is_none()
         );
+        #[cfg(feature = "bench-serial")]
+        esp_println::println!(
+            "bench: hyphenation lookups={} lookup_ms={}",
+            HYPHEN_LOOKUPS.swap(0, portable_atomic::Ordering::Relaxed),
+            HYPHEN_LOOKUP_MICROS.swap(0, portable_atomic::Ordering::Relaxed) / 1000,
+        );
         Ok(())
     } else if next_spine.is_some() {
         Ok(())
@@ -2138,6 +2144,15 @@ fn push_styled_preview_fragment<
     }
 }
 
+/// Character boundaries measured for one word at a line end; a head never
+/// holds more letters than a line does.
+const HEAD_WIDTH_SLOTS: usize = 64;
+
+#[cfg(feature = "bench-serial")]
+static HYPHEN_LOOKUPS: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+#[cfg(feature = "bench-serial")]
+static HYPHEN_LOOKUP_MICROS: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
+
 /// Where a word piece went: onto the current line, or (its tail, or the
 /// whole piece after a line break) still waiting for the next line.
 enum Placement<'w> {
@@ -2227,20 +2242,27 @@ where
         return Placement::Done;
     }
 
-    let worth_splitting = line_was_empty || {
-        let kept_width = match kept_ink {
-            LineInkCursor::BuiltIn(cursor) => cursor.width(),
-            LineInkCursor::Custom(cursor) => cursor.width(),
+    let worth_splitting = line_was_empty
+        || may_hyphenate && {
+            let kept_width = match kept_ink {
+                LineInkCursor::BuiltIn(cursor) => cursor.width(),
+                LineInkCursor::Custom(cursor) => cursor.width(),
+            };
+            let slack = limit - (x_eff + kept_width);
+            // The word's own average letter, from the width just measured: a
+            // line end with room for under about three of them (two letters
+            // and a hyphen) cannot take a head, so it skips the glyph-by-glyph
+            // measure and the pattern lookup.
+            let piece_width = sink.line_ink_width() - kept_width;
+            let average = piece_width / piece.chars().count().max(1) as i16;
+            slack >= 3 * average
+                && ui::reading::worth_hyphenating(
+                    slack,
+                    ui::reading::justify_gap_count(&sink.line[..kept_len]),
+                    ui::reading::word_space_width(sink.library.type_settings(), style),
+                    sink.hyphen_run,
+                )
         };
-        let space = ui::reading::word_space_width(sink.library.type_settings(), style);
-        may_hyphenate
-            && ui::reading::worth_hyphenating(
-                limit - (x_eff + kept_width),
-                ui::reading::justify_gap_count(&sink.line[..kept_len]),
-                space,
-                sink.hyphen_run,
-            )
-    };
     sink.line.truncate(kept_len);
     sink.line_ink = kept_ink;
     if worth_splitting {
@@ -2267,6 +2289,12 @@ where
 /// Ends the line with the longest head of `piece` that fits before `limit`
 /// (plus its hyphen), flushes it, and returns where the piece resumes.
 /// None, with the line as it was, when no break fits.
+///
+/// The piece is measured first, one glyph at a time, recording the head's
+/// width at each character until it overruns the line: the glyph tables are
+/// already cached from measuring every word, while the hyphenation patterns
+/// are cold by the time a line ends, so they are only consulted when at
+/// least a two-letter head and its hyphen fit, and only for that head.
 #[inline(never)]
 fn split_word_at_line_end<
     'w,
@@ -2287,41 +2315,98 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let mut breaks = heapless::Vec::<WordBreak, MAX_WORD_BREAKS>::new();
-    word_breaks(piece, sink.hyphenation, &mut breaks);
     let kept_ink = sink.line_ink;
-    let mut measure = String::<MAX_READER_BLOCK_TEXT>::new();
-    for item in breaks.iter().rev() {
-        sink.line.truncate(kept_len);
-        sink.line_ink = kept_ink;
-        if append_styled_word(
-            &mut sink.line,
-            &piece[..item.head_end],
-            placement.style,
-            sink.line_style,
-            placement.leading_space,
-        )
-        .is_err()
-            || (item.hyphen && sink.line.push('-').is_err())
-        {
-            continue;
+    // What `append_styled_word` puts before the word: its space and, when
+    // the run changes style, the style marker.
+    let mut lead = String::<4>::new();
+    if placement.leading_space {
+        let _ = lead.push(' ');
+    }
+    if placement.style != sink.line_style {
+        let _ = append_style_marker(&mut lead, placement.style);
+    }
+    sink.push_line_ink_str(lead.as_str());
+    let hyphen_width = {
+        let before = sink.line_ink_width();
+        let head_ink = sink.line_ink;
+        sink.push_line_ink_str("-");
+        let width = sink.line_ink_width() - before;
+        sink.line_ink = head_ink;
+        width
+    };
+    // Head width (with its hyphen) at each character boundary that still
+    // fits; `fits_to` ends up at the longest head that does.
+    let mut head_widths = heapless::Vec::<(u16, i16), HEAD_WIDTH_SLOTS>::new();
+    let mut fits_to = 0;
+    let mut encoded = [0u8; 4];
+    for (index, ch) in piece.char_indices() {
+        let with_hyphen = sink.line_ink_width() + hyphen_width;
+        if with_hyphen + x_eff > limit || head_widths.is_full() {
+            break;
         }
-        measure.clear();
-        let _ = measure.push_str(&sink.line[kept_len..]);
-        sink.push_line_ink_str(measure.as_str());
-        if sink.line_ink_width() + x_eff <= limit {
-            sink.line_role = placement.role;
-            sink.line_align = placement.align;
-            sink.line_style = placement.style;
-            sink.pending_space = false;
-            sink.line_hyphenated = item.hyphen;
-            flush_styled_preview_line(sink, false);
-            return Some(&piece[item.tail_start..]);
+        let _ = head_widths.push((index as u16, with_hyphen));
+        fits_to = index;
+        if ch != SOFT_HYPHEN {
+            sink.push_line_ink_str(ch.encode_utf8(&mut encoded));
         }
     }
-    sink.line.truncate(kept_len);
     sink.line_ink = kept_ink;
-    None
+    if piece[..fits_to]
+        .chars()
+        .filter(|ch| ch.is_alphanumeric())
+        .count()
+        < 2
+    {
+        // Not even a two-letter head fits: nothing to look up.
+        return None;
+    }
+    let mut breaks = heapless::Vec::<WordBreak, MAX_WORD_BREAKS>::new();
+    #[cfg(feature = "bench-serial")]
+    let lookup_started = Instant::now();
+    word_breaks(piece, sink.hyphenation, fits_to, &mut breaks);
+    #[cfg(feature = "bench-serial")]
+    {
+        use portable_atomic::Ordering;
+        HYPHEN_LOOKUPS.fetch_add(1, Ordering::Relaxed);
+        HYPHEN_LOOKUP_MICROS.fetch_add(
+            lookup_started.elapsed().as_micros() as u32,
+            Ordering::Relaxed,
+        );
+    }
+    // The longest break whose head fits; a dash break draws no hyphen.
+    let item = breaks.iter().rev().copied().find(|item| {
+        head_widths
+            .iter()
+            .find(|(offset, _)| usize::from(*offset) == item.head_end)
+            .is_some_and(|(_, with_hyphen)| {
+                let width = if item.hyphen {
+                    *with_hyphen
+                } else {
+                    with_hyphen - hyphen_width
+                };
+                width + x_eff <= limit
+            })
+    })?;
+    if append_styled_word(
+        &mut sink.line,
+        &piece[..item.head_end],
+        placement.style,
+        sink.line_style,
+        placement.leading_space,
+    )
+    .is_err()
+        || (item.hyphen && sink.line.push('-').is_err())
+    {
+        sink.line.truncate(kept_len);
+        return None;
+    }
+    sink.line_role = placement.role;
+    sink.line_align = placement.align;
+    sink.line_style = placement.style;
+    sink.pending_space = false;
+    sink.line_hyphenated = item.hyphen;
+    flush_styled_preview_line(sink, false);
+    Some(&piece[item.tail_start..])
 }
 
 fn append_styled_word<const N: usize>(
