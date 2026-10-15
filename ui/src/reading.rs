@@ -39,12 +39,13 @@ impl PageBox {
     };
 
     /// Portrait keeps the same insets as landscape — 8 from the wrap
-    /// edges, 6 above, 23 clear of the footer — inside the upright frame.
+    /// edges, 6 above, 23 clear of the footer — inside the upright frame,
+    /// with the footer lifted off the bezel (`PORTRAIT_FOOTER_LIFT`).
     pub const PORTRAIT: Self = Self {
         left: 8,
         right: FbFrame::Portrait.width() as i16 - 8,
         top: 6,
-        bottom: FbFrame::Portrait.height() as i16 - 23,
+        bottom: FbFrame::Portrait.height() as i16 - 23 - PORTRAIT_FOOTER_LIFT,
     };
 
     pub const fn for_portrait(portrait: bool) -> Self {
@@ -398,13 +399,21 @@ pub fn draw_reading_page_counter(fb: &mut Framebuffer, label: &str) {
     draw_reading_page_counter_aligned(fb, label, false);
 }
 
+/// Rows the portrait footer (and page bottom) stand above the frame's
+/// bottom edge beyond landscape's. That edge is the panel's short side,
+/// where landscape keeps an 8-pixel text margin: its first columns sit
+/// under the bezel, and a counter 3 rows off it lost its lowest ink.
+pub const PORTRAIT_FOOTER_LIFT: i16 = 8;
+
 pub fn draw_reading_page_counter_aligned(fb: &mut Framebuffer, label: &str, left: bool) {
     // Frame-relative, not panel-relative: the portrait page's footer sits
     // at the bottom of the upright frame. Landscape frames keep the
     // historical panel numbers.
     let font = display::font::literata_small(FontStyle::Regular);
     let frame_right = fb.frame_width() as i16 - 8;
-    let baseline = fb.frame_height() as i16 - 3;
+    let portrait = fb.frame_width() < fb.frame_height();
+    let lift = if portrait { PORTRAIT_FOOTER_LIFT } else { 0 };
+    let baseline = fb.frame_height() as i16 - 3 - lift;
     let x = if left {
         READER_LEFT_X + 16
     } else {
@@ -479,8 +488,9 @@ pub const READER_WRAP_SAFETY: i16 = 4;
 /// them whole. v23: justified prose hyphenates (patterns for English, the
 /// book's soft hyphens and compound dashes everywhere), which moves line
 /// breaks throughout. v24: a v23 build lost the space at the start of
-/// some styled runs and parser chunks; retire those lines.
-const READER_LAYOUT_VERSION: u16 = 24;
+/// some styled runs and parser chunks; retire those lines. v25: the portrait
+/// page ends 8 rows higher, clear of the bezel.
+const READER_LAYOUT_VERSION: u16 = 25;
 
 /// Panel-geometry salt folded into the version bits: wrap points and page
 /// heights depend on the page box, so pagination cached on one panel must
