@@ -592,13 +592,14 @@
   // Restore the shelf position saved by a previous visit.
   try {
     const saved = JSON.parse(localStorage.getItem(SAVE_KEY));
-    if (Array.isArray(saved) && saved.length >= 8 && saved.length <= 10) {
-      // Shorter saves predate the Font (length 8) and Front buttons
-      // (length 9) settings; default the missing trailing words to zero.
-      wasm.x4_restore(...saved, ...Array(10 - saved.length).fill(0));
+    if (Array.isArray(saved) && saved.length >= 8 && saved.length <= 11) {
+      // Shorter saves predate the Font (length 8), Front buttons (length 9)
+      // and Alignment (length 10) settings; default the missing trailing
+      // words to zero.
+      wasm.x4_restore(...saved, ...Array(11 - saved.length).fill(0));
     }
   } catch (_) { /* fresh start */ }
-  syncDeviceOrientation(new Uint32Array(wasm.memory.buffer, wasm.x4_snapshot_ptr(), 10)[3]);
+  syncDeviceOrientation(new Uint32Array(wasm.memory.buffer, wasm.x4_snapshot_ptr(), 11)[3]);
 
   const frame = () =>
     new Uint8ClampedArray(wasm.memory.buffer, wasm.x4_frame_ptr(), WIDTH * HEIGHT * 4);
@@ -712,7 +713,7 @@
   }
 
   function save() {
-    const snap = new Uint32Array(wasm.memory.buffer, wasm.x4_snapshot_ptr(), 10);
+    const snap = new Uint32Array(wasm.memory.buffer, wasm.x4_snapshot_ptr(), 11);
     syncDeviceOrientation(snap[3]);
     localStorage.setItem(SAVE_KEY, JSON.stringify([...snap]));
   }

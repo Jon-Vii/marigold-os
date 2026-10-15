@@ -257,13 +257,7 @@ fn ui_library_status(status: LibraryScanStatus) -> UiLibraryStatus {
 fn draw_sd_reader_page(fb: &mut Framebuffer, request: RenderRequest, sd_library: &ReaderStore) {
     // A store paginated under different type settings is as unusable as an
     // unloaded one; show the loading plate until the relayout lands.
-    let layout_current = sd_library.type_settings()
-        == display::font::TypeSettings {
-            size: request.font_size,
-            spacing: request.line_spacing,
-            weight: request.font_weight,
-            family: request.font_family,
-        };
+    let layout_current = sd_library.type_settings() == request.type_settings();
     // While the Chapters overview borrows the reading text buffer for the
     // on-disk TOC, page/block records still point at the old section but the
     // bytes underneath are TOC records -- drawing the body now paints garbage
@@ -298,13 +292,7 @@ fn draw_sd_reader_page_with_custom_font(
     font_metrics: &mut crate::custom_font::MetricCache,
     root: &crate::sd_session::SdRoot<'_>,
 ) {
-    let layout_current = sd_library.type_settings()
-        == display::font::TypeSettings {
-            size: request.font_size,
-            spacing: request.line_spacing,
-            weight: request.font_weight,
-            family: request.font_family,
-        };
+    let layout_current = sd_library.type_settings() == request.type_settings();
     // The page box is part of the layout: blocks wrapped for the portrait
     // column must not paint into a landscape frame (they cover half the
     // panel); hold the bookplate until the rebuild lands.

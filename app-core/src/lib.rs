@@ -1,10 +1,12 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
-use display::font::{FontFamily, FontSize, FontWeight, LineSpacing, TypeSettings};
+use display::font::{Alignment, FontFamily, FontSize, FontWeight, LineSpacing, TypeSettings};
 use display::{epd::RefreshMode, Rect};
 
-pub const SETTINGS_ITEMS: u8 = 8;
+pub const SETTINGS_ITEMS: u8 = 9;
+/// The last Settings row opens the firmware picker instead of cycling a value.
+const FIRMWARE_UPDATE_ROW: u16 = SETTINGS_ITEMS as u16 - 1;
 pub const MAX_SD_CHAPTERS: usize = 128;
 pub const FIRST_SD_BOOK_ID: u32 = 2;
 
@@ -231,6 +233,7 @@ impl RefreshPlanner {
             || request.line_spacing != last.line_spacing
             || request.font_weight != last.font_weight
             || request.font_family != last.font_family
+            || request.alignment != last.alignment
             || Self::needs_clean_library_refresh(request, last)
         {
             return RefreshMode::FastClean;
@@ -298,6 +301,7 @@ pub struct RenderRequest {
     pub line_spacing: LineSpacing,
     pub font_weight: FontWeight,
     pub font_family: FontFamily,
+    pub alignment: Alignment,
     pub last_button: Option<Button>,
     pub aux_raw: u16,
     pub nav_raw: u16,
@@ -312,6 +316,19 @@ pub struct RenderRequest {
     pub wifi_ssid: [u8; 32],
     pub wifi_ssid_len: u8,
     pub dirty: Rect,
+}
+
+impl RenderRequest {
+    /// The reader type settings this frame was requested under.
+    pub fn type_settings(&self) -> TypeSettings {
+        TypeSettings {
+            size: self.font_size,
+            spacing: self.line_spacing,
+            weight: self.font_weight,
+            family: self.font_family,
+            alignment: self.alignment,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -600,6 +617,7 @@ pub enum LibraryEvent {
         font_weight: u8,
         font_family: u8,
         front_buttons: u8,
+        alignment: u8,
     },
 }
 
@@ -710,6 +728,7 @@ pub struct PersistedAppState {
     pub font_weight: u8,
     pub font_family: u8,
     pub front_buttons: u8,
+    pub alignment: u8,
     pub source_hash: u32,
     pub source_size: u32,
 }
@@ -743,6 +762,7 @@ pub struct ReaderState {
     pub line_spacing: LineSpacing,
     pub font_weight: FontWeight,
     pub font_family: FontFamily,
+    pub alignment: Alignment,
     pub custom_font_available: bool,
     pub last_button: Option<Button>,
     pub aux_raw: u16,
@@ -784,6 +804,7 @@ impl ReaderState {
             line_spacing: LineSpacing::Normal,
             font_weight: FontWeight::Normal,
             font_family: FontFamily::Literata,
+            alignment: Alignment::Justified,
             custom_font_available: false,
             last_button: None,
             aux_raw: 0,
@@ -1020,7 +1041,7 @@ impl ReaderState {
                 next.selection = wrap_prev(self.selection, SETTINGS_ITEMS as u16);
             }
             (AppView::Settings, Some(Button::Confirm)) => {
-                if self.selection == 7 {
+                if self.selection == FIRMWARE_UPDATE_ROW {
                     next.view = AppView::FirmwareUpdate;
                     next.selection = 0;
                     next.firmware_count = 0;
@@ -1060,7 +1081,7 @@ impl ReaderState {
                     next.firmware_status = FirmwareUpdateStatus::Ready;
                 } else if self.firmware_status != FirmwareUpdateStatus::Staging {
                     next.view = AppView::Settings;
-                    next.selection = 7;
+                    next.selection = FIRMWARE_UPDATE_ROW;
                 }
             }
         }
@@ -1250,6 +1271,7 @@ impl ReaderState {
                 font_weight,
                 font_family,
                 front_buttons,
+                alignment,
             } => {
                 self.book_id = book_id;
                 self.chapter = chapter;
@@ -1299,6 +1321,9 @@ impl ReaderState {
                 }
                 if let Some(front) = front_buttons_from_u8(front_buttons) {
                     self.front_buttons = front;
+                }
+                if let Some(alignment) = Alignment::from_u8(alignment) {
+                    self.alignment = alignment;
                 }
                 self.dirty = Rect::FULL;
             }
@@ -1369,6 +1394,7 @@ impl ReaderState {
             line_spacing: self.line_spacing,
             font_weight: self.font_weight,
             font_family: self.font_family,
+            alignment: self.alignment,
             last_button: self.last_button,
             aux_raw: self.aux_raw,
             nav_raw: self.nav_raw,
@@ -1398,6 +1424,7 @@ impl ReaderState {
             font_weight: self.font_weight as u8,
             font_family: self.font_family as u8,
             front_buttons: self.front_buttons as u8,
+            alignment: self.alignment as u8,
             source_hash: 0,
             source_size: 0,
         }
@@ -1409,6 +1436,7 @@ impl ReaderState {
             spacing: self.line_spacing,
             weight: self.font_weight,
             family: self.font_family,
+            alignment: self.alignment,
         }
     }
 
@@ -1579,8 +1607,8 @@ fn orient_button(orientation: DisplayOrientation, button: Option<Button>) -> Opt
 }
 
 /// Settings rows, top to bottom: the type block first (typeface, then its
-/// size, weight, and spacing — broadest choice to finest adjustment), then
-/// the set-and-forget display rows.
+/// size, weight, spacing, and alignment — broadest choice to finest
+/// adjustment), then the set-and-forget display rows.
 fn apply_setting(mut state: ReaderState) -> ReaderState {
     match state.selection {
         0 => {
@@ -1607,13 +1635,19 @@ fn apply_setting(mut state: ReaderState) -> ReaderState {
             };
         }
         4 => {
+            state.alignment = match state.alignment {
+                Alignment::Justified => Alignment::Left,
+                Alignment::Left => Alignment::Justified,
+            };
+        }
+        5 => {
             state.refresh_policy = match state.refresh_policy {
                 RefreshPolicy::FastOnly => RefreshPolicy::FullOnWake,
                 RefreshPolicy::FullOnWake => RefreshPolicy::FullEveryTen,
                 RefreshPolicy::FullEveryTen => RefreshPolicy::FastOnly,
             };
         }
-        5 => {
+        6 => {
             // Three holds are offered: the two landscapes and the one
             // portrait (front buttons below the screen). The buttons-above
             // portrait variant stays in the enum for the persistence format
@@ -1626,7 +1660,7 @@ fn apply_setting(mut state: ReaderState) -> ReaderState {
                 _ => DisplayOrientation::LandscapeButtonsBottom,
             };
         }
-        6 => {
+        7 => {
             state.front_buttons = match state.front_buttons {
                 FrontButtons::PagesRight => FrontButtons::PagesLeft,
                 FrontButtons::PagesLeft => FrontButtons::PagesRight,
@@ -2225,7 +2259,7 @@ mod tests {
     fn late_firmware_scan_does_not_move_the_settings_cursor() {
         let mut state = ReaderState::boot();
         state.view = AppView::Settings;
-        state.selection = 7;
+        state.selection = FIRMWARE_UPDATE_ROW;
         state = press(state, Button::Confirm);
         assert_eq!(state.view, AppView::FirmwareUpdate);
         state = press(state, Button::Back);
@@ -2418,6 +2452,7 @@ mod tests {
                 font_weight: FontWeight::Normal as u8,
                 font_family: FontFamily::Literata as u8,
                 front_buttons: FrontButtons::PagesRight as u8,
+                alignment: 0,
             },
         );
         assert_eq!(state.book_id, ReaderSource::sd(2).book_id());
@@ -2453,6 +2488,7 @@ mod tests {
                 font_weight: FontWeight::Normal as u8,
                 font_family: FontFamily::Literata as u8,
                 front_buttons: FrontButtons::PagesRight as u8,
+                alignment: 0,
             },
         );
         assert_eq!(state.selection, home_selection);
@@ -2475,7 +2511,7 @@ mod tests {
     #[test]
     fn settings_change_key_cycles_refresh_policy() {
         let mut state = press(ReaderState::boot(), Button::Next);
-        state.selection = 4;
+        state.selection = 5;
         let state = press(state, Button::Confirm);
         assert_eq!(state.refresh_policy, RefreshPolicy::FullOnWake);
         let state = press(state, Button::Confirm);
@@ -2485,7 +2521,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_change_key_cycles_type_size_spacing_and_weight() {
+    fn settings_change_key_cycles_the_type_rows() {
         let state = press(ReaderState::boot(), Button::Next);
         assert_eq!(state.selection, 0);
         let state = press(state, Button::Confirm);
@@ -2514,6 +2550,12 @@ mod tests {
 
         let state = press(state, Button::Next);
         assert_eq!(state.selection, 4);
+        let state = press(state, Button::Confirm);
+        assert_eq!(state.alignment, Alignment::Left);
+        assert_eq!(state.type_settings().alignment, Alignment::Left);
+        let state = press(state, Button::Confirm);
+        assert_eq!(state.alignment, Alignment::Justified);
+
         let state = press(state, Button::Next);
         assert_eq!(state.selection, 5);
         let state = press(state, Button::Next);
@@ -2521,13 +2563,15 @@ mod tests {
         let state = press(state, Button::Next);
         assert_eq!(state.selection, 7);
         let state = press(state, Button::Next);
+        assert_eq!(state.selection, FIRMWARE_UPDATE_ROW);
+        let state = press(state, Button::Next);
         assert_eq!(state.selection, 0, "selection wraps after the last row");
     }
 
     #[test]
     fn settings_change_key_toggles_front_buttons() {
         let mut state = press(ReaderState::boot(), Button::Next);
-        state.selection = 6;
+        state.selection = 7;
 
         let state = press(state, Button::Confirm);
         assert_eq!(state.front_buttons, FrontButtons::PagesLeft);
@@ -2589,7 +2633,7 @@ mod tests {
     #[test]
     fn settings_change_key_cycles_the_three_offered_orientations() {
         let mut state = press(ReaderState::boot(), Button::Next);
-        state.selection = 5;
+        state.selection = 6;
 
         let state = press(state, Button::Confirm);
         assert_eq!(state.orientation, DisplayOrientation::LandscapeButtonsTop);
@@ -2690,6 +2734,7 @@ mod tests {
                 font_weight: FontWeight::Normal as u8,
                 font_family: FontFamily::Literata as u8,
                 front_buttons: FrontButtons::PagesRight as u8,
+                alignment: Alignment::Left as u8,
             },
         );
         assert_eq!(state.book_id, 2);
@@ -2699,6 +2744,7 @@ mod tests {
         assert_eq!(state.refresh_policy, RefreshPolicy::FastOnly);
         assert_eq!(state.font_size, FontSize::Large);
         assert_eq!(state.line_spacing, LineSpacing::Compact);
+        assert_eq!(state.alignment, Alignment::Left);
     }
 
     #[test]
@@ -2720,7 +2766,7 @@ mod tests {
     fn firmware_picker_uses_list_navigation_and_two_step_confirmation() {
         let mut state = ReaderState::boot();
         state.view = AppView::Settings;
-        state.selection = 7;
+        state.selection = FIRMWARE_UPDATE_ROW;
         state = press(state, Button::Confirm);
         assert_eq!(state.view, AppView::FirmwareUpdate);
         assert_eq!(state.firmware_status, FirmwareUpdateStatus::Scanning);
@@ -2914,6 +2960,7 @@ mod tests {
             font_weight: 0,
             font_family: 0,
             front_buttons: 0,
+            alignment: 0,
             source_hash: 0,
             source_size: 0,
         };

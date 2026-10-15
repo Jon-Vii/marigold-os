@@ -319,13 +319,7 @@ pub async fn run(
                             .is_some_and(|index| {
                                 sd_library.covers_global_page(index as usize, request.page)
                             })
-                        && sd_library.type_settings()
-                            == display::font::TypeSettings {
-                                size: request.font_size,
-                                spacing: request.line_spacing,
-                                weight: request.font_weight,
-                                family: request.font_family,
-                            }
+                        && sd_library.type_settings() == request.type_settings()
                         && sd_library.portrait() == app_core::is_portrait(request.orientation);
                     prev_fb.copy_from(fb);
                     let prestage_start = Instant::now();
@@ -572,10 +566,7 @@ pub(crate) fn pending_reader_matches(command: StorageCommand, request: RenderReq
     };
     request.view == AppView::Reading
         && request.book_id == book_id
-        && request.font_size == type_settings.size
-        && request.line_spacing == type_settings.spacing
-        && request.font_family == type_settings.family
-        && request.font_weight == type_settings.weight
+        && request.type_settings() == type_settings
         && app_core::is_portrait(request.orientation) == portrait
 }
 
@@ -788,6 +779,7 @@ fn open_loading_plate_request(
     request.line_spacing = type_settings.spacing;
     request.font_weight = type_settings.weight;
     request.font_family = type_settings.family;
+    request.alignment = type_settings.alignment;
     // Continuation steps keep the same loading plate. Repainting it between
     // spines adds a full panel refresh to every preparation step. The plate
     // shows no page, so a resume whose target only resolved after the first
@@ -1420,6 +1412,7 @@ fn restore_saved_state(
         font_weight: record.font_weight,
         font_family: record.font_family,
         front_buttons: record.front_buttons,
+        alignment: record.alignment,
     });
 }
 
@@ -1484,6 +1477,8 @@ fn sleep_request_from_saved_state(
             .unwrap_or(display::font::FontWeight::Normal),
         font_family: display::font::FontFamily::from_u8(record.font_family)
             .unwrap_or(display::font::FontFamily::Literata),
+        alignment: display::font::Alignment::from_u8(record.alignment)
+            .unwrap_or(display::font::Alignment::Justified),
         last_button: None,
         aux_raw: 0,
         nav_raw: 0,
@@ -1533,6 +1528,7 @@ fn progress_record(
         font_weight: record.font_weight,
         font_family: record.font_family,
         front_buttons: record.front_buttons,
+        alignment: record.alignment,
         source_hash,
         source_size,
     }

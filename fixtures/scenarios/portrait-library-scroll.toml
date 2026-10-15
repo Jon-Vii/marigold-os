@@ -22,6 +22,9 @@ button = "Next"
 button = "Next"
 
 [[steps]]
+button = "Next"
+
+[[steps]]
 button = "Confirm"
 
 [[steps]]

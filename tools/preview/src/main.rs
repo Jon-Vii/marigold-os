@@ -1754,6 +1754,7 @@ fn write_shell_preview(
         line_spacing: display::font::LineSpacing::Normal,
         font_weight: display::font::FontWeight::Normal,
         font_family: display::font::FontFamily::Literata,
+        alignment: display::font::Alignment::Justified,
         custom_font_name: "",
         selection,
         chapter: 2,

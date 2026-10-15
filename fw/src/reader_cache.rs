@@ -2522,7 +2522,10 @@ fn push_styled_preview_fragment<
     }
 
     normalize_decorative_separator(&mut normalized);
-    let align = block_align_for(align, normalized.as_str(), role);
+    let align = reader_layout::effective_align(
+        block_align_for(align, normalized.as_str(), role),
+        sink.library.type_settings(),
+    );
     let page_box = sink.library.page_box();
     let x = page_box.x_for(role);
     let max_x = page_box.right;

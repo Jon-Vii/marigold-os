@@ -418,6 +418,15 @@ line at natural spacing rather than open gaps past one and a half spaces, as
 well as lines under two thirds of the measure. Soft hyphens survive
 normalisation as break hints and are stripped from stored lines.
 
+All of this applies to text the book sets justified, which is the body
+default. The Alignment setting's Left choice turns that text left-aligned
+before the line builder sees it (`ui::reading::effective_align`), so it
+keeps words whole, draws at natural spacing, and builds without the pattern
+lookups; centred text keeps its own alignment either way. Alignment is part
+of the reader layout config (bit 15, zero for justified), so switching it
+rebuilds books, and caches built before the setting existed stay valid
+under Justified.
+
 The firmware still ships one built-in catalog entry as a fallback, but the
 board I/O task owns the shared SPI bus while it scans FAT16/FAT32
 microSD cards for EPUBs under `/books` and then the card root. X4 SD pins are
@@ -748,9 +757,9 @@ The firmware now has the e-reader surfaces as explicit app state:
 - `Chapters`: selects a chapter within the current book.
 - `Wireless`: the wireless session's connect/forget, onboarding, and shelf
   status screen.
-- `Settings`: cycles typeface, font size, type weight, line spacing, refresh
-  policy, orientation, and front-button order, and opens `FirmwareUpdate`, the
-  SD firmware picker.
+- `Settings`: cycles typeface, font size, type weight, line spacing,
+  alignment, refresh policy, orientation, and front-button order, and opens
+  `FirmwareUpdate`, the SD firmware picker.
 
 Landscape is the default hold: the X4 is held that way for its side page
 buttons, and `Home`, `Library`, and `Settings` share the reading posture. The

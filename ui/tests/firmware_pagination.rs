@@ -103,6 +103,7 @@ fn firmware_index_preserves_blocks_and_spines_across_layouts() {
                         spacing,
                         weight: FontWeight::Normal,
                         family: FontFamily::Literata,
+                        ..TypeSettings::DEFAULT
                     },
                     portrait,
                 );

@@ -4,7 +4,7 @@
 [[steps]]
 button = "Next"
 
-# Firmware update is the eighth Settings row.
+# Firmware update is the last Settings row.
 [[steps]]
 button = "Previous"
 

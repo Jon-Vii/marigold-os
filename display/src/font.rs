@@ -164,6 +164,28 @@ impl FontFamily {
     }
 }
 
+/// How body paragraphs set their lines, behind the Alignment setting.
+/// Justified fills each line to the measure and hyphenates to keep the
+/// gaps even; Left keeps words whole and spacing natural, leaving a ragged
+/// right edge. Only text the book sets justified (the body default) follows
+/// it; centred and left-set text keep the book's alignment.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Alignment {
+    #[default]
+    Justified,
+    Left,
+}
+
+impl Alignment {
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Justified),
+            1 => Some(Self::Left),
+            _ => None,
+        }
+    }
+}
+
 /// The reader type settings that change page layout. Carried from the app
 /// reducer through storage commands into the cache build, so pagination,
 /// cached sections, and drawing always agree on one set.
@@ -173,6 +195,7 @@ pub struct TypeSettings {
     pub spacing: LineSpacing,
     pub weight: FontWeight,
     pub family: FontFamily,
+    pub alignment: Alignment,
 }
 
 impl TypeSettings {
@@ -181,6 +204,7 @@ impl TypeSettings {
         spacing: LineSpacing::Normal,
         weight: FontWeight::Normal,
         family: FontFamily::Literata,
+        alignment: Alignment::Justified,
     };
 }
 

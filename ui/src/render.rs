@@ -537,10 +537,10 @@ fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
     dash_key(fb, layout, 3, "next", false);
     heading(fb, layout, "Settings");
 
-    // Eight rows must clear the landscape footer line, so the settings
+    // Nine rows must clear the landscape footer line, so the settings
     // index runs tighter than the Library's ROW_STEP.
-    const SETTINGS_ROW_STEP: i16 = 45;
-    let rows: [(&str, &str); 8] = [
+    const SETTINGS_ROW_STEP: i16 = 40;
+    let rows: [(&str, &str); 9] = [
         (
             "Typeface",
             font_family_label(shell.font_family, shell.custom_font_name),
@@ -548,6 +548,7 @@ fn render_settings(fb: &mut Framebuffer, shell: &UiShell<'_>) {
         ("Type size", font_size_label(shell.font_size)),
         ("Type weight", font_weight_label(shell.font_weight)),
         ("Line spacing", line_spacing_label(shell.line_spacing)),
+        ("Alignment", alignment_label(shell.alignment)),
         ("Refresh", refresh_policy_label(shell.refresh_policy)),
         ("Orientation", orientation_label(shell.orientation)),
         ("Front buttons", front_buttons_label(shell.front_pages_left)),
@@ -1347,6 +1348,13 @@ fn font_weight_label(weight: display::font::FontWeight) -> &'static str {
     match weight {
         display::font::FontWeight::Normal => "regular",
         display::font::FontWeight::Heavy => "heavier",
+    }
+}
+
+fn alignment_label(alignment: display::font::Alignment) -> &'static str {
+    match alignment {
+        display::font::Alignment::Justified => "justified",
+        display::font::Alignment::Left => "left",
     }
 }
 

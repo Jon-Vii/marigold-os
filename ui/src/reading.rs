@@ -10,7 +10,7 @@
 use display::fb::{FbFrame, Framebuffer};
 use display::font::{
     draw_text, family_weighted, fixed_ceil, fixed_round, literata, measure_text,
-    style_from_marker_code, BitmapFont, FontSize, FontStyle, LineSpacing, TypeSettings,
+    style_from_marker_code, Alignment, BitmapFont, FontSize, FontStyle, LineSpacing, TypeSettings,
     STYLE_MARKER,
 };
 use proto::cache::{BlockRecord, PageRecord};
@@ -309,7 +309,7 @@ pub fn draw_reading_page_body(fb: &mut Framebuffer, source: &impl ReadingBlocks,
     let page_box = source.page_box();
     for_each_drawable_block(source, page, |block| {
         let role = block.record.role;
-        match block.record.align {
+        match effective_align(block.record.align, settings) {
             TextAlign::Left => {
                 let x = page_box.x_for(role);
                 if block.record.line_count == 1 {
@@ -497,31 +497,47 @@ const READER_LAYOUT_VERSION: u16 = 25;
 /// read as stale on the other (an SD card can move between an X4 and an
 /// X3). Zero on the X4's 800x480 keeps every existing cache valid; other
 /// geometries claim a disjoint version band well clear of routine bumps.
-/// (128, not the former 256: the config field gained the portrait bit, so
-/// version + salt must stay under 256 to fit the u16.)
+/// (64, not the former 256 or 128: the config field gained the portrait
+/// bit and then the alignment bit, so version + salt must stay under 128
+/// to fit the u16.)
 const PANEL_LAYOUT_SALT: u16 = if display::WIDTH == 800 && display::HEIGHT == 480 {
     0
 } else {
-    128
+    64
 };
 
-const _: () = assert!(READER_LAYOUT_VERSION + PANEL_LAYOUT_SALT < 256);
+// Versions stay below the salt so the two panels' bands never meet.
+const _: () =
+    assert!(READER_LAYOUT_VERSION < 64 && READER_LAYOUT_VERSION + PANEL_LAYOUT_SALT < 128);
 
 /// Section cache layout config: the wrap-rule version plus the layout the
 /// section was paginated under. Stored in cache headers; a mismatch on
 /// load invalidates the cached pagination and rebuilds it. Bit layout:
 /// spacing in bits 0-1 (a spacing change only re-walks heights, so the
 /// load check masks these off), size in bits 2-3, weight in bit 4, family
-/// in bits 5-6, portrait in bit 7, version above. Size, weight, family,
-/// and the page box all change wrap points, so a change in any forces a
-/// full rebuild.
+/// in bits 5-6, portrait in bit 7, version in bits 8-14, and left
+/// alignment in bit 15 (zero for justified, so caches built before the
+/// setting existed stay valid). Size, weight, family, the page box, and
+/// alignment all change wrap points, so a change in any forces a full
+/// rebuild.
 pub fn reader_layout_config(settings: TypeSettings, portrait: bool) -> u16 {
-    ((READER_LAYOUT_VERSION + PANEL_LAYOUT_SALT) << 8)
+    ((settings.alignment as u16) << 15)
+        | ((READER_LAYOUT_VERSION + PANEL_LAYOUT_SALT) << 8)
         | ((portrait as u16) << 7)
         | ((settings.family as u16) << 5)
         | ((settings.weight as u16) << 4)
         | ((settings.size as u16) << 2)
         | settings.spacing as u16
+}
+
+/// The alignment a block lays out and draws with: text the book sets
+/// justified follows the Alignment setting; every other alignment is the
+/// book's own.
+pub fn effective_align(align: TextAlign, settings: TypeSettings) -> TextAlign {
+    match (align, settings.alignment) {
+        (TextAlign::Justify, Alignment::Left) => TextAlign::Left,
+        _ => align,
+    }
 }
 
 /// The reading body face for the given settings and style run.
@@ -1366,6 +1382,7 @@ mod tests {
                             spacing: spacings[j],
                             weight: weights[k],
                             family: families[l],
+                            alignment: Alignment::Justified,
                         };
                         l += 1;
                     }
@@ -1438,19 +1455,53 @@ mod tests {
 
     #[test]
     fn layout_configs_are_distinct_per_type_settings_and_page_box() {
-        let mut seen = [0u16; 2 * ALL_SETTINGS.len()];
+        let mut seen = [0u16; 4 * ALL_SETTINGS.len()];
         let mut index = 0;
         for portrait in [false, true] {
-            for settings in ALL_SETTINGS.iter() {
-                let config = reader_layout_config(*settings, portrait);
-                assert!(
-                    !seen[..index].contains(&config),
-                    "duplicate layout config {config} for {settings:?} portrait={portrait}"
-                );
-                seen[index] = config;
-                index += 1;
+            for alignment in [Alignment::Justified, Alignment::Left] {
+                for settings in ALL_SETTINGS.iter() {
+                    let settings = TypeSettings {
+                        alignment,
+                        ..*settings
+                    };
+                    let config = reader_layout_config(settings, portrait);
+                    assert!(
+                        !seen[..index].contains(&config),
+                        "duplicate layout config {config} for {settings:?} portrait={portrait}"
+                    );
+                    seen[index] = config;
+                    index += 1;
+                }
             }
         }
+    }
+
+    #[test]
+    fn justified_layout_configs_predate_the_alignment_setting() {
+        // Caches built before the setting existed carry these configs; a
+        // justified reader must keep reading them without a rebuild.
+        let config = reader_layout_config(TypeSettings::DEFAULT, false);
+        assert_eq!(config & 0x8000, 0);
+        let left = TypeSettings {
+            alignment: Alignment::Left,
+            ..TypeSettings::DEFAULT
+        };
+        assert_eq!(reader_layout_config(left, false), config | 0x8000);
+    }
+
+    #[test]
+    fn left_alignment_only_overrides_justified_text() {
+        let left = TypeSettings {
+            alignment: Alignment::Left,
+            ..TypeSettings::DEFAULT
+        };
+        assert_eq!(effective_align(TextAlign::Justify, left), TextAlign::Left);
+        assert_eq!(effective_align(TextAlign::Center, left), TextAlign::Center);
+        assert_eq!(effective_align(TextAlign::Left, left), TextAlign::Left);
+        assert_eq!(
+            effective_align(TextAlign::Justify, TypeSettings::DEFAULT),
+            TextAlign::Justify
+        );
     }
 
     #[test]

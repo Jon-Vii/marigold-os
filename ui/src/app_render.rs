@@ -65,6 +65,7 @@ pub fn render_request(fb: &mut Framebuffer, request: RenderRequest, model: &UiRe
         line_spacing: request.line_spacing,
         font_weight: request.font_weight,
         font_family: request.font_family,
+        alignment: request.alignment,
         custom_font_name: model.custom_font_name,
         selection: request.selection,
         chapter: request.chapter,

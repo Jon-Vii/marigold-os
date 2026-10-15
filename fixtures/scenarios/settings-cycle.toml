@@ -1,9 +1,15 @@
 # Walk every visible Settings row with the change key: typeface, type size,
-# type weight, line spacing, refresh policy, orientation, and front buttons
-# each advance one step, then Back returns home. The buttons named below are
-# physical: after the orientation confirm the mapping rotates (landscape-top),
-# and after the front-buttons confirm the two front pairs also swap, so the
-# closing presses land on the rotated-and-swapped keys.
+# type weight, line spacing, alignment, refresh policy, orientation, and
+# front buttons each advance one step, then Back returns home. The buttons
+# named below are physical: after the orientation confirm the mapping rotates
+# (landscape-top), and after the front-buttons confirm the two front pairs
+# also swap, so the closing presses land on the rotated-and-swapped keys.
+
+[[steps]]
+button = "Next"
+
+[[steps]]
+button = "Confirm"
 
 [[steps]]
 button = "Next"
@@ -60,6 +66,7 @@ font_family = "Merriweather"
 font_size = "Large"
 font_weight = "Heavy"
 line_spacing = "Relaxed"
+alignment = "Left"
 refresh_policy = "FullOnWake"
 orientation = "landscape-top"
 front_buttons = "pages-left"

@@ -22,6 +22,9 @@ button = "Next"
 button = "Next"
 
 [[steps]]
+button = "Next"
+
+[[steps]]
 button = "Confirm"
 
 [[steps]]
@@ -29,6 +32,6 @@ button = "Previous"
 
 [expect]
 view = "Settings"
-selection = 5
+selection = 6
 orientation = "portrait-left"
 last_refresh = "FastClean"
