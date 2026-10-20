@@ -27,8 +27,14 @@ pub const CACHE_VERSION: u16 = 1;
 // describe the seed run (spines laid out ahead of the prefix), whose records
 // follow the prefix's. A v26 index reads as having no run, so its pages can
 // still pin a reader's place across a relayout.
-pub const CACHE_V2_VERSION: u16 = 27;
-const CACHE_V2_COMPAT_VERSION: u16 = 26;
+// Bumped 27 -> 28 when BlockRecord grew to 16 bytes to carry image blocks:
+// a kind flag plus the fitted display size the build measured from the
+// image's PNG header. A v27 section reads as having no image blocks at all,
+// so its pages would reserve no space for them; rejecting the old version
+// forces the one-time, lazy, per-book re-paginate that rebuilds sections
+// with image records.
+pub const CACHE_V2_VERSION: u16 = 28;
+const CACHE_V2_COMPAT_VERSION: u16 = 27;
 pub const CACHE_ROOT_DIR: &str = "XTEINK";
 pub const CACHE_DIR: &str = "CACHE";
 pub const CACHE_V2_DIR: &str = "CACHE2";
@@ -50,7 +56,7 @@ pub const PAGE_HEADER_BYTES: usize = 28;
 pub const PAGE_RECORD_BYTES: usize = 4;
 pub const LINE_RECORD_BYTES: usize = 12;
 pub const WORD_RECORD_BYTES: usize = 12;
-pub const BLOCK_RECORD_BYTES: usize = 12;
+pub const BLOCK_RECORD_BYTES: usize = 16;
 pub const COVER_MAGIC: &[u8; 4] = b"X4CV";
 pub const COVER_VERSION: u8 = 1;
 pub const COVER_HEADER_BYTES: usize = 12;
@@ -80,6 +86,7 @@ pub enum CacheError {
     BadMagic,
     BadVersion,
     BadLength,
+    BadRecord,
     Utf8,
 }
 
@@ -219,6 +226,14 @@ pub struct WordRecord {
     pub style: FontStyle,
 }
 
+/// Fitted on-page display size of an image block, in pixels, measured at
+/// build time from the image header against the current page box.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageSize {
+    pub width: u16,
+    pub height: u16,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockRecord {
     pub text_offset: u32,
@@ -227,6 +242,8 @@ pub struct BlockRecord {
     pub role: TextRole,
     pub style: FontStyle,
     pub align: TextAlign,
+    /// Present only for image blocks; `text` then holds the image href.
+    pub image: Option<ImageSize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -709,12 +726,27 @@ pub fn encode_block(record: BlockRecord, out: &mut [u8]) -> Result<usize, CacheE
     out[7] = role_byte(record.role);
     out[8] = style_byte(record.style);
     out[9] = align_byte(record.align);
-    write_u16(out, 10, 0);
+    out[10] = u8::from(record.image.is_some());
+    out[11] = 0;
+    let (width, height) = record
+        .image
+        .map(|image| (image.width, image.height))
+        .unwrap_or((0, 0));
+    write_u16(out, 12, width);
+    write_u16(out, 14, height);
     Ok(BLOCK_RECORD_BYTES)
 }
 
 pub fn decode_block(input: &[u8]) -> Result<BlockRecord, CacheError> {
     require(input, BLOCK_RECORD_BYTES)?;
+    let image = match input[10] {
+        0 => None,
+        1 => Some(ImageSize {
+            width: read_u16(input, 12)?,
+            height: read_u16(input, 14)?,
+        }),
+        _ => return Err(CacheError::BadRecord),
+    };
     Ok(BlockRecord {
         text_offset: read_u32(input, 0)?,
         text_len: read_u16(input, 4)?,
@@ -722,6 +754,7 @@ pub fn decode_block(input: &[u8]) -> Result<BlockRecord, CacheError> {
         role: role_from_byte(input[7])?,
         style: style_from_byte(input[8])?,
         align: align_from_byte(input[9])?,
+        image,
     })
 }
 
@@ -1003,6 +1036,7 @@ mod tests {
             role: TextRole::Heading2,
             style: FontStyle::BoldItalic,
             align: TextAlign::Center,
+            image: None,
         };
 
         let mut bytes = [0u8; 48];
@@ -1203,6 +1237,36 @@ mod tests {
     }
 
     #[test]
+    fn image_block_records_round_trip() {
+        let image = BlockRecord {
+            text_offset: 8,
+            text_len: 9,
+            line_count: 0,
+            role: TextRole::Body,
+            style: FontStyle::Regular,
+            align: TextAlign::Center,
+            image: Some(ImageSize {
+                width: 320,
+                height: 200,
+            }),
+        };
+        let mut bytes = [0u8; BLOCK_RECORD_BYTES];
+        encode_block(image, &mut bytes).expect("image block encodes");
+        assert_eq!(decode_block(&bytes).unwrap(), image);
+        assert_eq!(bytes[10], 1);
+
+        let mut text = image;
+        text.image = None;
+        text.line_count = 2;
+        encode_block(text, &mut bytes).expect("text block encodes");
+        assert_eq!(decode_block(&bytes).unwrap(), text);
+        assert_eq!(bytes[10], 0);
+
+        bytes[10] = 2;
+        assert_eq!(decode_block(&bytes).unwrap_err(), CacheError::BadRecord);
+    }
+
+    #[test]
     fn book_v2_cache_records_round_trip() {
         let header = BookV2Header {
             next_spine: Some(17),
@@ -1248,15 +1312,14 @@ mod tests {
         let old = decode_book_v2_header(&legacy).unwrap();
         assert_eq!(old.next_spine, None);
         assert_eq!(old.text_start_spine, None);
-        // A v26 index held the viewport size where the run is described:
-        // it reads as having none.
+        // The compat window is one version deep: once v28 is current, a v26
+        // index is rejected and rebuilt rather than interpreted.
         let mut v26 = header_bytes;
         v26[4..6].copy_from_slice(&26u16.to_le_bytes());
-        v26[28..32].copy_from_slice(&[0x20, 0x03, 0xe0, 0x01]);
-        let v26 = decode_book_v2_header(&v26).unwrap();
-        assert_eq!((v26.seed_first_spine, v26.seed_section_count), (None, 0));
-        assert!(!v26.seed_capped && !v26.seed_reaches_end);
-        assert_eq!(v26.total_pages, header.total_pages);
+        assert_eq!(
+            decode_book_v2_header(&v26).unwrap_err(),
+            CacheError::BadVersion
+        );
         assert!(!old.generated_toc);
         assert!(old.partial);
         assert_eq!(old.total_pages, header.total_pages);

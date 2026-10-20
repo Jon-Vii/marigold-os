@@ -201,6 +201,14 @@ impl Default for ZipInflateScratch {
     }
 }
 
+impl ZipInflateScratch {
+    /// The streaming state, borrowable while the ZIP layer itself is idle —
+    /// the image pipeline reuses it for a PNG's IDAT stream.
+    pub fn state_mut(&mut self) -> &mut InflateState {
+        &mut self.state
+    }
+}
+
 impl<R> ZipLocalStream<R>
 where
     R: ByteStream,
@@ -769,6 +777,27 @@ pub trait EpubZipOps {
         false
     }
 
+    /// Raw bytes at an absolute file offset, for callers that copy an
+    /// entry's compressed payload without decompressing it (the image
+    /// pipeline spools compressed PNG bytes so one inflate state can serve
+    /// both the ZIP layer and the PNG's own IDAT stream). Forward-only
+    /// readers cannot serve it.
+    fn read_raw_at(&mut self, _offset: u32, _out: &mut [u8]) -> Result<usize, ZipError> {
+        Err(ZipError::UnsupportedCompression)
+    }
+
+    /// Absolute offset of an entry's compressed payload. Forward-only
+    /// readers can only answer for the entry they just found.
+    fn entry_data_offset(
+        &mut self,
+        entry: OwnedZipEntry,
+        _header_scratch: &mut [u8; 46],
+        _name_scratch: &mut [u8],
+    ) -> Result<u32, ZipError> {
+        let _ = entry;
+        Err(ZipError::UnsupportedCompression)
+    }
+
     fn find_entry(
         &mut self,
         name: &str,
@@ -857,6 +886,20 @@ where
             inflate_scratch,
             emit,
         )
+    }
+
+    fn read_raw_at(&mut self, offset: u32, out: &mut [u8]) -> Result<usize, ZipError> {
+        read_exact_at(&mut self.reader, offset, out)?;
+        Ok(out.len())
+    }
+
+    fn entry_data_offset(
+        &mut self,
+        entry: OwnedZipEntry,
+        _header_scratch: &mut [u8; 46],
+        _name_scratch: &mut [u8],
+    ) -> Result<u32, ZipError> {
+        self.entry_payload_offset(entry)
     }
 }
 
@@ -1329,6 +1372,21 @@ pub trait XhtmlBlockSink {
         align: TextAlign,
         paragraph_end: bool,
     ) -> Result<(), XhtmlError>;
+
+    /// An `<img>` element: `href` is the raw `src` attribute (resolution
+    /// against the chapter's location is the receiver's job) and `alt` is
+    /// the attribute value when present. The default renders the historical
+    /// placeholder so sinks that ignore images keep their behavior.
+    fn push_image(&mut self, _href: &str, alt: Option<&str>) -> Result<(), XhtmlError> {
+        let placeholder = alt.unwrap_or("[Image]");
+        self.push_block(
+            placeholder,
+            TextRole::Body,
+            FontStyle::Italic,
+            TextAlign::Center,
+            true,
+        )
+    }
 }
 
 pub trait EpubTocSink {
@@ -1340,6 +1398,10 @@ pub trait EpubTocSink {
 }
 
 pub const MAX_CSS_RULES: usize = 96;
+
+/// Upper bound on manifest image items the package retains for the image
+/// pipeline. A book with more images renders the overflow as placeholders.
+pub const MAX_IMAGE_ITEMS: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CssRule {
@@ -1476,6 +1538,12 @@ pub struct EpubPackage<'a> {
     /// The cover image's href: the `cover-image` item, else an image whose id
     /// or href says cover.
     pub cover_href: Option<&'a str>,
+    /// Manifest image items (PNG only in v1) as href spans over `opf_text`,
+    /// for the image pipeline's pre-build probe. `image_count` entries are
+    /// valid; `images_truncated` reports overflow past `MAX_IMAGE_ITEMS`.
+    pub image_hrefs: [Span; MAX_IMAGE_ITEMS],
+    pub image_count: usize,
+    pub images_truncated: bool,
     /// True when the OPF held more spine items than `MAX_SPINE_ITEMS`, so the
     /// spine (and the book) is clipped. Callers flag the book partial instead
     /// of silently dropping the tail chapters.
@@ -1685,6 +1753,9 @@ where
         nav_href: None,
         ncx_href: None,
         cover_href: None,
+        image_hrefs: [Span::default(); MAX_IMAGE_ITEMS],
+        image_count: 0,
+        images_truncated: false,
         spine_truncated: false,
         spine: Spine::empty(),
     };
@@ -1737,6 +1808,9 @@ where
     package.nav_href = summary.nav.map(|span| span.of(text));
     package.ncx_href = summary.ncx.map(|span| span.of(text));
     package.cover_href = summary.cover.map(|span| span.of(text));
+    package.image_hrefs = summary.image_hrefs;
+    package.image_count = summary.image_count;
+    package.images_truncated = summary.images_truncated;
     package.meta.cover_status = if summary.any_cover {
         CoverStatus::Present
     } else {
@@ -1855,6 +1929,9 @@ struct OpfSummary {
     ncx: Option<Span>,
     cover: Option<Span>,
     any_cover: bool,
+    image_hrefs: [Span; MAX_IMAGE_ITEMS],
+    image_count: usize,
+    images_truncated: bool,
     lost: bool,
 }
 
@@ -1889,6 +1966,9 @@ struct OpfCollector<'b> {
     cover: Option<Span>,
     image_cover: Option<Span>,
     any_cover: bool,
+    image_hrefs: [Span; MAX_IMAGE_ITEMS],
+    image_count: usize,
+    images_truncated: bool,
     interned: Vec<Span, OPF_INTERNED_VALUES>,
     lost: bool,
 }
@@ -1916,8 +1996,28 @@ impl<'b> OpfCollector<'b> {
             cover: None,
             image_cover: None,
             any_cover: false,
+            image_hrefs: [Span::default(); MAX_IMAGE_ITEMS],
+            image_count: 0,
+            images_truncated: false,
             interned: Vec::new(),
             lost: false,
+        }
+    }
+
+    /// Records a PNG manifest item's href span for the image pipeline.
+    /// Only PNG in v1; the decode path falls back to placeholders for the
+    /// rest rather than carrying formats it cannot render.
+    fn record_image(&mut self, href: &str, media_type: &str) {
+        if !media_type.eq_ignore_ascii_case("image/png") {
+            return;
+        }
+        if self.image_count == MAX_IMAGE_ITEMS {
+            self.images_truncated = true;
+            return;
+        }
+        if let Some(span) = self.push(href) {
+            self.image_hrefs[self.image_count] = span;
+            self.image_count += 1;
         }
     }
 
@@ -1931,6 +2031,8 @@ impl<'b> OpfCollector<'b> {
         self.in_spine = false;
         self.in_guide = false;
         self.capture = OpfCapture::None;
+        self.image_count = 0;
+        self.images_truncated = false;
     }
 
     fn summary(&self) -> OpfSummary {
@@ -1950,6 +2052,9 @@ impl<'b> OpfCollector<'b> {
             ncx: self.ncx,
             cover: self.cover.or(self.image_cover),
             any_cover: self.any_cover,
+            image_hrefs: self.image_hrefs,
+            image_count: self.image_count,
+            images_truncated: self.images_truncated,
             lost: self.lost,
         }
     }
@@ -2111,6 +2216,7 @@ impl<'b> OpfCollector<'b> {
         let media_type = attr_value(tag, "media-type").unwrap_or("");
         let properties = attr_value(tag, "properties").unwrap_or("");
         if self.fallback {
+            self.record_image(href, media_type);
             if !manifest_item_is_reading_candidate(href, media_type, properties) {
                 return;
             }
@@ -2139,6 +2245,9 @@ impl<'b> OpfCollector<'b> {
             .any(|prop| prop == "cover-image");
         let names_cover = id == "cover" || href.contains("cover");
         let is_image = media_type.starts_with("image/");
+        if is_image {
+            self.record_image(href, media_type);
+        }
         if names_cover || is_cover_image {
             self.any_cover = true;
         }
@@ -2431,18 +2540,7 @@ impl XhtmlBlockStreamParser {
             )?;
         } else if tag_name_is(tag, "img") {
             self.flush(sink)?;
-            let mut placeholder = heapless::String::<160>::new();
-            match attr_value(tag, "alt") {
-                Some(alt) => append_owned_text(&mut placeholder, alt),
-                None => append_owned_text(&mut placeholder, "[Image]"),
-            }
-            sink.push_block(
-                placeholder.as_str(),
-                TextRole::Body,
-                FontStyle::Italic,
-                TextAlign::Center,
-                true,
-            )?;
+            sink.push_image(attr_value(tag, "src").unwrap_or(""), attr_value(tag, "alt"))?;
         } else if tag_name_is(tag, "ul") || tag_name_is(tag, "ol") {
             self.flush(sink)?;
             if self.list_depth < self.list_kind_stack.len() {
@@ -6026,6 +6124,80 @@ mod tests {
     }
 
     #[test]
+    fn img_elements_report_href_and_alt_to_image_sinks() {
+        struct ImageSpy {
+            images: StdVec<(std::string::String, Option<std::string::String>)>,
+            blocks: StdVec<Fragment>,
+        }
+        impl XhtmlBlockSink for ImageSpy {
+            fn push_block(
+                &mut self,
+                text: &str,
+                role: TextRole,
+                style: FontStyle,
+                align: TextAlign,
+                paragraph_end: bool,
+            ) -> Result<(), XhtmlError> {
+                self.blocks.push((
+                    std::string::String::from(text),
+                    role,
+                    style,
+                    align,
+                    paragraph_end,
+                ));
+                Ok(())
+            }
+            fn push_image(&mut self, href: &str, alt: Option<&str>) -> Result<(), XhtmlError> {
+                self.images.push((
+                    std::string::String::from(href),
+                    alt.map(std::string::String::from),
+                ));
+                Ok(())
+            }
+        }
+
+        let mut whole = ImageSpy {
+            images: StdVec::new(),
+            blocks: StdVec::new(),
+        };
+        xhtml_blocks_to_sink(
+            r#"<body><p>before</p><img src="pics/x.png" alt="A map"/><p>after</p></body>"#,
+            None,
+            &mut whole,
+        )
+        .expect("whole parse");
+        assert_eq!(whole.images.len(), 1);
+        assert_eq!(whole.images[0].0, "pics/x.png");
+        assert_eq!(whole.images[0].1.as_deref(), Some("A map"));
+        // The image ends its paragraph and does not join surrounding text.
+        // The image no longer becomes a placeholder text block.
+        assert!(whole
+            .blocks
+            .iter()
+            .all(|(text, ..)| text != "A map" && text != "[Image]"));
+
+        // The streamed path reports the same image.
+        let mut streamed = ImageSpy {
+            images: StdVec::new(),
+            blocks: StdVec::new(),
+        };
+        let mut tokenizer = StreamingXmlTokenizer::new();
+        let mut parser = XhtmlBlockStreamParser::new(false);
+        tokenizer
+            .feed_xhtml_blocks(
+                b"<body><p>before</p><img src=\"pics/x.png\" alt=\"A map\"/><p>after</p></body>",
+                &mut parser,
+                None,
+                &mut streamed,
+            )
+            .expect("stream parse");
+        tokenizer
+            .finish_xhtml_blocks(&mut parser, &mut streamed)
+            .expect("finish");
+        assert_eq!(streamed.images, whole.images);
+    }
+
+    #[test]
     fn non_ascii_attribute_values_survive() {
         let fragments = parse_both_ways(r#"<body><img src="x.png" alt="Café Ægir"/></body>"#);
         assert_eq!(reading_text(&fragments), "Café Ægir\n");
@@ -6336,5 +6508,130 @@ mod tests {
 
     fn push_u32(bytes: &mut StdVec<u8>, value: u32) {
         bytes.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
+pub fn resolve_relative_href<const N: usize>(
+    base: &str,
+    relative: &str,
+    out: &mut heapless::String<N>,
+) -> bool {
+    out.clear();
+    let relative = relative.split('#').next().unwrap_or(relative);
+    if relative.is_empty() {
+        return false;
+    }
+    // Segment stack: directory segments of the base, then the relative
+    // segments applied on top, with `..` popping.
+    let mut segments: heapless::Vec<&str, 24> = heapless::Vec::new();
+    let base_dir = base.split('#').next().unwrap_or(base);
+    let mut parts = base_dir.split('/');
+    // The last segment is the document itself; drop it.
+    let _document = parts.next_back();
+    for segment in parts {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        if segments.push(segment).is_err() {
+            return false;
+        }
+    }
+    for segment in relative.split('/') {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        if segment == ".." {
+            if segments.pop().is_none() {
+                return false;
+            }
+            continue;
+        }
+        if segments.push(segment).is_err() {
+            return false;
+        }
+    }
+    for (index, segment) in segments.iter().enumerate() {
+        if index > 0 && out.push('/').is_err() {
+            return false;
+        }
+        if out.push_str(segment).is_err() {
+            return false;
+        }
+    }
+    !out.is_empty()
+}
+
+#[cfg(test)]
+mod href_tests {
+    use super::*;
+
+    #[test]
+    fn resolve_relative_href_joins_and_folds() {
+        let mut out = heapless::String::<128>::new();
+        assert!(resolve_relative_href(
+            "OEBPS/text/ch1.xhtml",
+            "images/map.png",
+            &mut out
+        ));
+        assert_eq!(out.as_str(), "OEBPS/text/images/map.png");
+
+        assert!(resolve_relative_href(
+            "OEBPS/text/ch1.xhtml",
+            "../img/x.png",
+            &mut out
+        ));
+        assert_eq!(out.as_str(), "OEBPS/img/x.png");
+
+        assert!(resolve_relative_href("ch1.xhtml", "sub/y.png", &mut out));
+        assert_eq!(out.as_str(), "sub/y.png");
+
+        assert!(resolve_relative_href(
+            "OEBPS/a/b.xhtml",
+            "./c.png#frag",
+            &mut out
+        ));
+        assert_eq!(out.as_str(), "OEBPS/a/c.png");
+
+        // A leading slash has no zip-root meaning in EPUB hrefs; it joins
+        // like any other segment rather than escaping the book.
+        assert!(resolve_relative_href(
+            "OEBPS/a/b.xhtml",
+            "/root/x.png",
+            &mut out
+        ));
+        assert_eq!(out.as_str(), "OEBPS/a/root/x.png");
+
+        assert!(!resolve_relative_href("a.xhtml", "../../out.png", &mut out));
+        assert!(!resolve_relative_href("a.xhtml", "", &mut out));
+        assert!(!resolve_relative_href("a.xhtml", "#frag", &mut out));
+    }
+
+    #[test]
+    fn package_lists_png_manifest_items() {
+        let opf = r#"<package>
+            <manifest>
+                <item id="c1" href="text/ch1.xhtml" media-type="application/xhtml+xml"/>
+                <item id="fig1" href="images/fig1.png" media-type="image/png"/>
+                <item id="jpg" href="images/photo.jpg" media-type="image/jpeg"/>
+                <item id="fig2" href="images/fig2.png" media-type="image/png"/>
+            </manifest>
+            <spine><itemref idref="c1"/></spine>
+        </package>"#;
+        let mut arena = [0u8; 2048];
+        let package = parse_opf(
+            opf.as_bytes(),
+            &mut arena,
+            BookId(7),
+            "book.epub",
+            100,
+            "content.opf",
+        )
+        .expect("package parses");
+        let hrefs: std::vec::Vec<&str> = package.image_hrefs[..package.image_count]
+            .iter()
+            .map(|span| span.of(package.opf_text))
+            .collect();
+        assert_eq!(hrefs, ["images/fig1.png", "images/fig2.png"]);
+        assert!(!package.images_truncated);
     }
 }
