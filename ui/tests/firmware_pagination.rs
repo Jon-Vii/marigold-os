@@ -22,6 +22,7 @@ fn append_block(store: &mut ReaderStore, role: TextRole) {
         role,
         style: FontStyle::Regular,
         align: TextAlign::Left,
+        image: None,
     };
     store.block_paragraph_end[index] = true;
     store.block_count += 1;
@@ -273,4 +274,72 @@ fn benchmark_cache_pagination() {
             );
         }
     }
+}
+
+#[test]
+fn image_blocks_reserve_their_recorded_height_and_center() {
+    use display::font::FontStyle as DisplayFontStyle;
+    use proto::cache::ImageSize;
+    use ui::reading::{for_each_drawable_block, page_record_at, PageBox, ReadingBlocks};
+
+    struct Source {
+        blocks: Vec<BlockRecord>,
+    }
+    impl ReadingBlocks for Source {
+        fn block_count(&self) -> usize {
+            self.blocks.len()
+        }
+        fn block(&self, index: usize) -> Option<BlockRecord> {
+            self.blocks.get(index).copied()
+        }
+        fn block_text(&self, _index: usize) -> &str {
+            ""
+        }
+        fn block_style(&self, _index: usize) -> DisplayFontStyle {
+            DisplayFontStyle::Regular
+        }
+        fn page_break_before(&self, _index: usize) -> bool {
+            false
+        }
+        fn paragraph_end(&self, _index: usize) -> bool {
+            true
+        }
+    }
+
+    let image = |w: u16, h: u16| BlockRecord {
+        text_offset: 0,
+        text_len: 0,
+        line_count: 0,
+        role: TextRole::Body,
+        style: FontStyle::Regular,
+        align: TextAlign::Center,
+        image: Some(ImageSize {
+            width: w,
+            height: h,
+        }),
+    };
+    let source = Source {
+        blocks: vec![image(400, 400), image(200, 200)],
+    };
+
+    // The 400-px image fills most of the landscape page box; the 200-px one
+    // must break to the next page rather than squeeze under it.
+    let first = page_record_at(&source, 0);
+    assert_eq!(first.block_count, 1);
+    let second = page_record_at(&source, 1);
+    assert_eq!(second.first_block, 1);
+
+    // Drawable geometry: the image rect is centered in the page box.
+    let mut rects = Vec::new();
+    for_each_drawable_block(&source, first, |block| {
+        rects.push(block.image.expect("image rect"));
+        true
+    });
+    assert_eq!(rects.len(), 1);
+    let box_ = PageBox::LANDSCAPE;
+    let expected_x = box_.left + ((box_.right - box_.left - 400) / 2).max(0);
+    assert_eq!(rects[0].x, expected_x);
+    assert_eq!(rects[0].width, 400);
+    assert_eq!(rects[0].height, 400);
+    assert!(ui::reading::page_has_images(&source, first));
 }

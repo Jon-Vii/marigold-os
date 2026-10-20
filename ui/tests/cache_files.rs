@@ -857,7 +857,7 @@ fn justified_lines_fill_the_measure_except_a_paragraphs_last() {
 
     let mut fb = Framebuffer::new();
     fb.clear(true);
-    ui::reading::draw_reading_page_body(&mut fb, &store, store.pages[0]);
+    ui::reading::draw_reading_page_body(&mut fb, &store, store.pages[0], &mut |_, _, _| {});
     let page_box = ui::reading::ReadingBlocks::page_box(&store);
     let target = page_box.right - ui::reading::READER_WRAP_SAFETY;
     let settings = ui::reading::ReadingBlocks::type_settings(&store);

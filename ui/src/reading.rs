@@ -102,7 +102,20 @@ pub trait ReadingBlocks {
     }
 }
 
+/// On-page rectangle of an image block: centered horizontally in the page
+/// box, top edge at `y`, sized to the fitted dimensions the build recorded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReaderImageRect {
+    pub x: i16,
+    pub y: i16,
+    pub width: u16,
+    pub height: u16,
+}
+
 pub struct ReaderDrawableBlock<'a> {
+    /// Block's index in the source, so image drawers can find the image's
+    /// href and sidecar.
+    pub index: usize,
     pub record: BlockRecord,
     pub text: &'a str,
     pub y: i16,
@@ -115,12 +128,20 @@ pub struct ReaderDrawableBlock<'a> {
     /// The block ends its paragraph. A justified paragraph's last line
     /// keeps its natural spacing.
     pub paragraph_end: bool,
+    /// Present for image blocks; text drawing is skipped and the receiver
+    /// paints the bitmap instead.
+    pub image: Option<ReaderImageRect>,
 }
 
 pub fn block_height(source: &impl ReadingBlocks, index: usize) -> i16 {
     let Some(record) = source.block(index) else {
         return 0;
     };
+    if let Some(image) = record.image {
+        // The build already fitted the image to the page box it paginated
+        // under; the height is the image's own ink with no line wrap.
+        return image.height as i16 + paragraph_gap_after(source, index);
+    }
     let settings = source.type_settings();
     let advance = line_advance(settings, record.role);
     let height = if record.line_count == 1 {
@@ -236,6 +257,19 @@ pub fn page_record_at(source: &impl ReadingBlocks, page_index: usize) -> PageRec
     last
 }
 
+/// Whether any block on `page` is an image: pages with images escalate to a
+/// cleaning refresh, and firmware opens an SD session for their sidecars.
+pub fn page_has_images(source: &impl ReadingBlocks, page: PageRecord) -> bool {
+    for offset in 0..page.block_count as usize {
+        if let Some(record) = source.block(page.first_block as usize + offset) {
+            if record.image.is_some() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// The loading bookplate shared by the firmware and host reading views.
 /// Coordinates follow the framebuffer's current drawing frame; long labels
 /// keep their leading text and an ellipsis inside the page margins.
@@ -286,7 +320,18 @@ pub fn for_each_drawable_block(
         if y + block_ink_height(source, index) > page_box.bottom && y > page_box.top {
             break;
         }
+        let image = record.image.map(|image| {
+            let column = i32::from(page_box.right - page_box.left);
+            let x = page_box.left + ((column - i32::from(image.width)) / 2).max(0) as i16;
+            ReaderImageRect {
+                x,
+                y,
+                width: image.width,
+                height: image.height,
+            }
+        });
         if !visit(ReaderDrawableBlock {
+            index,
             record,
             text,
             y: y + advance,
@@ -295,6 +340,7 @@ pub fn for_each_drawable_block(
             font: body_font(settings, style),
             indent: block_first_line_indent(source, index),
             paragraph_end: source.paragraph_end(index),
+            image,
         }) {
             break;
         }
@@ -304,10 +350,24 @@ pub fn for_each_drawable_block(
 
 /// Draw one page of reading-body blocks: the single rendering of cached
 /// reader content shared by firmware views and host tooling.
-pub fn draw_reading_page_body(fb: &mut Framebuffer, source: &impl ReadingBlocks, page: PageRecord) {
+/// Draws image blocks that the caller can load pixels for. Firmware streams
+/// the cached 1-bpp sidecar from the card; host tools draw a synthetic
+/// pattern so golden frames can verify placement without a decoder.
+pub type ImageDrawer<'a> = dyn FnMut(&mut Framebuffer, &ReaderImageRect, usize) + 'a;
+
+pub fn draw_reading_page_body(
+    fb: &mut Framebuffer,
+    source: &impl ReadingBlocks,
+    page: PageRecord,
+    draw_image: &mut ImageDrawer<'_>,
+) {
     let settings = source.type_settings();
     let page_box = source.page_box();
     for_each_drawable_block(source, page, |block| {
+        if let Some(rect) = block.image {
+            draw_image(fb, &rect, block.index);
+            return true;
+        }
         let role = block.record.role;
         match effective_align(block.record.align, settings) {
             TextAlign::Left => {
@@ -1193,6 +1253,7 @@ mod tests {
                 role: *self.roles.get(index)?,
                 style: proto::text::FontStyle::Regular,
                 align: self.aligns[index],
+                image: None,
             })
         }
         fn block_text(&self, _index: usize) -> &str {
