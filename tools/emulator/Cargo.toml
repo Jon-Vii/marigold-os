@@ -23,3 +23,8 @@ png = "0.17"
 proto = { path = "../../proto" }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+
+[dev-dependencies]
+# The reading golden decodes a real PNG through proto's decoder, which
+# borrows an InflateState the test owns.
+miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"] }

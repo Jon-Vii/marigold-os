@@ -98,6 +98,7 @@ fn record(role: TextRole, align: TextAlign, line_count: u8) -> BlockRecord {
         role,
         style: proto::text::FontStyle::Regular,
         align,
+        image: None,
     }
 }
 
@@ -237,6 +238,117 @@ fn golden_path(name: &str) -> PathBuf {
         .join(format!("{name}{suffix}.png"))
 }
 
+/// Decodes the committed orientation-marker PNG through the real
+/// `proto::png` decoder and Bayer-dithers it into `rect`, mirroring the
+/// firmware's build pipeline (decode -> luma rows -> ordered dither). The
+/// arrows, labels, and ladder make any flip, mirror, scale, or placement
+/// error readable directly in the golden.
+fn draw_orientation_test_image(fb: &mut Framebuffer, rect: &ui::reading::ReaderImageRect) {
+    const PNG: &[u8] = include_bytes!("../../../fixtures/images/orientation-test.png");
+    fn bayer_threshold(x: usize, y: usize) -> u8 {
+        const BAYER8: [[u8; 8]; 8] = [
+            [0, 32, 8, 40, 2, 34, 10, 42],
+            [48, 16, 56, 24, 50, 18, 58, 26],
+            [12, 44, 4, 36, 14, 46, 6, 38],
+            [60, 28, 52, 20, 62, 30, 54, 22],
+            [3, 35, 11, 43, 1, 33, 9, 41],
+            [51, 19, 59, 27, 49, 17, 57, 25],
+            [15, 47, 7, 39, 13, 45, 5, 37],
+            [63, 31, 55, 23, 61, 29, 53, 21],
+        ];
+        ((BAYER8[y & 7][x & 7] as u32 * 255 + 32) / 64) as u8
+    }
+    struct BlitSink<'a> {
+        fb: &'a mut Framebuffer,
+        x: usize,
+        y: usize,
+        failed: bool,
+    }
+    impl proto::png::LumaSink for BlitSink<'_> {
+        fn row(&mut self, dy: u32, luma: &[u8]) -> Result<(), proto::png::PngError> {
+            for (dx, &value) in luma.iter().enumerate() {
+                self.fb.set_pixel(
+                    self.x + dx,
+                    self.y + dy as usize,
+                    u32::from(value) > u32::from(bayer_threshold(dx, dy as usize)),
+                );
+            }
+            Ok(())
+        }
+    }
+    let mut scratch = vec![0u8; proto::png::PNG_SCRATCH_BYTES];
+    let mut state = miniz_oxide::inflate::stream::InflateState::new(miniz_oxide::DataFormat::Zlib);
+    let mut sink = BlitSink {
+        fb,
+        x: rect.x.max(0) as usize,
+        y: rect.y.max(0) as usize,
+        failed: false,
+    };
+    let Ok(mut decoder) =
+        proto::png::PngDecoder::new(&mut scratch, u32::from(rect.width), u32::from(rect.height))
+    else {
+        panic!("orientation fixture must fit the decoder scratch");
+    };
+    for chunk in PNG.chunks(512) {
+        if decoder.feed(&mut state, chunk, &mut sink).is_err() {
+            panic!("orientation fixture must decode cleanly");
+        }
+    }
+    decoder
+        .finish(&mut state, &mut sink)
+        .expect("orientation fixture completes");
+}
+
+/// A reading page whose middle block is an image: text above and below
+/// must wrap around the reserved rect, and the synthetic checker pins the
+/// image's centered placement and size. Image blocks carry the fitted size
+/// in the record, so no decoder is needed on the host.
+#[test]
+fn image_page_matches_goldens() {
+    for (portrait, name) in [
+        (false, "reading-image-page"),
+        (true, "reading-image-page-portrait"),
+    ] {
+        let image_record = BlockRecord {
+            image: Some(proto::cache::ImageSize {
+                width: 300,
+                height: 200,
+            }),
+            ..record(TextRole::Body, TextAlign::Center, 0)
+        };
+        let mut source = fixture(TypeSettings::DEFAULT);
+        source.portrait = portrait;
+        // Insert the image after the chapter heading and the first body
+        // block; both panels must break the page rather than squeeze it.
+        source.blocks.insert(
+            2,
+            FixtureBlock {
+                record: image_record,
+                text: "images/figure-1.png".into(),
+                style: FontStyle::Regular,
+                page_break_before: false,
+                paragraph_end: true,
+            },
+        );
+        let page = page_record_at(&source, 0);
+        assert!(
+            page.block_count >= 2,
+            "image page should hold at least two blocks"
+        );
+        let mut fb = Framebuffer::new();
+        if portrait {
+            fb.set_frame(display::fb::FbFrame::Portrait);
+            fb.clear(true);
+        }
+        let mut draw_image =
+            |fb: &mut Framebuffer, rect: &ui::reading::ReaderImageRect, _index: usize| {
+                draw_orientation_test_image(fb, rect);
+            };
+        draw_reading_page_body(&mut fb, &source, page, &mut draw_image);
+        assert_frame_matches_golden(&fb, name);
+    }
+}
+
 /// Compare `fb` with the named golden, or rewrite the golden when
 /// `REGEN_READING_GOLDEN=1`.
 fn assert_frame_matches_golden(fb: &Framebuffer, name: &str) {
@@ -254,7 +366,21 @@ fn assert_page_matches_golden(source: &FixtureBlocks, page_index: usize, name: &
     let page = page_record_at(source, page_index);
     assert!(page.block_count > 0, "page {page_index} should hold blocks");
     let mut fb = Framebuffer::new();
-    draw_reading_page_body(&mut fb, source, page);
+    let mut draw_image =
+        |fb: &mut Framebuffer, rect: &ui::reading::ReaderImageRect, _index: usize| {
+            // Synthetic 50% checker: image-page goldens verify placement and
+            // size without a decoder.
+            for dy in 0..rect.height as usize {
+                for dx in 0..rect.width as usize {
+                    fb.set_pixel(
+                        rect.x.max(0) as usize + dx,
+                        rect.y.max(0) as usize + dy,
+                        (dx + dy) % 2 == 0,
+                    );
+                }
+            }
+        };
+    draw_reading_page_body(&mut fb, source, page, &mut draw_image);
     assert_frame_matches_golden(&fb, name);
 }
 
@@ -280,7 +406,21 @@ fn full_reading_surface_matches_golden() {
     let source = fixture(TypeSettings::DEFAULT);
     let page = page_record_at(&source, 0);
     let mut fb = Framebuffer::new();
-    draw_reading_page_body(&mut fb, &source, page);
+    let mut draw_image =
+        |fb: &mut Framebuffer, rect: &ui::reading::ReaderImageRect, _index: usize| {
+            // Synthetic 50% checker: image-page goldens verify placement and
+            // size without a decoder.
+            for dy in 0..rect.height as usize {
+                for dx in 0..rect.width as usize {
+                    fb.set_pixel(
+                        rect.x.max(0) as usize + dx,
+                        rect.y.max(0) as usize + dy,
+                        (dx + dy) % 2 == 0,
+                    );
+                }
+            }
+        };
+    draw_reading_page_body(&mut fb, &source, page, &mut draw_image);
     draw_reading_page_counter(&mut fb, "1/2");
 
     assert_frame_matches_golden(&fb, "reading-surface-0");
@@ -413,7 +553,21 @@ fn portrait_reading_surface_matches_golden() {
     let mut fb = Framebuffer::new();
     fb.set_frame(display::fb::FbFrame::Portrait);
     fb.clear(true);
-    draw_reading_page_body(&mut fb, &source, page);
+    let mut draw_image =
+        |fb: &mut Framebuffer, rect: &ui::reading::ReaderImageRect, _index: usize| {
+            // Synthetic 50% checker: image-page goldens verify placement and
+            // size without a decoder.
+            for dy in 0..rect.height as usize {
+                for dx in 0..rect.width as usize {
+                    fb.set_pixel(
+                        rect.x.max(0) as usize + dx,
+                        rect.y.max(0) as usize + dy,
+                        (dx + dy) % 2 == 0,
+                    );
+                }
+            }
+        };
+    draw_reading_page_body(&mut fb, &source, page, &mut draw_image);
     draw_reading_page_counter(&mut fb, "1/2");
 
     assert_frame_matches_golden(&fb, "reading-portrait-surface-0");

@@ -2904,6 +2904,7 @@ dependencies = [
  "display",
  "eframe",
  "egui",
+ "miniz_oxide 0.9.1",
  "png 0.17.16",
  "proto",
  "serde",

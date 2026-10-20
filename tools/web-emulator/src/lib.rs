@@ -417,7 +417,20 @@ impl WebEmulator {
         }
         let store = self.store.as_ref().unwrap();
         let page = store.page(request.page);
-        ui::reading::draw_reading_page_body(&mut self.fb, store, page);
+        let mut draw_image = |fb: &mut display::fb::Framebuffer,
+                              rect: &ui::reading::ReaderImageRect,
+                              _index: usize| {
+            for dy in 0..rect.height as usize {
+                for dx in 0..rect.width as usize {
+                    fb.set_pixel(
+                        rect.x.max(0) as usize + dx,
+                        rect.y.max(0) as usize + dy,
+                        (dx + dy) % 2 == 0,
+                    );
+                }
+            }
+        };
+        ui::reading::draw_reading_page_body(&mut self.fb, store, page, &mut draw_image);
 
         let (current, total) = store.chapter_page_position(request.page);
         let label = format!("{}/{}", current, total);
