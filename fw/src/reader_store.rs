@@ -71,6 +71,7 @@ pub(crate) const EMPTY_BLOCK_RECORD: BlockRecord = BlockRecord {
     role: TextRole::Body,
     style: proto::text::FontStyle::Regular,
     align: TextAlign::Justify,
+    image: None,
 };
 pub(crate) const EMPTY_PAGE_RECORD: PageRecord = PageRecord {
     first_block: 0,
@@ -1885,6 +1886,7 @@ impl ReaderStore {
             role,
             style: proto_style_for_display_style(style),
             align,
+            image: None,
         };
         self.block_styles[self.block_count] = style;
         self.block_spine[self.block_count] = spine_index;
@@ -1894,6 +1896,53 @@ impl ReaderStore {
         // A line opens a paragraph when the previous block closed one (and the
         // first block always does). This mirrors the indent budget the build
         // wrap charged this line, so draw and pagination agree.
+        self.block_paragraph_start[self.block_count] = self.block_count == 0
+            || self
+                .block_paragraph_end
+                .get(self.block_count.wrapping_sub(1))
+                .copied()
+                .unwrap_or(true);
+        self.block_count += 1;
+        true
+    }
+
+    /// Records an image block: `href` is the zip path the build resolved,
+    /// stored in the text blob so the render path can find the sidecar;
+    /// `width`/`height` are the fitted on-page pixel size the build measured.
+    /// Images always center in the column and close their paragraph.
+    pub(crate) fn push_image_block(
+        &mut self,
+        href: &str,
+        width: u16,
+        height: u16,
+        spine_index: u16,
+    ) -> bool {
+        if self.block_count >= self.blocks.len() || width == 0 || height == 0 {
+            return false;
+        }
+        let start = self.text_len;
+        let bytes = href.as_bytes();
+        if start + bytes.len() > self.text.len() || bytes.len() > u16::MAX as usize {
+            return false;
+        }
+        self.text[start..start + bytes.len()].copy_from_slice(bytes);
+        self.text_len += bytes.len();
+        self.blocks[self.block_count] = BlockRecord {
+            text_offset: start as u32,
+            text_len: bytes.len() as u16,
+            line_count: 0,
+            role: TextRole::Body,
+            style: proto::text::FontStyle::Regular,
+            align: TextAlign::Center,
+            image: Some(proto::cache::ImageSize { width, height }),
+        };
+        self.block_styles[self.block_count] = FontStyle::Regular;
+        self.block_spine[self.block_count] = spine_index;
+        self.block_page_break_before[self.block_count] = should_break_before_block(
+            TextRole::Body,
+            self.blocks.get(self.block_count.wrapping_sub(1)),
+        );
+        self.block_paragraph_end[self.block_count] = true;
         self.block_paragraph_start[self.block_count] = self.block_count == 0
             || self
                 .block_paragraph_end

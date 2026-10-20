@@ -119,6 +119,7 @@ mod library_sd;
 mod ota_update;
 mod reader_cache;
 mod reader_cache_files;
+mod reader_images;
 mod reader_layout;
 mod reader_store;
 mod sd_session;

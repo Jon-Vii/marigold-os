@@ -23,7 +23,7 @@ pub(crate) fn render(fb: &mut Framebuffer, request: RenderRequest, sd_library: &
     fb.set_frame(app_render::fb_frame(request.orientation));
     if request.view == AppView::Reading && ReaderSource::from_book_id(request.book_id).is_sd() {
         fb.clear(true);
-        draw_sd_reader_page(fb, request, sd_library);
+        draw_sd_reader_page(fb, request, sd_library, None);
     } else {
         let mut library_entries = [""; LIBRARY_WINDOW];
         let mut firmware_entries = [""; MAX_FIRMWARE_FILES];
@@ -45,6 +45,19 @@ pub(crate) fn render(fb: &mut Framebuffer, request: RenderRequest, sd_library: &
     if SHOW_INPUT_DEBUG {
         draw_input_sample(fb, request);
     }
+}
+
+/// Renders a reading page that contains image blocks: same checks as the
+/// plain reader path, with an SD session open so sidecars can stream in.
+pub(crate) fn render_reader_page_with_images(
+    fb: &mut Framebuffer,
+    request: RenderRequest,
+    sd_library: &ReaderStore,
+    root: &crate::sd_session::SdRoot<'_>,
+) {
+    fb.set_frame(app_render::fb_frame(request.orientation));
+    fb.clear(true);
+    draw_sd_reader_page(fb, request, sd_library, Some(root));
 }
 
 pub(crate) fn render_custom_reader_from_root(
@@ -254,7 +267,56 @@ fn ui_library_status(status: LibraryScanStatus) -> UiLibraryStatus {
     }
 }
 
-fn draw_sd_reader_page(fb: &mut Framebuffer, request: RenderRequest, sd_library: &ReaderStore) {
+/// Draws one image block: streams the sidecar from the book's SECTIONS
+/// dir, falling back to an outlined box when the sidecar never arrived.
+fn draw_reader_image(
+    fb: &mut Framebuffer,
+    sd_library: &ReaderStore,
+    root: &crate::sd_session::SdRoot<'_>,
+    rect: &ui::reading::ReaderImageRect,
+    index: usize,
+) {
+    let href = sd_library.block_text(index);
+    let drawn = crate::reader_cache_files::with_v2_sections_dir(
+        root,
+        sd_library.cache_key.as_str(),
+        |sections| match sections {
+            Some(sections) => crate::reader_images::draw_image_from_sidecar(
+                sections,
+                href,
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+                fb,
+            ),
+            None => false,
+        },
+    );
+    if !drawn {
+        crate::reader_images::draw_image_placeholder(fb, rect.x, rect.y, rect.width, rect.height);
+    }
+}
+
+fn draw_sd_reader_page(
+    fb: &mut Framebuffer,
+    request: RenderRequest,
+    sd_library: &ReaderStore,
+    root: Option<&crate::sd_session::SdRoot<'_>>,
+) {
+    let mut image_drawer =
+        move |fb: &mut Framebuffer, rect: &ui::reading::ReaderImageRect, index: usize| match root {
+            Some(root) => draw_reader_image(fb, sd_library, root, rect, index),
+            None => {
+                crate::reader_images::draw_image_placeholder(
+                    fb,
+                    rect.x,
+                    rect.y,
+                    rect.width,
+                    rect.height,
+                );
+            }
+        };
     // A store paginated under different type settings is as unusable as an
     // unloaded one; show the loading plate until the relayout lands.
     let layout_current = sd_library.type_settings() == request.type_settings();
@@ -279,7 +341,7 @@ fn draw_sd_reader_page(fb: &mut Framebuffer, request: RenderRequest, sd_library:
         (BookLoadStatus::Ready, _) => {
             let plan = reader_layout::ReaderPagePlan::new(sd_library, request.page);
             let page_count = plan.page_count().max(1);
-            ui::reading::draw_reading_page_body(fb, sd_library, plan.page());
+            ui::reading::draw_reading_page_body(fb, sd_library, plan.page(), &mut image_drawer);
             draw_reader_footer(fb, request, sd_library, page_count);
         }
     }
@@ -320,7 +382,11 @@ fn draw_sd_reader_page_with_custom_font(
                 // The custom face may have painted part of the page before
                 // failing; start the built-in fallback from a clean frame.
                 fb.clear(true);
-                ui::reading::draw_reading_page_body(fb, sd_library, plan.page());
+                let mut image_drawer =
+                    |fb: &mut Framebuffer, rect: &ui::reading::ReaderImageRect, index: usize| {
+                        draw_reader_image(fb, sd_library, root, rect, index);
+                    };
+                ui::reading::draw_reading_page_body(fb, sd_library, plan.page(), &mut image_drawer);
             }
             draw_reader_footer(fb, request, sd_library, page_count);
         }

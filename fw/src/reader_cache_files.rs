@@ -2163,7 +2163,13 @@ where
     true
 }
 
-fn read_exact_file<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+pub(crate) fn read_exact_file<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
     file: &File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     mut out: &mut [u8],
 ) -> Result<(), ()>

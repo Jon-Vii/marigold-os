@@ -228,6 +228,37 @@ where
     let page_box = ui::reading::ReadingBlocks::page_box(source);
     let mut ok = true;
     ui::reading::for_each_drawable_block(source, page, |block| {
+        if let Some(rect) = block.image {
+            // Image blocks carry no glyphs; stream the sidecar like the
+            // built-in path does, with an outlined box on failure.
+            let href = block.text;
+            let drawn = crate::reader_cache_files::with_v2_sections_dir(
+                root,
+                source.cache_key.as_str(),
+                |sections| match sections {
+                    Some(sections) => crate::reader_images::draw_image_from_sidecar(
+                        sections,
+                        href,
+                        rect.x,
+                        rect.y,
+                        rect.width,
+                        rect.height,
+                        fb,
+                    ),
+                    None => false,
+                },
+            );
+            if !drawn {
+                crate::reader_images::draw_image_placeholder(
+                    fb,
+                    rect.x,
+                    rect.y,
+                    rect.width,
+                    rect.height,
+                );
+            }
+            return true;
+        }
         if block.record.line_count != 1 {
             ok = false;
             return false;

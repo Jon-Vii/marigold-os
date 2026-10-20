@@ -263,6 +263,10 @@ pub async fn run(
                         }
                     }
                 }
+                // Pages with image blocks need the card open to stream
+                // their sidecars; other pages keep the pure, session-free
+                // render path.
+                let image_page = image_page_request(&request, sd_library);
                 let layout_start = Instant::now();
                 if !render_custom_reader(
                     &mut epd,
@@ -272,7 +276,15 @@ pub async fn run(
                     sd_library,
                     font_metrics,
                 ) {
-                    crate::views::render(fb, request, sd_library);
+                    if image_page {
+                        let _ = crate::sd_session::with_root(&mut epd, &mut sd_cs, |root| {
+                            crate::views::render_reader_page_with_images(
+                                fb, request, sd_library, root,
+                            );
+                        });
+                    } else {
+                        crate::views::render(fb, request, sd_library);
+                    }
                 }
                 let layout_ms = layout_start.elapsed().as_millis();
 
@@ -290,7 +302,16 @@ pub async fn run(
                     panel_ready = true;
                 }
 
-                let mode = refresh_planner.mode_for(request);
+                // Dithered image areas are the worst case for fast-refresh
+                // ghosting; a page carrying images always cleans.
+                let mode = if image_page {
+                    match refresh_planner.mode_for(request) {
+                        RefreshMode::Fast => RefreshMode::FastClean,
+                        other => other,
+                    }
+                } else {
+                    refresh_planner.mode_for(request)
+                };
                 if content_context_changed {
                     esp_println::println!(
                         "display: context changed, refresh policy {:?} -> {:?}",
@@ -706,6 +727,19 @@ fn send_library_event(event: &LibraryEvent) {
     if LIBRARY_EVENTS.try_send(*event).is_err() {
         esp_println::println!("display: library event queue full");
     }
+}
+
+/// Whether this render shows a reading page that contains image blocks,
+/// decided from the resident page records alone (no SD access).
+fn image_page_request(request: &RenderRequest, sd_library: &ReaderStore) -> bool {
+    if request.view != AppView::Reading
+        || !ReaderSource::from_book_id(request.book_id).is_sd()
+        || sd_library.reader_status() != BookLoadStatus::Ready
+    {
+        return false;
+    }
+    let plan = crate::reader_layout::ReaderPagePlan::new(sd_library, request.page);
+    ui::reading::page_has_images(sd_library, plan.page())
 }
 
 fn render_custom_reader(

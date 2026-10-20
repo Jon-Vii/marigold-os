@@ -1,6 +1,7 @@
 use crate::display_flush::Epd;
 use crate::reader_cache_files;
 use crate::reader_cache_files::{BookIndexLoadResult, CacheLoadResult};
+use crate::reader_images;
 use crate::reader_layout;
 use crate::reader_store::{
     source_hash, BookLoadStatus, ReaderStore, MAX_BOOK_SECTIONS, MAX_READER_BLOCK_TEXT,
@@ -991,7 +992,7 @@ fn set_preview_error_from_error(library: &mut ReaderStore, error: ReaderCacheErr
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ReaderCacheError {
+pub(crate) enum ReaderCacheError {
     Zip(proto::epub::ZipError),
     Epub(proto::epub::EpubError),
     Xhtml(proto::epub::XhtmlError),
@@ -1290,6 +1291,18 @@ where
         xhtml: &mut *scratch.xhtml,
         zip_inflate: &mut *scratch.zip_inflate,
     };
+    // The image table must be ready before the first spine streams: probing
+    // runs now, while the zip inflate is still idle.
+    reader_images::probe_book_images(
+        &mut zip,
+        opf_path,
+        &package,
+        spine_scratch.header,
+        spine_scratch.name,
+        spine_scratch.compressed,
+        spine_scratch.zip_inflate,
+    );
+    reader_images::clear_pending_images();
     // One session lays out spines until the request is answered, a button
     // is pressed, the budget is spent, or the book is done, committing the
     // index after each: no ZIP, OPF, or index reload between spines, and
@@ -1742,6 +1755,7 @@ where
             book_partial: &mut *book_partial,
             write_micros: &mut *write_micros,
             spine_index: spine_index.min(u16::MAX as usize) as u16,
+            xhtml_path: xhtml_path.clone(),
             line: String::new(),
             line_ink: LineInkCursor::new(type_settings, FontStyle::Regular),
             line_role: TextRole::Body,
@@ -1843,7 +1857,22 @@ where
         if !sink.run_full {
             sink.finish_spine(false);
         }
-        if sink.write_failed {
+        let write_failed = sink.write_failed;
+        // The zip inflate is idle now: decode this spine's images into their
+        // sidecars before the next spine's stream claims the state again.
+        if let Some(sections) = sections_dir {
+            reader_images::decode_pending_images(
+                zip,
+                sections,
+                scratch.header,
+                scratch.name,
+                scratch.compressed,
+                scratch.xhtml,
+                scratch.zip_inflate,
+            );
+        }
+        reader_images::clear_pending_images();
+        if write_failed {
             return Err(ReaderCacheError::CacheWrite);
         }
         Ok(if sink.run_full {
@@ -2109,7 +2138,7 @@ fn find_full_path(xml: &str) -> Option<&str> {
     Some(&value[..end])
 }
 
-fn resolve_epub_href(
+pub(crate) fn resolve_epub_href(
     opf_path: &str,
     href: &str,
     out: &mut String<MAX_ENTRY_NAME_BYTES>,
@@ -2161,6 +2190,8 @@ struct LibraryBlockSink<
     /// `bench: storage_build` line.
     write_micros: &'a mut u64,
     spine_index: u16,
+    /// The current spine member's zip path: `<img src>` resolves against it.
+    xhtml_path: String<MAX_ENTRY_NAME_BYTES>,
     line: String<MAX_READER_BLOCK_TEXT>,
     /// Running ink width of `line`. `line` always starts with a style
     /// marker (or is empty), so the cursor's default font never shows
@@ -2447,6 +2478,81 @@ where
         );
         self.flush_if_full();
         Ok(())
+    }
+
+    fn push_image(&mut self, href: &str, alt: Option<&str>) -> Result<(), XhtmlError> {
+        if self.stopped || self.interrupted {
+            return Err(XhtmlError::TooManyRuns);
+        }
+        if self.preparation.gives_way() {
+            self.interrupted = true;
+            return Err(XhtmlError::TooManyRuns);
+        }
+        let mut resolved = String::<MAX_ENTRY_NAME_BYTES>::new();
+        let resolved_ok = resolve_epub_href(&self.xhtml_path, href, &mut resolved).is_ok();
+        let fitted = resolved_ok
+            .then(|| {
+                reader_images::image_table().lookup(reader_images::image_hash(resolved.as_str()))
+            })
+            .flatten();
+        let Some((src_w, src_h)) = fitted else {
+            // Not probed as a decodable PNG: keep the alt placeholder.
+            self.push_image_placeholder(alt);
+            return Ok(());
+        };
+        let page_box = self.library.page_box();
+        let column = u32::try_from(page_box.right - page_box.left)
+            .unwrap_or(1)
+            .max(1);
+        let page_height = u32::try_from(page_box.bottom - page_box.top)
+            .unwrap_or(1)
+            .max(1);
+        let (width, height) =
+            proto::png::fit_inside(u32::from(src_w), u32::from(src_h), column, page_height);
+        self.flush_if_full();
+        let pushed = self.library.push_image_block(
+            resolved.as_str(),
+            width.min(u16::MAX as u32) as u16,
+            height.min(u16::MAX as u32) as u16,
+            self.spine_index,
+        ) || (self.flush_section(false, true)
+            && self.library.push_image_block(
+                resolved.as_str(),
+                width.min(u16::MAX as u32) as u16,
+                height.min(u16::MAX as u32) as u16,
+                self.spine_index,
+            ));
+        if !pushed {
+            self.push_image_placeholder(alt);
+            return Ok(());
+        }
+        reader_images::push_pending_image(resolved.as_str(), width as u16, height as u16);
+        Ok(())
+    }
+}
+
+impl<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>
+    LibraryBlockSink<'_, '_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    /// The pre-image behavior: the `alt` text, or `[Image]`, as a centered
+    /// italic block. Used when an image cannot be decoded or reserved.
+    fn push_image_placeholder(&mut self, alt: Option<&str>) {
+        let placeholder = match alt {
+            Some(alt) if !alt.is_empty() => alt,
+            _ => "[Image]",
+        };
+        self.flush_if_full();
+        let _ = self.push_block(
+            placeholder,
+            TextRole::Body,
+            proto::text::FontStyle::Italic,
+            TextAlign::Center,
+            true,
+        );
+        self.flush_if_full();
     }
 }
 
