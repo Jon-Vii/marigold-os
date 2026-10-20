@@ -73,6 +73,8 @@ pub enum PngError {
     Unsupported,
     Decompress(MZError),
     Sink,
+    /// The byte source feeding the decoder failed.
+    Source,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,6 +158,7 @@ fn crc32_update(crc: u32, bytes: &[u8]) -> u32 {
 pub struct PngDecoder<'a> {
     target_w: u32,
     target_h: u32,
+    exact_size: bool,
     header: Option<PngHeader>,
 
     phase: Phase,
@@ -226,6 +229,27 @@ impl<'a> PngDecoder<'a> {
     /// after the shared [`fit_inside`] sizing. Carves its buffers from
     /// `scratch` — see [`PNG_SCRATCH_BYTES`] for the required length.
     pub fn new(scratch: &'a mut [u8], target_w: u32, target_h: u32) -> Result<Self, PngError> {
+        Self::with_sizing(scratch, target_w, target_h, false)
+    }
+
+    /// A decoder that emits exactly `width × height` rows, for a size that
+    /// layout already fitted. Fitting a second time is not idempotent:
+    /// `fit_inside` floors, so a fitted size can shrink by a pixel or more
+    /// and the emitted rows would no longer match the reserved rect.
+    pub fn with_output_size(
+        scratch: &'a mut [u8],
+        width: u32,
+        height: u32,
+    ) -> Result<Self, PngError> {
+        Self::with_sizing(scratch, width, height, true)
+    }
+
+    fn with_sizing(
+        scratch: &'a mut [u8],
+        target_w: u32,
+        target_h: u32,
+        exact_size: bool,
+    ) -> Result<Self, PngError> {
         if scratch.len() < PNG_SCRATCH_BYTES {
             return Err(PngError::ScratchTooSmall);
         }
@@ -242,6 +266,7 @@ impl<'a> PngDecoder<'a> {
         Ok(Self {
             target_w,
             target_h,
+            exact_size,
             header: None,
             phase: Phase::Sig,
             sig_pos: 0,
@@ -538,12 +563,19 @@ impl<'a> PngDecoder<'a> {
             return Err(PngError::Unsupported);
         }
         self.bpl = bpl;
-        let (out_w, out_h) = fit_inside(
-            header.width,
-            header.height,
-            self.target_w.min(PNG_MAX_OUTPUT_WIDTH as u32),
-            self.target_h,
-        );
+        let max_w = self.target_w.min(PNG_MAX_OUTPUT_WIDTH as u32);
+        let (out_w, out_h) = if self.exact_size {
+            if max_w == 0
+                || self.target_h == 0
+                || max_w > header.width
+                || self.target_h > header.height
+            {
+                return Err(PngError::Unsupported);
+            }
+            (max_w, self.target_h)
+        } else {
+            fit_inside(header.width, header.height, max_w, self.target_h)
+        };
         // The vertical box accumulator is u16 per column; a span beyond 200
         // source rows per output row would overflow it, and such extreme
         // downscales look bad anyway. Reject to the placeholder path.

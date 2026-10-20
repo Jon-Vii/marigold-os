@@ -348,13 +348,13 @@ pub fn for_each_drawable_block(
     }
 }
 
-/// Draw one page of reading-body blocks: the single rendering of cached
-/// reader content shared by firmware views and host tooling.
 /// Draws image blocks that the caller can load pixels for. Firmware streams
 /// the cached 1-bpp sidecar from the card; host tools draw a synthetic
 /// pattern so golden frames can verify placement without a decoder.
 pub type ImageDrawer<'a> = dyn FnMut(&mut Framebuffer, &ReaderImageRect, usize) + 'a;
 
+/// Draw one page of reading-body blocks: the single rendering of cached
+/// reader content shared by firmware views and host tooling.
 pub fn draw_reading_page_body(
     fb: &mut Framebuffer,
     source: &impl ReadingBlocks,

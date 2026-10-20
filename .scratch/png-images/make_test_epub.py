@@ -1,4 +1,8 @@
-"""Assembles image-test.epub: two pages, one orientation PNG each."""
+"""Assembles image-test.epub: two pages, one orientation PNG each.
+
+The chapters sit in Text/ and the images in Images/, so every <img src>
+starts with ../ as in Sigil-made books. One PNG is stored and one is
+deflated, so both decode paths run on hardware."""
 
 import zipfile
 
@@ -20,10 +24,10 @@ opf = """<?xml version="1.0" encoding="UTF-8"?>
   </metadata>
   <manifest>
     <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
-    <item id="p1" href="page1.xhtml" media-type="application/xhtml+xml"/>
-    <item id="p2" href="page2.xhtml" media-type="application/xhtml+xml"/>
-    <item id="tall" href="images/tall.png" media-type="image/png"/>
-    <item id="full" href="images/fullpage.png" media-type="image/png"/>
+    <item id="p1" href="Text/page1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="p2" href="Text/page2.xhtml" media-type="application/xhtml+xml"/>
+    <item id="tall" href="Images/tall.png" media-type="image/png"/>
+    <item id="full" href="Images/fullpage.png" media-type="image/png"/>
   </manifest>
   <spine><itemref idref="p1"/><itemref idref="p2"/></spine>
 </package>"""
@@ -32,8 +36,8 @@ nav = """<?xml version="1.0" encoding="UTF-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
 <head><title>Contents</title></head>
 <body><nav epub:type="toc"><ol>
-<li><a href="page1.xhtml">Tall marker</a></li>
-<li><a href="page2.xhtml">Full-page marker</a></li>
+<li><a href="Text/page1.xhtml">Tall marker</a></li>
+<li><a href="Text/page2.xhtml">Full-page marker</a></li>
 </ol></nav></body></html>"""
 
 def page(src, label):
@@ -47,8 +51,8 @@ with zipfile.ZipFile(BOOK, "w") as z:
     z.writestr("META-INF/container.xml", container, compress_type=zipfile.ZIP_DEFLATED)
     z.writestr("OEBPS/content.opf", opf, compress_type=zipfile.ZIP_DEFLATED)
     z.writestr("OEBPS/nav.xhtml", nav, compress_type=zipfile.ZIP_DEFLATED)
-    z.writestr("OEBPS/page1.xhtml", page("images/tall.png", "Tall marker"), compress_type=zipfile.ZIP_DEFLATED)
-    z.writestr("OEBPS/page2.xhtml", page("images/fullpage.png", "Full-page marker"), compress_type=zipfile.ZIP_DEFLATED)
-    z.write(".scratch/png-images/orientation-test.png", "OEBPS/images/tall.png", compress_type=zipfile.ZIP_STORED)
-    z.write(".scratch/png-images/orientation-fullpage.png", "OEBPS/images/fullpage.png", compress_type=zipfile.ZIP_STORED)
+    z.writestr("OEBPS/Text/page1.xhtml", page("../Images/tall.png", "Tall marker"), compress_type=zipfile.ZIP_DEFLATED)
+    z.writestr("OEBPS/Text/page2.xhtml", page("../Images/fullpage.png", "Full-page marker"), compress_type=zipfile.ZIP_DEFLATED)
+    z.write(".scratch/png-images/orientation-test.png", "OEBPS/Images/tall.png", compress_type=zipfile.ZIP_STORED)
+    z.write(".scratch/png-images/orientation-fullpage.png", "OEBPS/Images/fullpage.png", compress_type=zipfile.ZIP_DEFLATED)
 print("wrote", BOOK)

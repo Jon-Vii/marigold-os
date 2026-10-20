@@ -50,6 +50,8 @@ static EPUB_OPF: ConstStaticCell<[u8; READER_OPF_SCRATCH]> =
     ConstStaticCell::new([0; READER_OPF_SCRATCH]);
 static EPUB_XHTML: ConstStaticCell<[u8; READER_XHTML_SCRATCH]> =
     ConstStaticCell::new([0; READER_XHTML_SCRATCH]);
+static EPUB_IMAGES: ConstStaticCell<proto::epub_images::BookImages> =
+    ConstStaticCell::new(proto::epub_images::BookImages::new());
 static EPUB_SCRATCH: static_cell::StaticCell<ReaderCacheScratch<'static>> =
     static_cell::StaticCell::new();
 
@@ -1367,6 +1369,7 @@ pub(crate) fn init_epub_scratch() -> &'static mut ReaderCacheScratch<'static> {
             EPUB_CONTAINER.take(),
             EPUB_OPF.take(),
             EPUB_XHTML.take(),
+            EPUB_IMAGES.take(),
         )
     })
 }

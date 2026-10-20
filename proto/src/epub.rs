@@ -1401,7 +1401,7 @@ pub const MAX_CSS_RULES: usize = 96;
 
 /// Upper bound on manifest image items the package retains for the image
 /// pipeline. A book with more images renders the overflow as placeholders.
-pub const MAX_IMAGE_ITEMS: usize = 64;
+pub const MAX_IMAGE_ITEMS: usize = 48;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CssRule {
@@ -1780,6 +1780,23 @@ where
             })?;
         }
         collector.compact_slots();
+        // Image hrefs get their own pass, after every spine string is in
+        // the arena: they only take the room that is left, so a book with
+        // many images loses images, never chapters.
+        if collector.saw_png {
+            collector.begin_image_pass();
+            tokenizer = StreamingXmlTokenizer::new();
+            replay(&mut |chunk| {
+                tokenizer.feed(chunk, &mut |event| {
+                    collector.handle(event);
+                    Ok::<(), EpubError>(())
+                })
+            })?;
+            tokenizer.finish(&mut |event| {
+                collector.handle(event);
+                Ok::<(), EpubError>(())
+            })?;
+        }
         collector.summary()
     };
 
@@ -1969,6 +1986,10 @@ struct OpfCollector<'b> {
     image_hrefs: [Span; MAX_IMAGE_ITEMS],
     image_count: usize,
     images_truncated: bool,
+    /// A PNG manifest item streamed by, so the image pass has work.
+    saw_png: bool,
+    /// The image pass: only PNG manifest items are recorded.
+    images_only: bool,
     interned: Vec<Span, OPF_INTERNED_VALUES>,
     lost: bool,
 }
@@ -1999,6 +2020,8 @@ impl<'b> OpfCollector<'b> {
             image_hrefs: [Span::default(); MAX_IMAGE_ITEMS],
             image_count: 0,
             images_truncated: false,
+            saw_png: false,
+            images_only: false,
             interned: Vec::new(),
             lost: false,
         }
@@ -2011,7 +2034,7 @@ impl<'b> OpfCollector<'b> {
         if !media_type.eq_ignore_ascii_case("image/png") {
             return;
         }
-        if self.image_count == MAX_IMAGE_ITEMS {
+        if self.image_count == MAX_IMAGE_ITEMS || self.len + href.len() > self.slots_start() {
             self.images_truncated = true;
             return;
         }
@@ -2019,6 +2042,16 @@ impl<'b> OpfCollector<'b> {
             self.image_hrefs[self.image_count] = span;
             self.image_count += 1;
         }
+    }
+
+    fn begin_image_pass(&mut self) {
+        self.images_only = true;
+        self.in_manifest = false;
+        self.in_spine = false;
+        self.in_guide = false;
+        self.capture = OpfCapture::None;
+        self.image_count = 0;
+        self.images_truncated = false;
     }
 
     fn begin_pass(&mut self, fallback: bool) {
@@ -2031,8 +2064,6 @@ impl<'b> OpfCollector<'b> {
         self.in_spine = false;
         self.in_guide = false;
         self.capture = OpfCapture::None;
-        self.image_count = 0;
-        self.images_truncated = false;
     }
 
     fn summary(&self) -> OpfSummary {
@@ -2152,7 +2183,17 @@ impl<'b> OpfCollector<'b> {
                 } else if tag_name_is(tag, "guide") {
                     self.in_guide = !self_closing;
                 } else if self.in_manifest && tag_name_is(tag, "item") {
-                    self.handle_item(tag);
+                    if self.images_only {
+                        if let (Some(href), Some(media_type)) =
+                            (attr_value(tag, "href"), attr_value(tag, "media-type"))
+                        {
+                            self.record_image(href, media_type);
+                        }
+                    } else {
+                        self.handle_item(tag);
+                    }
+                } else if self.images_only {
+                    // The image pass reads manifest items and nothing else.
                 } else if self.in_guide && tag_name_is(tag, "reference") {
                     if !self.fallback {
                         self.handle_reference(tag);
@@ -2215,8 +2256,10 @@ impl<'b> OpfCollector<'b> {
         };
         let media_type = attr_value(tag, "media-type").unwrap_or("");
         let properties = attr_value(tag, "properties").unwrap_or("");
+        if media_type.eq_ignore_ascii_case("image/png") {
+            self.saw_png = true;
+        }
         if self.fallback {
-            self.record_image(href, media_type);
             if !manifest_item_is_reading_candidate(href, media_type, properties) {
                 return;
             }
@@ -2245,9 +2288,6 @@ impl<'b> OpfCollector<'b> {
             .any(|prop| prop == "cover-image");
         let names_cover = id == "cover" || href.contains("cover");
         let is_image = media_type.starts_with("image/");
-        if is_image {
-            self.record_image(href, media_type);
-        }
         if names_cover || is_cover_image {
             self.any_cover = true;
         }
@@ -5540,6 +5580,61 @@ mod tests {
     }
 
     #[test]
+    fn png_manifest_items_never_crowd_out_the_spine() {
+        struct TestCase {
+            name: &'static str,
+            images: usize,
+            arena: usize,
+            expected_images: usize,
+            expected_images_truncated: bool,
+        }
+        let cases = [
+            TestCase {
+                name: "room for every image",
+                images: 3,
+                arena: 1024,
+                expected_images: 3,
+                expected_images_truncated: false,
+            },
+            TestCase {
+                name: "images listed before the chapters, arena tight",
+                images: 40,
+                arena: 512,
+                expected_images: 13,
+                expected_images_truncated: true,
+            },
+        ];
+        for case in cases {
+            let mut opf = std::string::String::from("<package><manifest>");
+            for index in 0..case.images {
+                opf.push_str(&std::format!(
+                    "<item id=\"i{index}\" href=\"images/picture-{index:04}.png\" media-type=\"image/png\"/>"
+                ));
+            }
+            for index in 0..8 {
+                opf.push_str(&std::format!(
+                    "<item id=\"c{index}\" href=\"text/ch{index}.xhtml\" media-type=\"application/xhtml+xml\"/>"
+                ));
+            }
+            opf.push_str("</manifest><spine>");
+            for index in 0..8 {
+                opf.push_str(&std::format!("<itemref idref=\"c{index}\"/>"));
+            }
+            opf.push_str("</spine></package>");
+            let mut arena = std::vec![0u8; case.arena];
+            let package = parse_streamed_in_chunks(&opf, 64, &mut arena).expect("parses");
+            assert_eq!(package.spine.len(), 8, "{}", case.name);
+            assert!(!package.spine_truncated, "{}", case.name);
+            assert_eq!(package.image_count, case.expected_images, "{}", case.name);
+            assert_eq!(
+                package.images_truncated, case.expected_images_truncated,
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
     fn opf_spine_past_the_arena_is_flagged_truncated() {
         let opf = large_opf(1500, 0);
         let mut arena = [0u8; 16_384];
@@ -6169,7 +6264,6 @@ mod tests {
         assert_eq!(whole.images.len(), 1);
         assert_eq!(whole.images[0].0, "pics/x.png");
         assert_eq!(whole.images[0].1.as_deref(), Some("A map"));
-        // The image ends its paragraph and does not join surrounding text.
         // The image no longer becomes a placeholder text block.
         assert!(whole
             .blocks

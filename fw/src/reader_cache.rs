@@ -21,6 +21,7 @@ use proto::epub::{
     NcxStreamParser, ReadAt, StreamingXmlTokenizer, TocError, XhtmlBlockSink,
     XhtmlBlockStreamParser, XhtmlError, ZipInflateScratch, ZipStream, MAX_ENTRY_NAME_BYTES,
 };
+use proto::epub_images::BookImages;
 use proto::hyphen::{word_breaks, Hyphenation, WordBreak, MAX_WORD_BREAKS};
 use proto::text::{TextAlign, TextRole};
 use ui::reading::StyledInkCursor;
@@ -50,6 +51,7 @@ pub(crate) struct ReaderCacheScratch<'a> {
     container: &'a mut [u8; READER_CONTAINER_SCRATCH],
     opf: &'a mut [u8; READER_OPF_SCRATCH],
     xhtml: &'a mut [u8; READER_XHTML_SCRATCH],
+    images: &'a mut BookImages,
     zip_inflate: ZipInflateScratch,
 }
 
@@ -124,6 +126,7 @@ impl<'a> ReaderCacheScratch<'a> {
         container: &'a mut [u8; READER_CONTAINER_SCRATCH],
         opf: &'a mut [u8; READER_OPF_SCRATCH],
         xhtml: &'a mut [u8; READER_XHTML_SCRATCH],
+        images: &'a mut BookImages,
     ) -> Self {
         Self {
             tail,
@@ -133,6 +136,7 @@ impl<'a> ReaderCacheScratch<'a> {
             container,
             opf,
             xhtml,
+            images,
             zip_inflate: ZipInflateScratch::new(),
         }
     }
@@ -1090,6 +1094,7 @@ where
             container: scratch.container,
             opf: scratch.opf,
             xhtml: scratch.xhtml,
+            images: scratch.images,
             zip_inflate: &mut scratch.zip_inflate,
         },
     )
@@ -1102,6 +1107,7 @@ struct ZipBuildScratch<'a> {
     container: &'a mut [u8; READER_CONTAINER_SCRATCH],
     opf: &'a mut [u8; READER_OPF_SCRATCH],
     xhtml: &'a mut [u8; READER_XHTML_SCRATCH],
+    images: &'a mut BookImages,
     zip_inflate: &'a mut ZipInflateScratch,
 }
 
@@ -1289,20 +1295,21 @@ where
         name: &mut *scratch.name,
         compressed: &mut *scratch.compressed,
         xhtml: &mut *scratch.xhtml,
+        images: &mut *scratch.images,
         zip_inflate: &mut *scratch.zip_inflate,
     };
     // The image table must be ready before the first spine streams: probing
     // runs now, while the zip inflate is still idle.
-    reader_images::probe_book_images(
+    proto::epub_images::probe_book_images(
         &mut zip,
-        opf_path,
         &package,
         spine_scratch.header,
         spine_scratch.name,
         spine_scratch.compressed,
         spine_scratch.zip_inflate,
+        &mut spine_scratch.images.table,
     );
-    reader_images::clear_pending_images();
+    spine_scratch.images.pending.clear();
     // One session lays out spines until the request is answered, a button
     // is pressed, the budget is spent, or the book is done, committing the
     // index after each: no ZIP, OPF, or index reload between spines, and
@@ -1517,6 +1524,7 @@ struct SpineScratch<'a> {
     name: &'a mut [u8; MAX_ENTRY_NAME_BYTES],
     compressed: &'a mut [u8; READER_COMPRESSED_SCRATCH],
     xhtml: &'a mut [u8; READER_XHTML_SCRATCH],
+    images: &'a mut BookImages,
     zip_inflate: &'a mut ZipInflateScratch,
 }
 
@@ -1756,6 +1764,7 @@ where
             write_micros: &mut *write_micros,
             spine_index: spine_index.min(u16::MAX as usize) as u16,
             xhtml_path: xhtml_path.clone(),
+            images: &mut *scratch.images,
             line: String::new(),
             line_ink: LineInkCursor::new(type_settings, FontStyle::Regular),
             line_role: TextRole::Body,
@@ -1858,6 +1867,7 @@ where
             sink.finish_spine(false);
         }
         let write_failed = sink.write_failed;
+        let run_full = sink.run_full;
         // The zip inflate is idle now: decode this spine's images into their
         // sidecars before the next spine's stream claims the state again.
         if let Some(sections) = sections_dir {
@@ -1869,13 +1879,14 @@ where
                 scratch.compressed,
                 scratch.xhtml,
                 scratch.zip_inflate,
+                &scratch.images.pending,
             );
         }
-        reader_images::clear_pending_images();
+        scratch.images.pending.clear();
         if write_failed {
             return Err(ReaderCacheError::CacheWrite);
         }
-        Ok(if sink.run_full {
+        Ok(if run_full {
             SpineOutcome::RunFull
         } else {
             SpineOutcome::Laid
@@ -2138,7 +2149,7 @@ fn find_full_path(xml: &str) -> Option<&str> {
     Some(&value[..end])
 }
 
-pub(crate) fn resolve_epub_href(
+fn resolve_epub_href(
     opf_path: &str,
     href: &str,
     out: &mut String<MAX_ENTRY_NAME_BYTES>,
@@ -2192,6 +2203,8 @@ struct LibraryBlockSink<
     spine_index: u16,
     /// The current spine member's zip path: `<img src>` resolves against it.
     xhtml_path: String<MAX_ENTRY_NAME_BYTES>,
+    /// The probed image table and this spine's decode queue.
+    images: &'a mut BookImages,
     line: String<MAX_READER_BLOCK_TEXT>,
     /// Running ink width of `line`. `line` always starts with a style
     /// marker (or is empty), so the cursor's default font never shows
@@ -2489,17 +2502,25 @@ where
             return Err(XhtmlError::TooManyRuns);
         }
         let mut resolved = String::<MAX_ENTRY_NAME_BYTES>::new();
-        let resolved_ok = resolve_epub_href(&self.xhtml_path, href, &mut resolved).is_ok();
-        let fitted = resolved_ok
-            .then(|| {
-                reader_images::image_table().lookup(reader_images::image_hash(resolved.as_str()))
-            })
-            .flatten();
+        let fitted =
+            if proto::epub_images::resolve_image_href(&self.xhtml_path, href, &mut resolved) {
+                self.images
+                    .table
+                    .lookup(proto::epub_images::image_hash(resolved.as_str()))
+            } else {
+                None
+            };
         let Some((src_w, src_h)) = fitted else {
             // Not probed as a decodable PNG: keep the alt placeholder.
             self.push_image_placeholder(alt);
             return Ok(());
         };
+        if !self.images.pending.has_room_for(resolved.as_str()) {
+            // The spine's decode queue is full: a reserved image would
+            // only ever draw as an empty box.
+            self.push_image_placeholder(alt);
+            return Ok(());
+        }
         let page_box = self.library.page_box();
         let column = u32::try_from(page_box.right - page_box.left)
             .unwrap_or(1)
@@ -2526,7 +2547,9 @@ where
             self.push_image_placeholder(alt);
             return Ok(());
         }
-        reader_images::push_pending_image(resolved.as_str(), width as u16, height as u16);
+        self.images
+            .pending
+            .push(resolved.as_str(), width as u16, height as u16);
         Ok(())
     }
 }
