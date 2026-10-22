@@ -1,3 +1,4 @@
+use crate::book_images::{BookImages, ImagePlacement, ProbeStop};
 use crate::display_flush::Epd;
 use crate::reader_cache_files;
 use crate::reader_cache_files::{BookIndexLoadResult, CacheLoadResult};
@@ -16,11 +17,12 @@ use heapless::String;
 use proto::book::BookId;
 use proto::cache::BookV2SectionRecord;
 use proto::epub::{
-    parse_opf_streamed, strip_fragment, Epub3NavStreamParser, EpubTocSink, EpubZipOps,
-    NcxStreamParser, ReadAt, StreamingXmlTokenizer, TocError, XhtmlBlockSink,
+    parse_opf_streamed, push_image_placeholder, strip_fragment, Epub3NavStreamParser, EpubTocSink,
+    EpubZipOps, NcxStreamParser, ReadAt, StreamingXmlTokenizer, TocError, XhtmlBlockSink,
     XhtmlBlockStreamParser, XhtmlError, ZipInflateScratch, ZipStream, MAX_ENTRY_NAME_BYTES,
 };
 use proto::hyphen::{word_breaks, Hyphenation, WordBreak, MAX_WORD_BREAKS};
+use proto::image::token::encode_image_token;
 use proto::text::{TextAlign, TextRole};
 use ui::reading::StyledInkCursor;
 
@@ -318,6 +320,10 @@ where
         "epub: stage TryV2BookIndexFast page={}",
         target_pages as u32
     );
+    let epub = EpubSource {
+        name: open_name.as_str(),
+        in_books_dir,
+    };
     if try_load_v2_book_cache(
         root,
         cache_key.as_str(),
@@ -327,7 +333,8 @@ where
         library,
         Instant::now(),
         "fast",
-        scratch.xhtml,
+        epub,
+        scratch,
         preparation,
     ) {
         return BookLoadStatus::Ready;
@@ -419,7 +426,8 @@ where
             library,
             Instant::now(),
             "resume",
-            scratch.xhtml,
+            epub,
+            scratch,
             Preparation::Request,
         ) {
             return BookLoadStatus::Ready;
@@ -702,6 +710,15 @@ pub(crate) fn restore_book_page_count(
     .unwrap_or(0)
 }
 
+/// Where a catalog entry's EPUB file is on the card.
+#[derive(Clone, Copy)]
+struct EpubSource<'a> {
+    /// The FAT name it opens by.
+    name: &'a str,
+    /// In `/BOOKS`, else the card root.
+    in_books_dir: bool,
+}
+
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn try_load_v2_book_cache<
@@ -719,7 +736,8 @@ fn try_load_v2_book_cache<
     library: &mut ReaderStore,
     started: Instant,
     label: &str,
-    reflow_scratch: &mut [u8],
+    epub: EpubSource<'_>,
+    scratch: &mut ReaderCacheScratch<'_>,
     preparation: Preparation,
 ) -> bool
 where
@@ -728,6 +746,29 @@ where
 {
     let mut result =
         reader_cache_files::load_v2_book_index(root, cache_key, source_identity, library);
+    if let BookIndexLoadResult::BeforeImages { spacing_changed } = result {
+        // Laid out before image blocks existed. The ZIP's central directory
+        // says whether that matters: once per book, as whatever follows
+        // writes the index as the current version.
+        let checked = Instant::now();
+        let has_images = epub_has_images(root, epub, scratch);
+        esp_println::println!(
+            "epub: v27 book index; images={:?} checked in {} ms",
+            has_images,
+            checked.elapsed().as_millis()
+        );
+        result = reader_cache_files::settle_index_before_images(
+            root,
+            cache_key,
+            source_identity,
+            library,
+            has_images,
+            spacing_changed,
+            requested_global_page,
+            requested_spine,
+        );
+    }
+    let reflow_scratch = &mut scratch.xhtml[..];
     if result == BookIndexLoadResult::SpacingMismatch {
         // The resident sections are still the old spacing's pages.
         if requested_spine.is_none() {
@@ -810,7 +851,9 @@ where
                 }
             }
         }
-        BookIndexLoadResult::Invalid | BookIndexLoadResult::SpacingMismatch => {
+        BookIndexLoadResult::Invalid
+        | BookIndexLoadResult::SpacingMismatch
+        | BookIndexLoadResult::BeforeImages { .. } => {
             esp_println::println!("epub: v2 {label} book index invalid");
             false
         }
@@ -819,6 +862,44 @@ where
             false
         }
     }
+}
+
+/// Whether the book's ZIP has image entries, from its central directory
+/// alone: the open reads the end record and the directory (or indexes it),
+/// and only a directory too big for that index is walked once more,
+/// through the idle compressed scratch. No image is read. None when the
+/// book cannot be opened; a directory damaged past the open counts as no
+/// images, as it does for a build.
+#[inline(never)]
+fn epub_has_images<D, T, const ND: usize, const NF: usize, const NV: usize>(
+    root: &Directory<'_, D, T, ND, NF, NV>,
+    epub: EpubSource<'_>,
+    scratch: &mut ReaderCacheScratch<'_>,
+) -> Option<bool>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let books;
+    let dir = if epub.in_books_dir {
+        books = root.open_dir("BOOKS").ok()?;
+        &books
+    } else {
+        root
+    };
+    let file = dir.open_file_in_dir(epub.name, Mode::ReadOnly).ok()?;
+    let len = file.length();
+    let reader = SdFileReadAt {
+        file,
+        len,
+        read_ops: 0,
+        read_bytes: 0,
+    };
+    let mut zip = ZipStream::new(reader, scratch.tail).ok()?;
+    Some(crate::book_images::book_has_images(
+        &mut zip,
+        scratch.compressed,
+    ))
 }
 
 fn generated_toc_is_current<D, T, const ND: usize, const NF: usize, const NV: usize>(
@@ -1283,6 +1364,35 @@ where
     // (see ReaderStore::requested_page), and paging back or the Contents
     // still reach the cover, title, and foreword pages.
     let mut prefix_next = next_eligible_spine(&package, resume_next.map_or(0, usize::from));
+    // A book with images keeps an index of them beside its book index,
+    // built once from the central directory through the compressed scratch
+    // and the XHTML window, both idle until the first spine. A fresh build
+    // learns whether the book has any from the ZIP's open (walking only a
+    // directory too big for its index pass), and the book index keeps the
+    // answer for the sessions that resume it. A book without them never
+    // touches the index.
+    let has_images = if resuming {
+        library.book_has_images()
+    } else {
+        let found = crate::book_images::book_has_images(&mut zip, &mut scratch.compressed[..]);
+        library.set_book_has_images(found);
+        found
+    };
+    let images_dir;
+    let images = if has_images {
+        images_dir = crate::book_images::book_cache_dir(root, cache_key);
+        images_dir.as_ref().and_then(|dir| {
+            crate::book_images::open_book_images(
+                dir,
+                source_identity,
+                &mut zip,
+                &mut scratch.compressed[..],
+                &mut scratch.xhtml[..],
+            )
+        })
+    } else {
+        None
+    };
     let mut spine_scratch = SpineScratch {
         header: &mut *scratch.header,
         name: &mut *scratch.name,
@@ -1320,23 +1430,39 @@ where
             esp_println::println!("epub: laying out spine {} ahead of the prefix", spine_index);
         }
         let seed_len = library.seed.sections.len();
-        let outcome = lay_out_spine(
-            &mut zip,
-            root,
-            source_identity,
-            &package,
-            opf_path,
-            spine_index,
-            run,
-            run_base,
-            library,
-            font_metrics,
-            preparation,
-            generate_toc_from_headings && run == SpineRun::Prefix,
-            &mut book_partial,
-            &mut section_write_micros,
-            &mut spine_scratch,
-        )?;
+        // A spine that meets images no probe has read is laid out twice; see
+        // `lay_out_spine`. Nothing commits in between: the book index is
+        // written below, after the second pass.
+        let mut first_pass = true;
+        let outcome = loop {
+            let laid = lay_out_spine(
+                &mut zip,
+                root,
+                source_identity,
+                &package,
+                opf_path,
+                spine_index,
+                run,
+                run_base,
+                library,
+                font_metrics,
+                preparation,
+                generate_toc_from_headings && run == SpineRun::Prefix,
+                &mut book_partial,
+                &mut section_write_micros,
+                images.as_ref(),
+                first_pass,
+                &mut spine_scratch,
+            )?;
+            match laid {
+                SpinePass::Laid(outcome) => break outcome,
+                SpinePass::Again if first_pass => first_pass = false,
+                // A second pass never waits for a probe. Were one to, its
+                // sections are already taken back: fail the step, which
+                // commits nothing, rather than move past the spine.
+                SpinePass::Again => return Err(ReaderCacheError::CacheWrite),
+            }
+        };
         spines_laid += 1;
         let after = next_eligible_spine(&package, spine_index + 1);
         match run {
@@ -1675,6 +1801,17 @@ where
 }
 
 /// Lay out one spine into `run`'s table, writing its sections as they fill.
+///
+/// A spine whose first pass meets images no probe has read is laid out
+/// twice: the first pass marks them in the image index and stops laying
+/// out at the first of them, then probes them, and the second pass lays
+/// the whole spine out with their sizes. Nothing commits between the
+/// passes (the session writes the book index only after the second), and
+/// the first is taken back before the second (`take_back_first_pass`): its
+/// sections leave the run's table, and its generated TOC record goes. Its
+/// section files are a prefix of what the second pass writes under the
+/// same ids, since both lay the spine out identically up to the first
+/// unprobed image, so the second overwrites every one of them.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn lay_out_spine<Z, D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
@@ -1692,15 +1829,17 @@ fn lay_out_spine<Z, D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const M
     generate_toc_from_headings: bool,
     book_partial: &mut bool,
     write_micros: &mut u64,
+    images: Option<&BookImages<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>,
+    first_pass: bool,
     scratch: &mut SpineScratch<'_>,
-) -> Result<SpineOutcome, ReaderCacheError>
+) -> Result<SpinePass, ReaderCacheError>
 where
     Z: EpubZipOps,
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
     let Some(spine) = package.spine.get(spine_index) else {
-        return Ok(SpineOutcome::Skipped);
+        return Ok(SpinePass::Laid(SpineOutcome::Skipped));
     };
     let cache_key = library.cache_key.clone();
     library.clear_lines();
@@ -1718,7 +1857,7 @@ where
                 xhtml_path.as_str(),
                 err
             );
-            return Ok(SpineOutcome::Skipped);
+            return Ok(SpinePass::Laid(SpineOutcome::Skipped));
         }
     };
     esp_println::println!(
@@ -1763,6 +1902,11 @@ where
             generated_toc_for_spine: false,
             pages_dirty: true,
             write_failed: false,
+            images,
+            chapter: xhtml_path.as_str(),
+            image_path: &mut *scratch.name,
+            first_pass,
+            unprobed: None,
         };
         // Stream the whole member through the resumable block parser in
         // bounded windows: spine XHTML of any size decodes completely, with
@@ -1840,18 +1984,104 @@ where
                 *sink.book_partial = true;
             }
         }
+        if sink.write_failed {
+            return Err(ReaderCacheError::CacheWrite);
+        }
+        if let (Some((first, last)), Some(images)) = (sink.unprobed, images) {
+            let generated_toc = sink.generated_toc_for_spine;
+            take_back_first_pass(library, run, spine_index, generated_toc);
+            probe_spine_images(images, zip, first..=last, scratch, preparation, spine_index)?;
+            return Ok(SpinePass::Again);
+        }
         if !sink.run_full {
             sink.finish_spine(false);
         }
         if sink.write_failed {
             return Err(ReaderCacheError::CacheWrite);
         }
-        Ok(if sink.run_full {
+        Ok(SpinePass::Laid(if sink.run_full {
             SpineOutcome::RunFull
         } else {
             SpineOutcome::Laid
-        })
+        }))
     })
+}
+
+/// Probes the images a spine's first pass marked, between its passes.
+/// Out of line, so the spine's own frame, which the parse runs beneath,
+/// does not carry this one's.
+#[inline(never)]
+fn probe_spine_images<Z, D, T, const ND: usize, const NF: usize, const NV: usize>(
+    images: &BookImages<'_, D, T, ND, NF, NV>,
+    zip: &mut Z,
+    slots: core::ops::RangeInclusive<u16>,
+    scratch: &mut SpineScratch<'_>,
+    preparation: Preparation,
+    spine_index: usize,
+) -> Result<(), ReaderCacheError>
+where
+    Z: EpubZipOps,
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let started = Instant::now();
+    let probed = images
+        .probe_marked(
+            zip,
+            slots,
+            &mut scratch.compressed[..],
+            &mut scratch.xhtml[..],
+            scratch.zip_inflate,
+            || preparation.gives_way(),
+        )
+        .map_err(|stop| match stop {
+            ProbeStop::Interrupted => ReaderCacheError::Interrupted,
+            // A failed read of the book is worth retrying, as for a spine.
+            ProbeStop::Archive => proto::epub::ZipError::Io.into(),
+            ProbeStop::Index => ReaderCacheError::CacheWrite,
+        })?;
+    esp_println::println!(
+        "epub: spine {} probed {} image(s) in {} ms; laying it out again",
+        spine_index,
+        probed,
+        started.elapsed().as_millis()
+    );
+    Ok(())
+}
+
+/// Takes back what a spine's first pass added outside its section files,
+/// before the second: nothing it added needs remembering beforehand. A
+/// spine's sections are the tail of its run's table (a session lays each
+/// spine out once, in order), and the TOC record a pass generates from a
+/// heading is the list's last. The book's partial mark needs no undoing:
+/// it only ever goes true, and the second pass, identical up to the first
+/// pass's first unprobed image and adding nothing after it, sets it
+/// wherever the first did.
+fn take_back_first_pass(
+    library: &mut ReaderStore,
+    run: SpineRun,
+    spine_index: usize,
+    generated_toc: bool,
+) {
+    let spine = spine_index.min(u16::MAX as usize) as u16;
+    match run {
+        SpineRun::Prefix => library.book_sections.drop_trailing_spine(spine),
+        SpineRun::Seed => library.seed.sections.drop_trailing_spine(spine),
+    }
+    if generated_toc && library.toc_count > 0 {
+        library.toc_count -= 1;
+        library.toc_text_len = library.toc[library.toc_count].title_offset as usize;
+    }
+    library.clear_lines();
+}
+
+/// How one layout pass over a spine ended.
+#[derive(Clone, Copy)]
+enum SpinePass {
+    Laid(SpineOutcome),
+    /// The pass met images no probe had read; they are probed now, and the
+    /// pass taken back: lay the spine out again.
+    Again,
 }
 
 fn spine_item_is_navigation(
@@ -2190,6 +2420,30 @@ struct LibraryBlockSink<
     /// Completed pages stay valid; the dirty trailing page is repaginated.
     pages_dirty: bool,
     write_failed: bool,
+    /// The book's image index, when it has images.
+    images: Option<&'a BookImages<'r, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>,
+    /// The chapter's ZIP path, which its images' sources are relative to.
+    chapter: &'a str,
+    /// Where an image source resolves to: the ZIP name scratch, idle while
+    /// the chapter streams.
+    image_path: &'a mut [u8; MAX_ENTRY_NAME_BYTES],
+    /// The spine's first layout pass, in which an unprobed image waits for
+    /// a probe; in the second it shows as alt text.
+    first_pass: bool,
+    /// The first and last index slots of the unprobed images this pass
+    /// met. Once set, the pass is only looking for more: the spine is laid
+    /// out again after they are probed.
+    unprobed: Option<(u16, u16)>,
+}
+
+/// What `<img>` or an svg image comes to, once the book's index has had a
+/// look at it.
+enum ImagePush {
+    /// Nothing to show: the alt-text placeholder, for an `<img>`.
+    Placeholder,
+    Done,
+    /// The spine stops here.
+    Stop,
 }
 
 #[derive(Clone, Copy)]
@@ -2436,6 +2690,10 @@ where
             self.interrupted = true;
             return Err(XhtmlError::TooManyRuns);
         }
+        if self.unprobed.is_some() {
+            // This pass is laid out again once its images are probed.
+            return Ok(());
+        }
         self.flush_if_full();
         push_styled_preview_fragment(
             self,
@@ -2447,6 +2705,123 @@ where
         );
         self.flush_if_full();
         Ok(())
+    }
+
+    fn push_image(&mut self, src: &str, alt: Option<&str>) -> Result<(), XhtmlError> {
+        match self.push_book_image(src, alt) {
+            ImagePush::Placeholder => push_image_placeholder(self, alt),
+            ImagePush::Done => Ok(()),
+            ImagePush::Stop => Err(XhtmlError::TooManyRuns),
+        }
+    }
+
+    fn push_svg_image(&mut self, href: &str) -> Result<(), XhtmlError> {
+        match self.push_book_image(href, None) {
+            ImagePush::Stop => Err(XhtmlError::TooManyRuns),
+            // An svg image never had a placeholder.
+            ImagePush::Placeholder | ImagePush::Done => Ok(()),
+        }
+    }
+
+    /// Only a book with an image index hears of svg images: the parser ends
+    /// the paragraph around each, which must not change a book without.
+    fn wants_svg_images(&self) -> bool {
+        self.images.is_some()
+    }
+}
+
+impl<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>
+    LibraryBlockSink<'_, '_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    /// Looks the image up in the book's index and lays out what it finds.
+    /// Out of line, and the placeholder pushed by the caller: neither the
+    /// lookup's buffers nor this frame ride under the placeholder's
+    /// paragraph, which takes the text path's deepest frames.
+    #[inline(never)]
+    fn push_book_image(&mut self, src: &str, alt: Option<&str>) -> ImagePush {
+        let Some(images) = self.images else {
+            return ImagePush::Placeholder;
+        };
+        if self.stopped || self.interrupted {
+            return ImagePush::Stop;
+        }
+        if self.preparation.gives_way() {
+            self.interrupted = true;
+            return ImagePush::Stop;
+        }
+        let page_box = self.library.page_box();
+        let placement = images.place(
+            self.chapter,
+            src,
+            &mut self.image_path[..],
+            page_box,
+            self.library.portrait(),
+            self.first_pass,
+        );
+        match placement {
+            Err(()) => {
+                self.write_failed = true;
+                self.stopped = true;
+                ImagePush::Stop
+            }
+            Ok(ImagePlacement::Unprobed { slot }) => {
+                self.unprobed = Some(match self.unprobed {
+                    Some((first, last)) => (first.min(slot), last.max(slot)),
+                    None => (slot, slot),
+                });
+                ImagePush::Done
+            }
+            // Laid out again after the probe: only unprobed images matter.
+            Ok(_) if self.unprobed.is_some() => ImagePush::Done,
+            Ok(ImagePlacement::Missing) => ImagePush::Placeholder,
+            Ok(ImagePlacement::Block {
+                slot,
+                width,
+                height,
+            }) => {
+                if self.push_image_block(slot, width, height, alt) {
+                    ImagePush::Done
+                } else if self.stopped {
+                    ImagePush::Stop
+                } else {
+                    // No room even in a fresh arena: the alt text, rather
+                    // than nothing.
+                    ImagePush::Placeholder
+                }
+            }
+        }
+    }
+
+    /// An image block for the image in `slot`, `width × height` as fitted:
+    /// its own paragraph, whose token (slot, width, cleaned alt) is written
+    /// straight into the store's text arena. False when there is no room
+    /// for it, or the spine stopped.
+    fn push_image_block(&mut self, slot: u16, width: u16, height: u16, alt: Option<&str>) -> bool {
+        // The parser ended the paragraph before the image.
+        if !self.line.is_empty() {
+            flush_styled_preview_line(self, true);
+        }
+        self.flush_if_full();
+        if self.stopped {
+            return false;
+        }
+        let spine = self.spine_index;
+        let token = |out: &mut [u8]| encode_image_token(slot, width, alt, out).map(str::len);
+        if !self.library.push_image_block(height, spine, token) {
+            // The arena filled: flush and retry in a fresh one, as a line
+            // does.
+            self.flush_section(false, true);
+            if self.stopped || !self.library.push_image_block(height, spine, token) {
+                return false;
+            }
+        }
+        self.pages_dirty = true;
+        self.hyphen_run = 0;
+        self.flush_if_full();
+        true
     }
 }
 

@@ -279,7 +279,12 @@ fn draw_sd_reader_page(fb: &mut Framebuffer, request: RenderRequest, sd_library:
         (BookLoadStatus::Ready, _) => {
             let plan = reader_layout::ReaderPagePlan::new(sd_library, request.page);
             let page_count = plan.page_count().max(1);
-            ui::reading::draw_reading_page_body(fb, sd_library, plan.page());
+            ui::reading::draw_reading_page_body(
+                fb,
+                sd_library,
+                plan.page(),
+                ui::reading::draw_image_placeholder,
+            );
             draw_reader_footer(fb, request, sd_library, page_count);
         }
     }
@@ -316,11 +321,17 @@ fn draw_sd_reader_page_with_custom_font(
                 sd_library,
                 font_metrics,
                 plan.page(),
+                ui::reading::draw_image_placeholder,
             ) {
                 // The custom face may have painted part of the page before
                 // failing; start the built-in fallback from a clean frame.
                 fb.clear(true);
-                ui::reading::draw_reading_page_body(fb, sd_library, plan.page());
+                ui::reading::draw_reading_page_body(
+                    fb,
+                    sd_library,
+                    plan.page(),
+                    ui::reading::draw_image_placeholder,
+                );
             }
             draw_reader_footer(fb, request, sd_library, page_count);
         }

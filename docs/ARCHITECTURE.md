@@ -93,7 +93,8 @@ fw/        boot, Embassy executor, task wiring, board-owned peripherals
 ui/        shared shell rendering plus ui::reading, the reader page-plan seam
            (page bounds, ink measurement, wrapping) used by fw and host tools
 proto/     bounded book/storage/text/cache models plus ZIP/EPUB/XHTML parser pieces,
-           and book images (proto::image: streaming PNG decode, dithering)
+           and book images (proto::image: the IMAGES.BIN index, image paths,
+           image-block tokens, streaming PNG decode, dithering)
 tools/emulator/ host-side development emulator and scenario runner
 tools/cargo.sh  rustup Cargo wrapper on the toolchain pinned in rust-toolchain.toml
 tools/bench/    serial bench harness for hardware timing, storage/cache,
@@ -387,7 +388,20 @@ and the host preview tool:
   the arena, marks the package `spine_truncated`, and the book's last page
   says it was cut short.
 - `xhtml_blocks_to_sink` with `TextRole`, `FontStyle`, and `TextAlign` as the
-  single XHTML extraction path feeding bounded block records.
+  single XHTML extraction path feeding bounded block records. Images reach
+  the sink through `XhtmlBlockSink::push_image` as raw `src`/`alt` slices
+  (and, for a sink that asks, the first `<image>` of each `<svg>`); the
+  default pushes the alt-text placeholder.
+- `proto::image` for images in books: `path` resolves an image `src` against
+  its chapter's ZIP path and hashes it, `index` owns the per-book
+  `IMAGES.BIN` format (entries from the ZIP central directory, sorted by
+  path hash, probed and decoded state filled in place), and `token` is the
+  text an image block stores. An image block is a `BlockRecord` whose
+  `image_height` (the record's last two bytes, zero in caches before v28)
+  is non-zero; `ui::reading` fits images with `fit_image`, gives the block
+  gaps above and below so the neighbouring lines' descenders and tallest
+  marks clear the image by a row, and hands its rect to the page's image
+  drawer.
 - `hyphen::word_breaks` for where a word may break at a line end: the book's
   soft hyphens (the only breaks when present), dashes already in a compound,
   and for English (`dc:language` `en*`), Liang's algorithm over the US English
@@ -546,6 +560,41 @@ building. The pin stays in the `ReaderStore` across the rebuild's steps,
 spine is laid out, and the completed load spends it. This covers a type or
 orientation change mid-book and opening a book last read under other settings.
 
+Images get an index of their own. A build session whose ZIP has image
+entries opens the book's `IMAGES.BIN` before its first spine, building it
+from the central directory when there is no valid one (`fw::book_images`).
+The index holds PNGs; JPEGs, which most covers are, keep their alt text
+with no probe until a decoder takes them. A fresh build learns whether
+there are any from the ZIP open's own pass over the central directory
+(only a directory of more than about 200 entries, too many for that pass's
+index, is walked once more), and records it in the book index, where every
+later session reads it. A directory damaged past the entries a build looks
+up counts as having none, so the book still builds, and a book without
+images never touches the index. The compressed scratch and the XHTML
+window are idle then, and lend the build its buffers. No image is read:
+each is probed the first time a chapter's layout meets it. A spine that
+meets images no probe has read marks them wanted in the index and stops
+laying out at the first, probes them from their stored ZIP offsets (a
+stored image reads its first 33 bytes, a deflated one inflates that far
+through the idle inflater, from at most 4 KB), and is laid out again with
+their fitted sizes; an idle session's probes give way to a press between
+images. A probe whose local header is missing, lies past the archive's
+end, or names another file marks the image failed for good; a read that
+fails records nothing and fails the step, so the image is probed again.
+Nothing commits between the two passes, the first pass's sections leave
+the run's table before the second, and the second rewrites every section
+file the first wrote, so the discarded pass leaves nothing behind. Only
+spines with newly met images pay for it. An image the decoder does not
+take keeps its alt-text placeholder; an svg-wrapped image, which never had
+one, leaves nothing. The index does not depend on type settings, so it
+survives every relayout, and it goes with the book's cache directory.
+
+Caches from before image blocks (v27) are still read. The first load of
+such a book's index reads its ZIP's central directory once: without PNGs
+(a JPEG cover alone does not count) the index is written again as v28, as
+it stands, and with them the book rebuilds, pinned to the reader's place,
+so its images replace the alt text it was laid out with.
+
 Cache paths use FAT 8.3-safe names because `embedded-sdmmc` operates on short
 file names in the firmware path. The library list is a windowed catalog
 snapshot at `/XTEINK/CATALOG.BIN` (v4: `X4CT` magic, u16 book count, 92-byte
@@ -575,6 +624,7 @@ snapshot or a completed scan has no EPUBs.
 /XTEINK/CACHE2/E<hash>/BOOK.BIN       (legacy fallback)
 /XTEINK/CACHE2/E<hash>/TOC.BIN
 /XTEINK/CACHE2/E<hash>/COVER.BIN
+/XTEINK/CACHE2/E<hash>/IMAGES.BIN     (books with images)
 /XTEINK/CACHE2/E<hash>/SECTIONS/S000.BIN
 /XTEINK/CACHE2/E<hash>/SECTIONS/S001.BIN
 /XTEINK/CACHE2/E<hash>/POSA.BIN       (per-book position, alternating with POSB.BIN)
@@ -805,6 +855,7 @@ fw::library_sd          FAT scan, SD chip-select handling, and file discovery
 fw::sd_session          SD session open/close and the upload write pump
 fw::reader_cache        EPUB-to-cache loading into bounded proto::cache records
 fw::reader_cache_files  cache/state/credential/label file records on the card
+fw::book_images         a book's IMAGES.BIN during a build: open/build, lookups, probes
 ui::reading             Reader page plan: one page walk, wrapping, measurements, drawing
 fw::reader_layout       bounded page-index and TOC adapters over the shared page walk
 fw::reader_store        bounded loaded-book/library state shared by cache and views

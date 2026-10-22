@@ -25,10 +25,12 @@ use display::font::{
 use proto::cache::BlockRecord;
 use proto::text::{TextAlign, TextRole};
 use ui::reading::{
-    block_first_line_indent, body_font, paginate_block_pages, wrapped_line_count, PageBox,
-    ReadingBlocks,
+    block_first_line_indent, body_font, fit_image, paginate_block_pages, wrapped_line_count,
+    PageBox, ReaderImage, ReadingBlocks,
 };
-use ui::reading::{draw_reading_page_body, draw_reading_page_counter, page_record_at};
+use ui::reading::{
+    draw_image_placeholder, draw_reading_page_body, draw_reading_page_counter, page_record_at,
+};
 
 struct FixtureBlock {
     record: BlockRecord,
@@ -98,6 +100,7 @@ fn record(role: TextRole, align: TextAlign, line_count: u8) -> BlockRecord {
         role,
         style: proto::text::FontStyle::Regular,
         align,
+        image_height: 0,
     }
 }
 
@@ -254,7 +257,7 @@ fn assert_page_matches_golden(source: &FixtureBlocks, page_index: usize, name: &
     let page = page_record_at(source, page_index);
     assert!(page.block_count > 0, "page {page_index} should hold blocks");
     let mut fb = Framebuffer::new();
-    draw_reading_page_body(&mut fb, source, page);
+    draw_reading_page_body(&mut fb, source, page, draw_image_placeholder);
     assert_frame_matches_golden(&fb, name);
 }
 
@@ -280,7 +283,7 @@ fn full_reading_surface_matches_golden() {
     let source = fixture(TypeSettings::DEFAULT);
     let page = page_record_at(&source, 0);
     let mut fb = Framebuffer::new();
-    draw_reading_page_body(&mut fb, &source, page);
+    draw_reading_page_body(&mut fb, &source, page, draw_image_placeholder);
     draw_reading_page_counter(&mut fb, "1/2");
 
     assert_frame_matches_golden(&fb, "reading-surface-0");
@@ -413,8 +416,200 @@ fn portrait_reading_surface_matches_golden() {
     let mut fb = Framebuffer::new();
     fb.set_frame(display::fb::FbFrame::Portrait);
     fb.clear(true);
-    draw_reading_page_body(&mut fb, &source, page);
+    draw_reading_page_body(&mut fb, &source, page, draw_image_placeholder);
     draw_reading_page_counter(&mut fb, "1/2");
 
     assert_frame_matches_golden(&fb, "reading-portrait-surface-0");
+}
+
+/// Jan Steinke's orientation marker (640x900, 8-bit gray): arrows and labels
+/// at its top and bottom, a thick bar on its left and a thin one on its
+/// right, so a flip, mirror or misplacement shows in the golden.
+const MARKER: &[u8] = include_bytes!("../../../fixtures/images/orientation-test.png");
+/// The same marker at a third of the size (213x300; see
+/// `fixtures/images/shrink_orientation_marker.py`): it fits every page box
+/// unscaled, with lines of text above it on the same page.
+const SMALL_MARKER: &[u8] = include_bytes!("../../../fixtures/images/orientation-small.png");
+const MARKERS: [&[u8]; 2] = [SMALL_MARKER, MARKER];
+
+/// A text line whose descenders hang over where an image below would start.
+fn descender_line(text: &str, paragraph_end: bool) -> FixtureBlock {
+    FixtureBlock {
+        record: record(TextRole::Body, TextAlign::Left, 1),
+        text: text.into(),
+        style: FontStyle::Regular,
+        page_break_before: false,
+        paragraph_end,
+    }
+}
+
+/// An image block laid out the way the firmware will: probe the PNG, fit it
+/// with the layout's helper, and store the height in the record and the
+/// slot, width and alt in the block's token.
+fn image_block(slot: u16, page_box: PageBox, alt: &str) -> FixtureBlock {
+    let info = proto::image::png::probe(MARKERS[usize::from(slot)]).expect("marker probes");
+    let (width, height) = fit_image(page_box, info.width, info.height);
+    let mut token = [0u8; proto::image::token::IMAGE_TOKEN_MAX_BYTES];
+    let text = proto::image::token::encode_image_token(slot, width, Some(alt), &mut token)
+        .expect("token fits");
+    FixtureBlock {
+        record: BlockRecord {
+            image_height: height,
+            ..record(TextRole::Body, TextAlign::Center, 1)
+        },
+        text: text.into(),
+        style: FontStyle::Regular,
+        page_break_before: false,
+        paragraph_end: true,
+    }
+}
+
+/// Text lines dense with descenders directly above the small marker, a
+/// line of the tallest marks (stacked Vietnamese, accented capitals) under
+/// it, then the full-size marker, fitted to the page box, with a closing
+/// line.
+fn image_fixture(portrait: bool) -> FixtureBlocks {
+    let page_box = PageBox::for_portrait(portrait);
+    let blocks = vec![
+        descender_line("Quietly, a pygmy yak jogged past", false),
+        descender_line("gypsy figs, ripe quinces, jumpy", false),
+        descender_line("gnu, pug, jay; gyp jig qypjgy gjpqy", true),
+        image_block(0, page_box, "The marker, small"),
+        descender_line(
+            "Below: \u{1EB2}\u{1E4C}\u{C9}\u{C5} \u{1EB2}\u{1E4C}\u{C9}\u{C5} \u{1EB2}\u{1E4C}\u{C9}\u{C5} \u{1EB2}\u{1E4C}",
+            true,
+        ),
+        image_block(1, page_box, "The marker, fitted to the page"),
+        descender_line("After the page-sized marker.", true),
+    ];
+    FixtureBlocks {
+        blocks,
+        settings: TypeSettings::DEFAULT,
+        portrait,
+    }
+}
+
+/// Draws a marker into the rect layout reserved, through the decoder the
+/// firmware uses: `PngDecoder` at exactly the rect's size (never fitted
+/// again), Floyd-Steinberg dithered to 1 bpp, rows copied in.
+fn draw_marker(fb: &mut Framebuffer, image: &ReaderImage<'_>) {
+    use proto::image::dither::Ditherer;
+    use proto::image::png::{probe, PngDecoder};
+    use proto::image::SinkError;
+
+    let png = MARKERS[usize::from(image.slot.expect("token names a slot"))];
+    let info = probe(png).expect("marker probes");
+    let (width, height) = (u32::from(image.width), u32::from(image.height));
+    // The decoders clear what they read: hand them dirty memory.
+    let mut scratch = vec![0xA5u8; info.scratch_bytes(width)];
+    let mut dither_scratch = vec![0xA5u8; Ditherer::scratch_bytes(width)];
+    let mut ditherer = Ditherer::new(&mut dither_scratch, width).expect("ditherer");
+    let mut packed = vec![0u8; Ditherer::packed_len(width)];
+    let mut inflate = Box::new(miniz_oxide::inflate::stream::InflateState::new(
+        miniz_oxide::DataFormat::Zlib,
+    ));
+    let mut decoder = PngDecoder::new(&mut scratch, width, height).expect("decoder");
+    let mut rows = 0;
+    let mut sink = |y: u32, luma: &[u8]| -> Result<(), SinkError> {
+        ditherer.row(luma, &mut packed).expect("dither row");
+        for x in 0..width as usize {
+            let white = packed[x / 8] & (0x80 >> (x % 8)) != 0;
+            fb.set_pixel(image.x as usize + x, image.y as usize + y as usize, white);
+        }
+        rows += 1;
+        Ok(())
+    };
+    for chunk in png.chunks(1024) {
+        decoder
+            .feed(&mut inflate, chunk, &mut sink)
+            .expect("marker decodes");
+    }
+    decoder
+        .finish(&mut inflate, &mut sink)
+        .expect("marker completes");
+    assert_eq!(rows, height, "every row of the reserved rect");
+}
+
+/// Checks, with the page's text drawn and its images not yet, that no text
+/// ink reached an image's rect or the rows just above and below it. With
+/// `text_alongside`, the line above must also hang its descenders into the
+/// image's top gap, and the line below reach its marks into the bottom gap:
+/// close enough that without the gaps they would have met the image.
+fn assert_text_clears_image(
+    fb: &Framebuffer,
+    (x, y, width, height): (i16, i16, u16, u16),
+    text_alongside: bool,
+    settings: TypeSettings,
+) {
+    let columns = x as usize..x as usize + usize::from(width);
+    let inked = |row: i16| {
+        columns
+            .clone()
+            .any(|column| !fb.pixel(column, row as usize))
+    };
+    let end = y + height as i16;
+    for row in y - 1..=end {
+        assert!(!inked(row), "text ink at row {row}, image rows {y}..{end}");
+    }
+    if text_alongside {
+        let top_gap = ui::reading::image_top_gap(settings);
+        let deepest = (y - 2 * top_gap..y).rev().find(|&row| inked(row));
+        assert!(
+            deepest.is_some_and(|row| row >= y - top_gap),
+            "descenders should reach the top gap: deepest ink {deepest:?}, image at {y}"
+        );
+        let bottom_gap = ui::reading::image_bottom_gap(settings);
+        let tallest = (end..end + 40).find(|&row| inked(row));
+        assert!(
+            tallest.is_some_and(|row| row <= end + bottom_gap),
+            "marks should reach the bottom gap: tallest ink {tallest:?}, image ends {end}"
+        );
+    }
+}
+
+/// Image pages in both orientations, on whichever panel this build is for:
+/// page 0 holds text with descenders directly over the small marker, shown
+/// at its own size; page 1 the full marker, fitted to the page box. Both are
+/// centred in the column and sit below the gap that keeps the line above
+/// clear of them.
+#[test]
+fn image_pages_match_goldens() {
+    for (portrait, orientation) in [(false, "landscape"), (true, "portrait")] {
+        let source = image_fixture(portrait);
+        let pages = paginate_block_pages(&source);
+        assert!(pages >= 2, "{orientation}: {pages} pages");
+        for page_index in 0..2 {
+            let page = page_record_at(&source, page_index);
+            let mut fb = Framebuffer::new();
+            if portrait {
+                fb.set_frame(display::fb::FbFrame::Portrait);
+                fb.clear(true);
+            }
+            // Text first, then the images: so the check below sees the
+            // lines on both sides of each image before it is drawn.
+            let mut images = Vec::new();
+            draw_reading_page_body(&mut fb, &source, page, |_, image| {
+                images.push((image.x, image.y, image.width, image.height));
+            });
+            for &image in &images {
+                assert_text_clears_image(&fb, image, page_index == 0, source.settings);
+            }
+            ui::reading::for_each_drawable_block(&source, page, |block| {
+                if let Some(image) = block.image {
+                    draw_marker(&mut fb, &image);
+                }
+                true
+            });
+            draw_reading_page_counter(&mut fb, &format!("{}/{pages}", page_index + 1));
+            assert_eq!(images.len(), 1, "{orientation} page {page_index}");
+            let (x, _, width, height) = images[0];
+            let page_box = PageBox::for_portrait(portrait);
+            let column = page_box.right - page_box.left;
+            assert_eq!(x, page_box.left + (column - width as i16) / 2, "centred");
+            if page_index == 0 {
+                assert_eq!((width, height), (213, 300), "shown at its own size");
+            }
+            assert_frame_matches_golden(&fb, &format!("reading-image-{orientation}-{page_index}"));
+        }
+    }
 }

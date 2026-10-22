@@ -1,5 +1,6 @@
-//! Images in books: decoding to gray rows at the size layout fitted, and
-//! dithering those rows to the panel's 1 bpp.
+//! Images in books: finding them ([`path`], [`index`]), naming them in a
+//! section's text ([`token`]), decoding them to gray rows at the size layout
+//! fitted, and dithering those rows to the panel's 1 bpp.
 //!
 //! Nothing here allocates or keeps static buffers. Each piece borrows its
 //! working memory from the caller, which on device lends buffers that sit
@@ -8,7 +9,10 @@
 
 pub mod dither;
 mod fit;
+pub mod index;
+pub mod path;
 pub mod png;
+pub mod token;
 
 pub use fit::fit_inside;
 

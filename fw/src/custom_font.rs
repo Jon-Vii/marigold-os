@@ -1,4 +1,5 @@
 #[cfg(feature = "bench-serial")]
+#[path = "custom_font/bench.rs"]
 pub(crate) mod bench;
 
 use crate::reader_store::ReaderStore;
@@ -15,6 +16,9 @@ use proto::font_pack::{
 };
 use proto::text::TextAlign;
 
+// Both submodules are named by path, so that host tests (and rustfmt)
+// find them from a test that includes this file.
+#[path = "custom_font/bitmap_cache.rs"]
 mod bitmap_cache;
 use bitmap_cache::BitmapCache;
 
@@ -187,6 +191,11 @@ impl MetricCache {
     }
 }
 
+/// Draws one page of reading-body blocks in the custom face, as
+/// `ui::reading::draw_reading_page_body` does in a built-in one: image
+/// blocks go to `draw_image` with their placement, and their text (an
+/// image token) is never drawn. False when the face cannot draw a line,
+/// which leaves the page part-drawn for the caller to redo.
 // Keep the temporary bitmap working set out of the deeper EPUB build stack.
 #[inline(never)]
 pub(crate) fn draw_reading_page_body<
@@ -201,6 +210,7 @@ pub(crate) fn draw_reading_page_body<
     source: &ReaderStore,
     cache: &mut MetricCache,
     page: PageRecord,
+    mut draw_image: impl FnMut(&mut Framebuffer, &ui::reading::ReaderImage<'_>),
 ) -> bool
 where
     D: embedded_sdmmc::BlockDevice,
@@ -228,6 +238,10 @@ where
     let page_box = ui::reading::ReadingBlocks::page_box(source);
     let mut ok = true;
     ui::reading::for_each_drawable_block(source, page, |block| {
+        if let Some(image) = block.image {
+            draw_image(fb, &image);
+            return true;
+        }
         if block.record.line_count != 1 {
             ok = false;
             return false;

@@ -5,6 +5,7 @@ use proto::cache::{
     BlockRecord, BookV2SectionRecord, PageRecord, TocRecord, CACHE_KEY_BYTES, COVER_BYTES,
     COVER_HEIGHT, COVER_STRIDE, COVER_WIDTH, TOC_CHAPTER_RECORD_BYTES, TOC_CHAPTER_TITLE_BYTES,
 };
+use proto::image::token::IMAGE_TOKEN_MAX_BYTES;
 use proto::text::{TextAlign, TextRole};
 
 /// Resident slice of the on-disk catalog kept for the Library list. The full
@@ -71,6 +72,7 @@ pub(crate) const EMPTY_BLOCK_RECORD: BlockRecord = BlockRecord {
     role: TextRole::Body,
     style: proto::text::FontStyle::Regular,
     align: TextAlign::Justify,
+    image_height: 0,
 };
 pub(crate) const EMPTY_PAGE_RECORD: PageRecord = PageRecord {
     first_block: 0,
@@ -233,6 +235,13 @@ impl<const N: usize> SectionTable<N> {
         while self.len > len {
             self.len -= 1;
             self.end_page -= u32::from(self.entries[self.len].pages & !SECTION_PARTIAL);
+        }
+    }
+
+    /// Drops the sections at the table's end that belong to `spine`.
+    pub(crate) fn drop_trailing_spine(&mut self, spine: u16) {
+        while self.last().is_some_and(|section| section.spine == spine) {
+            self.truncate(self.len - 1);
         }
     }
 
@@ -464,6 +473,9 @@ pub(crate) struct ReaderStore {
     pub(crate) book_cache_partial: bool,
     book_next_spine: Option<u16>,
     book_generated_toc: bool,
+    /// The loaded book has images an image index holds, as its index
+    /// header or its build's look at the ZIP says.
+    book_has_images: bool,
     pub(crate) book_sections: SectionTable,
     pub(crate) seed: SeedRun,
     /// Pin for the page a layout-changing load asked for, held across the
@@ -575,6 +587,7 @@ impl ReaderStore {
             book_cache_partial: false,
             book_next_spine: None,
             book_generated_toc: false,
+            book_has_images: false,
             book_sections: SectionTable::new(),
             seed: SeedRun::new(),
             page_anchor: None,
@@ -969,6 +982,7 @@ impl ReaderStore {
         self.book_next_spine = None;
         self.seed.clear();
         self.book_generated_toc = false;
+        self.book_has_images = false;
         self.book_total_pages = 0;
         self.current_section_start_page = 0;
         self.current_section_page_count = 0;
@@ -1178,6 +1192,14 @@ impl ReaderStore {
 
     pub(crate) fn set_book_generated_toc(&mut self, generated: bool) {
         self.book_generated_toc = generated;
+    }
+
+    pub(crate) fn book_has_images(&self) -> bool {
+        self.book_has_images
+    }
+
+    pub(crate) fn set_book_has_images(&mut self, has_images: bool) {
+        self.book_has_images = has_images;
     }
 
     pub(crate) fn book_next_spine(&self) -> Option<u16> {
@@ -1885,6 +1907,7 @@ impl ReaderStore {
             role,
             style: proto_style_for_display_style(style),
             align,
+            image_height: 0,
         };
         self.block_styles[self.block_count] = style;
         self.block_spine[self.block_count] = spine_index;
@@ -1900,6 +1923,49 @@ impl ReaderStore {
                 .get(self.block_count.wrapping_sub(1))
                 .copied()
                 .unwrap_or(true);
+        self.block_count += 1;
+        true
+    }
+
+    /// Appends an image block `height` rows tall: its own paragraph,
+    /// centred, whose text is the image token `write_token` writes into the
+    /// text arena (returning its length). Writing in place keeps the token
+    /// off the EPUB build's deepest frames. False when the block table or
+    /// the arena has no room for a whole token, so the builder flushes the
+    /// section and retries, as for a line.
+    pub(crate) fn push_image_block(
+        &mut self,
+        height: u16,
+        spine_index: u16,
+        write_token: impl FnOnce(&mut [u8]) -> Option<usize>,
+    ) -> bool {
+        let start = self.text_len;
+        let Some(room) = self.text.get_mut(start..start + IMAGE_TOKEN_MAX_BYTES) else {
+            return false;
+        };
+        if self.block_count >= self.blocks.len() {
+            return false;
+        }
+        let Some(len) = write_token(room).filter(|len| (1..=IMAGE_TOKEN_MAX_BYTES).contains(len))
+        else {
+            return false;
+        };
+        self.text_len += len;
+        let index = self.block_count;
+        self.blocks[index] = BlockRecord {
+            text_offset: start as u32,
+            text_len: len as u16,
+            line_count: 1,
+            role: TextRole::Body,
+            style: proto::text::FontStyle::Regular,
+            align: TextAlign::Center,
+            image_height: height,
+        };
+        self.block_styles[index] = FontStyle::Regular;
+        self.block_spine[index] = spine_index;
+        self.block_page_break_before[index] = false;
+        self.block_paragraph_end[index] = true;
+        self.block_paragraph_start[index] = index == 0 || self.block_paragraph_end[index - 1];
         self.block_count += 1;
         true
     }

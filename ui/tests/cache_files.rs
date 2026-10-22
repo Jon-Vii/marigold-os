@@ -4,6 +4,8 @@ extern crate self as hal_ext;
 #[path = "../../hal-ext/src/nvm.rs"]
 pub mod nvm;
 pub use std::println;
+#[path = "../../fw/src/book_images.rs"]
+mod book_images;
 #[path = "support/fat.rs"]
 mod fat;
 #[path = "../../fw/src/reader_cache_files.rs"]
@@ -12,6 +14,8 @@ mod reader_cache_files;
 mod reader_layout;
 #[path = "../../fw/src/reader_store.rs"]
 mod reader_store;
+#[path = "support/zip.rs"]
+mod zip;
 // Same truncate-then-delete operation as the board adapter, without ESP HAL.
 mod sd_session {
     use embedded_sdmmc::{Directory, Mode, TimeSource};
@@ -857,7 +861,12 @@ fn justified_lines_fill_the_measure_except_a_paragraphs_last() {
 
     let mut fb = Framebuffer::new();
     fb.clear(true);
-    ui::reading::draw_reading_page_body(&mut fb, &store, store.pages[0]);
+    ui::reading::draw_reading_page_body(
+        &mut fb,
+        &store,
+        store.pages[0],
+        ui::reading::draw_image_placeholder,
+    );
     let page_box = ui::reading::ReadingBlocks::page_box(&store);
     let target = page_box.right - ui::reading::READER_WRAP_SAFETY;
     let settings = ui::reading::ReadingBlocks::type_settings(&store);
@@ -971,6 +980,19 @@ fn deleting_files_and_cache_directories_returns_every_cluster() {
     // folder alive.
     reader_cache_files::write_position_file(&root, KEY, 3, 42).unwrap();
     reader_cache_files::write_position_file(&root, KEY, 3, 43).unwrap();
+    // And the book's image index goes with its folder.
+    {
+        let xteink = root.open_dir(proto::cache::CACHE_ROOT_DIR).unwrap();
+        let cache = xteink.open_dir(proto::cache::CACHE_V2_DIR).unwrap();
+        let book = cache.open_dir(KEY).unwrap();
+        let index = book
+            .open_file_in_dir(
+                proto::image::index::IMAGE_INDEX_FILE,
+                embedded_sdmmc::Mode::ReadWriteCreateOrTruncate,
+            )
+            .unwrap();
+        index.write(&[1u8; 3000]).unwrap();
+    }
     assert!(free_clusters(&disk) < baseline);
     assert!(reader_cache_files::empty_cache_dir(&root, KEY));
     {
@@ -1251,4 +1273,515 @@ fn a_provisional_page_pins_its_place_in_the_old_seed_run() {
     assert_eq!(anchor(SEED + 12), None);
     // Prefix pages pin as before.
     assert_eq!(anchor(5), Some((0, reader_store::page_fraction(5, 10))));
+}
+
+/// An image block (an image token, with the image's height in the record)
+/// survives the firmware's section writer and loader, and draws from the
+/// loaded store as the image it names. The firmware sink that builds such
+/// blocks comes later; here the record's height is set by hand.
+#[test]
+fn an_image_block_round_trips_through_a_section_file() {
+    use display::font::{FontStyle, TypeSettings};
+    use proto::text::{TextAlign, TextRole};
+    for portrait in [false, true] {
+        let disk = fat::Disk::new();
+        let manager: VolumeManager<_, _, 8, 8, 1> =
+            VolumeManager::new_with_limits(&disk, fat::Clock, 0);
+        let volume = manager.open_volume(VolumeIdx(0)).unwrap();
+        let root = volume.open_root_dir().unwrap();
+        let mut store = ReaderStore::new();
+        store.set_layout(TypeSettings::DEFAULT, portrait);
+        let page_box = ui::reading::ReadingBlocks::page_box(&store);
+        let (width, height) = ui::reading::fit_image(page_box, 640, 900);
+        let mut token = [0u8; proto::image::token::IMAGE_TOKEN_MAX_BYTES];
+        let token =
+            proto::image::token::encode_image_token(7, width, Some("A &amp; B"), &mut token)
+                .expect("token fits");
+        let (regular, body) = (FontStyle::Regular, TextRole::Body);
+        assert!(store.push_line_block(
+            "Before the figure",
+            regular,
+            body,
+            TextAlign::Left,
+            true,
+            0
+        ));
+        assert!(store.push_line_block(token, regular, body, TextAlign::Center, true, 0));
+        store.blocks[1].image_height = height;
+        assert!(store.push_line_block("After the figure", regular, body, TextAlign::Left, true, 0));
+        reader_layout::rebuild_page_index(&mut store);
+        store.set_cached_spine(0);
+        assert!(reader_cache_files::write_v2_section_cache(
+            &root, KEY, ID, 0, &store
+        ));
+
+        let mut loaded = ReaderStore::new();
+        loaded.set_layout(TypeSettings::DEFAULT, portrait);
+        assert!(matches!(
+            reader_cache_files::load_v2_section_cache(
+                &root,
+                KEY,
+                ID,
+                0,
+                0,
+                store.page_count,
+                &mut loaded
+            ),
+            CacheLoadResult::Hit {
+                repaginated: false,
+                ..
+            }
+        ));
+        assert_eq!(loaded.block_count, 3);
+        assert_eq!(loaded.page_count, store.page_count);
+        assert_eq!(
+            loaded.pages[..loaded.page_count],
+            store.pages[..store.page_count]
+        );
+        for index in 0..3 {
+            assert_eq!(loaded.blocks[index], store.blocks[index], "block {index}");
+            assert_eq!(loaded.block_text(index), store.block_text(index));
+            assert_eq!(
+                loaded.block_paragraph_end[index],
+                store.block_paragraph_end[index]
+            );
+        }
+        assert_eq!(loaded.blocks[1].image_height, height);
+
+        let mut seen = Vec::new();
+        for page in 0..loaded.page_count {
+            ui::reading::for_each_drawable_block(&loaded, loaded.pages[page], |block| {
+                if let Some(image) = block.image {
+                    seen.push((image.slot, image.width, image.height, image.alt.to_string()));
+                }
+                true
+            });
+        }
+        assert_eq!(seen, [(Some(7), width, height, "A & B".to_string())]);
+    }
+}
+
+/// A fixture image block: one in five fills most of a page.
+fn append_fixture_image(store: &mut ReaderStore, spine: u16, image: usize) {
+    let page_box = ui::reading::ReadingBlocks::page_box(store);
+    let (src_w, src_h) = if image % 5 == 4 {
+        (640, 900)
+    } else {
+        (300, 90)
+    };
+    let (width, height) = ui::reading::fit_image(page_box, src_w, src_h);
+    let alt = format!("Figure {spine}.{image}");
+    assert!(store.push_image_block(height, spine, |out| {
+        proto::image::token::encode_image_token(image as u16, width, Some(&alt), out).map(str::len)
+    }));
+    reader_layout::extend_page_index(store);
+}
+
+/// A chapter of lines with an image every few lines.
+fn append_fixture_chapter(store: &mut ReaderStore, spine: u16, block: usize) {
+    if block % 9 == 4 {
+        append_fixture_image(store, spine, block / 9);
+    } else {
+        append_fixture_line(store, spine, block);
+    }
+}
+
+/// Every block in reading order: its text, image height, and paragraph
+/// flags.
+fn block_text(store: &ReaderStore) -> Vec<(String, u16, bool, bool)> {
+    (0..store.block_count)
+        .map(|index| {
+            (
+                store.block_text(index).to_string(),
+                store.blocks[index].image_height,
+                store.block_paragraph_start[index],
+                store.block_paragraph_end[index],
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn image_blocks_keep_their_height_through_windows_carries_files_and_the_reflow() {
+    use display::font::{LineSpacing, TypeSettings};
+    for portrait in [false, true] {
+        let disk = fat::Disk::new();
+        let manager: VolumeManager<_, _, 8, 8, 1> =
+            VolumeManager::new_with_limits(&disk, fat::Clock, 0);
+        let volume = manager.open_volume(VolumeIdx(0)).unwrap();
+        let root = volume.open_root_dir().unwrap();
+        let mut store = ReaderStore::new();
+        let compact = TypeSettings {
+            spacing: LineSpacing::Compact,
+            ..TypeSettings::DEFAULT
+        };
+        store.set_layout(compact, portrait);
+        let mut records = Vec::new();
+        let mut total = 0u32;
+        let mut carried_images = 0;
+        let mut written = Vec::new();
+        for spine in 0..2u16 {
+            store.clear_lines();
+            for block in 0..120 {
+                append_fixture_chapter(&mut store, spine, block);
+                let last = block == 119;
+                // Cut right after an image too: the window's last page is
+                // carried, and an image is on it.
+                let image = store.blocks[store.block_count - 1].is_image();
+                if store.page_count >= 3 || (image && store.page_count > 1) || last {
+                    store.set_cached_spine(spine);
+                    assert!(reader_layout::flush_page_window(
+                        &mut store,
+                        !last,
+                        |window| {
+                            written.extend(block_text(window));
+                            let section = records.len() as u16;
+                            if !reader_cache_files::write_v2_section_cache(
+                                &root, KEY, ID, section, window,
+                            ) {
+                                return false;
+                            }
+                            records.push(BookV2SectionRecord {
+                                section,
+                                spine,
+                                start_page: total,
+                                page_count: window.page_count as u16,
+                                partial: false,
+                            });
+                            total += window.page_count as u32;
+                            true
+                        }
+                    ));
+                    // The unfinished last page moves to the front of the
+                    // next window, its images as they were.
+                    carried_images += (0..store.block_count)
+                        .filter(|&index| store.blocks[index].is_image())
+                        .count();
+                }
+            }
+        }
+        assert!(carried_images > 0, "an image rode a carried page");
+        assert!(records.len() > 3);
+        assert!(write_index(&root, KEY, ID, total, &records, &store, false));
+
+        // The section files hold every block as the windows wrote it.
+        let mut loaded = Vec::new();
+        for record in &records {
+            assert!(matches!(
+                reader_cache_files::load_v2_section_cache(
+                    &root,
+                    KEY,
+                    ID,
+                    record.section,
+                    record.spine,
+                    record.page_count as usize,
+                    &mut store
+                ),
+                CacheLoadResult::Hit { .. }
+            ));
+            loaded.extend(block_text(&store));
+        }
+        assert_eq!(loaded, written);
+        assert!(loaded.iter().filter(|block| block.1 > 0).count() >= 2 * 13);
+
+        // A spacing change reflows them unchanged, into the pages a fresh
+        // layout makes.
+        let relaxed = TypeSettings {
+            spacing: LineSpacing::Relaxed,
+            ..TypeSettings::DEFAULT
+        };
+        store.set_layout(relaxed, portrait);
+        assert_eq!(
+            reader_cache_files::load_v2_book_index(&root, KEY, ID, &mut store),
+            BookIndexLoadResult::SpacingMismatch
+        );
+        let mut scratch = vec![0u8; 24576];
+        assert!(reader_cache_files::reflow_book_spacing(
+            &root,
+            KEY,
+            ID,
+            &mut store,
+            &mut scratch
+        ));
+        let mut reflowed = Vec::new();
+        let mut pages = Vec::new();
+        for record in store.book_sections.iter().collect::<Vec<_>>() {
+            assert!(matches!(
+                reader_cache_files::load_v2_section_cache(
+                    &root,
+                    KEY,
+                    ID,
+                    record.section,
+                    record.spine,
+                    record.page_count as usize,
+                    &mut store
+                ),
+                CacheLoadResult::Hit {
+                    repaginated: false,
+                    ..
+                }
+            ));
+            reflowed.extend(block_text(&store));
+            pages.extend(page_text(&store));
+        }
+        assert_eq!(reflowed, written, "portrait={portrait}");
+        let mut expected = Vec::new();
+        for spine in 0..2u16 {
+            let mut fresh = ReaderStore::new();
+            fresh.set_layout(relaxed, portrait);
+            for block in 0..120 {
+                append_fixture_chapter(&mut fresh, spine, block);
+            }
+            expected.extend(page_text(&fresh));
+        }
+        assert_eq!(pages, expected, "portrait={portrait}");
+    }
+}
+
+/// Rewrites the book's committed index as a v27 index: the legacy
+/// `BOOK.BIN` (no generation footer), with the version a v27 writer put.
+fn make_index_v27(root: &embedded_sdmmc::Directory<'_, &fat::Disk, fat::Clock, 8, 8, 1>) {
+    let x = root.open_dir(proto::cache::CACHE_ROOT_DIR).unwrap();
+    let c = x.open_dir(proto::cache::CACHE_V2_DIR).unwrap();
+    let b = c.open_dir(KEY).unwrap();
+    let mut body = Vec::new();
+    for name in ["BOOKA.BIN", "BOOKB.BIN"] {
+        if let Ok(file) = b.open_file_in_dir(name, embedded_sdmmc::Mode::ReadOnly) {
+            body = vec![0u8; file.length() as usize - 16];
+            assert_eq!(file.read(&mut body).unwrap(), body.len());
+        }
+    }
+    assert!(!body.is_empty());
+    body[4..6].copy_from_slice(&27u16.to_le_bytes());
+    let legacy = b
+        .open_file_in_dir("BOOK.BIN", embedded_sdmmc::Mode::ReadWriteCreateOrTruncate)
+        .unwrap();
+    legacy.write(&body).unwrap();
+    legacy.close().unwrap();
+    for name in ["BOOKA.BIN", "BOOKB.BIN"] {
+        let _ = sd_session::remove_file_reclaiming_clusters(&b, name);
+    }
+}
+
+#[test]
+fn a_v27_index_is_checked_once_then_written_current_or_rebuilt() {
+    use display::font::{LineSpacing, TypeSettings};
+    let disk = fat::Disk::new();
+    let manager: VolumeManager<_, _, 8, 8, 1> =
+        VolumeManager::new_with_limits(&disk, fat::Clock, 0);
+    let volume = manager.open_volume(VolumeIdx(0)).unwrap();
+    let root = volume.open_root_dir().unwrap();
+    let sections = [record(0, 0, 0, 4), record(1, 1, 4, 3)];
+    let fresh = |store: &mut ReaderStore| {
+        *store = ReaderStore::new();
+        store.set_book_labels("A Book", "An Author");
+    };
+    let mut store = ReaderStore::new();
+    fresh(&mut store);
+    assert_eq!(
+        reader_cache_files::prepare_book_replacement(&root, KEY),
+        Some(0)
+    );
+    assert!(write_index(&root, KEY, ID, 7, &sections, &store, false));
+    make_index_v27(&root);
+    let load = |store: &mut ReaderStore| {
+        fresh(store);
+        reader_cache_files::load_v2_book_index(&root, KEY, ID, store)
+    };
+    let settle = |store: &mut ReaderStore, has_images, spacing_changed| {
+        reader_cache_files::settle_index_before_images(
+            &root,
+            KEY,
+            ID,
+            store,
+            has_images,
+            spacing_changed,
+            5,
+            None,
+        )
+    };
+    let before = BookIndexLoadResult::BeforeImages {
+        spacing_changed: false,
+    };
+    assert_eq!(load(&mut store), before);
+    assert_eq!(store.book_total_pages, 7, "loaded like a hit");
+
+    // A book that could not be read is used as it stands, and checked
+    // again next time.
+    assert_eq!(settle(&mut store, None, false), BookIndexLoadResult::Hit);
+    assert_eq!(load(&mut store), before);
+
+    // One with images: its place is pinned and the index dropped, so it
+    // rebuilds. The old index stays readable until a new one commits.
+    assert_eq!(
+        settle(&mut store, Some(true), false),
+        BookIndexLoadResult::Invalid
+    );
+    assert!(store.book_sections.is_empty());
+    assert!(store.anchors(ID, 5));
+    assert_eq!(load(&mut store), before);
+
+    // A spacing change waits for the check too: with no images the reflow
+    // goes ahead (and writes the index as it always does).
+    store.set_layout(
+        TypeSettings {
+            spacing: LineSpacing::Relaxed,
+            ..TypeSettings::DEFAULT
+        },
+        false,
+    );
+    let spacing = |store: &mut ReaderStore| {
+        let settings = store.type_settings();
+        *store = ReaderStore::new();
+        store.set_layout(settings, false);
+        reader_cache_files::load_v2_book_index(&root, KEY, ID, store)
+    };
+    assert_eq!(
+        spacing(&mut store),
+        BookIndexLoadResult::BeforeImages {
+            spacing_changed: true
+        }
+    );
+    assert_eq!(
+        settle(&mut store, Some(false), true),
+        BookIndexLoadResult::SpacingMismatch
+    );
+    assert_eq!(
+        spacing(&mut store),
+        BookIndexLoadResult::BeforeImages {
+            spacing_changed: true
+        }
+    );
+    assert_eq!(
+        settle(&mut store, None, true),
+        BookIndexLoadResult::Invalid,
+        "no reflow on an unchecked index"
+    );
+    store.set_layout(TypeSettings::DEFAULT, false);
+
+    // No images: written again as the current version, and nothing else
+    // changes.
+    assert_eq!(load(&mut store), before);
+    assert_eq!(
+        settle(&mut store, Some(false), false),
+        BookIndexLoadResult::Hit
+    );
+    assert_eq!(load(&mut store), BookIndexLoadResult::Hit);
+    assert_eq!(store.book_total_pages, 7);
+    assert_eq!(
+        store.book_sections.iter().collect::<Vec<_>>(),
+        sections.to_vec()
+    );
+    assert_eq!(store.title.as_str(), "A Book");
+
+    // An unchecked prefix is never built on.
+    store.set_book_next_spine(Some(2));
+    assert!(write_index(&root, KEY, ID, 7, &sections, &store, false));
+    make_index_v27(&root);
+    assert_eq!(load(&mut store), before);
+    assert_eq!(store.book_next_spine(), Some(2));
+    assert_eq!(
+        settle(&mut store, None, false),
+        BookIndexLoadResult::Invalid
+    );
+}
+
+#[test]
+fn a_v27_book_whose_only_image_is_a_jpeg_cover_is_written_current_not_rebuilt() {
+    let disk = fat::Disk::new();
+    let manager: VolumeManager<_, _, 8, 8, 1> =
+        VolumeManager::new_with_limits(&disk, fat::Clock, 0);
+    let volume = manager.open_volume(VolumeIdx(0)).unwrap();
+    let root = volume.open_root_dir().unwrap();
+    let sections = [record(0, 0, 0, 4), record(1, 1, 4, 3)];
+    let mut store = ReaderStore::new();
+    assert_eq!(
+        reader_cache_files::prepare_book_replacement(&root, KEY),
+        Some(0)
+    );
+    assert!(write_index(&root, KEY, ID, 7, &sections, &store, false));
+    make_index_v27(&root);
+    store = ReaderStore::new();
+    assert_eq!(
+        reader_cache_files::load_v2_book_index(&root, KEY, ID, &mut store),
+        BookIndexLoadResult::BeforeImages {
+            spacing_changed: false
+        }
+    );
+
+    // The check the firmware makes on such an index: the ZIP's central
+    // directory, through the open.
+    let (bytes, _) = zip::zip(&[
+        ("OEBPS/cover.xhtml", false, b"<img src='cover.jpg'/>"),
+        ("OEBPS/cover.jpg", false, &[0xff, 0xd8, 0xff, 0xe0]),
+        ("OEBPS/ch01.xhtml", false, b"<p>Text</p>"),
+    ]);
+    let reads = std::cell::RefCell::new(Vec::new());
+    let fails = std::cell::Cell::new(None);
+    let mut tail = [0u8; 4096];
+    let mut zip = proto::epub::ZipStream::new(
+        zip::Archive {
+            bytes: &bytes,
+            reads: &reads,
+            fails: &fails,
+        },
+        &mut tail,
+    )
+    .unwrap();
+    let has_images = book_images::book_has_images(&mut zip, &mut [0u8; 512]);
+    assert!(!has_images, "a JPEG waits for its decoder");
+    assert_eq!(
+        reader_cache_files::settle_index_before_images(
+            &root,
+            KEY,
+            ID,
+            &mut store,
+            Some(has_images),
+            false,
+            5,
+            None,
+        ),
+        BookIndexLoadResult::Hit
+    );
+    store = ReaderStore::new();
+    assert_eq!(
+        reader_cache_files::load_v2_book_index(&root, KEY, ID, &mut store),
+        BookIndexLoadResult::Hit,
+        "written current, with its sections: nothing to rebuild"
+    );
+    assert_eq!(
+        store.book_sections.iter().collect::<Vec<_>>(),
+        sections.to_vec()
+    );
+    assert!(!store.book_has_images());
+}
+
+#[test]
+fn the_book_index_remembers_whether_the_book_has_images() {
+    let disk = fat::Disk::new();
+    let manager: VolumeManager<_, _, 8, 8, 1> =
+        VolumeManager::new_with_limits(&disk, fat::Clock, 0);
+    let volume = manager.open_volume(VolumeIdx(0)).unwrap();
+    let root = volume.open_root_dir().unwrap();
+    let sections = [record(0, 0, 0, 4)];
+    assert_eq!(
+        reader_cache_files::prepare_book_replacement(&root, KEY),
+        Some(0)
+    );
+    for has_images in [true, false, true] {
+        let mut store = ReaderStore::new();
+        store.set_book_has_images(has_images);
+        store.set_book_next_spine(Some(1));
+        assert!(write_index(&root, KEY, ID, 4, &sections, &store, false));
+        let mut loaded = ReaderStore::new();
+        assert_eq!(
+            reader_cache_files::load_v2_book_index(&root, KEY, ID, &mut loaded),
+            BookIndexLoadResult::Hit
+        );
+        // A resumed build reads it here instead of walking the ZIP again.
+        assert_eq!(loaded.book_has_images(), has_images);
+        assert_eq!(loaded.book_next_spine(), Some(1));
+        loaded.clear_book_index();
+        assert!(!loaded.book_has_images());
+    }
 }

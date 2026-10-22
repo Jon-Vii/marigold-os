@@ -10,15 +10,15 @@ use display::font::FontStyle;
 use embedded_sdmmc::{Directory, File, Mode, TimeSource};
 use heapless::String;
 use proto::cache::{
-    decode_block, decode_book_v2_header, decode_book_v2_section, decode_cover_header, decode_page,
-    decode_section_v2_header, decode_toc, decode_toc_chapter, decode_toc_file_header, encode_block,
-    encode_book_v2_header, encode_book_v2_section, encode_page, encode_section_v2_header,
-    encode_toc, encode_toc_file_header, section_file_name, BookV2Header, BookV2SectionRecord,
-    SectionV2Header, TocFileHeader, BLOCK_RECORD_BYTES, BOOK_V2_HEADER_BYTES,
-    BOOK_V2_SECTION_RECORD_BYTES, CACHE_BOOK_FILE, CACHE_COVER_FILE, CACHE_ROOT_DIR,
-    CACHE_SECTIONS_DIR, CACHE_SECTION_FILE_BYTES, CACHE_STATE_FILE, CACHE_TOC_FILE, CACHE_V2_DIR,
-    COVER_HEADER_BYTES, PAGE_RECORD_BYTES, SECTION_V2_HEADER_BYTES, TOC_CHAPTER_RECORD_BYTES,
-    TOC_FILE_HEADER_BYTES, TOC_RECORD_BYTES,
+    book_v2_predates_images, decode_block, decode_book_v2_header, decode_book_v2_section,
+    decode_cover_header, decode_page, decode_section_v2_header, decode_toc, decode_toc_chapter,
+    decode_toc_file_header, encode_block, encode_book_v2_header, encode_book_v2_section,
+    encode_page, encode_section_v2_header, encode_toc, encode_toc_file_header, section_file_name,
+    BookV2Header, BookV2SectionRecord, SectionV2Header, TocFileHeader, BLOCK_RECORD_BYTES,
+    BOOK_V2_HEADER_BYTES, BOOK_V2_SECTION_RECORD_BYTES, CACHE_BOOK_FILE, CACHE_COVER_FILE,
+    CACHE_ROOT_DIR, CACHE_SECTIONS_DIR, CACHE_SECTION_FILE_BYTES, CACHE_STATE_FILE, CACHE_TOC_FILE,
+    CACHE_V2_DIR, COVER_HEADER_BYTES, PAGE_RECORD_BYTES, SECTION_V2_HEADER_BYTES,
+    TOC_CHAPTER_RECORD_BYTES, TOC_FILE_HEADER_BYTES, TOC_RECORD_BYTES,
 };
 use proto::font_pack::{
     decode_font_pack_name, FontPackFaceRecord, FontPackHeader, FONT_PACK_DIR,
@@ -188,6 +188,13 @@ pub(crate) enum CacheLoadResult {
 pub(crate) enum BookIndexLoadResult {
     Hit,
     SpacingMismatch,
+    /// A valid index written before sections held image blocks (cache
+    /// v27), loaded like a hit (or, with `spacing_changed`, a spacing
+    /// mismatch). Its book's images, if it has any, were laid out as alt
+    /// text: see `settle_index_before_images`.
+    BeforeImages {
+        spacing_changed: bool,
+    },
     Miss,
     Invalid,
 }
@@ -946,14 +953,85 @@ where
         library.commit_book_index(header.total_pages, header.partial);
         library.set_book_next_spine(header.next_spine);
         library.set_book_generated_toc(header.generated_toc);
+        library.set_book_has_images(header.has_images);
         library.set_text_start_spine(header.text_start_spine);
-        if spacing_changed {
+        if book_v2_predates_images(&header_bytes) {
+            BookIndexLoadResult::BeforeImages { spacing_changed }
+        } else if spacing_changed {
             BookIndexLoadResult::SpacingMismatch
         } else {
             BookIndexLoadResult::Hit
         }
     })
     .unwrap_or(BookIndexLoadResult::Miss)
+}
+
+/// Settles a book index loaded as `BookIndexLoadResult::BeforeImages`,
+/// once the book's ZIP has been checked for image entries (`None` when it
+/// could not be read). This runs once per book: whatever it decides, the
+/// book's next index is written as the current version.
+///
+/// - No images: the index is written again unchanged but for its version,
+///   through the usual generation-safe write, and is a hit; with the
+///   spacing changed, the reflow that follows writes it instead. Nothing
+///   is rebuilt.
+/// - Images: `page` is pinned in the old pagination and the index is
+///   dropped, so the book rebuilds into the other bank (the old index
+///   stays on the card until the new one commits) and its images replace
+///   the alt text it was laid out with.
+/// - Unread: a complete book is read as it stands and checked again at its
+///   next open; one that would be built on (a prefix, or a spacing reflow)
+///   rebuilds instead, so nothing ever extends an unchecked index.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn settle_index_before_images<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    key: &str,
+    source_identity: (u32, u32),
+    library: &mut ReaderStore,
+    has_images: Option<bool>,
+    spacing_changed: bool,
+    page: u32,
+    spine: Option<u16>,
+) -> BookIndexLoadResult
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if has_images == Some(false) {
+        library.set_book_has_images(false);
+    }
+    match has_images {
+        Some(false) if spacing_changed => BookIndexLoadResult::SpacingMismatch,
+        Some(false) => {
+            if !write_v2_book_index(
+                root,
+                key,
+                source_identity,
+                library.book_total_pages,
+                &library.book_sections,
+                library,
+                library.book_cache_partial,
+            ) {
+                // Still readable as it is; the next open tries again.
+                esp_println::println!("cache: v27 index kept; the rewrite failed key={}", key);
+            }
+            BookIndexLoadResult::Hit
+        }
+        None if !spacing_changed && library.book_next_spine().is_none() => BookIndexLoadResult::Hit,
+        Some(true) | None => {
+            if spine.is_none() {
+                library.anchor_resident_page(source_identity, page);
+            }
+            library.clear_book_index();
+            BookIndexLoadResult::Invalid
+        }
+    }
 }
 
 /// Read just the stored EPUB title from a book's v2 cache index, skipping the
@@ -1278,6 +1356,7 @@ where
             seed_section_count: seed.sections.len() as u16,
             seed_reaches_end: seed.first_spine.is_some() && seed.next_spine.is_none(),
             seed_capped: seed.capped,
+            has_images: library.book_has_images(),
         };
         let mut bytes = [0u8; BOOK_V2_HEADER_BYTES];
         if encode_book_v2_header(header, &mut bytes).is_err() {
@@ -2414,6 +2493,8 @@ where
                 {
                     return false;
                 }
+                // An image keeps its size, which no spacing changes.
+                library.blocks[next].image_height = block.image_height;
                 // The old section may start in the middle of a paragraph.
                 library.block_paragraph_start[next] = flags & 2 != 0;
                 reader_layout::extend_page_index(library);

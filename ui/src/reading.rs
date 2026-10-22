@@ -14,6 +14,8 @@ use display::font::{
     STYLE_MARKER,
 };
 use proto::cache::{BlockRecord, PageRecord};
+use proto::image::fit_inside;
+use proto::image::token::decode_image_token;
 use proto::text::{TextAlign, TextRole};
 
 /// The reading page's text box: wrap edges and the vertical page walk
@@ -115,6 +117,125 @@ pub struct ReaderDrawableBlock<'a> {
     /// The block ends its paragraph. A justified paragraph's last line
     /// keeps its natural spacing.
     pub paragraph_end: bool,
+    /// Present for an image block, whose text is an image token rather
+    /// than a line: draw the image here instead of the text.
+    pub image: Option<ReaderImage<'a>>,
+}
+
+/// Where an image block's image goes on the page.
+#[derive(Clone, Copy)]
+pub struct ReaderImage<'a> {
+    /// Top-left corner, in the drawing frame. The image is centred in the
+    /// column and starts [`image_top_gap`] rows into its block.
+    pub x: i16,
+    pub y: i16,
+    /// The fitted size layout reserved, which the decoder must emit
+    /// exactly: never fit it again.
+    pub width: u16,
+    pub height: u16,
+    /// The image's entry in the book's image index; `None` when the block's
+    /// token cannot be read, which only damage to the cache can cause.
+    pub slot: Option<u16>,
+    /// Alt text, already cleaned; may be empty.
+    pub alt: &'a str,
+    /// The face the alt text draws in when the image cannot be shown: the
+    /// body's italic, as the alt-text placeholder always was.
+    pub alt_font: &'static BitmapFont,
+}
+
+/// Most rows [`image_top_gap`] keeps, whatever the type settings.
+pub const IMAGE_TOP_GAP_MAX: i16 = 10;
+/// Most rows [`image_bottom_gap`] keeps, whatever the type settings.
+pub const IMAGE_BOTTOM_GAP_MAX: i16 = 5;
+/// Rows of a page an image is fitted to leave free: both gaps at their
+/// largest. Fitting against these rather than the current settings' gaps
+/// makes the fitted size depend only on the page box, so it survives every
+/// type change, and an image block always fits a page whatever the type.
+pub const IMAGE_GAPS_MAX: i16 = IMAGE_TOP_GAP_MAX + IMAGE_BOTTOM_GAP_MAX;
+
+/// White rows above an image: the body face's descent, plus one clear row,
+/// so the line above's descenders never touch it. Text draws its baseline
+/// at the bottom of its slot and its descenders spill into the next block,
+/// which an image block's gap absorbs.
+pub fn image_top_gap(settings: TypeSettings) -> i16 {
+    let font = body_font(settings, FontStyle::Regular);
+    (i16::from(font.line_height) - i16::from(font.baseline) + 1).clamp(1, IMAGE_TOP_GAP_MAX)
+}
+
+/// White rows below an image, so the next line's tallest glyph clears it by
+/// a row. A line's ink can stand taller than its advance: capitals with
+/// stacked marks (Vietnamese Ẳ, Ṍ) reach above the faces' own ascent, and
+/// at the tighter spacings accented capitals (É, Å) reach the slot above.
+/// Body lines have the smallest advance of any role, so they set the gap.
+pub fn image_bottom_gap(settings: TypeSettings) -> i16 {
+    IMAGE_BOTTOM_GAPS[settings.size as usize][settings.spacing as usize]
+}
+
+/// [`image_bottom_gap`] for every size (rows) and spacing (columns), worked
+/// out at compile time. Worked out per block, the advances it needs became
+/// lookup tables, which the ESP32-C3 build keeps in RAM.
+const IMAGE_BOTTOM_GAPS: [[i16; 3]; 3] = {
+    let sizes = [FontSize::Small, FontSize::Medium, FontSize::Large];
+    let spacings = [
+        LineSpacing::Compact,
+        LineSpacing::Normal,
+        LineSpacing::Relaxed,
+    ];
+    let mut gaps = [[0; 3]; 3];
+    let mut size = 0;
+    while size < sizes.len() {
+        let reach = tallest_ink_above_baseline(sizes[size]) + 1;
+        let mut spacing = 0;
+        while spacing < spacings.len() {
+            let gap = reach - body_line_advance(sizes[size], spacings[spacing]);
+            gaps[size][spacing] = if gap < 0 {
+                0
+            } else if gap > IMAGE_BOTTOM_GAP_MAX {
+                IMAGE_BOTTOM_GAP_MAX
+            } else {
+                gap
+            };
+            spacing += 1;
+        }
+        size += 1;
+    }
+    gaps
+};
+
+/// Rows the tallest glyph of any built-in body face reaches above its
+/// baseline, at each size, across families, weights and styles. The
+/// Vietnamese stacked marks set it. A test checks it against every glyph.
+const fn tallest_ink_above_baseline(size: FontSize) -> i16 {
+    match size {
+        FontSize::Small => 24,
+        FontSize::Medium => 28,
+        FontSize::Large => 33,
+    }
+}
+
+/// The size an image of `src_w × src_h` shows at in `page_box`: as large
+/// as fits the column and the page less [`IMAGE_GAPS_MAX`], keeping its
+/// shape, and never larger than the source. So an image block is never
+/// taller than a page, and pagination cannot stall on one.
+///
+/// Layout calls this once per image and orientation, stores the result in
+/// the block (height in the record, width in its token), and the decoder
+/// emits exactly that size.
+pub fn fit_image(page_box: PageBox, src_w: u32, src_h: u32) -> (u16, u16) {
+    let column = (page_box.right - page_box.left).max(1) as u32;
+    let rows = (page_box.bottom - page_box.top - IMAGE_GAPS_MAX).max(1) as u32;
+    let (width, height) = fit_inside(src_w, src_h, column, rows);
+    // Both fit the page box, so both fit u16.
+    (width as u16, height as u16)
+}
+
+/// Rows an image block's image takes: its recorded height, which layout
+/// fitted to the page box, and never more than [`fit_image`] can give even
+/// when a damaged record says otherwise. So with its gaps the block fits a
+/// page, and its rect never passes the page box.
+fn image_rows(page_box: PageBox, record: BlockRecord) -> i16 {
+    let most = (page_box.bottom - page_box.top - IMAGE_GAPS_MAX).max(1);
+    i16::try_from(record.image_height).map_or(most, |rows| rows.min(most))
 }
 
 pub fn block_height(source: &impl ReadingBlocks, index: usize) -> i16 {
@@ -122,6 +243,12 @@ pub fn block_height(source: &impl ReadingBlocks, index: usize) -> i16 {
         return 0;
     };
     let settings = source.type_settings();
+    if record.is_image() {
+        return image_top_gap(settings)
+            + image_rows(source.page_box(), record)
+            + image_bottom_gap(settings)
+            + paragraph_gap_after(source, index);
+    }
     let advance = line_advance(settings, record.role);
     let height = if record.line_count == 1 {
         advance
@@ -286,6 +413,9 @@ pub fn for_each_drawable_block(
         if y + block_ink_height(source, index) > page_box.bottom && y > page_box.top {
             break;
         }
+        let image = record
+            .is_image()
+            .then(|| place_image(settings, page_box, y, record, text));
         if !visit(ReaderDrawableBlock {
             record,
             text,
@@ -295,6 +425,7 @@ pub fn for_each_drawable_block(
             font: body_font(settings, style),
             indent: block_first_line_indent(source, index),
             paragraph_end: source.paragraph_end(index),
+            image,
         }) {
             break;
         }
@@ -302,12 +433,79 @@ pub fn for_each_drawable_block(
     }
 }
 
+/// An image block's image, for a block starting at row `top`: centred in
+/// the column by the width its token records, below the top gap.
+fn place_image<'a>(
+    settings: TypeSettings,
+    page_box: PageBox,
+    top: i16,
+    record: BlockRecord,
+    text: &'a str,
+) -> ReaderImage<'a> {
+    let column = (page_box.right - page_box.left).max(0) as u16;
+    let token = decode_image_token(text);
+    let width = token.map_or(column, |token| token.width.min(column));
+    ReaderImage {
+        x: page_box.left + ((column - width) / 2) as i16,
+        y: top + image_top_gap(settings),
+        width,
+        height: image_rows(page_box, record) as u16,
+        slot: token.map(|token| token.slot),
+        alt: token.map_or("", |token| token.alt),
+        alt_font: body_font(settings, FontStyle::Italic),
+    }
+}
+
+/// Draws an image that cannot be shown: its outline, with the alt text on
+/// one line inside, cut to fit, when the box is tall enough for a line.
+/// The image drawer to pass to [`draw_reading_page_body`] when there are
+/// no image pixels to draw.
+pub fn draw_image_placeholder(fb: &mut Framebuffer, image: &ReaderImage<'_>) {
+    const INSET: i16 = 4;
+    let (Ok(x), Ok(y)) = (u16::try_from(image.x), u16::try_from(image.y)) else {
+        return;
+    };
+    display::render::stroke_rect(
+        fb,
+        display::Rect::new(x, y, image.width, image.height),
+        false,
+    );
+    let font = image.alt_font;
+    let room = i32::from(image.width) - 2 * i32::from(INSET);
+    if image.alt.is_empty()
+        || room <= 0
+        || i32::from(image.height) < i32::from(font.line_height) + 2 * i32::from(INSET)
+    {
+        return;
+    }
+    let shown = crate::render::fit_text(font, image.alt, room as u16);
+    let shown_width = measure_text(font, shown) as i16;
+    let x = image.x + (image.width as i16 - shown_width) / 2;
+    let baseline = image.y
+        + (image.height as i16 - i16::from(font.line_height)) / 2
+        + i16::from(font.baseline);
+    draw_text(fb, font, shown, x, baseline, false);
+}
+
 /// Draw one page of reading-body blocks: the single rendering of cached
 /// reader content shared by firmware views and host tooling.
-pub fn draw_reading_page_body(fb: &mut Framebuffer, source: &impl ReadingBlocks, page: PageRecord) {
+///
+/// Image blocks draw nothing themselves: `draw_image` is called with each
+/// one's placement and draws whatever it has, the image's rows or
+/// [`draw_image_placeholder`].
+pub fn draw_reading_page_body(
+    fb: &mut Framebuffer,
+    source: &impl ReadingBlocks,
+    page: PageRecord,
+    mut draw_image: impl FnMut(&mut Framebuffer, &ReaderImage<'_>),
+) {
     let settings = source.type_settings();
     let page_box = source.page_box();
     for_each_drawable_block(source, page, |block| {
+        if let Some(image) = block.image {
+            draw_image(fb, &image);
+            return true;
+        }
         let role = block.record.role;
         match effective_align(block.record.align, settings) {
             TextAlign::Left => {
@@ -550,7 +748,17 @@ pub fn body_font(settings: TypeSettings, style: FontStyle) -> &'static BitmapFon
 /// page grid closes at seventeen lines: 6 + 17*26 = 448 <= 457, where the
 /// historical 27 left a dead row above the footer on every full page.
 pub fn line_advance(settings: TypeSettings, role: TextRole) -> i16 {
-    let body = match (settings.size, settings.spacing) {
+    let body = body_line_advance(settings.size, settings.spacing);
+    if matches!(role, TextRole::Heading1 | TextRole::Heading2) {
+        body + 5
+    } else {
+        body
+    }
+}
+
+/// A body line's advance: [`line_advance`] for `TextRole::Body`.
+const fn body_line_advance(size: FontSize, spacing: LineSpacing) -> i16 {
+    match (size, spacing) {
         (FontSize::Small, LineSpacing::Compact) => 22,
         (FontSize::Small, LineSpacing::Normal) => 24,
         (FontSize::Small, LineSpacing::Relaxed) => 28,
@@ -560,11 +768,6 @@ pub fn line_advance(settings: TypeSettings, role: TextRole) -> i16 {
         (FontSize::Large, LineSpacing::Compact) => 29,
         (FontSize::Large, LineSpacing::Normal) => 32,
         (FontSize::Large, LineSpacing::Relaxed) => 36,
-    };
-    if matches!(role, TextRole::Heading1 | TextRole::Heading2) {
-        body + 5
-    } else {
-        body
     }
 }
 
@@ -1193,6 +1396,7 @@ mod tests {
                 role: *self.roles.get(index)?,
                 style: proto::text::FontStyle::Regular,
                 align: self.aligns[index],
+                image_height: 0,
             })
         }
         fn block_text(&self, _index: usize) -> &str {
@@ -1207,6 +1411,372 @@ mod tests {
         fn paragraph_end(&self, index: usize) -> bool {
             self.ends.get(index).copied().unwrap_or(true)
         }
+    }
+
+    /// Lines of body text with images among them: `Some((width, height))`
+    /// marks an image block, whose text is its token.
+    struct ImageBlocks {
+        blocks: Vec<(BlockRecord, String)>,
+        settings: TypeSettings,
+        page_box: PageBox,
+    }
+
+    impl ImageBlocks {
+        fn new(layout: &[Option<(u16, u16)>], settings: TypeSettings, page_box: PageBox) -> Self {
+            let blocks = layout
+                .iter()
+                .enumerate()
+                .map(|(index, image)| {
+                    let mut record = BlockRecord {
+                        text_offset: 0,
+                        text_len: 0,
+                        line_count: 1,
+                        role: TextRole::Body,
+                        style: proto::text::FontStyle::Regular,
+                        align: TextAlign::Left,
+                        image_height: 0,
+                    };
+                    let text = match image {
+                        Some((width, height)) => {
+                            record.align = TextAlign::Center;
+                            record.image_height = *height;
+                            let mut out = [0u8; proto::image::token::IMAGE_TOKEN_MAX_BYTES];
+                            proto::image::token::encode_image_token(
+                                index as u16,
+                                *width,
+                                Some("A figure"),
+                                &mut out,
+                            )
+                            .unwrap()
+                            .into()
+                        }
+                        None => "Typography gjpqy".into(),
+                    };
+                    (record, text)
+                })
+                .collect();
+            Self {
+                blocks,
+                settings,
+                page_box,
+            }
+        }
+    }
+
+    impl ReadingBlocks for ImageBlocks {
+        fn block_count(&self) -> usize {
+            self.blocks.len()
+        }
+        fn block(&self, index: usize) -> Option<BlockRecord> {
+            self.blocks.get(index).map(|block| block.0)
+        }
+        fn block_text(&self, index: usize) -> &str {
+            self.blocks.get(index).map_or("", |block| block.1.as_str())
+        }
+        fn block_style(&self, _index: usize) -> FontStyle {
+            FontStyle::Regular
+        }
+        fn page_break_before(&self, _index: usize) -> bool {
+            false
+        }
+        fn paragraph_end(&self, _index: usize) -> bool {
+            true
+        }
+        fn type_settings(&self) -> TypeSettings {
+            self.settings
+        }
+        fn page_box(&self) -> PageBox {
+            self.page_box
+        }
+    }
+
+    fn every_body_type() -> impl Iterator<Item = TypeSettings> {
+        [FontFamily::Literata, FontFamily::Merriweather]
+            .into_iter()
+            .flat_map(|family| {
+                [FontSize::Small, FontSize::Medium, FontSize::Large]
+                    .into_iter()
+                    .flat_map(move |size| {
+                        [FontWeight::Normal, FontWeight::Heavy]
+                            .into_iter()
+                            .flat_map(move |weight| {
+                                [
+                                    LineSpacing::Compact,
+                                    LineSpacing::Normal,
+                                    LineSpacing::Relaxed,
+                                ]
+                                .into_iter()
+                                .map(move |spacing| TypeSettings {
+                                    family,
+                                    size,
+                                    weight,
+                                    spacing,
+                                    ..TypeSettings::DEFAULT
+                                })
+                            })
+                    })
+            })
+    }
+
+    /// A text line, an image the full column wide, and another line: the
+    /// first line's baseline, the image's rows, the second line's baseline.
+    fn line_image_line(settings: TypeSettings, text: &str) -> (i16, (i16, i16), i16, ImageBlocks) {
+        let page_box = PageBox::LANDSCAPE;
+        let column = (page_box.right - page_box.left) as u16;
+        let mut source = ImageBlocks::new(&[None, Some((column, 40)), None], settings, page_box);
+        for block in [0, 2] {
+            source.blocks[block].1 = text.into();
+        }
+        let page = page_record_at(&source, 0);
+        assert_eq!(page.block_count, 3, "{settings:?}");
+        let mut baselines = Vec::new();
+        let mut rows = None;
+        for_each_drawable_block(&source, page, |block| {
+            match block.image {
+                Some(image) => rows = Some((image.y, image.y + image.height as i16)),
+                None => baselines.push(block.y),
+            }
+            true
+        });
+        (baselines[0], rows.expect("an image"), baselines[1], source)
+    }
+
+    #[test]
+    fn every_glyph_clears_an_image_by_a_row_above_and_below() {
+        for settings in every_body_type() {
+            // The gaps are what the type needs, never cut short by a clamp.
+            let font = body_font(settings, FontStyle::Regular);
+            let descent = i16::from(font.line_height) - i16::from(font.baseline);
+            assert_eq!(image_top_gap(settings), descent + 1, "{settings:?}");
+            let reach = tallest_ink_above_baseline(settings.size) + 1;
+            let advance = line_advance(settings, TextRole::Body);
+            assert_eq!(
+                image_bottom_gap(settings),
+                (reach - advance).max(0),
+                "{settings:?}"
+            );
+
+            let (above, (top, end), below, _) = line_image_line(settings, "line");
+            let mut tallest = 0;
+            for style in STYLES {
+                let font = body_font(settings, style);
+                for (index, metric) in font.metrics.iter().enumerate() {
+                    let codepoint = font.codepoints[index];
+                    // A glyph inks rows `baseline + y_offset` through
+                    // `baseline + y_offset + height - 1`.
+                    let first = i16::from(metric.y_offset);
+                    let last = first + i16::from(metric.height) - 1;
+                    assert!(
+                        above + last < top - 1,
+                        "{settings:?} {style:?} U+{codepoint:04X} reaches row {} above an image at {top}",
+                        above + last
+                    );
+                    assert!(
+                        below + first > end,
+                        "{settings:?} {style:?} U+{codepoint:04X} reaches row {} below an image ending at {end}",
+                        below + first
+                    );
+                    tallest = tallest.max(-first);
+                }
+            }
+            assert_eq!(
+                tallest,
+                tallest_ink_above_baseline(settings.size),
+                "{settings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stacked_marks_and_descenders_leave_a_clear_row_on_the_page() {
+        // The tallest glyphs (stacked marks, accented capitals) and the
+        // deepest (marks below, descenders), in every style.
+        let mut text = String::new();
+        for style in STYLES {
+            text.push(STYLE_MARKER);
+            text.push(style_marker_code(style));
+            text.push_str("\u{1EB2}\u{1E4C}\u{C9}\u{C5}\u{122}\u{1E00}\u{104}gjpqy ");
+        }
+        let text = text.trim_end();
+        for settings in every_body_type() {
+            let (_, (top, end), _, source) = line_image_line(settings, text);
+            let mut fb = Framebuffer::new();
+            draw_reading_page_body(&mut fb, &source, page_record_at(&source, 0), |_, _| {});
+            let inked = |y: i16| (0..fb.frame_width()).any(|x| !fb.pixel(x, y as usize));
+            // A clear row above, the image's rows, a clear row below.
+            for y in top - 1..=end {
+                assert!(
+                    !inked(y),
+                    "{settings:?}: text ink at row {y}, image {top}..{end}"
+                );
+            }
+            // And the text comes close: these glyphs are what the gaps are
+            // for. At Relaxed spacing the line below sits further off.
+            assert!(
+                (top - 4..top - 1).any(inked),
+                "{settings:?}: descenders above"
+            );
+            if settings.spacing != LineSpacing::Relaxed {
+                assert!((end + 1..end + 4).any(inked), "{settings:?}: marks below");
+            }
+        }
+    }
+
+    #[test]
+    fn fitted_images_fit_a_page_with_their_gap_and_never_grow() {
+        for page_box in [PageBox::LANDSCAPE, PageBox::PORTRAIT] {
+            let column = (page_box.right - page_box.left) as u16;
+            let rows = (page_box.bottom - page_box.top) as u16;
+            // Small images keep their size.
+            assert_eq!(fit_image(page_box, 138, 40), (138, 40));
+            for (src_w, src_h) in [(640, 900), (1600, 1200), (5000, 10), (10, 5000), (1, 1)] {
+                let (width, height) = fit_image(page_box, src_w, src_h);
+                assert!(width <= column && u32::from(width) <= src_w);
+                assert!(u32::from(height) <= src_h);
+                assert!(height as i16 + IMAGE_GAPS_MAX <= rows as i16);
+            }
+        }
+    }
+
+    #[test]
+    fn image_blocks_take_their_gap_and_height_and_never_stall_pagination() {
+        for settings in every_body_type() {
+            for page_box in [PageBox::LANDSCAPE, PageBox::PORTRAIT] {
+                let (width, height) = fit_image(page_box, 640, 5000);
+                let source = ImageBlocks::new(
+                    &[
+                        None,
+                        Some((width, height)),
+                        None,
+                        Some((width, height)),
+                        None,
+                    ],
+                    settings,
+                    page_box,
+                );
+                assert_eq!(
+                    block_height(&source, 1),
+                    image_top_gap(settings) + height as i16 + image_bottom_gap(settings)
+                );
+                // A page-tall image cannot share a page with a line, and
+                // each page still holds at least one block.
+                let pages: Vec<_> = (0..5).map(|page| page_record_at(&source, page)).collect();
+                assert_eq!(paginate_block_pages(&source), 5, "{settings:?}");
+                assert!(pages.iter().all(|page| page.block_count == 1));
+            }
+        }
+    }
+
+    #[test]
+    fn a_damaged_image_height_stays_within_a_page() {
+        let page_box = PageBox::LANDSCAPE;
+        let source = ImageBlocks::new(
+            &[Some((100, u16::MAX)), None, Some((100, 40_000)), None],
+            TypeSettings::DEFAULT,
+            page_box,
+        );
+        assert_eq!(paginate_block_pages(&source), 4);
+        for page in 0..4 {
+            let mut blocks = 0;
+            for_each_drawable_block(&source, page_record_at(&source, page), |block| {
+                if let Some(image) = block.image {
+                    assert!(image.y >= page_box.top);
+                    assert!(image.y + image.height as i16 <= page_box.bottom);
+                }
+                blocks += 1;
+                true
+            });
+            assert_eq!(blocks, 1);
+        }
+    }
+
+    #[test]
+    fn image_rects_sit_below_the_gap_centred_by_their_token_width() {
+        let settings = TypeSettings::DEFAULT;
+        let page_box = PageBox::LANDSCAPE;
+        let source = ImageBlocks::new(&[None, Some((300, 120)), None], settings, page_box);
+        let page = page_record_at(&source, 0);
+        assert_eq!(page.block_count, 3);
+        let mut seen = Vec::new();
+        for_each_drawable_block(&source, page, |block| {
+            let image = block.image.map(|image| {
+                (
+                    image.x,
+                    image.y,
+                    image.width,
+                    image.height,
+                    image.slot,
+                    String::from(image.alt),
+                )
+            });
+            seen.push((block.y, image));
+            true
+        });
+        let advance = line_advance(settings, TextRole::Body);
+        assert_eq!((&seen[0].1, &seen[2].1), (&None, &None));
+        let (x, y, width, height, slot, alt) = seen[1].1.clone().expect("block 1 is an image");
+        // The line above has its baseline where the image block begins.
+        assert_eq!(seen[0].0, page_box.top + advance);
+        assert_eq!(y, seen[0].0 + image_top_gap(settings));
+        assert_eq!((width, height), (300, 120));
+        assert_eq!(
+            x,
+            page_box.left + (page_box.right - page_box.left - 300) / 2
+        );
+        assert_eq!((slot, alt.as_str()), (Some(1), "A figure"));
+        // The next line's slot starts below the image and its bottom gap.
+        assert_eq!(seen[2].0, y + 120 + image_bottom_gap(settings) + advance);
+    }
+
+    #[test]
+    fn the_page_body_hands_image_blocks_to_the_drawer_only() {
+        let settings = TypeSettings::DEFAULT;
+        let page_box = PageBox::LANDSCAPE;
+        let source = ImageBlocks::new(&[None, Some((200, 60))], settings, page_box);
+        let page = page_record_at(&source, 0);
+        let mut drawn = Vec::new();
+        let mut fb = Framebuffer::new();
+        fb.set_frame(display::fb::FbFrame::Landscape);
+        draw_reading_page_body(&mut fb, &source, page, |_, image| {
+            drawn.push((image.x, image.y, image.slot));
+        });
+        assert_eq!(drawn.len(), 1);
+        let (image_x, image_y) = (drawn[0].0, drawn[0].1);
+        assert_eq!(drawn[0].2, Some(1));
+        // The token's text was not drawn: the image's rows are blank, and
+        // the line above's descenders stop short of them.
+        for y in image_y..image_y + 60 {
+            for x in page_box.left..page_box.right {
+                assert!(fb.pixel(x as usize, y as usize), "ink at {x},{y}");
+            }
+        }
+        draw_image_placeholder(
+            &mut fb,
+            &ReaderImage {
+                x: image_x,
+                y: image_y,
+                width: 200,
+                height: 60,
+                slot: Some(1),
+                alt: "A figure",
+                alt_font: body_font(settings, FontStyle::Italic),
+            },
+        );
+        // The placeholder outlines the rect and writes the alt inside it,
+        // and nothing else (the token's text) was drawn.
+        let (x0, y0) = (image_x as usize, image_y as usize);
+        let (x1, y1) = (x0 + 199, y0 + 59);
+        assert!(!fb.pixel(x0, y0) && !fb.pixel(x1, y1) && !fb.pixel(x0, y1));
+        let inside_ink = (y0 + 1..y1)
+            .flat_map(|y| (x0 + 1..x1).map(move |x| (x, y)))
+            .filter(|&(x, y)| !fb.pixel(x, y))
+            .count();
+        assert!(inside_ink > 50, "alt text drawn inside");
+        let outside_ink = (y0 - 2..y1 + 20)
+            .flat_map(|y| (0..fb.frame_width()).map(move |x| (x, y)))
+            .filter(|&(x, y)| (x < x0 || x > x1 || y < y0 || y > y1) && !fb.pixel(x, y))
+            .count();
+        assert_eq!(outside_ink, 0, "nothing beside or below the box");
     }
 
     #[test]
