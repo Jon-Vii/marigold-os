@@ -77,6 +77,8 @@ pub trait ReadingBlocks {
     /// Record at `index` while it is inside the live block range.
     fn block(&self, index: usize) -> Option<BlockRecord>;
     fn block_text(&self, index: usize) -> &str;
+    /// The block's stored style. It styles text without markers; text
+    /// with markers draws as [`line_opening_style`] says.
     fn block_style(&self, index: usize) -> FontStyle;
     fn page_break_before(&self, index: usize) -> bool;
     fn paragraph_end(&self, index: usize) -> bool;
@@ -109,6 +111,8 @@ pub struct ReaderDrawableBlock<'a> {
     pub text: &'a str,
     pub y: i16,
     pub advance: i16,
+    /// The style the text opens in ([`line_opening_style`]), not the stored
+    /// block style: every drawer and width measure starts from it.
     pub style: FontStyle,
     pub font: &'static BitmapFont,
     /// First-line indent for the block's opening line; 0 for continuation
@@ -469,7 +473,7 @@ pub fn for_each_drawable_block(
         };
         let text = source.block_text(index);
         let advance = line_advance(settings, record.role);
-        let style = source.block_style(index);
+        let style = line_opening_style(text, source.block_style(index));
         let height = block_height(source, index);
         if y + block_ink_height(source, index) > page_box.bottom && y > page_box.top {
             break;
@@ -1287,14 +1291,30 @@ pub fn styled_text_ink_width(text: &str, settings: TypeSettings, default_style: 
     cursor.width()
 }
 
-pub fn first_styled_line_style(text: &str) -> Option<FontStyle> {
+/// The style a stored line opens in: what its text up to the first
+/// [`STYLE_MARKER`] draws and measures in.
+///
+/// The line builder starts every line in Regular and marks a run only where
+/// the style changes, so a line led by a marker opens in that marker's
+/// style, and any other line that carries markers opens in Regular: in
+/// `plain {1}italic {0}end.` (`{n}` standing for a marker and its style
+/// code) the lead-in is plain. Only a line without
+/// markers draws whole in `block_style`. Caches built before this rule
+/// stored a line's first marker as its block style, which for that line
+/// is Italic; deriving the opening from the text draws them right too.
+pub fn line_opening_style(text: &str, block_style: FontStyle) -> FontStyle {
     let mut chars = text.chars();
-    while let Some(ch) = chars.next() {
-        if ch == STYLE_MARKER {
-            return chars.next().and_then(style_from_marker_code);
-        }
+    if chars.next() == Some(STYLE_MARKER) {
+        return chars
+            .next()
+            .and_then(style_from_marker_code)
+            .unwrap_or(FontStyle::Regular);
     }
-    None
+    if text.contains(STYLE_MARKER) {
+        FontStyle::Regular
+    } else {
+        block_style
+    }
 }
 
 /// Greedy word wrap step. Starting at `cursor` (skipping leading ASCII
@@ -2981,5 +3001,417 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// One stored reading line, given as its true style runs. A run's
+    /// spaces end it, as the line builder writes them (the space before a
+    /// style change goes ahead of the marker).
+    struct StyleCase {
+        name: &'static str,
+        runs: &'static [(FontStyle, &'static str)],
+        align: TextAlign,
+    }
+
+    const STYLE_CASES: &[StyleCase] = &[
+        StyleCase {
+            name: "plain lead-in, then italic",
+            runs: &[
+                (FontStyle::Regular, "At last the Mouse, who seemed to be a person of "),
+                (FontStyle::Italic, "authority "),
+                (FontStyle::Regular, "among them,"),
+            ],
+            align: TextAlign::Justify,
+        },
+        StyleCase {
+            name: "plain lead-in, then an italic quotation",
+            runs: &[
+                (FontStyle::Regular, "called out \u{201C}"),
+                (FontStyle::Italic, "Sit down, all of you, and listen to me!"),
+                (FontStyle::Regular, "\u{201D} I\u{2019}ll soon make you"),
+            ],
+            align: TextAlign::Justify,
+        },
+        StyleCase {
+            name: "italic run continued from the line before",
+            runs: &[
+                (FontStyle::Italic, "dry enough!"),
+                (FontStyle::Regular, "\u{201D} They all sat down at once, in a large ring, with the Mouse"),
+            ],
+            align: TextAlign::Justify,
+        },
+        StyleCase {
+            name: "plain lead-in, then bold",
+            runs: &[
+                (FontStyle::Regular, "the Mouse in the middle. Alice kept her eyes "),
+                (FontStyle::Bold, "anxiously fixed "),
+                (FontStyle::Regular, "on it,"),
+            ],
+            align: TextAlign::Justify,
+        },
+        StyleCase {
+            name: "plain lead-in, then bold italic",
+            runs: &[
+                (FontStyle::Regular, "sure she would catch a "),
+                (FontStyle::BoldItalic, "bad cold "),
+                (FontStyle::Regular, "if she did not get dry very soon, and"),
+            ],
+            align: TextAlign::Justify,
+        },
+        StyleCase {
+            name: "centred, plain lead-in, then italic",
+            runs: &[
+                (FontStyle::Regular, "The "),
+                (FontStyle::Italic, "Mouse\u{2019}s "),
+                (FontStyle::Regular, "Long and Sad Tale"),
+            ],
+            align: TextAlign::Center,
+        },
+        StyleCase {
+            name: "only emphasis",
+            runs: &[(
+                FontStyle::Italic,
+                "\u{201C}Ahem!\u{201D} said the Mouse with an important air, \u{201C}are you all ready? This",
+            )],
+            align: TextAlign::Justify,
+        },
+        StyleCase {
+            name: "no emphasis",
+            runs: &[(
+                FontStyle::Regular,
+                "This is the driest thing I know. Silence all round, if you please! William",
+            )],
+            align: TextAlign::Justify,
+        },
+    ];
+
+    fn push_marker(out: &mut String, style: FontStyle) {
+        out.push(STYLE_MARKER);
+        out.push(style_marker_code(style));
+    }
+
+    /// The line as the builder stores it: it opens in Regular and marks a
+    /// run only where the style changes.
+    fn builder_text(runs: &[(FontStyle, &str)]) -> String {
+        let mut out = String::new();
+        let mut current = FontStyle::Regular;
+        for (style, text) in runs {
+            if *style != current {
+                push_marker(&mut out, *style);
+                current = *style;
+            }
+            out.push_str(text);
+        }
+        out
+    }
+
+    /// The same line with every run marked, so no opening style can
+    /// change how it draws.
+    fn marked_text(runs: &[(FontStyle, &str)]) -> String {
+        let mut out = String::new();
+        for (style, text) in runs {
+            push_marker(&mut out, *style);
+            out.push_str(text);
+        }
+        out
+    }
+
+    /// The block style v0.6.1's builder stored: the line's first marker,
+    /// wherever it sits.
+    fn v061_block_style(text: &str) -> FontStyle {
+        let mut chars = text.chars();
+        while let Some(ch) = chars.next() {
+            if ch == STYLE_MARKER {
+                return chars
+                    .next()
+                    .and_then(style_from_marker_code)
+                    .unwrap_or(FontStyle::Regular);
+            }
+        }
+        FontStyle::Regular
+    }
+
+    /// A page of one stored line.
+    struct OneLine<'a> {
+        text: &'a str,
+        style: FontStyle,
+        align: TextAlign,
+        paragraph_end: bool,
+        settings: TypeSettings,
+    }
+
+    impl ReadingBlocks for OneLine<'_> {
+        fn block_count(&self) -> usize {
+            1
+        }
+        fn block(&self, index: usize) -> Option<BlockRecord> {
+            (index == 0).then_some(BlockRecord {
+                text_offset: 0,
+                text_len: self.text.len() as u16,
+                line_count: 1,
+                role: TextRole::Body,
+                style: proto::text::FontStyle::Regular,
+                align: self.align,
+                image_height: 0,
+            })
+        }
+        fn block_text(&self, _index: usize) -> &str {
+            self.text
+        }
+        fn block_style(&self, _index: usize) -> FontStyle {
+            self.style
+        }
+        fn page_break_before(&self, _index: usize) -> bool {
+            false
+        }
+        fn paragraph_end(&self, _index: usize) -> bool {
+            self.paragraph_end
+        }
+        fn type_settings(&self) -> TypeSettings {
+            self.settings
+        }
+    }
+
+    const ONE_LINE_PAGE: PageRecord = PageRecord {
+        first_block: 0,
+        block_count: 1,
+    };
+
+    fn draw_one_line(source: &OneLine<'_>) -> Box<Framebuffer> {
+        let mut fb = Box::new(Framebuffer::new());
+        draw_reading_page_body(&mut fb, source, ONE_LINE_PAGE, |_, _| {});
+        fb
+    }
+
+    /// The style each visible word starts in, read off the runs.
+    fn expected_word_styles(runs: &[(FontStyle, &str)]) -> Vec<(String, FontStyle)> {
+        let mut words: Vec<(String, FontStyle)> = Vec::new();
+        let mut in_word = false;
+        for (style, text) in runs {
+            for ch in text.chars() {
+                if ch == ' ' {
+                    in_word = false;
+                } else if in_word {
+                    words.last_mut().unwrap().0.push(ch);
+                } else {
+                    words.push((ch.into(), *style));
+                    in_word = true;
+                }
+            }
+        }
+        words
+    }
+
+    /// The style each visible word starts in, as the justified drawers
+    /// (built-in and custom-font) walk a stored line from `opening`.
+    fn walked_word_styles(text: &str, opening: FontStyle) -> Vec<(String, FontStyle)> {
+        let mut words = Vec::new();
+        walk_styled_words(text, opening, |step| {
+            if let StyledWordStep::Word(segment, mut style) = step {
+                let mut visible = String::new();
+                let mut chars = segment.chars();
+                while let Some(ch) = chars.next() {
+                    if ch == STYLE_MARKER {
+                        let code = chars.next().and_then(style_from_marker_code);
+                        if visible.is_empty() {
+                            style = code.unwrap_or(style);
+                        }
+                    } else {
+                        visible.push(ch);
+                    }
+                }
+                words.push((visible, style));
+            }
+            true
+        });
+        words
+    }
+
+    /// The page drawn run by run, each in its own face: the line as it
+    /// should look at natural spacing.
+    fn reference_natural_line(
+        runs: &[(FontStyle, &str)],
+        source: &OneLine<'_>,
+    ) -> Box<Framebuffer> {
+        let settings = source.settings;
+        let page_box = source.page_box();
+        let marked = marked_text(runs);
+        let mut x = match effective_align(source.align, settings) {
+            TextAlign::Center => {
+                let width = styled_text_ink_width(&marked, settings, FontStyle::Regular)
+                    .min(page_box.right - page_box.left);
+                ((page_box.left + page_box.right - width) / 2).max(page_box.left)
+            }
+            TextAlign::Left | TextAlign::Justify => {
+                page_box.x_for(TextRole::Body) + block_first_line_indent(source, 0)
+            }
+        };
+        let y = page_box.top + line_advance(settings, TextRole::Body);
+        let mut fb = Box::new(Framebuffer::new());
+        for (style, text) in runs {
+            x = draw_text(&mut fb, body_font(settings, *style), text, x, y, false);
+        }
+        fb
+    }
+
+    const STYLE_CASE_SETTINGS: [TypeSettings; 6] = [
+        TypeSettings::DEFAULT,
+        TypeSettings {
+            family: FontFamily::Merriweather,
+            ..TypeSettings::DEFAULT
+        },
+        TypeSettings {
+            weight: FontWeight::Heavy,
+            ..TypeSettings::DEFAULT
+        },
+        TypeSettings {
+            size: FontSize::Small,
+            spacing: LineSpacing::Compact,
+            ..TypeSettings::DEFAULT
+        },
+        TypeSettings {
+            size: FontSize::Large,
+            ..TypeSettings::DEFAULT
+        },
+        TypeSettings {
+            alignment: Alignment::Left,
+            ..TypeSettings::DEFAULT
+        },
+    ];
+
+    #[test]
+    fn a_line_opens_in_regular_unless_a_marker_leads_it() {
+        for case in STYLE_CASES {
+            let stored = builder_text(case.runs);
+            let opening = case.runs[0].0;
+            for block_style in [v061_block_style(&stored), FontStyle::Regular] {
+                assert_eq!(
+                    line_opening_style(&stored, block_style),
+                    opening,
+                    "{}: stored {stored:?} as {block_style:?}",
+                    case.name
+                );
+            }
+            assert_eq!(
+                line_opening_style(&marked_text(case.runs), FontStyle::Bold),
+                opening,
+                "{}: a leading marker decides",
+                case.name
+            );
+        }
+        // Text without markers draws whole in its block style (host
+        // fixtures' italic block quotes, wrapped over several lines).
+        for style in STYLES {
+            assert_eq!(line_opening_style("a quoted aside", style), style);
+        }
+        assert_eq!(line_opening_style("", FontStyle::Italic), FontStyle::Italic);
+    }
+
+    /// Every case, as caches before the fix stored it (block style = first
+    /// marker) and as the builder stores it now, draws each run in its own
+    /// face: the same pixels as the line with every run marked, and at
+    /// natural spacing the same pixels as drawing the runs one by one.
+    #[test]
+    fn stored_lines_draw_and_measure_every_run_in_its_own_style() {
+        for settings in STYLE_CASE_SETTINGS {
+            for case in STYLE_CASES {
+                let stored = builder_text(case.runs);
+                let marked = marked_text(case.runs);
+                let opening = case.runs[0].0;
+                let old_style = v061_block_style(&stored);
+                let new_style = line_opening_style(&stored, FontStyle::Regular);
+                for paragraph_end in [false, true] {
+                    let line = |text, style| OneLine {
+                        text,
+                        style,
+                        align: case.align,
+                        paragraph_end,
+                        settings,
+                    };
+                    let label = format!(
+                        "{} (paragraph end {paragraph_end}, {settings:?})",
+                        case.name
+                    );
+                    // The style the drawers start from, the built-in and
+                    // custom-font page bodies alike.
+                    for style in [old_style, new_style] {
+                        let mut seen = None;
+                        for_each_drawable_block(&line(&stored, style), ONE_LINE_PAGE, |block| {
+                            seen = Some(block.style);
+                            true
+                        });
+                        assert_eq!(seen, Some(opening), "{label}: drawable style");
+                    }
+                    assert_eq!(
+                        walked_word_styles(&stored, opening),
+                        expected_word_styles(case.runs),
+                        "{label}: justified word styles"
+                    );
+
+                    let want = draw_one_line(&line(&marked, opening));
+                    for style in [old_style, new_style] {
+                        assert!(
+                            draw_one_line(&line(&stored, style)).bytes() == want.bytes(),
+                            "{label}: stored as {style:?} draws unlike the marked line"
+                        );
+                    }
+                    let natural = paragraph_end
+                        || effective_align(case.align, settings) != TextAlign::Justify;
+                    if natural {
+                        assert!(
+                            reference_natural_line(case.runs, &line(&stored, old_style)).bytes()
+                                == want.bytes(),
+                            "{label}: draws unlike its runs drawn one by one"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The cases above would catch the bug: drawing from the stored first
+    /// marker (the old start style) paints a plain lead-in in emphasis, and
+    /// the long body lines really are justified mid-paragraph.
+    #[test]
+    fn the_old_start_style_draws_a_plain_lead_in_wrongly() {
+        let settings = TypeSettings::DEFAULT;
+        let mut wrong = 0;
+        for case in STYLE_CASES {
+            let stored = builder_text(case.runs);
+            let old_style = v061_block_style(&stored);
+            for paragraph_end in [false, true] {
+                let line = |text, style| OneLine {
+                    text,
+                    style,
+                    align: case.align,
+                    paragraph_end,
+                    settings,
+                };
+                let mut old_start = String::new();
+                push_marker(&mut old_start, old_style);
+                old_start.push_str(&stored);
+                let fixed = draw_one_line(&line(&stored, old_style));
+                let old = draw_one_line(&line(&old_start, old_style));
+                let differs = fixed.bytes() != old.bytes();
+                assert_eq!(
+                    differs,
+                    old_style != case.runs[0].0,
+                    "{}: paragraph end {paragraph_end}",
+                    case.name
+                );
+                wrong += usize::from(differs);
+                if case.align == TextAlign::Justify && !paragraph_end {
+                    let natural = draw_one_line(&OneLine {
+                        paragraph_end: true,
+                        ..line(&stored, old_style)
+                    });
+                    assert!(
+                        natural.bytes() != fixed.bytes(),
+                        "{}: a mid-paragraph line should stretch",
+                        case.name
+                    );
+                }
+            }
+        }
+        assert_eq!(wrong, 10, "five cases open plain before emphasis");
     }
 }

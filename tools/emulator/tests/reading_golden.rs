@@ -134,6 +134,50 @@ fn styled(runs: &[(FontStyle, &str)]) -> String {
     out
 }
 
+/// Build cached text the way the line builder stores it: a line opens in
+/// Regular and takes a marker only where the style changes, so plain words
+/// that open a line carry none. Runs keep their own spaces.
+fn builder_styled(runs: &[(FontStyle, &str)]) -> String {
+    let mut out = String::new();
+    let mut current = FontStyle::Regular;
+    for (style, words) in runs {
+        if *style != current {
+            out.push(STYLE_MARKER);
+            out.push(style_marker_code(*style));
+            current = *style;
+        }
+        out.push_str(words);
+    }
+    out
+}
+
+/// The same runs with every one marked, so they draw the same whatever
+/// style the line is taken to open in.
+fn fully_marked(runs: &[(FontStyle, &str)]) -> String {
+    let mut out = String::new();
+    for (style, words) in runs {
+        out.push(STYLE_MARKER);
+        out.push(style_marker_code(*style));
+        out.push_str(words);
+    }
+    out
+}
+
+/// The block style books cached through v0.6.1 hold for a line: its first
+/// marker's style, wherever that marker sits.
+fn first_marker_style(text: &str) -> FontStyle {
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch == STYLE_MARKER {
+            return chars
+                .next()
+                .and_then(display::font::style_from_marker_code)
+                .unwrap_or(FontStyle::Regular);
+        }
+    }
+    FontStyle::Regular
+}
+
 fn fixture(settings: TypeSettings) -> FixtureBlocks {
     let mut blocks = Vec::new();
     blocks.push(FixtureBlock {
@@ -212,6 +256,135 @@ fn fixture(settings: TypeSettings) -> FixtureBlocks {
     FixtureBlocks {
         blocks,
         settings,
+        portrait: false,
+    }
+}
+
+/// Prose lines with emphasis mid-line, after plain words, as the line
+/// builder wraps and stores them (one block per line). `marked` stores every
+/// run marked instead, the reference the stored lines must draw like.
+fn mixed_style_fixture(marked: bool) -> FixtureBlocks {
+    use FontStyle::{Bold, BoldItalic, Italic, Regular};
+    let lines: [(TextRole, TextAlign, bool, &[(FontStyle, &str)]); 9] = [
+        (
+            TextRole::Heading2,
+            TextAlign::Center,
+            true,
+            &[(Bold, "A Caucus-Race and a Long Tale")],
+        ),
+        (
+            TextRole::Body,
+            TextAlign::Justify,
+            false,
+            &[
+                (Regular, "At last the Mouse, who seemed to be a person of "),
+                (Italic, "authority "),
+                (Regular, "among them,"),
+            ],
+        ),
+        (
+            TextRole::Body,
+            TextAlign::Justify,
+            false,
+            &[
+                (Regular, "called out to them \u{201C}"),
+                (
+                    Italic,
+                    "Sit down, all of you, and listen to me! I\u{2019}ll soon make",
+                ),
+            ],
+        ),
+        (
+            TextRole::Body,
+            TextAlign::Justify,
+            false,
+            &[
+                (Italic, "you dry enough!"),
+                (
+                    Regular,
+                    "\u{201D} They all sat down at once, in a large ring, with the Mouse",
+                ),
+            ],
+        ),
+        (
+            TextRole::Body,
+            TextAlign::Justify,
+            false,
+            &[
+                (Regular, "in the middle. Alice kept her eyes "),
+                (Bold, "anxiously fixed "),
+                (Regular, "on it, for she felt sure"),
+            ],
+        ),
+        (
+            TextRole::Body,
+            TextAlign::Justify,
+            true,
+            &[
+                (Regular, "she would catch a "),
+                (BoldItalic, "bad cold "),
+                (Regular, "if she did not get dry very soon."),
+            ],
+        ),
+        (
+            TextRole::Body,
+            TextAlign::Center,
+            true,
+            &[
+                (Regular, "The "),
+                (Italic, "Mouse\u{2019}s "),
+                (Regular, "Long and Sad Tale"),
+            ],
+        ),
+        (
+            TextRole::Body,
+            TextAlign::Justify,
+            false,
+            &[(
+                Italic,
+                "\u{201C}Ahem!\u{201D} said the Mouse with an important air, \u{201C}are you all \
+                 ready? This",
+            )],
+        ),
+        (
+            TextRole::Body,
+            TextAlign::Justify,
+            true,
+            &[
+                (
+                    Regular,
+                    "is the driest thing I know. Silence all round, if you ",
+                ),
+                (Italic, "please!"),
+                (Regular, "\u{201D}"),
+            ],
+        ),
+    ];
+    let blocks = lines
+        .iter()
+        .map(|(role, align, paragraph_end, runs)| {
+            let text = if marked {
+                fully_marked(runs)
+            } else {
+                builder_styled(runs)
+            };
+            FixtureBlock {
+                record: record(*role, *align, 1),
+                style: if marked {
+                    runs[0].0
+                } else {
+                    first_marker_style(&text)
+                },
+                text,
+                page_break_before: false,
+                paragraph_end: *paragraph_end,
+                paragraph_start: None,
+            }
+        })
+        .collect();
+    FixtureBlocks {
+        blocks,
+        settings: TypeSettings::DEFAULT,
         portrait: false,
     }
 }
@@ -309,6 +482,28 @@ fn full_reading_surface_matches_golden() {
     draw_reading_page_counter(&mut fb, "1/2");
 
     assert_frame_matches_golden(&fb, "reading-surface-0");
+}
+
+/// Plain words before mid-line emphasis draw plain. Each line is stored as
+/// books cached through v0.6.1 hold it: no marker on the plain lead-in, and
+/// the first marker's style as the block style (Italic for
+/// `plain {1}italic {0}end.`), which the drawer once started the line in. The
+/// page must match the same lines with every run marked, and the golden.
+#[test]
+fn mixed_style_lines_match_golden() {
+    let source = mixed_style_fixture(false);
+    let page = page_record_at(&source, 0);
+    assert_eq!(page.block_count as usize, source.blocks.len());
+    let mut fb = Framebuffer::new();
+    draw_reading_page_body(&mut fb, &source, page, |_, _| {});
+
+    let mut want = Framebuffer::new();
+    draw_reading_page_body(&mut want, &mixed_style_fixture(true), page, |_, _| {});
+    assert!(
+        fb.bytes() == want.bytes(),
+        "stored lines must draw like their fully marked runs"
+    );
+    assert_frame_matches_golden(&fb, "reading-mixed-styles");
 }
 
 /// The same blocks at the large size with relaxed leading: fewer lines fit

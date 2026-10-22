@@ -1,3 +1,6 @@
+// The submodule paths are spelled out so a host test can include this file
+// by `#[path]` (`ui/tests/custom_font_styles.rs`): a file loaded that way
+// looks for its submodules beside itself, not in `custom_font/`.
 #[cfg(feature = "bench-serial")]
 #[path = "custom_font/bench.rs"]
 pub(crate) mod bench;

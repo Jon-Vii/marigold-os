@@ -93,9 +93,9 @@ pub(crate) struct LibraryBlockSink<
     pub(crate) write_micros: &'a mut u64,
     pub(crate) spine_index: u16,
     pub(crate) line: String<MAX_READER_BLOCK_TEXT>,
-    /// Running ink width of `line`. `line` always starts with a style
-    /// marker (or is empty), so the cursor's default font never shows
-    /// through and the running width matches a from-scratch measure.
+    /// Running ink width of `line`, measured from Regular: a line opens in
+    /// Regular unless a style marker leads it (`line_opening_style`), so the
+    /// running width matches how the line draws.
     pub(crate) line_ink: LineInkCursor,
     pub(crate) line_role: TextRole,
     pub(crate) line_align: TextAlign,
@@ -1797,9 +1797,10 @@ fn append_styled_word<const N: usize>(
     // text per section and proportionally fewer chunks against the same
     // 16 KB arena. The draw and measure paths both key off the running
     // font, so a dropped redundant marker is a no-op; and because each line
-    // draws from a Regular default and `current_style` is reset to Regular
-    // on every flush, a continuation line still re-marks a non-Regular
-    // opening word.
+    // opens in Regular (`ui::reading::line_opening_style`) and
+    // `current_style` is reset to Regular on every flush, a continuation
+    // line still re-marks a non-Regular opening word, while plain words
+    // that open a line stay unmarked.
     if style != current_style {
         append_style_marker(line, style)?;
     }
@@ -1846,7 +1847,10 @@ fn flush_styled_preview_line<
     let line = sink.line.clone();
     let role = sink.line_role;
     let align = sink.line_align;
-    let style = reader_layout::first_styled_line_style(line.as_str()).unwrap_or(FontStyle::Regular);
+    // The style the line opens in, not its first marker's: `plain {1}italic`
+    // opens Regular. The drawer derives the same from the text, so caches
+    // that stored the first marker here still draw right.
+    let style = reader_layout::line_opening_style(line.as_str(), FontStyle::Regular);
     if sink.generate_toc_from_headings
         && !sink.generated_toc_for_spine
         && matches!(

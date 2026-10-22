@@ -8,8 +8,7 @@ use crate::reader_store::ReaderStore;
 pub(crate) use display::font::{style_marker_code, STYLE_MARKER};
 use proto::cache::PageRecord;
 pub(crate) use ui::reading::{
-    effective_align, first_styled_line_style, paragraph_indent, reader_layout_config,
-    READER_WRAP_SAFETY,
+    effective_align, line_opening_style, paragraph_indent, reader_layout_config, READER_WRAP_SAFETY,
 };
 use ui::reading::{page_record_at, paginate_block_pages, PageCursor};
 

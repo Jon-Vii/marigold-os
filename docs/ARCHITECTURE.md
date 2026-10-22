@@ -784,7 +784,10 @@ make a fallback index point into partially overwritten sections. The two banks
 provide recovery space, not a doubled active-section limit.
 
 Section files hold a `SectionV2Header`, page records, block records, per-block
-paragraph flags, and the UTF-8 text blob of pre-wrapped lines. `TOC.BIN` is a
+paragraph flags, and the UTF-8 text blob of pre-wrapped lines. A line carries a
+style marker only where its style changes, and opens in Regular unless a marker
+leads it (`ui::reading::line_opening_style`); a block record's style styles
+only a line without markers. `TOC.BIN` is a
 per-book chapter-list sidecar for the Chapters overview, distinct from the
 records inside the book index. Generated TOC metadata is carried across prefix
 commits; a missing or stale sidecar can be repaired from the committed index.
