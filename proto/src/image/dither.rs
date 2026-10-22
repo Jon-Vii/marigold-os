@@ -13,6 +13,27 @@
 //! weighted errors (7, 3, 5 and 1 sixteenths) still in units of 1/16, so the
 //! only division is a rounding shift per pixel. Errors stay within ±255 per
 //! pixel, so a cell never exceeds ±16 · 255 and fits `i16`.
+//!
+//! Before diffusion, gray levels are stretched so that [`WHITE_POINT`] and
+//! everything lighter becomes pure white. Scanned illustrations carry an
+//! off-white paper tone, which error diffusion would otherwise render as a
+//! sparse field of black dots across every background. The stretch is a
+//! multiply and a shift, so it adds no division per pixel.
+
+/// The gray level, and every lighter one, that dithers to pure white.
+/// Chosen on Rackham's plates for *Alice*: 255 left paper dots, 240 gives
+/// clean backgrounds with the faintest hatching intact, 224 starts to thin it.
+pub const WHITE_POINT: u8 = 240;
+
+/// `255 / WHITE_POINT` in 8.8 fixed point, rounded up so that
+/// `WHITE_POINT` itself reaches 255.
+const LEVEL_SCALE: u32 = (255u32 << 8).div_ceil(WHITE_POINT as u32);
+
+/// A gray level after the white-point stretch.
+#[inline(always)]
+fn level(luma: u8) -> i32 {
+    ((u32::from(luma) * LEVEL_SCALE) >> 8).min(255) as i32
+}
 
 /// Why a [`Ditherer`] refused its input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,7 +118,7 @@ impl<'a> Ditherer<'a> {
 /// both in sixteenths. Returns whether the pixel is white and its error.
 #[inline(always)]
 fn quantize(luma: u8, incoming: i16, carry: i32) -> (bool, i32) {
-    let value = i32::from(luma) + ((i32::from(incoming) + carry + 8) >> 4);
+    let value = level(luma) + ((i32::from(incoming) + carry + 8) >> 4);
     let white = value >= 128;
     (white, if white { value - 255 } else { value })
 }
@@ -225,7 +246,7 @@ mod tests {
             let step: isize = if y % 2 == 0 { 1 } else { -1 };
             for x in order {
                 let cell = x + 1;
-                let value = i32::from(row[x]) + ((errors[y][cell] + 8) >> 4);
+                let value = level(row[x]) + ((errors[y][cell] + 8) >> 4);
                 let white = value >= 128;
                 let e = value - if white { 255 } else { 0 };
                 if !white {
@@ -258,6 +279,23 @@ mod tests {
                 let expected = if partial == 0 { 0 } else { 0xFF >> partial };
                 assert_eq!(*last, expected, "width {width}");
             }
+        }
+    }
+
+    #[test]
+    fn the_white_point_and_lighter_dither_to_pure_white() {
+        assert_eq!(level(WHITE_POINT), 255);
+        assert_eq!(level(255), 255);
+        assert_eq!(level(0), 0);
+        assert!(level(WHITE_POINT - 1) < 255);
+        // Monotonic, so no tone is ever darkened past a darker one.
+        for luma in 1..=255u8 {
+            assert!(level(luma) >= level(luma - 1), "{luma}");
+        }
+        let width = 64u32;
+        for gray in WHITE_POINT..=255 {
+            let rows = dither(width, &vec![vec![gray; width as usize]; 8], 0xA5);
+            assert!(rows.iter().flatten().all(|&b| b == 0xFF), "gray {gray}");
         }
     }
 
