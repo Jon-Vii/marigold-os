@@ -1218,6 +1218,24 @@ impl ReaderStore {
         true
     }
 
+    /// Marks the last block as a line holding inline images, the tallest
+    /// `height` rows (`BlockRecord::INLINE_IMAGES`).
+    pub(crate) fn mark_last_block_inline_images(&mut self, height: u16) {
+        let last = self.block_count.checked_sub(1);
+        if let Some(record) = last.and_then(|index| self.blocks.get_mut(index)) {
+            record.image_height = BlockRecord::inline_image_field(height);
+        }
+    }
+
+    /// Marks the last block as taking no first-line indent, though it opens
+    /// a paragraph: it is drawn as a paragraph's continuation is.
+    pub(crate) fn mark_last_block_unindented(&mut self) {
+        let last = self.block_count.checked_sub(1);
+        if let Some(start) = last.and_then(|index| self.block_paragraph_start.get_mut(index)) {
+            *start = false;
+        }
+    }
+
     pub(crate) fn mark_last_block_paragraph_end(&mut self) {
         if self.block_count > 0 {
             self.block_paragraph_end[self.block_count - 1] = true;

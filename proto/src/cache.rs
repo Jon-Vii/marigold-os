@@ -36,7 +36,15 @@ pub const CACHE_VERSION: u16 = 1;
 // alt-text placeholders is the firmware's decision, not the decoder's. A
 // v28 book header also says whether the book has images (flag bit 4,
 // which v27 writers left clear).
-pub const CACHE_V2_VERSION: u16 = 28;
+//
+// Bumped 28 -> 29 when lines began to hold inline images: a line's text
+// carries a token per image (`proto::image::token`), and the top bit of its
+// record's `image_height` marks it, with the tallest image's height in the
+// low bits (`BlockRecord::INLINE_IMAGES`). v28 caches existed only on
+// development devices and are rebuilt. v27 is still accepted as before:
+// its records hold no image of either kind, and the firmware's one-time
+// check stamps a book without images as the current version.
+pub const CACHE_V2_VERSION: u16 = 29;
 const CACHE_V2_COMPAT_VERSION: u16 = 27;
 pub const CACHE_ROOT_DIR: &str = "XTEINK";
 pub const CACHE_DIR: &str = "CACHE";
@@ -241,14 +249,44 @@ pub struct BlockRecord {
     pub align: TextAlign,
     /// Rows the block's image takes at its fitted size; 0 for a text block.
     /// An image block's text is an image token (`proto::image::token`), and
-    /// its `line_count` is 1. Stored in the record's last two bytes, which
-    /// cache versions before 28 wrote as zero, so their blocks read as text.
+    /// its `line_count` is 1. A line of text that holds inline images has
+    /// [`BlockRecord::INLINE_IMAGES`] set here instead, with its tallest
+    /// image's height in the low bits; its text carries their tokens. A
+    /// block image is never as tall as that bit (it fits a page). Stored in
+    /// the record's last two bytes, which cache versions before 28 wrote as
+    /// zero, so their blocks read as text.
     pub image_height: u16,
 }
 
 impl BlockRecord {
+    /// The `image_height` bit that marks a line holding inline images.
+    pub const INLINE_IMAGES: u16 = 0x8000;
+
+    /// An image block: its text is an image token, and `image_height` its
+    /// image's rows.
     pub const fn is_image(&self) -> bool {
-        self.image_height != 0
+        self.image_height != 0 && self.image_height & Self::INLINE_IMAGES == 0
+    }
+
+    /// A line of text with images inside it.
+    pub const fn has_inline_images(&self) -> bool {
+        self.image_height & Self::INLINE_IMAGES != 0
+    }
+
+    /// The tallest inline image's height, as recorded, for a line that
+    /// [`BlockRecord::has_inline_images`]; 0 otherwise.
+    pub const fn inline_image_height(&self) -> u16 {
+        if self.has_inline_images() {
+            self.image_height & !Self::INLINE_IMAGES
+        } else {
+            0
+        }
+    }
+
+    /// The `image_height` a line whose tallest inline image is `height`
+    /// rows records.
+    pub const fn inline_image_field(height: u16) -> u16 {
+        Self::INLINE_IMAGES | (height & !Self::INLINE_IMAGES)
     }
 }
 
@@ -1093,11 +1131,37 @@ mod tests {
         assert_eq!(decode_block(&bytes).unwrap(), image);
         assert!(image.is_image());
 
+        assert!(!image.has_inline_images());
+        assert_eq!(image.inline_image_height(), 0);
+
+        // A line with inline images: the top bit, and the tallest's height.
+        let line = BlockRecord {
+            image_height: BlockRecord::inline_image_field(64),
+            align: TextAlign::Justify,
+            ..image
+        };
+        encode_block(line, &mut bytes).expect("inline line encodes");
+        assert_eq!(&bytes[10..12], &[0x40, 0x80]);
+        let read = decode_block(&bytes).unwrap();
+        assert_eq!(read, line);
+        assert!(read.has_inline_images() && !read.is_image());
+        assert_eq!(read.inline_image_height(), 64);
+        // The flag never eats into a height, nor a height into the flag.
+        assert_eq!(BlockRecord::inline_image_field(0xFFFF), 0xFFFF);
+        assert_eq!(
+            BlockRecord {
+                image_height: BlockRecord::inline_image_field(0x7FFF),
+                ..image
+            }
+            .inline_image_height(),
+            0x7FFF
+        );
+
         // A v27 writer left bytes 10-11 zero: its blocks read as text.
         bytes[10..12].fill(0);
         let text = decode_block(&bytes).unwrap();
         assert_eq!(text.image_height, 0);
-        assert!(!text.is_image());
+        assert!(!text.is_image() && !text.has_inline_images());
         assert_eq!(core::mem::size_of::<BlockRecord>(), 12);
     }
 
@@ -1323,6 +1387,11 @@ mod tests {
         let mut v26 = header_bytes;
         v26[4..6].copy_from_slice(&26u16.to_le_bytes());
         assert_eq!(decode_book_v2_header(&v26), Err(CacheError::BadVersion));
+        // v28 lived only on development devices, laid out without inline
+        // images: it rebuilds.
+        let mut v28 = header_bytes;
+        v28[4..6].copy_from_slice(&28u16.to_le_bytes());
+        assert_eq!(decode_book_v2_header(&v28), Err(CacheError::BadVersion));
         assert!(!old.generated_toc);
         assert!(old.partial);
         assert_eq!(old.total_pages, header.total_pages);

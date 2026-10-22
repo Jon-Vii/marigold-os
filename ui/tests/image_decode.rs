@@ -298,7 +298,7 @@ where
         .iter()
         .map(
             |&(name, at)| match place_at(&index, name, false, false, at) {
-                ImagePlacement::Block { slot, .. } => slot,
+                ImagePlacement::Shown { slot, .. } => slot,
                 other => panic!("{name}: {other:?}"),
             },
         )
@@ -804,7 +804,7 @@ fn a_relayout_finds_each_image_where_it_was_and_writes_nothing() {
     ] {
         assert!(matches!(
             place_at(&index, "small.png", false, true, later),
-            ImagePlacement::Block { .. }
+            ImagePlacement::Shown { .. }
         ));
     }
     assert_eq!(disk.writes.get(), writes);
@@ -841,6 +841,33 @@ fn a_section_on_the_card_lists_the_images_its_page_draws() {
                     proto::image::token::encode_image_token(block as u16, width, Some("alt"), out)
                         .map(str::len)
                 }));
+            } else if block % 6 == 4 {
+                // A line with images inside it, at every offset from the
+                // start, so some tokens straddle the pieces a section is
+                // read in.
+                let mut text = "w".repeat(block % 61);
+                for image in 0..1 + block % 4 {
+                    let mut token = [0u8; proto::image::token::INLINE_IMAGE_TOKEN_BYTES];
+                    text.push_str(proto::image::token::encode_inline_image_token(
+                        proto::image::token::InlineImageToken {
+                            slot: (100 + block * 4 + image) as u16,
+                            width: 17,
+                            height: 12 + image as u16,
+                        },
+                        &mut token,
+                    ));
+                    text.push_str(&" and".repeat(image * 7 + block % 5));
+                }
+                text.push('.');
+                assert!(store.push_line_block(
+                    &text,
+                    display::font::FontStyle::Regular,
+                    proto::text::TextRole::Body,
+                    proto::text::TextAlign::Left,
+                    true,
+                    spine,
+                ));
+                store.mark_last_block_inline_images(12 + (block % 4) as u16);
             } else {
                 assert!(store.push_line_block(
                     &format!("line {block} of the chapter"),
@@ -892,6 +919,25 @@ fn a_section_on_the_card_lists_the_images_its_page_draws() {
             seen_any |= !from_ram.is_empty();
         }
         assert!(seen_any);
+        // Images inside lines are listed too, from RAM and from the card.
+        let mut listed = 0;
+        for page in 40..40 + store.page_count as u32 {
+            assert!(reader_cache_files::read_section_page_images(
+                &dir,
+                ID,
+                &store,
+                section,
+                page,
+                |slot| {
+                    listed += usize::from(slot >= 100);
+                    true
+                }
+            ));
+        }
+        assert_eq!(
+            listed,
+            (0..80).filter(|b| b % 6 == 4).map(|b| 1 + b % 4).sum()
+        );
         // A page past the section, another book's copy, or another layout
         // lists nothing.
         let end = 40 + store.page_count as u32;
@@ -1169,6 +1215,452 @@ fn decoded_images_draw_from_the_pack_in_every_hold() {
             );
         }
     }
+}
+
+/// A store holding one line with the image in `slot` inside it, `width ×
+/// height` as the line builder fitted it, between words.
+fn inline_image_store(slot: u16, width: u16, height: u16, portrait: bool) -> ReaderStore {
+    let mut store = ReaderStore::new();
+    store.set_active_entry(0, NAME, "PLATES.EPU", true, ID.1, ID.0, None);
+    store.set_layout(TypeSettings::DEFAULT, portrait);
+    store.set_book_has_images(true);
+    let mut token = [0u8; proto::image::token::INLINE_IMAGE_TOKEN_BYTES];
+    let token = proto::image::token::encode_inline_image_token(
+        proto::image::token::InlineImageToken {
+            slot,
+            width,
+            height,
+        },
+        &mut token,
+    );
+    assert!(store.push_line_block(
+        &format!("A large {token} initial"),
+        display::font::FontStyle::Regular,
+        proto::text::TextRole::Body,
+        proto::text::TextAlign::Left,
+        true,
+        0,
+    ));
+    store.mark_last_block_inline_images(height);
+    reader_layout::rebuild_page_index(&mut store);
+    store
+}
+
+/// Draws `store`'s first page with the book's packs, and with the
+/// reference rows of `file` at `size` in each image's rect, centred, for
+/// comparison. Returns both frames and the rects the page asked for.
+fn draw_both<D, T, const ND: usize, const NF: usize, const NV: usize>(
+    root: &Directory<'_, D, T, ND, NF, NV>,
+    store: &ReaderStore,
+    file: &[u8],
+    size: (u16, u16),
+    frame: FbFrame,
+) -> (Framebuffer, Framebuffer, Vec<(i16, i16, u16, u16)>)
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: embedded_sdmmc::TimeSource,
+{
+    let page = store.pages[0];
+    let mut fb = Framebuffer::new();
+    fb.set_frame(frame);
+    let mut band = vec![0xa5u8; display::BAND_BYTES];
+    page_images::draw_page(
+        root,
+        store,
+        app_core::ReaderSource::sd(0).book_id(),
+        page,
+        &mut band,
+        || 0,
+        |images| ui::reading::draw_reading_page_body(&mut fb, store, page, images),
+    );
+    let rows = reference_rows(file, size.0, size.1);
+    let stride = usize::from(size.0.div_ceil(8));
+    let mut want = Framebuffer::new();
+    want.set_frame(frame);
+    let mut rects = Vec::new();
+    ui::reading::draw_reading_page_body(&mut want, store, page, |fb, image| {
+        rects.push((image.x, image.y, image.width, image.height));
+        let x = image.x as usize + usize::from((image.width - size.0) / 2);
+        let y = image.y as usize + usize::from((image.height - size.1) / 2);
+        for row in 0..usize::from(size.1) {
+            for column in 0..usize::from(size.0) {
+                let white = rows[row * stride + column / 8] & (0x80 >> (column % 8)) != 0;
+                fb.set_pixel(x + column, y + row, white);
+            }
+        }
+    });
+    (fb, want, rects)
+}
+
+#[test]
+fn an_image_shown_inside_a_line_decodes_once_at_its_inline_size() {
+    // An initial taller than the inline cap, laid out alone in one place
+    // and inside a line in another: once a line shows it, it decodes at its
+    // inline size, the block-size decode it had is forgotten, and the block
+    // draws the smaller decode centred in its box.
+    let initial = palette_png(100, 120);
+    let (bytes, _) = book(&[deflated("large.png", &initial)]);
+    let disk = fat::Disk::new();
+    let manager: VolumeManager<_, _, 8, 8, 1> =
+        VolumeManager::new_with_limits(&disk, fat::Clock, 0);
+    let volume = manager.open_volume(VolumeIdx(0)).unwrap();
+    let root = volume.open_root_dir().unwrap();
+    let key = proto::cache::cache_key_for(NAME, ID.1);
+    reader_cache_files::ensure_v2_cache_dirs(&root, key.as_str()).unwrap();
+    let mut scratch = scratch();
+    let dir = book_images::book_cache_dir(&root, key.as_str()).unwrap();
+    let slot = lay_out(&dir, &bytes, &[("large.png", AT)], &mut scratch)[0];
+    let (reads, fails) = (RefCell::new(Vec::new()), Cell::new(None));
+    let block = |portrait| fit_image(PageBox::for_portrait(portrait), 100, 120);
+    let inline =
+        |portrait| ui::reading::fit_inline_image(PageBox::for_portrait(portrait), 100, 120);
+    assert_eq!(inline(false), (53, 64));
+    assert!(ui::reading::fits_inline(100, 120));
+    // Decoded alone in a paragraph, in landscape.
+    let page = PageImage {
+        slot,
+        drawn: Some(block(false)),
+    };
+    let decode = |page, portrait, scratch: &mut Scratch| {
+        decode_one(
+            &dir,
+            &bytes,
+            &reads,
+            &fails,
+            page,
+            portrait,
+            scratch,
+            &|| false,
+        )
+    };
+    assert_eq!(
+        decode(page, false, &mut scratch),
+        Some(DecodeOutcome::Decoded)
+    );
+    let before = pack_len(&dir, false);
+    assert_eq!(pending_size(&entry(&dir, slot), false), None);
+
+    // A line shows it: the mark is one write, and forgets that decode.
+    {
+        let images = book_images::open_existing_book_images(&dir, ID).unwrap();
+        assert_eq!(images.mark_inline(slot), Ok(true));
+        assert_eq!(images.mark_inline(slot), Ok(false), "marked once");
+    }
+    let found = entry(&dir, slot);
+    assert!(found.inline && found.wanted);
+    assert_eq!(found.landscape.status, DecodeStatus::NotDecoded);
+    for portrait in [false, true] {
+        assert_eq!(pending_size(&found, portrait), Some(inline(portrait)));
+        assert_eq!(
+            book_images::decoded_size(&found, portrait),
+            inline(portrait)
+        );
+    }
+    // A line's request decodes it at its inline size; so does a block's,
+    // whose box holds that size. Each orientation decodes once.
+    let line_page = PageImage {
+        slot,
+        drawn: Some(inline(false)),
+    };
+    assert_eq!(
+        decode(line_page, false, &mut scratch),
+        Some(DecodeOutcome::Decoded)
+    );
+    let block_page = PageImage {
+        slot,
+        drawn: Some(block(true)),
+    };
+    assert_eq!(
+        decode(block_page, true, &mut scratch),
+        Some(DecodeOutcome::Decoded)
+    );
+    assert_eq!(decode(line_page, false, &mut scratch), None);
+    let found = entry(&dir, slot);
+    let (record, _) = pack_record(&dir, false, found.landscape.pack_offset);
+    assert!(
+        found.landscape.pack_offset >= before,
+        "the old record is an orphan"
+    );
+    assert_eq!((record.width, record.height), inline(false));
+    // What the packs hold for images in use: the inline records alone.
+    {
+        let images = book_images::open_existing_book_images(&dir, ID).unwrap();
+        let live = images.live_pack_bytes(false, &mut scratch.window).unwrap();
+        assert_eq!(
+            live,
+            PackRecord::new(found.path_hash, 53, 64)
+                .unwrap()
+                .record_len()
+        );
+    }
+    drop(dir);
+
+    // Drawn inside a line, standing on its baseline; and alone, centred
+    // in the box laid out for its block size.
+    for frame in [
+        FbFrame::Landscape,
+        FbFrame::LandscapeFlipped,
+        FbFrame::Portrait,
+    ] {
+        let portrait = frame == FbFrame::Portrait;
+        let (width, height) = inline(portrait);
+        let line = inline_image_store(slot, width, height, portrait);
+        let (fb, want, rects) = draw_both(&root, &line, &initial, (width, height), frame);
+        assert_eq!(rects.len(), 1);
+        let baseline = PageBox::for_portrait(portrait).top
+            + ui::reading::inline_line_ascent(TypeSettings::DEFAULT, line.blocks[0]);
+        assert_eq!(rects[0].1 + rects[0].3 as i16, baseline);
+        assert!(fb.bytes()[..] == want.bytes()[..], "{frame:?} inline");
+        let (bw, bh) = block(portrait);
+        let alone = one_image_store(slot, bw, bh, portrait);
+        let (fb, want, rects) = draw_both(&root, &alone, &initial, (width, height), frame);
+        assert_eq!(rects, [(rects[0].0, rects[0].1, bw, bh)]);
+        assert!(fb.bytes()[..] == want.bytes()[..], "{frame:?} block");
+    }
+}
+
+#[test]
+fn the_inline_mark_forgets_only_decodes_whose_size_it_changes() {
+    // A banner the same size inside a line and alone in landscape, but
+    // narrowed further inside a portrait line.
+    let banner = palette_png(600, 40);
+    let landscape = (PageBox::LANDSCAPE, false);
+    let portrait = (PageBox::PORTRAIT, true);
+    assert!(ui::reading::fits_inline(600, 40));
+    assert_eq!(
+        fit_image(PageBox::LANDSCAPE, 600, 40),
+        ui::reading::fit_inline_image(PageBox::LANDSCAPE, 600, 40)
+    );
+    assert_ne!(
+        fit_image(PageBox::PORTRAIT, 600, 40),
+        ui::reading::fit_inline_image(PageBox::PORTRAIT, 600, 40)
+    );
+    let (bytes, _) = book(&[stored("banner.png", &banner)]);
+    let disk = fat::Disk::new();
+    let manager: VolumeManager<_, _, 8, 8, 1> =
+        VolumeManager::new_with_limits(&disk, fat::Clock, 0);
+    let volume = manager.open_volume(VolumeIdx(0)).unwrap();
+    let root = volume.open_root_dir().unwrap();
+    reader_cache_files::ensure_v2_cache_dirs(&root, KEY).unwrap();
+    let dir = book_images::book_cache_dir(&root, KEY).unwrap();
+    let mut scratch = scratch();
+    let slot = lay_out(&dir, &bytes, &[("banner.png", AT)], &mut scratch)[0];
+    let (reads, fails) = (RefCell::new(Vec::new()), Cell::new(None));
+    for (page_box, orientation) in [landscape, portrait] {
+        let page = PageImage {
+            slot,
+            drawn: Some(fit_image(page_box, 600, 40)),
+        };
+        assert_eq!(
+            decode_one(
+                &dir,
+                &bytes,
+                &reads,
+                &fails,
+                page,
+                orientation,
+                &mut scratch,
+                &|| false
+            ),
+            Some(DecodeOutcome::Decoded)
+        );
+    }
+    let images = book_images::open_existing_book_images(&dir, ID).unwrap();
+    assert_eq!(images.mark_inline(slot), Ok(true));
+    drop(images);
+    let found = entry(&dir, slot);
+    assert!(found.inline);
+    // Landscape's decode is the size a line draws already: kept.
+    assert_eq!(found.landscape.status, DecodeStatus::Decoded);
+    assert_eq!(found.portrait.status, DecodeStatus::NotDecoded);
+    assert_eq!(pending_size(&found, false), None);
+    assert_eq!(
+        pending_size(&found, true),
+        Some(ui::reading::fit_inline_image(PageBox::PORTRAIT, 600, 40))
+    );
+}
+
+#[test]
+fn a_line_showing_an_image_that_lost_its_mark_marks_it_again() {
+    // An index built again while the sections lasted: the line names the
+    // inline size, the entry has no mark and a block-size decode.
+    let (bytes, _) = book(&[deflated("large.png", LARGE_PNG)]);
+    let disk = fat::Disk::new();
+    let manager: VolumeManager<_, _, 8, 8, 1> =
+        VolumeManager::new_with_limits(&disk, fat::Clock, 0);
+    let volume = manager.open_volume(VolumeIdx(0)).unwrap();
+    let root = volume.open_root_dir().unwrap();
+    reader_cache_files::ensure_v2_cache_dirs(&root, KEY).unwrap();
+    let dir = book_images::book_cache_dir(&root, KEY).unwrap();
+    let mut scratch = scratch();
+    let slot = lay_out(&dir, &bytes, &[("large.png", AT)], &mut scratch)[0];
+    let (reads, fails) = (RefCell::new(Vec::new()), Cell::new(None));
+    let block = fit_image(PageBox::LANDSCAPE, 640, 900);
+    let block_page = PageImage {
+        slot,
+        drawn: Some(block),
+    };
+    assert_eq!(
+        decode_one(
+            &dir,
+            &bytes,
+            &reads,
+            &fails,
+            block_page,
+            false,
+            &mut scratch,
+            &|| false
+        ),
+        Some(DecodeOutcome::Decoded)
+    );
+    // An illustration this tall never goes inside a line, so a line asking
+    // for some smaller size of it is damage: nothing is marked.
+    let inline = ui::reading::fit_inline_image(PageBox::LANDSCAPE, 640, 900);
+    let line_page = PageImage {
+        slot,
+        drawn: Some(inline),
+    };
+    assert!(!ui::reading::fits_inline(640, 900));
+    assert_eq!(
+        decode_one(
+            &dir,
+            &bytes,
+            &reads,
+            &fails,
+            line_page,
+            false,
+            &mut scratch,
+            &|| false
+        ),
+        None
+    );
+    assert!(!entry(&dir, slot).inline);
+
+    // A drop cap, though, is marked again and decoded at the line's size.
+    let initial = palette_png(75, 75);
+    let (bytes, _) = book(&[stored("t.png", &initial)]);
+    let disk = fat::Disk::new();
+    let manager: VolumeManager<_, _, 8, 8, 1> =
+        VolumeManager::new_with_limits(&disk, fat::Clock, 0);
+    let volume = manager.open_volume(VolumeIdx(0)).unwrap();
+    let root = volume.open_root_dir().unwrap();
+    reader_cache_files::ensure_v2_cache_dirs(&root, KEY).unwrap();
+    let dir = book_images::book_cache_dir(&root, KEY).unwrap();
+    let slot = lay_out(&dir, &bytes, &[("t.png", AT)], &mut scratch)[0];
+    let block_page = PageImage {
+        slot,
+        drawn: Some((75, 75)),
+    };
+    assert_eq!(
+        decode_one(
+            &dir,
+            &bytes,
+            &reads,
+            &fails,
+            block_page,
+            false,
+            &mut scratch,
+            &|| false
+        ),
+        Some(DecodeOutcome::Decoded)
+    );
+    let images = book_images::open_existing_book_images(&dir, ID).unwrap();
+    let archive = || {
+        Some(Archive {
+            bytes: &bytes,
+            reads: &reads,
+            fails: &fails,
+        })
+    };
+    let mut session = ImageSession::new(&dir, images, archive, false, now);
+    let line_page = PageImage {
+        slot,
+        drawn: Some((64, 64)),
+    };
+    assert_eq!(
+        session.decode_page_image(line_page, &mut parts(&mut scratch), &|| false),
+        Some(DecodeOutcome::Decoded)
+    );
+    assert!(session.stats.remarked && session.stats.forgot_decodes());
+    drop(session);
+    let found = entry(&dir, slot);
+    assert!(found.inline);
+    let (record, _) = pack_record(&dir, false, found.landscape.pack_offset);
+    assert_eq!((record.width, record.height), (64, 64));
+}
+
+#[test]
+fn the_reader_s_place_counts_images_inside_lines() {
+    let (bytes, _) = book(&[
+        stored("small.png", SMALL_PNG),
+        stored("large.png", LARGE_PNG),
+    ]);
+    let disk = fat::Disk::new();
+    let manager: VolumeManager<_, _, 8, 8, 1> =
+        VolumeManager::new_with_limits(&disk, fat::Clock, 0);
+    let volume = manager.open_volume(VolumeIdx(0)).unwrap();
+    let root = volume.open_root_dir().unwrap();
+    reader_cache_files::ensure_v2_cache_dirs(&root, KEY).unwrap();
+    let dir = book_images::book_cache_dir(&root, KEY).unwrap();
+    let mut scratch = scratch();
+    let at = |order| ImagePlace { spine: 2, order };
+    let slots = lay_out(
+        &dir,
+        &bytes,
+        &[("small.png", at(4)), ("large.png", at(9))],
+        &mut scratch,
+    );
+    // A page of plain lines, then a page whose first block is a line with
+    // the large image inside it.
+    let mut store = ReaderStore::new();
+    store.set_layout(TypeSettings::DEFAULT, false);
+    for line in 0..50 {
+        let text = if line == 20 {
+            let mut token = [0u8; proto::image::token::INLINE_IMAGE_TOKEN_BYTES];
+            let token = proto::image::token::encode_inline_image_token(
+                proto::image::token::InlineImageToken {
+                    slot: slots[1],
+                    width: 45,
+                    height: 64,
+                },
+                &mut token,
+            );
+            format!("words {token} more")
+        } else {
+            format!("line {line}")
+        };
+        assert!(store.push_line_block(
+            &text,
+            display::font::FontStyle::Regular,
+            proto::text::TextRole::Body,
+            proto::text::TextAlign::Left,
+            true,
+            2,
+        ));
+        if line == 20 {
+            store.mark_last_block_inline_images(64);
+        }
+    }
+    reader_layout::rebuild_page_index(&mut store);
+    store.set_cached_spine(2);
+    store.set_current_section_range(0, store.page_count);
+    let pages = store.page_count as u32;
+    store.set_book_index(pages, false, &[section(0, 2, 0, pages as u16)]);
+    let images = book_images::open_existing_book_images(&dir, ID).unwrap();
+    let page_of = |block: u16| {
+        (0..store.page_count)
+            .find(|&page| {
+                let record = store.pages[page];
+                (record.first_block..record.first_block + record.block_count).contains(&block)
+            })
+            .unwrap() as u32
+    };
+    // From a page before the line, the next image is the line's; from a
+    // page after it, the reader is just past it.
+    assert_eq!(image_decode::reader_place(&store, 0, &images), at(9));
+    let last = store.page_count as u32 - 1;
+    assert!(page_of(20) < last);
+    assert_eq!(image_decode::reader_place(&store, last, &images), at(10));
 }
 
 #[test]

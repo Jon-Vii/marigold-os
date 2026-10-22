@@ -43,8 +43,8 @@ set the priorities:
 
 Out of scope for v1: interlaced PNG (needs the whole image in RAM),
 progressive JPEG (needs every coefficient in RAM), GIF/WebP/SVG content,
-gray levels, inline images inside a text line (see Open questions), covers
-(still host-rendered).
+gray levels, covers (still host-rendered). Images inside a text line came
+after v1; see Inline images.
 
 ## Budgets (acceptance criteria)
 
@@ -262,9 +262,133 @@ before assuming either way.
 Code size: today's firmware leaves ~200 KB in the C3's 4 MB flash-mapped
 window for code plus read-only data, which bounds the decoders.
 
-## Open questions
+## Inline images
 
-1. **Inline images.** *Euclid*-style books put small images inside sentences.
-   v1 lays every image out as its own block, which breaks those sentences.
-   Supporting images inside a line means teaching the line builder about
-   inline objects. Decide after v1 ships.
+v1 laid every image out as its own block, which broke sentences that hold an
+image (*Euclid*: "Complete the [▱] AEBG" put the symbol on a centred line of
+its own) and split drop caps from their words (*Alice*: "HEY were…").
+
+**Classification.** An `<img>` is inline when its paragraph, the parser's
+current block, also holds text that is not whitespace, before or after it,
+and it is small enough for a line. An image alone in its block (ignoring
+whitespace) stays a block image, exactly as before, and so does every
+svg-wrapped image. So does an illustration: an image whose block size is
+taller than 128 rows (twice the inline cap) in either orientation stays a
+block and ends the paragraph around it, as v1 did, even when its paragraph
+has text (a plate beside a caption in `<div class="figcenter">`, say);
+deciding by both orientations keeps one decoded size per image. For a sink
+that keeps images in lines, `<figure>` and `<figcaption>` are blocks, so a
+caption is never its figure's paragraph text. A book without an image index
+keeps the old parse exactly: the parser ends the paragraph at every `<img>`,
+and treats figures as it always did, unless its sink says
+`wants_inline_images`, which only a sink with an index does.
+
+The parser streams, so the decision waits for the paragraph. At an `<img>`
+the parser ends the current run, not the paragraph, and the sink looks the
+image up at once, as before. If the paragraph already has text, the image is
+placed inline there. If not, it is held pending: a small record (slot, both
+fitted sizes, and the block token or alt text it would need as a block) in the
+idle tail of the container scratch, which `container.xml` leaves almost empty
+during layout. Nothing is copied onto the parse callbacks' stack. The
+paragraph's first text places the pending images inline ahead of it; a
+paragraph that ends without text pushes them as image blocks (or alt-text
+placeholders) exactly as v1 did. Spacing met among held images is held with
+them, in order, so either way it lands where it was; text the sanitizer drops
+(Gutenberg's metadata, title-page labels) is no text. If more images arrive
+before any text than the record space holds, those held go out as blocks. A
+`container.xml` that nearly fills the 4 KB container scratch leaves too
+little room to hold even one record (about 200 bytes for an image with its
+alt): every image then falls back to v1's block or alt-text placeholder,
+even inside a sentence. Real containers are a few hundred bytes.
+
+**Drop caps.** Project Gutenberg sets a drop cap in a floated block of its
+own, outside the paragraph it starts: `<div class="figleft"><img alt="T"
+…/></div><div class="unindent">HEY were…</div>` in Rackham's *Alice*. The
+rule above would keep it a block, so one narrow addition: an image alone in a
+block that floats left (class `figleft`, or a `float: left` style) whose alt
+is a single letter, optionally after a quote, is carried into the next
+paragraph and placed inline at its start when that paragraph is body text
+beginning with a letter (the rest of the drop cap's word), in place of the
+first-line indent (Gutenberg sets that paragraph `unindent`), its word glued
+to it. Anything else commits it as a block: another image, a heading, a
+centred line or scene break (typed `* * *` included), a list item's marker,
+the chapter's end. Floated illustrations, whose alt is a caption, stay
+blocks.
+
+**Size.** `fit_inside(src_w, src_h, column, INLINE_IMAGE_MAX_HEIGHT)` with a
+fixed 64 px cap, never upscaled. The column is the narrowest line any block
+can start (the page column less the largest first-line indent and the wrap
+margin), so an inline image always fits the line it starts. The cap does not
+depend on type settings, so an image still decodes once per orientation. A
+symbol keeps its natural size; a drop cap becomes a large initial.
+
+**Token and record.** A line holding images carries one token per image in its
+text: U+FFFC, then slot, width and height as four hex digits each (15 bytes,
+no alt). Style markers and tokens never overlap, and a book with an index
+drops any U+FFFC from its own text, so a token is never mistaken for text. The
+line keeps `line_count` 1 and its 12-byte `BlockRecord`: `image_height`'s top
+bit (0x8000) marks a line with inline images, and its low bits hold the
+tallest one's height. A block image's height is under 0x8000 (a page) and
+cache v27's zero bytes still read as text, so the field stays unambiguous.
+
+**Line height.** An inline image's bottom sits on the baseline, and text in
+its line draws on that baseline. The line's slot above the baseline is the
+larger of the line advance and the image plus the block images' top gap (the
+body descent and a clear row), and the block images' bottom gap follows it,
+so the line above's descenders and the line below's tallest marks clear the
+image by a row, as they clear a block image. `block_height` works this out
+from the record and the type settings, without reading the text. A line with
+a small symbol grows only by the bottom gap (0 to 5 rows by size and spacing;
+3 at the default).
+
+**Line breaking.** An inline image is one unbreakable unit of its fitted width
+for wrapping and justification; the spaces around it in the source are kept as
+they are (a glued neighbour may still wrap away from it, as a styled run's
+does). Tokens never reach the hyphenator. An image that cannot be shown
+(unsupported, like JPEG for now, missing, or failing its probe) places its alt
+text inline in italics instead; an empty alt places nothing, and no alt places
+`[Image]`, as the block placeholder does. At draw time an inline image that is
+not decoded, or fails, draws an outline of its fitted size in its place.
+
+A line holding images is justified whenever it fills two thirds of the
+measure, however far its gaps stretch, where a line of text stops at one and
+a half spaces a gap. An image takes width but adds no gap, so such a line has
+few gaps for its measure: Alice's first line, `[T]HEY were indeed a
+queer-looking party that assembled on the`, cannot take `bank—` beside the
+64-row initial, and its nine gaps would need two spaces each to fill it.
+
+**Inline and block use of one image.** An image used inline and also alone
+elsewhere has two fitted sizes when it is taller than the cap. The index entry
+gets a sticky `inline` flag (flags bit 1), set when layout first places the
+image inline at a size other than its block size; from then on that image
+decodes at its inline size, once per orientation. If it had already decoded at
+its block size in an orientation where the two sizes differ, that decode is
+forgotten in the same write (its record becomes an orphan in the pack) and is
+redone once; an orientation where they agree keeps its decode. The flag is
+also set again if it is lost while sections that show the image inline
+survive (an index built again, an entry read back fresh): a page that asks
+for the image at its inline size, which differs from its block size and only
+a line asks for, marks it before decoding. Block uses keep their block layout
+and draw the smaller record centred in their box. Nothing alternates between
+sizes, so nothing thrashes; the cost is a smaller picture in the rare book
+that shows one tall image both ways. Images under the cap, such as *Euclid*'s
+symbols, have one size either way and never set the flag.
+
+**Downstream.** The spacing reflow carries `image_height` through, so a line
+keeps its images' height; tokens pass its stored-line rules (non-empty, no
+edge whitespace, at most 768 bytes). Page windows, `carry_last_page` and
+section files move whole records, so nothing changes there. The decode passes
+find a page's inline images by walking its image lines' tokens: in RAM for
+pages the store holds, and from section files a few dozen bytes at a time
+otherwise. The page draw opens its SD session for a page with either kind of
+image and hands both to the same drawer, which accepts a record of the image no
+larger than its rect and centres it. The custom-font draw walks tokens as the
+built-in draw does. A chapter that meets unprobed images still stops, probes
+them and lays itself out again; classification happens in that second pass.
+
+**Caches.** `CACHE_V2_VERSION` goes to 29. A v27 index still gets the one-time
+image check and is stamped (now as 29) when the book has no PNGs; v28 caches
+existed only on development devices and simply rebuild. A book without images
+builds through the same code as before, byte for byte apart from the version
+stamp: the parser's old path, no tokens, no flagged records, and one branch per
+line.

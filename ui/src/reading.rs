@@ -15,7 +15,7 @@ use display::font::{
 };
 use proto::cache::{BlockRecord, PageRecord};
 use proto::image::fit_inside;
-use proto::image::token::decode_image_token;
+use proto::image::token::{decode_image_token, inline_pieces, InlineImageToken, InlinePiece};
 use proto::text::{TextAlign, TextRole};
 
 /// The reading page's text box: wrap edges and the vertical page walk
@@ -122,11 +122,12 @@ pub struct ReaderDrawableBlock<'a> {
     pub image: Option<ReaderImage<'a>>,
 }
 
-/// Where an image block's image goes on the page.
+/// Where an image goes on the page: an image block's, or one inside a line
+/// (with no alt, and its bottom row just above the line's baseline).
 #[derive(Clone, Copy)]
 pub struct ReaderImage<'a> {
-    /// Top-left corner, in the drawing frame. The image is centred in the
-    /// column and starts [`image_top_gap`] rows into its block.
+    /// Top-left corner, in the drawing frame. A block's image is centred in
+    /// the column and starts [`image_top_gap`] rows into its block.
     pub x: i16,
     pub y: i16,
     /// The fitted size layout reserved, which the decoder must emit
@@ -229,6 +230,61 @@ pub fn fit_image(page_box: PageBox, src_w: u32, src_h: u32) -> (u16, u16) {
     (width as u16, height as u16)
 }
 
+/// Tallest an image inside a line is shown, whatever the type settings, so
+/// an image decodes at one size per orientation however the reader sets
+/// type. A symbol in a sentence keeps its own size; a drop cap becomes a
+/// large initial.
+pub const INLINE_IMAGE_MAX_HEIGHT: u16 = 64;
+
+/// Tallest an image may stand alone in a paragraph, in either orientation,
+/// and still go inside a line when its paragraph has text: twice the
+/// inline cap. Symbols and drop caps are well under it; a taller image is
+/// an illustration (a plate with a caption beside it, say), which stays a
+/// block and ends the paragraph around it rather than shrink to a line.
+pub const INLINE_IMAGE_MAX_BLOCK_HEIGHT: u16 = 2 * INLINE_IMAGE_MAX_HEIGHT;
+
+/// Whether an image of `src_w × src_h` may go inside a line: its block
+/// size is no taller than [`INLINE_IMAGE_MAX_BLOCK_HEIGHT`] in either page
+/// box, so every orientation decides the same and decodes it at one size.
+pub fn fits_inline(src_w: u32, src_h: u32) -> bool {
+    [PageBox::LANDSCAPE, PageBox::PORTRAIT]
+        .into_iter()
+        .all(|page_box| fit_image(page_box, src_w, src_h).1 <= INLINE_IMAGE_MAX_BLOCK_HEIGHT)
+}
+
+/// Columns of the page box an inline image may not use: the widest
+/// first-line indent (the large size's), which takes more than a block
+/// quote's 24, and the wrap margin. So an inline image always fits the
+/// line it starts, whichever line that is.
+const INLINE_IMAGE_INSET: i16 = 34 + READER_WRAP_SAFETY;
+const _: () = assert!(INLINE_IMAGE_INSET - READER_WRAP_SAFETY >= 24);
+
+/// The size an image of `src_w × src_h` shows at inside a line in
+/// `page_box`: as large as fits [`INLINE_IMAGE_MAX_HEIGHT`] and the
+/// narrowest line, keeping its shape, and never larger than the source.
+/// Like [`fit_image`], it depends only on the page box.
+pub fn fit_inline_image(page_box: PageBox, src_w: u32, src_h: u32) -> (u16, u16) {
+    let column = (page_box.right - page_box.left - INLINE_IMAGE_INSET).max(1) as u32;
+    let (width, height) = fit_inside(src_w, src_h, column, u32::from(INLINE_IMAGE_MAX_HEIGHT));
+    (width as u16, height as u16)
+}
+
+/// Rows a line's tallest inline image takes, as its record says, and never
+/// more than [`INLINE_IMAGE_MAX_HEIGHT`] even when a damaged record says
+/// otherwise.
+fn inline_rows(record: BlockRecord) -> i16 {
+    record.inline_image_height().min(INLINE_IMAGE_MAX_HEIGHT) as i16
+}
+
+/// Rows from the top of a line holding inline images down to its baseline:
+/// the line advance, or the tallest image with the block images' top gap
+/// above it when that is more, so the line above's descenders clear it by a
+/// row. Below the baseline the line keeps [`image_bottom_gap`] for the line
+/// below's tallest marks.
+pub fn inline_line_ascent(settings: TypeSettings, record: BlockRecord) -> i16 {
+    line_advance(settings, record.role).max(image_top_gap(settings) + inline_rows(record))
+}
+
 /// Rows an image block's image takes: its recorded height, which layout
 /// fitted to the page box, and never more than [`fit_image`] can give even
 /// when a damaged record says otherwise. So with its gaps the block fits a
@@ -246,6 +302,11 @@ pub fn block_height(source: &impl ReadingBlocks, index: usize) -> i16 {
     if record.is_image() {
         return image_top_gap(settings)
             + image_rows(source.page_box(), record)
+            + image_bottom_gap(settings)
+            + paragraph_gap_after(source, index);
+    }
+    if record.has_inline_images() {
+        return inline_line_ascent(settings, record)
             + image_bottom_gap(settings)
             + paragraph_gap_after(source, index);
     }
@@ -416,10 +477,15 @@ pub fn for_each_drawable_block(
         let image = record
             .is_image()
             .then(|| place_image(settings, page_box, y, record, text));
+        let baseline = if record.has_inline_images() {
+            y + inline_line_ascent(settings, record)
+        } else {
+            y + advance
+        };
         if !visit(ReaderDrawableBlock {
             record,
             text,
-            y: y + advance,
+            y: baseline,
             advance,
             style,
             font: body_font(settings, style),
@@ -433,14 +499,51 @@ pub fn for_each_drawable_block(
     }
 }
 
-/// Whether `page` holds an image block, the only kind of block that needs
-/// more than RAM to draw: its pixels are on the card.
+/// Whether `page` holds an image block or a line with images inside it,
+/// the only blocks that need more than RAM to draw: their pixels are on
+/// the card.
 pub fn page_has_images(source: &impl ReadingBlocks, page: PageRecord) -> bool {
     (0..page.block_count as usize).any(|offset| {
         source
             .block(page.first_block as usize + offset)
-            .is_some_and(|record| record.is_image())
+            .is_some_and(|record| record.is_image() || record.has_inline_images())
     })
+}
+
+/// Calls `visit` with every image `page` shows, block images and the images
+/// inside its lines, in reading order: its slot and the size it draws at.
+/// Stops when `visit` returns false. Measures no text.
+pub fn for_each_page_image(
+    source: &impl ReadingBlocks,
+    page: PageRecord,
+    mut visit: impl FnMut(u16, u16, u16) -> bool,
+) {
+    let column = (source.page_box().right - source.page_box().left).max(0) as u16;
+    for_each_drawable_block(source, page, |block| {
+        if let Some(image) = block.image {
+            return image
+                .slot
+                .is_none_or(|slot| visit(slot, image.width, image.height));
+        }
+        if !block.record.has_inline_images() {
+            return true;
+        }
+        let rows = inline_rows(block.record) as u16;
+        inline_pieces(block.text).all(|piece| match piece {
+            InlinePiece::Image(token) => {
+                let (width, height) = inline_image_size(token, column, rows);
+                visit(token.slot, width, height)
+            }
+            InlinePiece::Text(_) => true,
+        })
+    });
+}
+
+/// The size an inline image draws at: its token's, kept inside the column
+/// and the line's recorded height, which only a damaged section can
+/// exceed.
+fn inline_image_size(token: InlineImageToken, column: u16, rows: u16) -> (u16, u16) {
+    (token.width.min(column), token.height.min(rows))
 }
 
 /// An image block's image, for a block starting at row `top`: centred in
@@ -514,6 +617,10 @@ pub fn draw_reading_page_body(
     for_each_drawable_block(source, page, |block| {
         if let Some(image) = block.image {
             draw_image(fb, &image);
+            return true;
+        }
+        if block.record.has_inline_images() {
+            draw_inline_line(fb, source, &block, &mut draw_image);
             return true;
         }
         let role = block.record.role;
@@ -598,6 +705,231 @@ pub fn draw_reading_page_body(
         };
         true
     });
+}
+
+/// What placing a line's inline images needs: the column, which no image
+/// is drawn wider than, the line's recorded image height, which none is
+/// drawn taller than (only a damaged section can say otherwise), and the
+/// italic face for an image drawn as a placeholder.
+#[derive(Clone, Copy)]
+pub struct InlineImages {
+    pub column: u16,
+    pub rows: u16,
+    pub alt_font: &'static BitmapFont,
+}
+
+impl InlineImages {
+    /// For a line whose record [`BlockRecord::has_inline_images`].
+    pub fn for_line(source: &impl ReadingBlocks, record: BlockRecord) -> Self {
+        let page_box = source.page_box();
+        Self {
+            column: (page_box.right - page_box.left).max(0) as u16,
+            rows: inline_rows(record) as u16,
+            alt_font: body_font(source.type_settings(), FontStyle::Italic),
+        }
+    }
+
+    /// The image `token` names, drawn from column `x` with its bottom row
+    /// just above `baseline`, so it stands on the line as its text does.
+    pub fn place(&self, token: InlineImageToken, x: i16, baseline: i16) -> ReaderImage<'static> {
+        let (width, height) = inline_image_size(token, self.column, self.rows);
+        ReaderImage {
+            x,
+            y: baseline.saturating_sub(height as i16),
+            width,
+            height,
+            slot: Some(token.slot),
+            alt: "",
+            alt_font: self.alt_font,
+        }
+    }
+}
+
+/// The natural width of a line holding inline images: its text measured as
+/// [`styled_text_ink_width`] does, each image by its width. The line
+/// builder measures a line the same way as it fills it.
+pub fn inline_line_ink_width(text: &str, settings: TypeSettings, default_style: FontStyle) -> i16 {
+    let mut cursor = StyledInkCursor::new(settings, default_style);
+    for piece in inline_pieces(text) {
+        match piece {
+            InlinePiece::Text(run) => cursor.push_str(run),
+            InlinePiece::Image(token) => cursor.push_object(token.width),
+        }
+    }
+    cursor.width()
+}
+
+/// Draws a line that holds inline images at natural spacing from `x`, as
+/// [`draw_styled_line`] draws one without: its runs of text on the
+/// baseline, the style carrying on past each image, and each image handed
+/// to `draw_image` where it stands. Returns the pen's column after it.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_inline_styled_line(
+    fb: &mut Framebuffer,
+    settings: TypeSettings,
+    images: &InlineImages,
+    text: &str,
+    x: i16,
+    baseline_y: i16,
+    default_style: FontStyle,
+    draw_image: &mut dyn FnMut(&mut Framebuffer, &ReaderImage<'_>),
+) -> i16 {
+    let mut cursor_x = x;
+    let mut style = default_style;
+    for piece in inline_pieces(text) {
+        let run = match piece {
+            InlinePiece::Image(token) => {
+                let image = images.place(token, cursor_x, baseline_y);
+                draw_image(fb, &image);
+                cursor_x = cursor_x.saturating_add(image.width as i16);
+                continue;
+            }
+            InlinePiece::Text(run) => run,
+        };
+        let mut run_start = 0usize;
+        let mut iter = run.char_indices();
+        while let Some((index, ch)) = iter.next() {
+            if ch != STYLE_MARKER {
+                continue;
+            }
+            if run_start < index {
+                cursor_x = draw_text(
+                    fb,
+                    body_font(settings, style),
+                    &run[run_start..index],
+                    cursor_x,
+                    baseline_y,
+                    false,
+                );
+            }
+            if let Some((code_index, code)) = iter.next() {
+                style = style_from_marker_code(code).unwrap_or(style);
+                run_start = code_index + code.len_utf8();
+            } else {
+                run_start = index + ch.len_utf8();
+            }
+        }
+        if run_start < run.len() {
+            cursor_x = draw_text(
+                fb,
+                body_font(settings, style),
+                &run[run_start..],
+                cursor_x,
+                baseline_y,
+                false,
+            );
+        }
+    }
+    cursor_x
+}
+
+/// [`draw_justified_styled_line`] for a line holding inline images: the
+/// leftover width spreads over its inter-word spaces, an image counting as
+/// a word, unless [`justify_extra`] declines.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_justified_inline_line(
+    fb: &mut Framebuffer,
+    settings: TypeSettings,
+    images: &InlineImages,
+    text: &str,
+    x: i16,
+    baseline_y: i16,
+    right: i16,
+    default_style: FontStyle,
+    draw_image: &mut dyn FnMut(&mut Framebuffer, &ReaderImage<'_>),
+) -> i16 {
+    let gaps = justify_gap_count(text);
+    let natural = inline_line_ink_width(text, settings, default_style);
+    let Some(extra) = justify_inline_extra(x, natural, right, gaps) else {
+        return draw_inline_styled_line(
+            fb,
+            settings,
+            images,
+            text,
+            x,
+            baseline_y,
+            default_style,
+            draw_image,
+        );
+    };
+    let per_gap = extra / gaps as i16;
+    let mut remainder = extra % gaps as i16;
+    let mut cursor_x = x;
+    walk_styled_words(text, default_style, |step| {
+        match step {
+            StyledWordStep::Word(word, style) => {
+                cursor_x = draw_inline_styled_line(
+                    fb, settings, images, word, cursor_x, baseline_y, style, draw_image,
+                );
+            }
+            StyledWordStep::Gap(style) => {
+                cursor_x += measure_text(body_font(settings, style), " ") as i16 + per_gap;
+                if remainder > 0 {
+                    cursor_x += 1;
+                    remainder -= 1;
+                }
+            }
+        }
+        true
+    });
+    cursor_x
+}
+
+/// Draws a line that holds inline images, aligned as its record says. Out
+/// of line, so a page without them draws in the frame it always had.
+#[inline(never)]
+fn draw_inline_line(
+    fb: &mut Framebuffer,
+    source: &impl ReadingBlocks,
+    block: &ReaderDrawableBlock<'_>,
+    draw_image: &mut dyn FnMut(&mut Framebuffer, &ReaderImage<'_>),
+) {
+    let settings = source.type_settings();
+    let page_box = source.page_box();
+    let images = InlineImages::for_line(source, block.record);
+    let x = page_box.x_for(block.record.role) + block.indent;
+    match effective_align(block.record.align, settings) {
+        TextAlign::Justify if !block.paragraph_end => {
+            draw_justified_inline_line(
+                fb,
+                settings,
+                &images,
+                block.text,
+                x,
+                block.y,
+                page_box.right,
+                block.style,
+                draw_image,
+            );
+        }
+        TextAlign::Left | TextAlign::Justify => {
+            draw_inline_styled_line(
+                fb,
+                settings,
+                &images,
+                block.text,
+                x,
+                block.y,
+                block.style,
+                draw_image,
+            );
+        }
+        TextAlign::Center => {
+            let width = inline_line_ink_width(block.text, settings, block.style)
+                .min(page_box.right - page_box.left);
+            let x = ((page_box.left + page_box.right - width) / 2).max(page_box.left);
+            draw_inline_styled_line(
+                fb,
+                settings,
+                &images,
+                block.text,
+                x,
+                block.y,
+                block.style,
+                draw_image,
+            );
+        }
+    }
 }
 
 /// Draw the page-in-chapter counter that completes the reading surface.
@@ -877,6 +1209,15 @@ impl InkCursor {
         self.previous = None;
     }
 
+    /// An inline image `width` columns wide: it takes exactly its width
+    /// and kerns with nothing.
+    pub fn push_object(&mut self, width: u16) {
+        let left = fixed_round(self.advance_fp);
+        self.right = self.right.max(left.saturating_add(width as i16));
+        self.advance_fp += i32::from(width) << 4;
+        self.previous = None;
+    }
+
     pub fn width(&self) -> i16 {
         self.right.max(fixed_ceil(self.advance_fp))
     }
@@ -927,6 +1268,12 @@ impl StyledInkCursor {
             }
             self.ink.push_char(self.font, ch);
         }
+    }
+
+    /// An inline image `width` columns wide. The style in effect carries
+    /// on past it.
+    pub fn push_object(&mut self, width: u16) {
+        self.ink.push_object(width);
     }
 
     pub fn width(&self) -> i16 {
@@ -1140,6 +1487,22 @@ pub fn justify_extra(
         || extra * 3 > target - x
         || i32::from(extra) * 2 > gaps as i32 * i32::from(space) * 3
     {
+        return None;
+    }
+    Some(extra)
+}
+
+/// [`justify_extra`] for a line holding inline images: justified whenever
+/// it fills two thirds of the measure, however far its gaps stretch, as a
+/// browser justifies. An image takes width but adds no gap, so such a line
+/// has few gaps for its measure; a drop cap opening a paragraph is where
+/// this shows, when the word after the line will not fit beside the
+/// initial and the first line would otherwise stay ragged among justified
+/// ones.
+pub fn justify_inline_extra(x: i16, natural_width: i16, right: i16, gaps: usize) -> Option<i16> {
+    let target = right - READER_WRAP_SAFETY;
+    let extra = target - (x + natural_width);
+    if gaps == 0 || extra <= 0 || extra * 3 > target - x {
         return None;
     }
     Some(extra)
@@ -1429,6 +1792,10 @@ mod tests {
         blocks: Vec<(BlockRecord, String)>,
         settings: TypeSettings,
         page_box: PageBox,
+        /// Paragraph ends, block by block; every block ends one when empty.
+        ends: Vec<bool>,
+        /// Paragraph starts, when not derived from the ends.
+        starts: Option<Vec<bool>>,
     }
 
     impl ImageBlocks {
@@ -1469,6 +1836,8 @@ mod tests {
                 blocks,
                 settings,
                 page_box,
+                ends: Vec::new(),
+                starts: None,
             }
         }
     }
@@ -1489,8 +1858,14 @@ mod tests {
         fn page_break_before(&self, _index: usize) -> bool {
             false
         }
-        fn paragraph_end(&self, _index: usize) -> bool {
-            true
+        fn paragraph_end(&self, index: usize) -> bool {
+            self.ends.get(index).copied().unwrap_or(true)
+        }
+        fn paragraph_start(&self, index: usize) -> bool {
+            match &self.starts {
+                Some(starts) => starts.get(index).copied().unwrap_or(false),
+                None => index == 0 || self.paragraph_end(index - 1),
+            }
         }
         fn type_settings(&self) -> TypeSettings {
             self.settings
@@ -1680,8 +2055,10 @@ mod tests {
     #[test]
     fn a_damaged_image_height_stays_within_a_page() {
         let page_box = PageBox::LANDSCAPE;
+        // Heights from 0x8000 up mark a line with inline images, whose own
+        // damage `damaged_inline_heights_stay_within_the_cap` covers.
         let source = ImageBlocks::new(
-            &[Some((100, u16::MAX)), None, Some((100, 40_000)), None],
+            &[Some((100, 0x7FFF)), None, Some((100, 30_000)), None],
             TypeSettings::DEFAULT,
             page_box,
         );
@@ -1807,6 +2184,405 @@ mod tests {
             .filter(|&(x, y)| (x < x0 || x > x1 || y < y0 || y > y1) && !fb.pixel(x, y))
             .count();
         assert_eq!(outside_ink, 0, "nothing beside or below the box");
+    }
+
+    /// A line's text with `{n}` standing for inline image `n` of `images`.
+    fn inline_text(template: &str, images: &[(u16, u16, u16)]) -> String {
+        let mut text = String::from(template);
+        for (index, &(slot, width, height)) in images.iter().enumerate() {
+            let mut out = [0u8; proto::image::token::INLINE_IMAGE_TOKEN_BYTES];
+            let token = proto::image::token::encode_inline_image_token(
+                InlineImageToken {
+                    slot,
+                    width,
+                    height,
+                },
+                &mut out,
+            );
+            text = text.replace(&format!("{{{index}}}"), token);
+        }
+        text
+    }
+
+    /// Body lines, some holding inline images: each line's text, alignment,
+    /// whether it ends its paragraph, and its tallest image (0 for none).
+    fn inline_blocks(
+        lines: &[(String, TextAlign, bool, u16)],
+        settings: TypeSettings,
+        page_box: PageBox,
+    ) -> ImageBlocks {
+        let mut source = ImageBlocks::new(&vec![None; lines.len()], settings, page_box);
+        for (block, (text, align, _, tallest)) in source.blocks.iter_mut().zip(lines) {
+            block.0.align = *align;
+            if *tallest > 0 {
+                block.0.image_height = BlockRecord::inline_image_field(*tallest);
+            }
+            block.1 = text.clone();
+        }
+        source.ends = lines.iter().map(|line| line.2).collect();
+        source
+    }
+
+    #[test]
+    fn inline_images_fit_the_cap_and_the_narrowest_line() {
+        for page_box in [PageBox::LANDSCAPE, PageBox::PORTRAIT] {
+            let narrowest = (page_box.right - page_box.left - 34 - READER_WRAP_SAFETY) as u16;
+            // Euclid's symbol keeps its size; Alice's drop cap is capped.
+            assert_eq!(fit_inline_image(page_box, 17, 12), (17, 12));
+            assert_eq!(fit_inline_image(page_box, 75, 75), (64, 64));
+            assert_eq!(fit_inline_image(page_box, 14, 31), (14, 31));
+            // A banner is held to the narrowest line.
+            let (width, height) = fit_inline_image(page_box, 4000, 60);
+            assert_eq!(width, narrowest);
+            assert!(height >= 1 && height < 60);
+            for (src_w, src_h) in [(1, 1), (640, 900), (64, 64), (65, 65), (5000, 3), (3, 5000)] {
+                let (width, height) = fit_inline_image(page_box, src_w, src_h);
+                assert!(height <= INLINE_IMAGE_MAX_HEIGHT && width <= narrowest);
+                assert!(u32::from(width) <= src_w && u32::from(height) <= src_h);
+                assert!(width >= 1 && height >= 1);
+                // Never larger than the image would be alone in a paragraph.
+                let (block_w, block_h) = fit_image(page_box, src_w, src_h);
+                assert!(width <= block_w && height <= block_h);
+            }
+        }
+    }
+
+    /// A text line, a line with an image `height` rows tall inside it, and
+    /// another text line: their baselines and the image's rows.
+    fn text_inline_text(
+        settings: TypeSettings,
+        text: &str,
+        height: u16,
+    ) -> ([i16; 3], (i16, i16), ImageBlocks) {
+        let line = inline_text(&format!("{text} {{0}} {text}"), &[(9, 20, height)]);
+        let source = inline_blocks(
+            &[
+                (text.into(), TextAlign::Left, false, 0),
+                (line, TextAlign::Left, false, height),
+                (text.into(), TextAlign::Left, true, 0),
+            ],
+            settings,
+            PageBox::LANDSCAPE,
+        );
+        let page = page_record_at(&source, 0);
+        assert_eq!(page.block_count, 3, "{settings:?}");
+        let mut baselines = [0; 3];
+        let mut index = 0;
+        for_each_drawable_block(&source, page, |block| {
+            baselines[index] = block.y;
+            index += 1;
+            true
+        });
+        let mut rows = None;
+        let mut fb = Framebuffer::new();
+        draw_reading_page_body(&mut fb, &source, page, |_, image| {
+            rows = Some((image.y, image.y + image.height as i16));
+        });
+        (baselines, rows.expect("an image"), source)
+    }
+
+    #[test]
+    fn every_glyph_clears_an_inline_image_by_a_row_above_and_below() {
+        for settings in every_body_type() {
+            let advance = line_advance(settings, TextRole::Body);
+            for height in [1, 12, 20, 31, 48, 64] {
+                let (baselines, (top, end), _) = text_inline_text(settings, "line", height);
+                // The image stands on its line's baseline.
+                assert_eq!(end, baselines[1], "{settings:?} {height}");
+                assert_eq!(end - top, height as i16);
+                // Its line is only as tall as it must be above the baseline,
+                // and keeps the bottom gap below.
+                assert_eq!(
+                    baselines[1] - baselines[0],
+                    advance.max(image_top_gap(settings) + height as i16),
+                    "{settings:?} {height}"
+                );
+                assert_eq!(
+                    baselines[2] - baselines[1],
+                    advance + image_bottom_gap(settings),
+                    "{settings:?} {height}"
+                );
+                for style in STYLES {
+                    let font = body_font(settings, style);
+                    for (index, metric) in font.metrics.iter().enumerate() {
+                        let codepoint = font.codepoints[index];
+                        let first = i16::from(metric.y_offset);
+                        let last = first + i16::from(metric.height) - 1;
+                        assert!(
+                            baselines[0] + last < top - 1,
+                            "{settings:?} {style:?} U+{codepoint:04X} reaches row {} above an inline image at {top}",
+                            baselines[0] + last
+                        );
+                        assert!(
+                            baselines[2] + first > end,
+                            "{settings:?} {style:?} U+{codepoint:04X} reaches row {} below an inline image ending at {end}",
+                            baselines[2] + first
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn real_ink_clears_inline_images_on_the_page() {
+        // The deepest and the tallest glyphs, in every style, on the lines
+        // around a line holding an image.
+        let mut text = String::new();
+        for style in STYLES {
+            text.push(STYLE_MARKER);
+            text.push(style_marker_code(style));
+            text.push_str("\u{1EB2}\u{1E4C}\u{C9}\u{C5}\u{122}gjpqy ");
+        }
+        let text = text.trim_end();
+        for settings in every_body_type() {
+            for height in [12, 40, 64] {
+                let (_, (top, end), source) = text_inline_text(settings, text, height);
+                let page = page_record_at(&source, 0);
+                let mut fb = Framebuffer::new();
+                let mut rect = None;
+                draw_reading_page_body(&mut fb, &source, page, |_, image| {
+                    rect = Some((image.x, image.width));
+                });
+                let (x, width) = rect.expect("an image");
+                let inked = |y: i16| {
+                    (x as usize..x as usize + width as usize)
+                        .any(|column| !fb.pixel(column, y as usize))
+                };
+                // Nothing drawn in the image's rect or the rows that keep it
+                // clear: the image draws there, and nothing else may.
+                for y in top - 1..=end {
+                    assert!(
+                        !inked(y),
+                        "{settings:?} {height}: ink at row {y}, image {top}..{end}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inline_images_stand_in_their_line_where_its_text_leaves_room() {
+        let settings = TypeSettings::DEFAULT;
+        let images = [(4, 17, 12), (5, 64, 64)];
+        let line = inline_text("Complete the {0} AEBG and {1}HEY", &images);
+        let source = inline_blocks(
+            &[(line.clone(), TextAlign::Left, true, 64)],
+            settings,
+            PageBox::LANDSCAPE,
+        );
+        let page = page_record_at(&source, 0);
+        let mut drawn = Vec::new();
+        let mut fb = Framebuffer::new();
+        draw_reading_page_body(&mut fb, &source, page, |_, image| {
+            drawn.push((
+                image.x,
+                image.y,
+                image.width,
+                image.height,
+                image.slot,
+                String::from(image.alt),
+            ));
+        });
+        let baseline = page_box_top() + inline_line_ascent(settings, source.blocks[0].0);
+        let indent = paragraph_indent(settings.size);
+        let left = PageBox::LANDSCAPE.left + indent;
+        let before =
+            |prefix: &str| left + styled_text_ink_width(prefix, settings, FontStyle::Regular);
+        assert_eq!(
+            drawn,
+            [
+                (
+                    before("Complete the "),
+                    baseline - 12,
+                    17,
+                    12,
+                    Some(4),
+                    String::new()
+                ),
+                (
+                    before("Complete the ")
+                        + 17
+                        + styled_text_ink_width(" AEBG and ", settings, FontStyle::Regular),
+                    baseline - 64,
+                    64,
+                    64,
+                    Some(5),
+                    String::new(),
+                ),
+            ]
+        );
+        // The line's width counts each image as its width.
+        assert_eq!(
+            inline_line_ink_width(&line, settings, FontStyle::Regular),
+            styled_text_ink_width("Complete the  AEBG and HEY", settings, FontStyle::Regular)
+                + 17
+                + 64
+        );
+        // Placeholders outline each image in place and write nothing else.
+        let mut fb = Framebuffer::new();
+        draw_reading_page_body(&mut fb, &source, page, draw_image_placeholder);
+        let (x, y, width, height, _, _) = drawn[0].clone();
+        let (x, y) = (x as usize, y as usize);
+        assert!(!fb.pixel(x, y) && !fb.pixel(x + width as usize - 1, y + height as usize - 1));
+        assert!(fb.pixel(x + 3, y + 3), "an outline, empty inside");
+    }
+
+    fn page_box_top() -> i16 {
+        PageBox::LANDSCAPE.top
+    }
+
+    #[test]
+    fn justified_inline_lines_spread_their_gaps_around_whole_images() {
+        let settings = TypeSettings::DEFAULT;
+        let page_box = PageBox::LANDSCAPE;
+        let words = "the parallelogram and the diagonal meet where the";
+        let line = inline_text(
+            &format!("Complete {{0}} {words} {{0}} ends"),
+            &[(2, 17, 12)],
+        );
+        let natural = inline_line_ink_width(&line, settings, FontStyle::Regular);
+        let target = page_box.right - READER_WRAP_SAFETY - page_box.left;
+        assert!(
+            natural < target && natural * 3 > target * 2,
+            "{natural} of {target}"
+        );
+        let source = inline_blocks(
+            &[
+                (line.clone(), TextAlign::Justify, false, 12),
+                ("last".into(), TextAlign::Justify, true, 0),
+            ],
+            settings,
+            page_box,
+        );
+        // Not a paragraph opening: no indent.
+        let mut source = source;
+        source.starts = Some(vec![false, false]);
+        let page = page_record_at(&source, 0);
+        let mut images = Vec::new();
+        let mut fb = Framebuffer::new();
+        draw_reading_page_body(&mut fb, &source, page, |fb, image| {
+            images.push(image.x);
+            draw_image_placeholder(fb, image);
+        });
+        assert_eq!(images.len(), 2);
+        // The second image moved right by the stretched gaps before it,
+        // and the line's ink now reaches the margin.
+        let natural_x = page_box.left
+            + styled_text_ink_width(&format!("Complete  {words} "), settings, FontStyle::Regular)
+            + 17;
+        assert!(images[1] > natural_x, "{} > {natural_x}", images[1]);
+        let baseline = page_box.top + inline_line_ascent(settings, source.blocks[0].0);
+        let rightmost = (0..fb.frame_width())
+            .rev()
+            .find(|&x| (baseline - 30..baseline + 6).any(|y| !fb.pixel(x, y as usize)))
+            .unwrap();
+        assert!(
+            (page_box.right - READER_WRAP_SAFETY - 3..page_box.right).contains(&(rightmost as i16)),
+            "justified ink ends at {rightmost}"
+        );
+    }
+
+    #[test]
+    fn lines_holding_images_justify_whenever_two_thirds_full() {
+        // A measure of 780 with nine four-pixel gaps: a text line takes 54
+        // to spare at most (one and a half spaces a gap); a line holding
+        // images takes anything up to a third of the measure.
+        let (x, right) = (8, 792);
+        let measure = right - READER_WRAP_SAFETY - x;
+        assert_eq!(justify_extra(x, measure - 54, right, 9, 4), Some(54));
+        assert_eq!(justify_extra(x, measure - 71, right, 9, 4), None);
+        assert_eq!(justify_inline_extra(x, measure - 71, right, 9), Some(71));
+        assert_eq!(justify_inline_extra(x, measure - 260, right, 4), Some(260));
+        assert_eq!(justify_inline_extra(x, measure - 261, right, 4), None);
+        assert_eq!(justify_inline_extra(x, measure - 10, right, 0), None);
+        assert_eq!(justify_inline_extra(x, measure, right, 3), None);
+    }
+
+    #[test]
+    fn pages_list_the_images_inside_their_lines() {
+        let settings = TypeSettings::DEFAULT;
+        let page_box = PageBox::LANDSCAPE;
+        let mut source = inline_blocks(
+            &[
+                ("plain".into(), TextAlign::Left, true, 0),
+                (
+                    inline_text("a {0} b {1}", &[(3, 17, 12), (4, 30, 40)]),
+                    TextAlign::Left,
+                    true,
+                    40,
+                ),
+                ("plain".into(), TextAlign::Left, true, 0),
+            ],
+            settings,
+            page_box,
+        );
+        let page = |first_block, block_count| PageRecord {
+            first_block,
+            block_count,
+        };
+        assert!(!page_has_images(&source, page(0, 1)));
+        assert!(page_has_images(&source, page(1, 1)));
+        let list = |source: &ImageBlocks| {
+            let mut seen = Vec::new();
+            for_each_page_image(source, page(0, source.blocks.len() as u16), |slot, w, h| {
+                seen.push((slot, w, h));
+                true
+            });
+            seen
+        };
+        assert_eq!(list(&source), [(3, 17, 12), (4, 30, 40)]);
+        // With an image block among them, in reading order; and a visit
+        // that says stop, stops.
+        let mut out = [0u8; proto::image::token::IMAGE_TOKEN_MAX_BYTES];
+        let token =
+            proto::image::token::encode_image_token(7, 300, Some("A plate"), &mut out).unwrap();
+        source.blocks[0].0.image_height = 200;
+        source.blocks[0].0.align = TextAlign::Center;
+        source.blocks[0].1 = token.into();
+        assert_eq!(list(&source), [(7, 300, 200), (3, 17, 12), (4, 30, 40)]);
+        let mut first = None;
+        for_each_page_image(&source, page(0, 3), |slot, _, _| {
+            first.get_or_insert(slot);
+            false
+        });
+        assert_eq!(first, Some(7));
+    }
+
+    #[test]
+    fn damaged_inline_heights_stay_within_the_cap() {
+        let settings = TypeSettings::DEFAULT;
+        // A record whose height passes the cap, holding a token taller
+        // than its record: the line is no taller than the cap allows, and
+        // the image no taller than its line.
+        let source = inline_blocks(
+            &[
+                (
+                    inline_text("x {0}", &[(1, 900, 900)]),
+                    TextAlign::Left,
+                    true,
+                    0x7FFF,
+                ),
+                (
+                    inline_text("y {0}", &[(1, 20, 60)]),
+                    TextAlign::Left,
+                    true,
+                    10,
+                ),
+            ],
+            settings,
+            PageBox::LANDSCAPE,
+        );
+        let most =
+            image_top_gap(settings) + INLINE_IMAGE_MAX_HEIGHT as i16 + image_bottom_gap(settings);
+        assert_eq!(block_height(&source, 0), most);
+        let mut seen = Vec::new();
+        for_each_page_image(&source, page_record_at(&source, 0), |_, w, h| {
+            seen.push((w, h));
+            true
+        });
+        let column = (PageBox::LANDSCAPE.right - PageBox::LANDSCAPE.left) as u16;
+        assert_eq!(seen, [(column, INLINE_IMAGE_MAX_HEIGHT), (20, 10)]);
     }
 
     #[test]

@@ -1377,10 +1377,49 @@ fn append_fixture_image(store: &mut ReaderStore, spine: u16, image: usize) {
     reader_layout::extend_page_index(store);
 }
 
-/// A chapter of lines with an image every few lines.
+/// A fixture line holding inline images (a symbol, and on some lines a
+/// 64-row initial), with its record marked as the line builder marks it.
+fn append_fixture_inline_line(store: &mut ReaderStore, spine: u16, line: usize) {
+    use proto::image::token::{encode_inline_image_token, InlineImageToken};
+    let mut tokens = [[0u8; proto::image::token::INLINE_IMAGE_TOKEN_BYTES]; 2];
+    let [symbol, initial] = &mut tokens;
+    let symbol = encode_inline_image_token(
+        InlineImageToken {
+            slot: 40 + line as u16,
+            width: 17,
+            height: 12,
+        },
+        symbol,
+    );
+    let tall = line % 3 == 0;
+    let initial = encode_inline_image_token(
+        InlineImageToken {
+            slot: 90,
+            width: 64,
+            height: if tall { 64 } else { 30 },
+        },
+        initial,
+    );
+    let text = format!("{initial}ine {line:03} of chapter {spine}, the {symbol} AEBG");
+    assert!(store.push_line_block(
+        &text,
+        display::font::FontStyle::Regular,
+        proto::text::TextRole::Body,
+        proto::text::TextAlign::Justify,
+        line % 7 == 6,
+        spine
+    ));
+    store.mark_last_block_inline_images(if tall { 64 } else { 30 });
+    reader_layout::extend_page_index(store);
+}
+
+/// A chapter of lines with an image every few lines, and lines holding
+/// inline images among them.
 fn append_fixture_chapter(store: &mut ReaderStore, spine: u16, block: usize) {
     if block % 9 == 4 {
         append_fixture_image(store, spine, block / 9);
+    } else if block % 5 == 2 {
+        append_fixture_inline_line(store, spine, block);
     } else {
         append_fixture_line(store, spine, block);
     }
@@ -1401,6 +1440,9 @@ fn block_text(store: &ReaderStore) -> Vec<(String, u16, bool, bool)> {
         .collect()
 }
 
+/// Image blocks and lines holding inline images through the page windows a
+/// build flushes, the pages they carry, section files, and a spacing
+/// reflow, which must lay them out as a fresh build would.
 #[test]
 fn image_blocks_keep_their_height_through_windows_carries_files_and_the_reflow() {
     use display::font::{LineSpacing, TypeSettings};
@@ -1483,6 +1525,13 @@ fn image_blocks_keep_their_height_through_windows_carries_files_and_the_reflow()
         }
         assert_eq!(loaded, written);
         assert!(loaded.iter().filter(|block| block.1 > 0).count() >= 2 * 13);
+        let inline_lines = |blocks: &[(String, u16, bool, bool)]| {
+            blocks
+                .iter()
+                .filter(|block| block.1 & proto::cache::BlockRecord::INLINE_IMAGES != 0)
+                .count()
+        };
+        assert!(inline_lines(&loaded) >= 2 * 20, "{}", inline_lines(&loaded));
 
         // A spacing change reflows them unchanged, into the pages a fresh
         // layout makes.
@@ -1524,7 +1573,10 @@ fn image_blocks_keep_their_height_through_windows_carries_files_and_the_reflow()
             reflowed.extend(block_text(&store));
             pages.extend(page_text(&store));
         }
+        // Lines holding images keep their tokens and their height: the
+        // reflow carries them unchanged.
         assert_eq!(reflowed, written, "portrait={portrait}");
+        assert_eq!(inline_lines(&reflowed), inline_lines(&written));
         let mut expected = Vec::new();
         for spine in 0..2u16 {
             let mut fresh = ReaderStore::new();

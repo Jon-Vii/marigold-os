@@ -8,8 +8,9 @@
 //! [`is_image_path`]).
 //! Everything else in an entry starts empty and is filled in place later:
 //! the image's format and size when it is first probed, a `wanted` mark
-//! when a chapter's layout meets it before that, and per orientation, the
-//! decode status and where its rows sit in that orientation's pack. The
+//! when a chapter's layout meets it before that, an `inline` mark once
+//! layout shows it inside a line at a size of its own, and per orientation,
+//! the decode status and where its rows sit in that orientation's pack. The
 //! index does not depend on type settings, so it survives every relayout.
 //!
 //! This module owns the format and the logic; the caller does the card
@@ -62,7 +63,7 @@
 //! | 22 | 2 | check: FNV-1a (32-bit) of bytes 0 to 21, its halves XORed |
 //! | 24 | 1 | [`ImageFormat`] |
 //! | 25 | 1 | [`ProbeStatus`] |
-//! | 26 | 1 | flags: bit 0 `wanted` |
+//! | 26 | 1 | flags: bit 0 `wanted`, bit 1 `inline` |
 //! | 27 | 1 | reserved, zero |
 //! | 28 | 2, 2 | source width, height (0 until probed) |
 //! | 32 | 1, 1 | landscape, portrait [`DecodeStatus`] |
@@ -132,6 +133,7 @@ const FANOUT_SCRATCH: usize = IMAGE_FANOUT_BYTES.next_multiple_of(8);
 const STAGING_BYTES: usize = 2048;
 const FLAG_TRUNCATED: u16 = 1;
 const FLAG_WANTED: u8 = 1;
+const FLAG_INLINE: u8 = 2;
 
 const _: () = assert!(IMAGE_ENTRIES_AT as usize >= IMAGE_FANOUT_AT as usize + IMAGE_FANOUT_BYTES);
 const _: () =
@@ -241,6 +243,12 @@ pub struct ImageEntry {
     pub probe: ProbeStatus,
     /// A chapter's layout met this image before it was probed.
     pub wanted: bool,
+    /// Layout showed this image inside a line, at a size other than the
+    /// one it has alone in a paragraph (it is taller than an inline image
+    /// may be). From then on it decodes at its inline size, in every
+    /// orientation; a block use draws that smaller decode in its box.
+    /// Never cleared, so an image has one decoded size per orientation.
+    pub inline: bool,
     /// Source size, once probed.
     pub width: u16,
     pub height: u16,
@@ -784,7 +792,8 @@ fn encode_entry(entry: &ImageEntry, out: &mut [u8]) {
     put_u16(out, 22, check);
     out[24] = entry.format as u8;
     out[25] = entry.probe as u8;
-    out[26] = if entry.wanted { FLAG_WANTED } else { 0 };
+    out[26] =
+        if entry.wanted { FLAG_WANTED } else { 0 } | if entry.inline { FLAG_INLINE } else { 0 };
     put_u16(out, 28, entry.width);
     put_u16(out, 30, entry.height);
     out[32] = entry.landscape.status as u8;
@@ -824,6 +833,7 @@ fn decode_entry(bytes: &[u8; IMAGE_ENTRY_BYTES]) -> Option<ImageEntry> {
         entry.format = state.format;
         entry.probe = state.probe;
         entry.wanted = state.wanted;
+        entry.inline = state.inline;
         entry.width = state.width;
         entry.height = state.height;
         entry.landscape = state.landscape;
@@ -860,13 +870,14 @@ fn decode_state(bytes: &[u8; IMAGE_ENTRY_BYTES]) -> Option<ImageEntry> {
             pack_offset: u32_at(bytes, offset),
         })
     };
-    if bytes[26] & !FLAG_WANTED != 0 {
+    if bytes[26] & !(FLAG_WANTED | FLAG_INLINE) != 0 {
         return None;
     }
     Some(ImageEntry {
         format,
         probe,
         wanted: bytes[26] & FLAG_WANTED != 0,
+        inline: bytes[26] & FLAG_INLINE != 0,
         width: u16_at(bytes, 28),
         height: u16_at(bytes, 30),
         landscape: decode(bytes[32], 36)?,
@@ -1243,6 +1254,17 @@ mod tests {
         assert_eq!(read_image(&mut file, &header, slot), Ok(Some(entry)));
         assert!(entry.decode(true).status == DecodeStatus::Decoded);
         assert!(entry.decode(false).status == DecodeStatus::NotDecoded);
+        // The inline mark is a flag beside `wanted`, kept with it.
+        for (wanted, inline) in [(false, true), (true, true), (false, false)] {
+            let marked = ImageEntry {
+                wanted,
+                inline,
+                ..entry
+            };
+            write_image_state(&mut file, &header, slot, &marked).unwrap();
+            assert_eq!(read_image(&mut file, &header, slot), Ok(Some(marked)));
+        }
+        write_image_state(&mut file, &header, slot, &entry).unwrap();
         // Nothing else moved.
         let changed: Vec<usize> = (0..before.len())
             .filter(|&at| before[at] != file.bytes[at])
@@ -1388,7 +1410,7 @@ mod tests {
             },
         );
         write_image_state(&mut good, &header, slot, &entry).unwrap();
-        for (byte, value) in [(24, 3u8), (25, 4), (26, 2), (32, 3), (33, 9)] {
+        for (byte, value) in [(24, 3u8), (25, 4), (26, 4), (32, 3), (33, 9)] {
             let mut file = File {
                 bytes: good.bytes.clone(),
                 ..File::default()
@@ -1398,7 +1420,7 @@ mod tests {
                 .unwrap()
                 .expect("still found");
             assert_eq!(found.probe, ProbeStatus::Unprobed, "byte {byte}");
-            assert!(!found.wanted && found.width == 0);
+            assert!(!found.wanted && !found.inline && found.width == 0);
             assert_eq!(found.landscape, DecodeState::default());
             assert_eq!(found.local_header_offset, entry.local_header_offset);
             assert_eq!(read_image(&mut file, &header, slot), Ok(Some(found)));

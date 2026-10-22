@@ -39,6 +39,9 @@ struct FixtureBlock {
     style: FontStyle,
     page_break_before: bool,
     paragraph_end: bool,
+    /// Whether the block opens a paragraph, when not derived from the
+    /// previous block's end (a drop cap's line opens one unindented).
+    paragraph_start: Option<bool>,
 }
 
 struct FixtureBlocks {
@@ -82,6 +85,17 @@ impl ReadingBlocks for FixtureBlocks {
             .get(index)
             .map(|block| block.paragraph_end)
             .unwrap_or(true)
+    }
+
+    fn paragraph_start(&self, index: usize) -> bool {
+        match self
+            .blocks
+            .get(index)
+            .and_then(|block| block.paragraph_start)
+        {
+            Some(start) => start,
+            None => index == 0 || self.paragraph_end(index - 1),
+        }
     }
 
     fn type_settings(&self) -> TypeSettings {
@@ -128,6 +142,7 @@ fn fixture(settings: TypeSettings) -> FixtureBlocks {
         style: FontStyle::Bold,
         page_break_before: false,
         paragraph_end: true,
+        paragraph_start: None,
     });
     blocks.push(FixtureBlock {
         record: record(TextRole::Body, TextAlign::Justify, 4),
@@ -139,6 +154,7 @@ fn fixture(settings: TypeSettings) -> FixtureBlocks {
         style: FontStyle::Regular,
         page_break_before: false,
         paragraph_end: true,
+        paragraph_start: None,
     });
     blocks.push(FixtureBlock {
         record: record(TextRole::Body, TextAlign::Justify, 1),
@@ -151,6 +167,7 @@ fn fixture(settings: TypeSettings) -> FixtureBlocks {
         style: FontStyle::Regular,
         page_break_before: false,
         paragraph_end: true,
+        paragraph_start: None,
     });
     blocks.push(FixtureBlock {
         record: record(TextRole::BlockQuote, TextAlign::Left, 2),
@@ -160,6 +177,7 @@ fn fixture(settings: TypeSettings) -> FixtureBlocks {
         style: FontStyle::Italic,
         page_break_before: false,
         paragraph_end: true,
+        paragraph_start: None,
     });
     for paragraph in 0..6 {
         blocks.push(FixtureBlock {
@@ -172,6 +190,7 @@ fn fixture(settings: TypeSettings) -> FixtureBlocks {
             style: FontStyle::Regular,
             page_break_before: false,
             paragraph_end: true,
+            paragraph_start: None,
         });
     }
     blocks.push(FixtureBlock {
@@ -180,6 +199,7 @@ fn fixture(settings: TypeSettings) -> FixtureBlocks {
         style: FontStyle::Bold,
         page_break_before: true,
         paragraph_end: true,
+        paragraph_start: None,
     });
     blocks.push(FixtureBlock {
         record: record(TextRole::Body, TextAlign::Center, 1),
@@ -187,6 +207,7 @@ fn fixture(settings: TypeSettings) -> FixtureBlocks {
         style: FontStyle::Regular,
         page_break_before: false,
         paragraph_end: true,
+        paragraph_start: None,
     });
     FixtureBlocks {
         blocks,
@@ -369,6 +390,7 @@ fn default_grid_uses_selected_panel_height() {
                 style: FontStyle::Regular,
                 page_break_before: false,
                 paragraph_end: index == lines - 1,
+                paragraph_start: None,
             })
             .collect();
         FixtureBlocks {
@@ -431,7 +453,13 @@ const MARKER: &[u8] = include_bytes!("../../../fixtures/images/orientation-test.
 /// `fixtures/images/shrink_orientation_marker.py`): it fits every page box
 /// unscaled, with lines of text above it on the same page.
 const SMALL_MARKER: &[u8] = include_bytes!("../../../fixtures/images/orientation-small.png");
-const MARKERS: [&[u8]; 2] = [SMALL_MARKER, MARKER];
+/// A 17 x 12 parallelogram, the size of the symbol Euclid sets inside a
+/// sentence, and a 75 x 75 initial T, the size of Alice's drop caps (see
+/// `fixtures/images/make_inline_images.py`).
+const SYMBOL: &[u8] = include_bytes!("../../../fixtures/images/inline-symbol.png");
+const INITIAL: &[u8] = include_bytes!("../../../fixtures/images/inline-initial.png");
+/// Every image the fixtures show, by the slot their tokens name.
+const MARKERS: [&[u8]; 4] = [SMALL_MARKER, MARKER, SYMBOL, INITIAL];
 
 /// A text line whose descenders hang over where an image below would start.
 fn descender_line(text: &str, paragraph_end: bool) -> FixtureBlock {
@@ -441,6 +469,7 @@ fn descender_line(text: &str, paragraph_end: bool) -> FixtureBlock {
         style: FontStyle::Regular,
         page_break_before: false,
         paragraph_end,
+        paragraph_start: None,
     }
 }
 
@@ -462,6 +491,7 @@ fn image_block(slot: u16, page_box: PageBox, alt: &str) -> FixtureBlock {
         style: FontStyle::Regular,
         page_break_before: false,
         paragraph_end: true,
+        paragraph_start: None,
     }
 }
 
@@ -582,6 +612,172 @@ fn assert_text_clears_image(
             tallest.is_some_and(|row| row <= end + bottom_gap),
             "marks should reach the bottom gap: tallest ink {tallest:?}, image ends {end}"
         );
+    }
+}
+
+/// The lines of a justified paragraph laid out as the firmware's line
+/// builder lays them out (greedily, each image one unit at its inline size,
+/// never split), from `template`, whose `{2}` and `{3}` stand for inline
+/// images in those slots. A paragraph whose first unit is a drop cap opens
+/// unindented, the drop cap in the indent's place.
+fn inline_paragraph(
+    template: &str,
+    page_box: PageBox,
+    settings: TypeSettings,
+) -> Vec<FixtureBlock> {
+    use proto::image::token::{encode_inline_image_token, inline_image_tokens, InlineImageToken};
+    let tokens: Vec<String> = [(2u16, 17u32, 12u32), (3, 75, 75)]
+        .into_iter()
+        .map(|(slot, width, height)| {
+            let (width, height) = ui::reading::fit_inline_image(page_box, width, height);
+            let mut out = [0u8; proto::image::token::INLINE_IMAGE_TOKEN_BYTES];
+            encode_inline_image_token(
+                InlineImageToken {
+                    slot,
+                    width,
+                    height,
+                },
+                &mut out,
+            )
+            .to_owned()
+        })
+        .collect();
+    let text = template
+        .replace("{2}", &tokens[0])
+        .replace("{3}", &tokens[1]);
+    let drop_cap = template.starts_with("{3}");
+    let limit = page_box.right - ui::reading::READER_WRAP_SAFETY;
+    let indent = ui::reading::paragraph_indent(settings.size);
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = String::new();
+    for word in text.split(' ') {
+        let opens = lines.is_empty() && !drop_cap;
+        let x = page_box.left + if opens { indent } else { 0 };
+        let candidate = if line.is_empty() {
+            word.to_owned()
+        } else {
+            format!("{line} {word}")
+        };
+        if line.is_empty()
+            || x + ui::reading::inline_line_ink_width(&candidate, settings, FontStyle::Regular)
+                <= limit
+        {
+            line = candidate;
+        } else {
+            lines.push(std::mem::replace(&mut line, word.to_owned()));
+        }
+    }
+    lines.push(line);
+    let count = lines.len();
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(index, text)| {
+            let tallest = inline_image_tokens(&text).map(|token| token.height).max();
+            FixtureBlock {
+                record: BlockRecord {
+                    image_height: tallest.map_or(0, BlockRecord::inline_image_field),
+                    ..record(TextRole::Body, TextAlign::Justify, 1)
+                },
+                text,
+                style: FontStyle::Regular,
+                page_break_before: false,
+                paragraph_end: index + 1 == count,
+                paragraph_start: (index == 0 && drop_cap).then_some(false),
+            }
+        })
+        .collect()
+}
+
+/// Euclid's sentence with its symbol inside a line, a justified line with
+/// symbols among its words, and Alice's chapter opening with its initial
+/// standing in the first line, below a line of descenders. That first line
+/// cannot take the dash-joined word after it beside the initial, and is
+/// justified all the same.
+fn inline_image_fixture(portrait: bool) -> FixtureBlocks {
+    let page_box = PageBox::for_portrait(portrait);
+    let settings = TypeSettings::DEFAULT;
+    let mut blocks = inline_paragraph(
+        "Dem.\u{2014}Complete the {2} AEBG. Draw DH, CI parallel to AG, BG. Join IH, and \
+         produce; then AB, CD, IH are concurrent, and the {2} on the diagonal is equal to \
+         the {2} beside it, which was to be shown.",
+        page_box,
+        settings,
+    );
+    blocks.push(descender_line("Quietly, a pygmy yak jogged past", true));
+    blocks.extend(inline_paragraph(
+        "{3}HEY were indeed a queer-looking party that assembled on the bank\u{2014}the \
+         birds with draggled feathers, the animals with their fur clinging close to them, \
+         and all dripping wet, cross, and uncomfortable.",
+        page_box,
+        settings,
+    ));
+    FixtureBlocks {
+        blocks,
+        settings,
+        portrait,
+    }
+}
+
+/// Inline images in every hold, on whichever panel this build is for: a
+/// small symbol standing on the baseline mid-sentence, justified lines
+/// whose gaps stretch around images, and a 64-row initial opening a
+/// paragraph in the indent's place, its line grown to clear the line
+/// above. Text is drawn first and checked clear of every image's rect and
+/// the rows that keep it apart, then the images through the decoder and
+/// the blit, as the firmware draws them.
+#[test]
+fn inline_image_pages_match_goldens() {
+    use display::fb::FbFrame;
+    for (frame, orientation) in [
+        (FbFrame::Native, "landscape"),
+        (FbFrame::Portrait, "portrait"),
+        (FbFrame::LandscapeFlipped, "landscape-flipped"),
+    ] {
+        let portrait = frame == FbFrame::Portrait;
+        let source = inline_image_fixture(portrait);
+        assert_eq!(paginate_block_pages(&source), 1, "{orientation}");
+        let page = page_record_at(&source, 0);
+        let mut fb = Framebuffer::new();
+        fb.set_frame(frame);
+        let mut images = Vec::new();
+        draw_reading_page_body(&mut fb, &source, page, |_, image| {
+            images.push((image.x, image.y, image.width, image.height));
+        });
+        // Three symbols and the initial, each on its line's baseline.
+        assert_eq!(images.len(), 4, "{orientation}");
+        let mut baselines = Vec::new();
+        ui::reading::for_each_drawable_block(&source, page, |block| {
+            baselines.push((block.y, block.record.has_inline_images()));
+            true
+        });
+        for &(x, y, width, height) in &images {
+            assert!(
+                baselines
+                    .iter()
+                    .any(|&(baseline, inline)| inline && y + height as i16 == baseline),
+                "{orientation}: image at {x},{y} {width}x{height} stands on no baseline"
+            );
+            assert_text_clears_image(&fb, (x, y, width, height), false, source.settings);
+        }
+        let initial = images
+            .iter()
+            .find(|image| image.3 == 64)
+            .expect("the initial");
+        let page_box = PageBox::for_portrait(portrait);
+        assert_eq!(
+            initial.0, page_box.left,
+            "the initial takes the indent's place"
+        );
+        ui::reading::for_each_drawable_block(&source, page, |block| {
+            if let Some(image) = block.image {
+                draw_marker(&mut fb, &image);
+            }
+            true
+        });
+        draw_reading_page_body(&mut fb, &source, page, |fb, image| draw_marker(fb, image));
+        draw_reading_page_counter_aligned(&mut fb, "1/1", frame == FbFrame::LandscapeFlipped);
+        assert_frame_matches_golden(&fb, &format!("reading-inline-{orientation}-0"));
     }
 }
 

@@ -111,6 +111,7 @@ use esp_rtos::embassy::InterruptExecutor;
 use static_cell::StaticCell;
 use tasks::input::InputPins;
 
+mod block_sink;
 mod book_images;
 pub mod catalog;
 mod custom_font;

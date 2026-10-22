@@ -98,6 +98,14 @@ impl PackRecord {
         self.path_check == path_hash as u32 && self.width == width && self.height == height
     }
 
+    /// Whether this record is a decode of the image at `path_hash` that a
+    /// rect of `width × height` holds: the fitted size, or a smaller one,
+    /// as when an image shown alone in a paragraph has since been shown
+    /// inside a line and decodes at its inline size.
+    pub fn fits_in(&self, path_hash: u64, width: u16, height: u16) -> bool {
+        self.path_check == path_hash as u32 && self.width <= width && self.height <= height
+    }
+
     pub fn encode(&self) -> [u8; PACK_RECORD_HEADER_BYTES] {
         let mut out = [0; PACK_RECORD_HEADER_BYTES];
         out[0..4].copy_from_slice(&PACK_RECORD_MAGIC);
@@ -155,6 +163,12 @@ mod tests {
         assert!(record.matches(0x1234_5678_9abc_def0, 586, 440));
         assert!(!record.matches(0x1234_5678_9abc_def0, 586, 439));
         assert!(!record.matches(0x1234_5678_0000_0000, 586, 440));
+        // A rect holds its own size or a larger one, of the same image.
+        assert!(record.fits_in(0x1234_5678_9abc_def0, 586, 440));
+        assert!(record.fits_in(0x1234_5678_9abc_def0, 700, 451));
+        assert!(!record.fits_in(0x1234_5678_9abc_def0, 585, 451));
+        assert!(!record.fits_in(0x1234_5678_9abc_def0, 700, 439));
+        assert!(!record.fits_in(0x1234_5678_0000_0000, 700, 451));
     }
 
     #[test]

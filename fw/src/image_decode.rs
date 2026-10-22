@@ -32,7 +32,7 @@
 //! Every buffer comes from the EPUB scratch, idle whenever no spine is
 //! being laid out (see [`ImageScratch`]), so decoding adds no static RAM.
 
-use crate::book_images::BookImages;
+use crate::book_images::{decoded_size, BookImages};
 use crate::reader_cache_files::read_exact_file;
 use crate::reader_store::ReaderStore;
 use core::cell::Cell;
@@ -48,7 +48,7 @@ pub(crate) use proto::image::pack::SPOOL_FILE;
 use proto::image::pack::{pack_file, PackRecord, MAX_PACK_BYTES};
 use proto::image::png::{PngDecoder, PngError};
 use proto::image::{LumaSink, SinkError};
-use ui::reading::{fit_image, PageBox};
+use ui::reading::{fit_image, fit_inline_image, fits_inline, PageBox};
 
 /// Largest deflated image spooled, by its declared size: about 14 s of
 /// card writes and reads at the X4's measured rates. Larger ones are
@@ -121,9 +121,18 @@ pub(crate) struct SessionStats {
     pub(crate) retry: u16,
     /// The pack was started afresh, so decodes recorded before are gone.
     pub(crate) pack_restarted: bool,
+    /// A page showed an image inside a line that had lost its inline mark,
+    /// and marking it again forgot a decode at its block size.
+    pub(crate) remarked: bool,
 }
 
 impl SessionStats {
+    /// Decodes recorded before may be gone, so what the store noted as
+    /// settled may not be.
+    pub(crate) fn forgot_decodes(&self) -> bool {
+        self.pack_restarted || self.remarked
+    }
+
     fn note(&mut self, outcome: DecodeOutcome) {
         let count = match outcome {
             DecodeOutcome::Decoded => &mut self.decoded,
@@ -163,19 +172,31 @@ fn png_fault(error: PngError) -> Fault {
 /// The size an image is decoded at in this orientation, when it still
 /// needs decoding there: an image the decoder takes, neither decoded nor
 /// failed in this orientation yet. Layout fitted it the same way, from the
-/// same source size and page box, so this is the size its blocks draw.
+/// same source size and page box, so this is the size its blocks draw, or
+/// its lines once layout has marked it inline (`decoded_size`).
 pub(crate) fn pending_size(entry: &ImageEntry, portrait: bool) -> Option<(u16, u16)> {
     (entry.probe == ProbeStatus::Supported
         && entry.width > 0
         && entry.height > 0
         && entry.decode(portrait).status == DecodeStatus::NotDecoded)
-        .then(|| {
-            fit_image(
-                PageBox::for_portrait(portrait),
-                entry.width.into(),
-                entry.height.into(),
-            )
-        })
+        .then(|| decoded_size(entry, portrait))
+}
+
+/// Whether a page draws `entry`'s image at `drawn`, its inline size in this
+/// orientation, which differs from its block size, while the entry has no
+/// inline mark: only a line can have asked for that size.
+fn shown_inline_unmarked(entry: &ImageEntry, drawn: (u16, u16), portrait: bool) -> bool {
+    if entry.inline
+        || entry.probe != ProbeStatus::Supported
+        || entry.width == 0
+        || entry.height == 0
+    {
+        return false;
+    }
+    let page_box = PageBox::for_portrait(portrait);
+    let (width, height) = (entry.width.into(), entry.height.into());
+    let inline = fit_inline_image(page_box, width, height);
+    fits_inline(width, height) && drawn == inline && inline != fit_image(page_box, width, height)
 }
 
 /// The pages whose images an idle session decodes before anything else,
@@ -376,9 +397,10 @@ impl<'a> PageImages<'a> {
 }
 
 /// The images page `page` shows, when the store holds it (the caller
-/// checks), at the size and in the order the page draws them. Reads
-/// nothing from the card, so a page without images costs a book nothing.
-/// False when the page is not held, or `out` filled before its last image.
+/// checks), at the size and in the order the page draws them: image blocks
+/// and the images inside its lines. Reads nothing from the card, so a page
+/// without images costs a book nothing. False when the page is not held,
+/// or `out` filled before its last image.
 pub(crate) fn resident_page_images(
     store: &ReaderStore,
     page: u32,
@@ -389,15 +411,11 @@ pub(crate) fn resident_page_images(
         return false;
     };
     let mut kept = true;
-    ui::reading::for_each_drawable_block(store, *record, |block| {
-        if let Some(image) = block.image.and_then(|image| {
-            image.slot.map(|slot| PageImage {
-                slot,
-                drawn: Some((image.width, image.height)),
-            })
-        }) {
-            kept = out.push(image);
-        }
+    ui::reading::for_each_page_image(store, *record, |slot, width, height| {
+        kept = out.push(PageImage {
+            slot,
+            drawn: Some((width, height)),
+        });
         kept
     });
     kept
@@ -474,18 +492,29 @@ where
     let Some(first) = store.pages.get(local).filter(|_| local < store.page_count) else {
         return place;
     };
-    let slot_of = |block: usize| {
-        store
-            .block_record(block)
-            .filter(|record| record.is_image())
-            .and_then(|_| proto::image::token::decode_image_token(store.block_text(block)))
-            .map(|token| token.slot)
+    // A block's first image, or its last, as a token names it.
+    let slot_of = |block: usize, last: bool| {
+        let record = store.block_record(block)?;
+        let text = store.block_text(block);
+        if record.is_image() {
+            return proto::image::token::decode_image_token(text).map(|token| token.slot);
+        }
+        if !record.has_inline_images() {
+            return None;
+        }
+        let mut tokens = proto::image::token::inline_image_tokens(text);
+        if last { tokens.last() } else { tokens.next() }.map(|token| token.slot)
     };
     let first = usize::from(first.first_block);
     let ahead = (first..store.block_count)
-        .find_map(slot_of)
+        .find_map(|block| slot_of(block, false))
         .map(|slot| (slot, 0));
-    let behind = || (0..first).rev().find_map(slot_of).map(|slot| (slot, 1));
+    let behind = || {
+        (0..first)
+            .rev()
+            .find_map(|block| slot_of(block, true))
+            .map(|slot| (slot, 1))
+    };
     if let Some((slot, past)) = ahead.or_else(behind) {
         if let Ok(Some(Some(seen))) = images.read(slot).map(|entry| entry.map(|e| e.seen_at)) {
             if seen.spine == spine {
@@ -571,9 +600,10 @@ where
     }
 
     /// Decodes a page's image unless it needs nothing here (see
-    /// [`pending_size`]), or the page draws it at another size than the
-    /// index fits it to, which only a damaged section can say. `None` when
-    /// nothing was tried.
+    /// [`pending_size`]), or the page draws it in a rect too small for the
+    /// size the index fits it to, which only a damaged section can say. (A
+    /// block whose image layout has since shown inside a line draws that
+    /// smaller decode in its larger rect.) `None` when nothing was tried.
     pub(crate) fn decode_page_image(
         &mut self,
         image: PageImage,
@@ -581,7 +611,7 @@ where
         gives_way: &dyn Fn() -> bool,
     ) -> Option<DecodeOutcome> {
         self.stats.checked = self.stats.checked.saturating_add(1);
-        let entry = match self.images.read(image.slot) {
+        let mut entry = match self.images.read(image.slot) {
             Ok(Some(entry)) => entry,
             Ok(None) => return None,
             Err(()) => {
@@ -589,8 +619,26 @@ where
                 return Some(DecodeOutcome::Retry);
             }
         };
+        if image
+            .drawn
+            .is_some_and(|drawn| shown_inline_unmarked(&entry, drawn, self.portrait))
+        {
+            // The page shows it inside a line, but its entry lost the mark
+            // (the index was built again while the sections lasted, or a
+            // torn write read back fresh): mark it again, so it decodes at
+            // the size the line draws rather than never.
+            let forgot = crate::book_images::mark_entry_inline(&mut entry);
+            if self.images.write_state(image.slot, &entry).is_err() {
+                self.stats.note(DecodeOutcome::Retry);
+                return Some(DecodeOutcome::Retry);
+            }
+            self.stats.remarked |= forgot;
+        }
         let size = pending_size(&entry, self.portrait)?;
-        if image.drawn.is_some_and(|drawn| drawn != size) {
+        if image
+            .drawn
+            .is_some_and(|(width, height)| width < size.0 || height < size.1)
+        {
             return None;
         }
         Some(self.decode(image.slot, entry, size, scratch, gives_way))

@@ -1463,8 +1463,9 @@ where
 
 /// The index slots of the images page `page` of `section` shows, read from
 /// its section file without loading it into the store, which keeps the
-/// page on screen: the header, the page's record, its block records, and
-/// the head of each image block's token, a few small reads in all. For the
+/// page on screen: the header, the page's record, its block records, the
+/// head of each image block's token, and the text of each line holding
+/// images (a few dozen bytes at a time), a few small reads in all. For the
 /// pages near the reader's that the store does not hold. A section laid
 /// out for other settings (its page records would not be this layout's),
 /// or one that does not add up, lists nothing; the request for the page
@@ -1547,6 +1548,13 @@ where
             let Ok(record) = decode_block(bytes) else {
                 return false;
             };
+            if record.has_inline_images() {
+                match visit_line_images(&file, text_at, header.text_bytes, record, &mut visit) {
+                    Some(true) => continue,
+                    Some(false) => return true,
+                    None => return false,
+                }
+            }
             let head_end = record
                 .text_offset
                 .checked_add(proto::image::token::IMAGE_TOKEN_HEAD_BYTES as u32);
@@ -1574,6 +1582,61 @@ where
         block += count;
     }
     true
+}
+
+/// Calls `visit` with the slot of each image inside a line of a section
+/// file whose text starts at `text_at` (`text_bytes` long), reading the
+/// line a few dozen bytes at a time. `Some(false)` when `visit` stopped,
+/// `None` when the line does not lie inside the text or a read fails.
+fn visit_line_images<D, T, const ND: usize, const NF: usize, const NV: usize>(
+    file: &File<'_, D, T, ND, NF, NV>,
+    text_at: u32,
+    text_bytes: u32,
+    record: proto::cache::BlockRecord,
+    visit: &mut impl FnMut(u16) -> bool,
+) -> Option<bool>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    use proto::image::token::{inline_image_token_at, INLINE_IMAGE_TOKEN_BYTES};
+    const PIECE: usize = 64;
+    let end = record.text_offset.checked_add(u32::from(record.text_len))?;
+    if end > text_bytes {
+        return None;
+    }
+    let mut piece = [0u8; PIECE];
+    let mut at = record.text_offset;
+    while at < end {
+        let len = (end - at).min(PIECE as u32) as usize;
+        let bytes = &mut piece[..len];
+        file.seek_from_start(text_at.checked_add(at)?).ok()?;
+        read_exact_file(file, bytes).ok()?;
+        // Read on from where a token could still begin, so one cut by the
+        // piece's end is read whole with the next.
+        let last = end - at <= PIECE as u32;
+        let scan = if last {
+            len
+        } else {
+            len - (INLINE_IMAGE_TOKEN_BYTES - 1)
+        };
+        let mut index = 0;
+        let mut next = scan;
+        while index < scan {
+            match inline_image_token_at(&bytes[index..]) {
+                Some(token) => {
+                    if !visit(token.slot) {
+                        return Some(false);
+                    }
+                    index += INLINE_IMAGE_TOKEN_BYTES;
+                    next = next.max(index);
+                }
+                None => index += 1,
+            }
+        }
+        at += next as u32;
+    }
+    Some(true)
 }
 
 fn open_or_make_dir<

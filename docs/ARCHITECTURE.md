@@ -94,7 +94,7 @@ ui/        shared shell rendering plus ui::reading, the reader page-plan seam
            (page bounds, ink measurement, wrapping) used by fw and host tools
 proto/     bounded book/storage/text/cache models plus ZIP/EPUB/XHTML parser pieces,
            and book images (proto::image: the IMAGES.BIN index, image paths,
-           image-block tokens, streaming PNG decode, dithering)
+           image tokens, streaming PNG decode, dithering)
 tools/emulator/ host-side development emulator and scenario runner
 tools/cargo.sh  rustup Cargo wrapper on the toolchain pinned in rust-toolchain.toml
 tools/bench/    serial bench harness for hardware timing, storage/cache,
@@ -396,18 +396,27 @@ and the host preview tool:
   single XHTML extraction path feeding bounded block records. Images reach
   the sink through `XhtmlBlockSink::push_image` as raw `src`/`alt` slices
   (and, for a sink that asks, the first `<image>` of each `<svg>`); the
-  default pushes the alt-text placeholder.
+  default pushes the alt-text placeholder. The parser ends the paragraph
+  before an `<img>` unless the sink `wants_inline_images`: then it ends only
+  the open run, the image belongs to the paragraph, and one in a block that
+  floats left goes to `push_floated_image`.
 - `proto::image` for images in books: `path` resolves an image `src` against
   its chapter's ZIP path and hashes it, `index` owns the per-book
   `IMAGES.BIN` format (entries from the ZIP central directory, sorted by
   path hash, probed and decoded state filled in place), `token` is the
-  text an image block stores, and `pack` is the record a decoded image
-  keeps in its orientation's pack. An image block is a `BlockRecord` whose
-  `image_height` (the record's last two bytes, zero in caches before v28)
-  is non-zero; `ui::reading` fits images with `fit_image`, gives the block
-  gaps above and below so the neighbouring lines' descenders and tallest
-  marks clear the image by a row, and hands its rect to the page's image
-  drawer.
+  text an image block stores and the 15-byte token (U+FFFC, slot, width,
+  height) a line carries for each image inside it, and `pack` is the record
+  a decoded image keeps in its orientation's pack. An image block is a
+  `BlockRecord` whose `image_height` (the record's last two bytes, zero in
+  caches before v28) is non-zero and under `BlockRecord::INLINE_IMAGES`
+  (0x8000); a line holding images has that bit set and its tallest image's
+  height in the low bits. `ui::reading` fits block images with `fit_image`
+  and inline ones with `fit_inline_image` (at most 64 rows,
+  `INLINE_IMAGE_MAX_HEIGHT`, whatever the type settings), gives a block
+  image gaps above and below so the neighbouring lines' descenders and
+  tallest marks clear it by a row, grows a line holding images by the same
+  gaps (`inline_line_ascent`) with each image standing on its baseline, and
+  hands every image's rect to the page's image drawer.
 - `hyphen::word_breaks` for where a word may break at a line end: the book's
   soft hyphens (the only breaks when present), dashes already in a compound,
   and for English (`dc:language` `en*`), Liang's algorithm over the US English
@@ -422,7 +431,8 @@ and the host preview tool:
   `SectionHeader`, `PageCacheHeader`, `LineRecord`, and `WordRecord` remain in
   `proto::cache` only for the disabled V1 migration path.
 
-The firmware's line builder wraps greedily at word spaces. When a word no
+The firmware's line builder (`fw::block_sink`, the XHTML block sink a
+spine's layout streams into) wraps greedily at word spaces. When a word no
 longer fits a justified body line, `ui::reading::worth_hyphenating` decides
 whether moving it would leave the line loose (each gap growing by more than
 half a space; after two hyphenated lines in a row, by more than a whole
@@ -437,7 +447,10 @@ paragraph's last word is never split, and a word wider than
 a whole line breaks wherever it can. At draw time, `justify_extra` leaves a
 line at natural spacing rather than open gaps past one and a half spaces, as
 well as lines under two thirds of the measure. Soft hyphens survive
-normalisation as break hints and are stripped from stored lines.
+normalisation as break hints and are stripped from stored lines. An image
+inside a line is one unit of its fitted width, measured as an object
+(`StyledInkCursor::push_object`) and never split or hyphenated; justified
+gaps stretch around it as around a word.
 
 All of this applies to text the book sets justified, which is the body
 default. The Alignment setting's Left choice turns that text left-aligned
@@ -595,6 +608,30 @@ take keeps its alt-text placeholder; an svg-wrapped image, which never had
 one, leaves nothing. The index does not depend on type settings, so it
 survives every relayout, and it goes with the book's cache directory.
 
+An `<img>` whose paragraph also holds text goes inside that paragraph's
+lines (`fw::block_sink`); one alone in its paragraph, every svg image, and
+every illustration (taller than 128 rows alone in a paragraph in either
+orientation, `ui::reading::fits_inline`) stays an image block, an
+illustration ending the paragraph around it. For such a sink `<figure>` and
+`<figcaption>` are blocks. The parser streams, so an image met before any of
+its paragraph's text is held back, as a small record in the idle tail of
+the container scratch (its slot, both fitted sizes, and its block token or
+alt text): the paragraph's first text places the images held inline ahead
+of it, and a paragraph that ends without text sends them out as blocks.
+Spacing among held images is held with them, in order, and text the
+sanitizer drops does not count. An inline image that cannot be shown
+leaves its alt text in the line in italics. A drop cap that Project Gutenberg floats in a block of its own
+(class `figleft`, a single-letter alt) carries into the next paragraph, when
+that is body text beginning with a letter, and opens its first line in place
+of the indent. A line holding images is justified whenever it fills two
+thirds of the measure (`justify_inline_extra`). An image shown inside a line
+at a size other than its block size (one taller than 64 rows) gets the
+index entry's sticky `inline` mark and decodes at its inline size from
+then on, once per orientation; a block-size decode it had is forgotten in
+the same write wherever the two sizes differ, and its block uses draw the
+smaller decode centred in their box. A page asking for an unmarked image at
+its inline size marks it again before decoding.
+
 Each image is decoded once per orientation, at the size layout fitted it
 to, into an append-only pack in the book's cache directory (`IMGL.BIN`,
 which flipped landscape shares, and `IMGP.BIN`; `proto::image::pack`,
@@ -654,24 +691,31 @@ nothing after a page turn but its pages' draws. Decode state only moves
 toward settled until the index is rebuilt, so the note lasts until the
 book, its layout or its index changes, or a fresh build numbers its pages
 anew; a spine laid out keeps the pages' note but unsettles the book. A
-book without images, or a page without image blocks, does none of this
-and reads nothing more. An orientation change decodes into the other pack
+book without images, or a page without images, does none of this
+and reads nothing more. A page's images include those inside its lines,
+found by walking their tokens (in the store, or a section file's line text
+64 bytes at a time). An orientation change decodes into the other pack
 as its pages are asked for and idle steps reach them; a change of type
 settings decodes nothing again.
 
 Caches from before image blocks (v27) are still read. The first load of
 such a book's index reads its ZIP's central directory once: without PNGs
-(a JPEG cover alone does not count) the index is written again as v28, as
-it stands, and with them the book rebuilds, pinned to the reader's place,
-so its images replace the alt text it was laid out with.
+(a JPEG cover alone does not count) the index is written again as the
+current version (v29), as it stands, and with them the book rebuilds,
+pinned to the reader's place, so its images replace the alt text it was
+laid out with. v28 caches, which only development builds wrote before
+images went inside lines, rebuild.
 
 A reading page draws its images from the book's packs (`fw::page_images`).
 Pages draw from RAM outside any SD session, as before, unless the book has
-images and the page holds an image block; such a page is drawn inside a
-session, as a page in a custom face from the card is. Each image block reads
-its index entry and, if the image is decoded for the orientation, its pack
-record's header, and draws only a record that is the image the block names,
-at the size layout fitted, lying inside the pack. The rows stream from the
+images and the page holds an image block or a line with images inside it;
+such a page is drawn inside a session, as a page in a custom face from the
+card is. Each image reads its index entry and, if the image is decoded for
+the orientation, its pack record's header, and draws only a record that is
+the image the page names, no larger than the rect layout reserved (a block
+whose image is also shown inside a line draws its smaller decode centred),
+lying inside the pack. An inline image that cannot be drawn shows the
+outline of its rect. The rows stream from the
 card a band at a time through the panel transfer band (only panel transfers
 fill it, so it is idle while a frame draws) into `Framebuffer::blit`, never
 reading past the record. Anything else draws the alt-text placeholder: a

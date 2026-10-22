@@ -1,8 +1,11 @@
-//! The text an image block stores in a section's text blob.
+//! The text that names an image in a section's text blob: an image block's
+//! token, and the tokens a line of text carries for its inline images.
 //!
 //! A section keeps every block's text in one UTF-8 blob, and an image block
-//! (a [`crate::cache::BlockRecord`] with a non-zero `image_height`) uses its
-//! share for a token naming the image:
+//! (a [`crate::cache::BlockRecord`] whose [`is_image`] holds) uses its share
+//! for a token naming the image:
+//!
+//! [`is_image`]: crate::cache::BlockRecord::is_image
 //!
 //! ```text
 //! U+FFFC  slot (4 hex digits)  width (4 hex digits)  alt text
@@ -31,6 +34,26 @@
 //! Nothing reads a block's text as a token unless its record says it is an
 //! image block, and the image drawer shows the alt in italic by convention,
 //! as the placeholder always was.
+//!
+//! # Inline images
+//!
+//! An image inside a line of text is a token of its own in the line, with
+//! no alt (an inline image that cannot be drawn shows an outline):
+//!
+//! ```text
+//! U+FFFC  slot (4 hex digits)  width (4 hex digits)  height (4 hex digits)
+//! "Complete the \u{FFFC}002a0011000c AEBG"
+//! ```
+//!
+//! The width and height are the image's fitted size in the layout the
+//! section was built for. Only a line whose record says it holds inline
+//! images ([`crate::cache::BlockRecord::has_inline_images`]) is read for
+//! these tokens, so the same characters in a book's own text are never
+//! taken for one; a sink that writes tokens drops U+FFFC from the book's
+//! text besides. A U+FFFC that is not followed by twelve hex digits is
+//! text. A token holds no space, no style marker and no control character,
+//! so the stored-line rules hold for a line that carries tokens as they do
+//! for any other.
 
 use crate::epub::decode_html_entity;
 
@@ -43,6 +66,13 @@ pub const IMAGE_TOKEN_HEAD_BYTES: usize = IMAGE_TOKEN_MARK.len_utf8() + 8;
 pub const IMAGE_ALT_MAX_BYTES: usize = 160;
 /// Longest token.
 pub const IMAGE_TOKEN_MAX_BYTES: usize = IMAGE_TOKEN_HEAD_BYTES + IMAGE_ALT_MAX_BYTES;
+
+/// Bytes of an inline image token: the mark and three four-digit hex fields.
+pub const INLINE_IMAGE_TOKEN_BYTES: usize = IMAGE_TOKEN_MARK.len_utf8() + 12;
+
+/// [`IMAGE_TOKEN_MARK`] as UTF-8.
+const MARK_BYTES: [u8; 3] = [0xEF, 0xBF, 0xBC];
+const _: () = assert!(IMAGE_TOKEN_MARK.len_utf8() == MARK_BYTES.len());
 
 /// A decoded token. `alt` borrows from the block text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,6 +141,115 @@ pub fn decode_image_token(text: &str) -> Option<ImageToken<'_>> {
     })
 }
 
+/// An image inside a line of text, as its token names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InlineImageToken {
+    pub slot: u16,
+    pub width: u16,
+    pub height: u16,
+}
+
+/// Writes the token for an inline image into `out` and returns it.
+pub fn encode_inline_image_token(
+    token: InlineImageToken,
+    out: &mut [u8; INLINE_IMAGE_TOKEN_BYTES],
+) -> &str {
+    out[..MARK_BYTES.len()].copy_from_slice(&MARK_BYTES);
+    let fields = [token.slot, token.width, token.height];
+    for (index, value) in fields.into_iter().enumerate() {
+        let at = MARK_BYTES.len() + 4 * index;
+        write_hex(&mut out[at..at + 4], value);
+    }
+    // The mark, then ASCII digits.
+    core::str::from_utf8(&out[..]).unwrap_or("")
+}
+
+/// The inline token that `bytes` starts with, if they start with a whole
+/// one. Works on raw bytes, so a caller can scan a line read a piece at a
+/// time without checking each piece is UTF-8.
+pub fn inline_image_token_at(bytes: &[u8]) -> Option<InlineImageToken> {
+    let token = bytes.get(..INLINE_IMAGE_TOKEN_BYTES)?;
+    if token[..MARK_BYTES.len()] != MARK_BYTES {
+        return None;
+    }
+    let field = |index: usize| {
+        let at = MARK_BYTES.len() + 4 * index;
+        read_hex(&token[at..at + 4])
+    };
+    Some(InlineImageToken {
+        slot: field(0)?,
+        width: field(1)?,
+        height: field(2)?,
+    })
+}
+
+/// A piece of a line that holds inline images: a run of text (style
+/// markers and all), or an image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InlinePiece<'a> {
+    Text(&'a str),
+    Image(InlineImageToken),
+}
+
+/// Splits a line that holds inline images into runs of text and images, in
+/// order. Text runs are never empty.
+pub fn inline_pieces(line: &str) -> InlinePieces<'_> {
+    InlinePieces { line, cursor: 0 }
+}
+
+/// The iterator [`inline_pieces`] returns.
+#[derive(Clone)]
+pub struct InlinePieces<'a> {
+    line: &'a str,
+    cursor: usize,
+}
+
+impl<'a> Iterator for InlinePieces<'a> {
+    type Item = InlinePiece<'a>;
+
+    fn next(&mut self) -> Option<InlinePiece<'a>> {
+        let rest = self
+            .line
+            .get(self.cursor..)
+            .filter(|rest| !rest.is_empty())?;
+        if let Some(token) = inline_image_token_at(rest.as_bytes()) {
+            self.cursor += INLINE_IMAGE_TOKEN_BYTES;
+            return Some(InlinePiece::Image(token));
+        }
+        // Text runs to the next whole token. The mark is three bytes that
+        // only ever begin a character, so every place found is a
+        // character boundary.
+        let bytes = rest.as_bytes();
+        let mut end = rest.len();
+        let mut search = 1;
+        while let Some(found) = find_mark(&bytes[search..]) {
+            let at = search + found;
+            if inline_image_token_at(&bytes[at..]).is_some() {
+                end = at;
+                break;
+            }
+            search = at + MARK_BYTES.len();
+        }
+        self.cursor += end;
+        Some(InlinePiece::Text(&rest[..end]))
+    }
+}
+
+/// Where the next mark starts in `bytes`.
+fn find_mark(bytes: &[u8]) -> Option<usize> {
+    bytes
+        .windows(MARK_BYTES.len())
+        .position(|window| window == MARK_BYTES)
+}
+
+/// The inline images in a line, in order.
+pub fn inline_image_tokens(line: &str) -> impl Iterator<Item = InlineImageToken> + '_ {
+    inline_pieces(line).filter_map(|piece| match piece {
+        InlinePiece::Image(token) => Some(token),
+        InlinePiece::Text(_) => None,
+    })
+}
+
 /// `raw` with HTML entities decoded, one character at a time.
 fn decoded_chars(raw: &str) -> impl Iterator<Item = char> + '_ {
     let mut cursor = 0usize;
@@ -149,6 +288,7 @@ mod tests {
     extern crate std;
 
     use super::*;
+    use std::format;
     use std::string::String;
 
     /// The stored-line rules the firmware's spacing reflow enforces
@@ -242,6 +382,127 @@ mod tests {
             decode_image_token("\u{FFFC}00FF0A00").map(|t| (t.slot, t.width)),
             Some((255, 2560))
         );
+    }
+
+    fn inline(slot: u16, width: u16, height: u16) -> String {
+        let mut out = [0u8; INLINE_IMAGE_TOKEN_BYTES];
+        encode_inline_image_token(
+            InlineImageToken {
+                slot,
+                width,
+                height,
+            },
+            &mut out,
+        )
+        .into()
+    }
+
+    #[test]
+    fn inline_tokens_round_trip_and_split_their_line() {
+        let symbol = InlineImageToken {
+            slot: 0x2a,
+            width: 17,
+            height: 12,
+        };
+        let text = inline(0x2a, 17, 12);
+        assert_eq!(text, "\u{FFFC}002a0011000c");
+        assert_eq!(text.len(), INLINE_IMAGE_TOKEN_BYTES);
+        assert_eq!(inline_image_token_at(text.as_bytes()), Some(symbol));
+        assert!(passes_reflow_rules(&text));
+
+        // Hex digits after a token are the next word's, not the token's.
+        let line = format!("Complete the {text}AEBG. Then {text}");
+        let pieces: std::vec::Vec<_> = inline_pieces(&line).collect();
+        assert_eq!(
+            pieces,
+            [
+                InlinePiece::Text("Complete the "),
+                InlinePiece::Image(symbol),
+                InlinePiece::Text("AEBG. Then "),
+                InlinePiece::Image(symbol),
+            ]
+        );
+        assert_eq!(inline_image_tokens(&line).count(), 2);
+        let line = format!("{text}{}", inline(1, 64, 64));
+        assert_eq!(
+            inline_pieces(&line).collect::<std::vec::Vec<_>>(),
+            [
+                InlinePiece::Image(symbol),
+                InlinePiece::Image(InlineImageToken {
+                    slot: 1,
+                    width: 64,
+                    height: 64,
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_mark_without_a_whole_token_is_text() {
+        let whole = inline(3, 4, 5);
+        for line in [
+            "\u{FFFC}",
+            "a \u{FFFC}0003 b",
+            "\u{FFFC}00030004000g",
+            "\u{FFFC}\u{FFFC}",
+            "plain \u{1b}2styled",
+        ] {
+            let pieces: std::vec::Vec<_> = inline_pieces(line).collect();
+            assert_eq!(pieces, [InlinePiece::Text(line)], "{line:?}");
+        }
+        // A broken token, then a whole one: the broken one stays text.
+        let line = format!("x\u{FFFC}12{whole}y");
+        let pieces: std::vec::Vec<_> = inline_pieces(&line).collect();
+        assert_eq!(
+            pieces,
+            [
+                InlinePiece::Text("x\u{FFFC}12"),
+                InlinePiece::Image(InlineImageToken {
+                    slot: 3,
+                    width: 4,
+                    height: 5,
+                }),
+                InlinePiece::Text("y"),
+            ]
+        );
+        assert_eq!(inline_pieces("").count(), 0);
+        // Cut anywhere, a token reads only when whole.
+        for cut in 0..whole.len() {
+            assert_eq!(inline_image_token_at(&whole.as_bytes()[..cut]), None);
+        }
+    }
+
+    #[test]
+    fn inline_pieces_cover_every_line_in_order() {
+        let pieces = ["a", "é ", "\u{FFFC}", "0", "\u{1b}1", " ", "世"];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        for _ in 0..3_000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let mut line = String::new();
+            for step in 0..(seed % 24) {
+                let pick = (seed >> (step % 40)) % (pieces.len() as u64 + 1);
+                match pieces.get(pick as usize) {
+                    Some(piece) => line.push_str(piece),
+                    None => line.push_str(&inline((seed >> 8) as u16, 9, 7)),
+                }
+            }
+            // Joined back up, the pieces are the line.
+            let mut joined = String::new();
+            for piece in inline_pieces(&line) {
+                match piece {
+                    InlinePiece::Text(text) => {
+                        assert!(!text.is_empty());
+                        joined.push_str(text);
+                    }
+                    InlinePiece::Image(token) => {
+                        joined.push_str(&inline(token.slot, token.width, token.height))
+                    }
+                }
+            }
+            assert_eq!(joined, line);
+        }
     }
 
     #[test]

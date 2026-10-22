@@ -3,23 +3,27 @@
 //! Each decoded image is a record in its orientation's pack in the book's
 //! cache directory (`proto::image::pack`), and the image index
 //! (`IMAGES.BIN`) says whether it is decoded and where its record starts. A
-//! page whose blocks include images is drawn inside an SD session, and
-//! [`draw_page`] hands its draw a drawer for them. For each image block the
-//! drawer reads the block's index entry and, when the image is decoded for
-//! this orientation, the record's header, and checks that the record is the
-//! image the block names at the size layout reserved and lies inside the
-//! pack. Its rows then stream from the card a band at a time into a
-//! borrowed buffer, and from there into the frame through
-//! `Framebuffer::blit`, which turns them for the frame.
+//! page whose blocks include images, image blocks or images inside its
+//! lines, is drawn inside an SD session, and [`draw_page`] hands its draw a
+//! drawer for them. For each image the drawer reads its index entry and,
+//! when the image is decoded for this orientation, the record's header, and
+//! checks that the record is the image the page names, no larger than the
+//! rect layout reserved, and lies inside the pack. Its rows then stream
+//! from the card a band at a time into a borrowed buffer, and from there
+//! into the frame through `Framebuffer::blit`, which turns them for the
+//! frame, centred in the rect. A record matches its rect exactly, except
+//! for a block whose image layout has since shown inside a line: the image
+//! then decodes at its smaller inline size, which the block draws centred.
 //!
-//! Anything else draws the block's placeholder, an outline with the alt
-//! text: no slot in the token, a damaged index or index entry, an image not
-//! decoded for this orientation or whose decode failed, a header that does
-//! not match or a record past the pack's end, or a failed read. Reads never
-//! go past the record: its header, then exactly its rows. Only a card error
-//! part way through the rows leaves some drawn; they are cleared for the
-//! placeholder, and the page's later images draw theirs without reading.
-//! A page without image blocks opens nothing.
+//! Anything else draws the image's placeholder, an outline with the alt
+//! text (an inline image has none): no slot in the token, a damaged index
+//! or index entry, an image not decoded for this orientation or whose
+//! decode failed, a header that does not match or a record past the pack's
+//! end, or a failed read. Reads never go past the record: its header, then
+//! exactly its rows. Only a card error part way through the rows leaves
+//! some drawn; they are cleared for the placeholder, and the page's later
+//! images draw theirs without reading. A page without images opens
+//! nothing.
 
 use crate::book_images::CardIndex;
 use crate::reader_cache_files::read_exact_file;
@@ -34,12 +38,13 @@ use proto::image::index::{
 use proto::image::pack::{pack_file, PackRecord, PACK_RECORD_HEADER_BYTES};
 use ui::reading::{draw_image_placeholder, ReaderImage};
 
-/// What a page's draw hands each image block to.
+/// What a page's draw hands each image to.
 pub(crate) type ImageDrawer<'a> = dyn FnMut(&mut Framebuffer, &ReaderImage<'_>) + 'a;
 
-/// Runs `draw`, the page's draw, with the drawer for `page`'s image blocks,
-/// then prints the page's `image_draw` bench line when it drew any. When
-/// `page` has image blocks, the drawer reads the book's index and pack for
+/// Runs `draw`, the page's draw, with the drawer for `page`'s images (its
+/// image blocks and the images inside its lines), then prints the page's
+/// `image_draw` bench line when it drew any. When `page` has images, the
+/// drawer reads the book's index and pack for
 /// the layout's orientation (the book is `book_id`'s) and streams rows
 /// through `band`, a buffer idle while a page draws. `clock` gives
 /// microseconds, for the bench line.
@@ -208,6 +213,9 @@ where
             }
         };
         // The rows follow the header, which the pack was just read past.
+        // A record smaller than its rect sits in the rect's middle.
+        let x = i32::from(image.x) + i32::from((image.width - record.width) / 2);
+        let y = i32::from(image.y) + i32::from((image.height - record.height) / 2);
         let stride = usize::from(record.stride);
         let rows_per_band = band.len() / stride;
         if rows_per_band == 0 {
@@ -231,8 +239,8 @@ where
             }
             let started = clock();
             fb.blit(
-                i32::from(image.x),
-                i32::from(image.y),
+                x,
+                y,
                 ImageRows {
                     width: usize::from(record.width),
                     stride,
@@ -265,11 +273,11 @@ where
     }
 }
 
-/// The pack record for image block `image`, whose token names `slot`,
-/// with the pack read just past its header: `None` when the image is not
-/// decoded for this orientation, its entry is damaged, or the record is
-/// not the image at the size layout reserved or does not lie inside the
-/// pack (`pack_len` bytes). Err when a read fails.
+/// The pack record for `image`, whose token names `slot`, with the pack
+/// read just past its header: `None` when the image is not decoded for
+/// this orientation, its entry is damaged, or the record is not the image,
+/// is larger than the rect layout reserved, or does not lie inside the pack
+/// (`pack_len` bytes). Err when a read fails.
 fn find_record<D, T, const ND: usize, const NF: usize, const NV: usize>(
     index: &File<'_, D, T, ND, NF, NV>,
     header: &ImageIndexHeader,
@@ -301,7 +309,7 @@ where
     let mut head = [0u8; PACK_RECORD_HEADER_BYTES];
     read_at(pack, decode.pack_offset, &mut head)?;
     Ok(PackRecord::decode(&head).filter(|record| {
-        record.matches(entry.path_hash, image.width, image.height) && fits(record.record_len())
+        record.fits_in(entry.path_hash, image.width, image.height) && fits(record.record_len())
     }))
 }
 

@@ -430,19 +430,21 @@ fn a_first_pass_marks_images_the_probe_sorts_and_the_second_pass_shows() {
     // The second pass shows what the decoder takes, fitted to the page.
     assert_eq!(
         place(&images, "../images/small.png", false),
-        ImagePlacement::Block {
+        ImagePlacement::Shown {
             slot: slots[0],
-            width: 213,
-            height: 300,
+            block: (213, 300),
+            // An illustration: too tall to go inside a line.
+            inline: None,
+            inline_marked: false,
         }
     );
-    let (width, height) = ui::reading::fit_image(PageBox::LANDSCAPE, 640, 900);
     assert_eq!(
         place(&images, "../images/large.png", false),
-        ImagePlacement::Block {
+        ImagePlacement::Shown {
             slot: slots[1],
-            width,
-            height,
+            block: ui::reading::fit_image(PageBox::LANDSCAPE, 640, 900),
+            inline: None,
+            inline_marked: false,
         },
         "a deflated image probes through the inflater"
     );
@@ -459,7 +461,7 @@ fn a_first_pass_marks_images_the_probe_sorts_and_the_second_pass_shows() {
     let writes = disk.writes.get();
     assert!(matches!(
         place(&images, "../images/small.png", true),
-        ImagePlacement::Block { .. }
+        ImagePlacement::Shown { .. }
     ));
     assert_eq!(disk.writes.get(), writes);
 }
@@ -596,4 +598,103 @@ fn the_custom_face_hands_image_blocks_to_the_image_drawer() {
     ));
     let (x1, y1) = (x as usize + w as usize - 1, y as usize + h as usize - 1);
     assert!(!fb.pixel(x as usize, y as usize) && !fb.pixel(x1, y1));
+}
+
+#[test]
+fn the_custom_face_stands_inline_images_in_their_lines() {
+    use display::font::{FontFamily, FontStyle, TypeSettings};
+    use proto::image::token::{encode_inline_image_token, InlineImageToken};
+    use proto::text::{TextAlign, TextRole};
+    let disk = fat::Disk::new();
+    let manager: VolumeManager<_, _, 8, 8, 1> =
+        VolumeManager::new_with_limits(&disk, fat::Clock, 0);
+    let volume = manager.open_volume(VolumeIdx(0)).unwrap();
+    let root = volume.open_root_dir().unwrap();
+    {
+        root.make_dir_in_dir(proto::cache::CACHE_ROOT_DIR).unwrap();
+        let xteink = root.open_dir(proto::cache::CACHE_ROOT_DIR).unwrap();
+        xteink
+            .make_dir_in_dir(proto::font_pack::FONT_PACK_DIR)
+            .unwrap();
+        let fonts = xteink.open_dir(proto::font_pack::FONT_PACK_DIR).unwrap();
+        let pack = fonts
+            .open_file_in_dir(proto::font_pack::FONT_PACK_FILE, Mode::ReadWriteCreate)
+            .unwrap();
+        pack.write(include_bytes!("../../fw/src/custom_font/bench_font.fnt"))
+            .unwrap();
+    }
+    let manifest = reader_cache_files::read_custom_font_manifest(&root).expect("pack");
+    let mut store = ReaderStore::new();
+    store.set_custom_font(
+        Some(manifest.name.as_str()),
+        manifest.identity,
+        &manifest.faces[..manifest.face_count],
+    );
+    store.set_layout(
+        TypeSettings {
+            family: FontFamily::Custom,
+            ..TypeSettings::DEFAULT
+        },
+        false,
+    );
+    let mut token = [0u8; proto::image::token::INLINE_IMAGE_TOKEN_BYTES];
+    let token = encode_inline_image_token(
+        InlineImageToken {
+            slot: 5,
+            width: 30,
+            height: 40,
+        },
+        &mut token,
+    );
+    let line = format!("AAAA {token} AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA");
+    let (regular, body) = (FontStyle::Regular, TextRole::Body);
+    for (align, end) in [
+        (TextAlign::Left, true),
+        (TextAlign::Justify, false),
+        (TextAlign::Center, true),
+    ] {
+        assert!(store.push_line_block(&line, regular, body, align, end, 0));
+        store.mark_last_block_inline_images(40);
+    }
+    reader_layout::rebuild_page_index(&mut store);
+    assert_eq!(store.page_count, 1);
+
+    let mut metrics = custom_font::MetricCache::new();
+    let mut fb = display::fb::Framebuffer::new();
+    fb.set_frame(display::fb::FbFrame::Landscape);
+    let mut drawn = Vec::new();
+    assert!(custom_font::draw_reading_page_body(
+        &root,
+        &mut fb,
+        &store,
+        &mut metrics,
+        store.pages[0],
+        |_, image| drawn.push((image.x, image.y, image.width, image.height, image.slot)),
+    ));
+    let mut baselines = Vec::new();
+    ui::reading::for_each_drawable_block(&store, store.pages[0], |block| {
+        baselines.push(block.y);
+        true
+    });
+    assert_eq!(drawn.len(), 3);
+    let ink = |fb: &display::fb::Framebuffer, x0: i16, y0: i16, x1: i16, y1: i16| {
+        (y0..y1)
+            .flat_map(|y| (x0..x1).map(move |x| (x, y)))
+            .filter(|&(x, y)| !fb.pixel(x as usize, y as usize))
+            .count()
+    };
+    for (index, &(x, y, w, h, slot)) in drawn.iter().enumerate() {
+        assert_eq!((w, h, slot), (30, 40, Some(5)));
+        // On the baseline, with the line's text on either side of it and
+        // none of its token drawn as glyphs.
+        assert_eq!(y + h as i16, baselines[index]);
+        assert_eq!(ink(&fb, x, y, x + w as i16, y + h as i16), 0);
+        assert!(ink(&fb, 0, y, x, y + h as i16) > 0, "{index}");
+        assert!(ink(&fb, x + w as i16, y, fb.frame_width() as i16, y + h as i16) > 0);
+    }
+    // Left and justified start at the same place but the justified line's
+    // gap before the image grows; the centred line sits in the middle.
+    let (left, justified, centred) = (drawn[0].0, drawn[1].0, drawn[2].0);
+    assert!(justified > left, "{justified} > {left}");
+    assert!(centred > justified);
 }

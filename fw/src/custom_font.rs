@@ -14,6 +14,7 @@ use proto::font_pack::{
     FONT_PACK_FACE_BOLD_ITALIC, FONT_PACK_FACE_ITALIC, FONT_PACK_FACE_REGULAR, FONT_PACK_FILE,
     FONT_PACK_METRIC_BYTES, FONT_PACK_SIZE_LARGE, FONT_PACK_SIZE_MEDIUM, FONT_PACK_SIZE_SMALL,
 };
+use proto::image::token::{inline_pieces, InlinePiece};
 use proto::text::TextAlign;
 
 // Both submodules are named by path, so that host tests (and rustfmt)
@@ -194,8 +195,9 @@ impl MetricCache {
 /// Draws one page of reading-body blocks in the custom face, as
 /// `ui::reading::draw_reading_page_body` does in a built-in one: image
 /// blocks go to `draw_image` with their placement, and their text (an
-/// image token) is never drawn. False when the face cannot draw a line,
-/// which leaves the page part-drawn for the caller to redo.
+/// image token) is never drawn; so do the images inside a line, where they
+/// stand among its text. False when the face cannot draw a line, which
+/// leaves the page part-drawn for the caller to redo.
 // Keep the temporary bitmap working set out of the deeper EPUB build stack.
 #[inline(never)]
 pub(crate) fn draw_reading_page_body<
@@ -241,6 +243,13 @@ where
         if let Some(image) = block.image {
             draw_image(fb, &image);
             return true;
+        }
+        if block.record.has_inline_images() {
+            let images = ui::reading::InlineImages::for_line(source, block.record);
+            ok = font
+                .draw_inline_line(fb, &images, &block, page_box, &mut draw_image)
+                .is_some();
+            return ok;
         }
         if block.record.line_count != 1 {
             ok = false;
@@ -492,6 +501,199 @@ where
         completed.then_some(cursor_x)
     }
 
+    /// A line holding inline images, aligned as its record says: as the
+    /// built-in draw does, in this face.
+    fn draw_inline_line(
+        &mut self,
+        fb: &mut Framebuffer,
+        images: &ui::reading::InlineImages,
+        block: &ui::reading::ReaderDrawableBlock<'_>,
+        page_box: ui::reading::PageBox,
+        draw_image: &mut dyn FnMut(&mut Framebuffer, &ui::reading::ReaderImage<'_>),
+    ) -> Option<i16> {
+        let settings = self.source.type_settings();
+        let (size, weight) = (settings.size, settings.weight);
+        let line = InlineLine {
+            images,
+            size,
+            weight,
+            baseline_y: block.y,
+        };
+        match ui::reading::effective_align(block.record.align, settings) {
+            TextAlign::Center => {
+                let width = self
+                    .inline_ink_width(block.text, size, weight, block.style)
+                    .min(page_box.right - page_box.left);
+                let x = ((page_box.left + page_box.right - width) / 2).max(page_box.left);
+                self.draw_inline_styled_line(fb, &line, block.text, block.style, x, draw_image)
+            }
+            align => {
+                let x = page_box.x_for(block.record.role) + block.indent;
+                if align == TextAlign::Justify && !block.paragraph_end {
+                    self.draw_justified_inline_line(
+                        fb,
+                        &line,
+                        block.text,
+                        block.style,
+                        x,
+                        page_box.right,
+                        draw_image,
+                    )
+                } else {
+                    self.draw_inline_styled_line(fb, &line, block.text, block.style, x, draw_image)
+                }
+            }
+        }
+    }
+
+    /// `draw_styled_line` for a line holding inline images: the style
+    /// carries on past each image, and each image goes to `draw_image`
+    /// where it stands, its bottom row just above the baseline.
+    fn draw_inline_styled_line(
+        &mut self,
+        fb: &mut Framebuffer,
+        line: &InlineLine<'_>,
+        text: &str,
+        default_style: FontStyle,
+        x: i16,
+        draw_image: &mut dyn FnMut(&mut Framebuffer, &ui::reading::ReaderImage<'_>),
+    ) -> Option<i16> {
+        let mut cursor_x = x;
+        let mut style = default_style;
+        for piece in inline_pieces(text) {
+            let run = match piece {
+                InlinePiece::Image(token) => {
+                    let image = line.images.place(token, cursor_x, line.baseline_y);
+                    draw_image(fb, &image);
+                    cursor_x = cursor_x.saturating_add(image.width as i16);
+                    continue;
+                }
+                InlinePiece::Text(run) => run,
+            };
+            let mut run_start = 0usize;
+            let mut iter = run.char_indices();
+            while let Some((index, ch)) = iter.next() {
+                if ch != STYLE_MARKER {
+                    continue;
+                }
+                if run_start < index {
+                    cursor_x = self.draw_text(
+                        fb,
+                        &run[run_start..index],
+                        line.size,
+                        line.weight,
+                        style,
+                        cursor_x,
+                        line.baseline_y,
+                    )?;
+                }
+                if let Some((code_index, code)) = iter.next() {
+                    style = display::font::style_from_marker_code(code).unwrap_or(style);
+                    run_start = code_index + code.len_utf8();
+                } else {
+                    run_start = index + ch.len_utf8();
+                }
+            }
+            if run_start < run.len() {
+                cursor_x = self.draw_text(
+                    fb,
+                    &run[run_start..],
+                    line.size,
+                    line.weight,
+                    style,
+                    cursor_x,
+                    line.baseline_y,
+                )?;
+            }
+        }
+        Some(cursor_x)
+    }
+
+    /// `draw_justified_line` for a line holding inline images, an image
+    /// counting as a word.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_justified_inline_line(
+        &mut self,
+        fb: &mut Framebuffer,
+        line: &InlineLine<'_>,
+        text: &str,
+        default_style: FontStyle,
+        x: i16,
+        right: i16,
+        draw_image: &mut dyn FnMut(&mut Framebuffer, &ui::reading::ReaderImage<'_>),
+    ) -> Option<i16> {
+        let (size, weight) = (line.size, line.weight);
+        let gaps = ui::reading::justify_gap_count(text);
+        let natural = self.inline_ink_width(text, size, weight, default_style);
+        let Some(extra) = ui::reading::justify_inline_extra(x, natural, right, gaps) else {
+            return self.draw_inline_styled_line(fb, line, text, default_style, x, draw_image);
+        };
+        let per_gap = extra / gaps as i16;
+        let mut remainder = extra % gaps as i16;
+        let mut cursor_x = x;
+        let completed = ui::reading::walk_styled_words(text, default_style, |step| {
+            let next = match step {
+                ui::reading::StyledWordStep::Word(word, style) => {
+                    self.draw_inline_styled_line(fb, line, word, style, cursor_x, draw_image)
+                }
+                ui::reading::StyledWordStep::Gap(style) => self
+                    .draw_text(fb, " ", size, weight, style, cursor_x, line.baseline_y)
+                    .map(|after_space| {
+                        let mut step_x = after_space + per_gap;
+                        if remainder > 0 {
+                            step_x += 1;
+                            remainder -= 1;
+                        }
+                        step_x
+                    }),
+            };
+            match next {
+                Some(next_x) => {
+                    cursor_x = next_x;
+                    true
+                }
+                None => false,
+            }
+        });
+        completed.then_some(cursor_x)
+    }
+
+    /// `styled_ink_width` for a line holding inline images, each image
+    /// measuring its width.
+    fn inline_ink_width(
+        &mut self,
+        text: &str,
+        size: FontSize,
+        weight: FontWeight,
+        default_style: FontStyle,
+    ) -> i16 {
+        let mut ink = CustomInkCursor::new();
+        let mut style = default_style;
+        for piece in inline_pieces(text) {
+            let run = match piece {
+                InlinePiece::Image(token) => {
+                    ink.push_object(token.width);
+                    continue;
+                }
+                InlinePiece::Text(run) => run,
+            };
+            let mut chars = run.chars();
+            while let Some(ch) = chars.next() {
+                if ch == STYLE_MARKER {
+                    if let Some(code) = chars.next() {
+                        ink.reset_pair();
+                        style = display::font::style_from_marker_code(code).unwrap_or(style);
+                    }
+                    continue;
+                }
+                if let Some(face) = custom_face(self.source, size, weight, style) {
+                    ink.push_char(self, face, ch);
+                }
+            }
+        }
+        ink.width()
+    }
+
     fn styled_ink_width(
         &mut self,
         text: &str,
@@ -731,7 +933,22 @@ impl CustomInkCursor {
 
     fn reset_pair(&mut self) {}
 
+    /// An inline image `width` columns wide.
+    fn push_object(&mut self, width: u16) {
+        let left = fixed_round(self.advance_fp);
+        self.right = self.right.max(left.saturating_add(width as i16));
+        self.advance_fp += i32::from(width) << 4;
+    }
+
     fn width(&self) -> i16 {
         self.right.max(fixed_ceil(self.advance_fp))
     }
+}
+
+/// What drawing a line's inline images in the custom face needs.
+struct InlineLine<'a> {
+    images: &'a ui::reading::InlineImages,
+    size: FontSize,
+    weight: FontWeight,
+    baseline_y: i16,
 }

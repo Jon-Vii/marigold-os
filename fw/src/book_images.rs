@@ -27,7 +27,7 @@ use proto::image::index::{
 };
 use proto::image::pack::{pack_file, PackRecord, SPOOL_FILE};
 use proto::image::path::{path_hash, resolve_image_path};
-use ui::reading::{fit_image, PageBox};
+use ui::reading::{fit_image, fit_inline_image, fits_inline, PageBox};
 
 /// Compressed bytes a deflated image's probe inflates from per read: its
 /// first bytes come out of the stream's first few dozen.
@@ -73,9 +73,18 @@ where
 /// What layout does with an image a chapter names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ImagePlacement {
-    /// An image block, `width × height` (fitted to the page box), naming
-    /// the image's slot in the index.
-    Block { slot: u16, width: u16, height: u16 },
+    /// An image the decoder takes, naming its slot in the index: `block` is
+    /// its size alone in a paragraph (fitted to the page box), `inline` its
+    /// size inside a line, or `None` for an illustration too tall to go
+    /// inside one (`ui::reading::fits_inline`). `inline_marked` says its
+    /// entry already carries the inline mark, so showing it inside a line
+    /// writes nothing.
+    Shown {
+        slot: u16,
+        block: (u16, u16),
+        inline: Option<(u16, u16)>,
+        inline_marked: bool,
+    },
     /// Nothing to show: not in the book, or not an image the decoder
     /// takes. An `<img>` keeps its alt-text placeholder.
     Missing,
@@ -97,6 +106,39 @@ pub(crate) enum ProbeStop {
     Index,
 }
 
+/// Gives an entry the inline mark (`ImageEntry::inline`), and forgets its
+/// decode in each orientation whose size that changes: one whose inline and
+/// block sizes are the same keeps it. True when one was forgotten.
+pub(crate) fn mark_entry_inline(entry: &mut ImageEntry) -> bool {
+    let mut forgot = false;
+    for portrait in [false, true] {
+        let block = decoded_size(entry, portrait);
+        entry.inline = true;
+        let changes = decoded_size(entry, portrait) != block;
+        entry.inline = false;
+        if changes && entry.decode(portrait).status == DecodeStatus::Decoded {
+            entry.set_decode(portrait, DecodeState::default());
+            entry.wanted = true;
+            forgot = true;
+        }
+    }
+    entry.inline = true;
+    forgot
+}
+
+/// The size an image decodes at in an orientation: its inline size once
+/// layout has marked it inline (`ImageEntry::inline`), else its block size.
+/// Layout fitted it from the same source size and page box.
+pub(crate) fn decoded_size(entry: &ImageEntry, portrait: bool) -> (u16, u16) {
+    let page_box = PageBox::for_portrait(portrait);
+    let (width, height) = (entry.width.into(), entry.height.into());
+    if entry.inline {
+        fit_inline_image(page_box, width, height)
+    } else {
+        fit_image(page_box, width, height)
+    }
+}
+
 /// Whether the book has images the index holds, from its ZIP's central
 /// directory. A directory that cannot be read through (a damaged entry, a
 /// failed read) counts as none: lookups by name still find the entries
@@ -113,9 +155,10 @@ where
 {
     /// Finds the image `src` names in the chapter at ZIP path `chapter`,
     /// resolving it into `path` (the ZIP name scratch, idle while a chapter
-    /// streams). A probed image the decoder takes becomes a block fitted to
-    /// the orientation's page box, and is marked wanted unless it is already
-    /// decoded for that orientation. On a spine's first pass an unprobed
+    /// streams). A probed image the decoder takes comes back with its sizes
+    /// alone in a paragraph and inside a line, fitted to the orientation's
+    /// page box (which one the chapter shows is the caller's to decide), and
+    /// is marked wanted unless it is already decoded for that orientation. On a spine's first pass an unprobed
     /// image is
     /// marked wanted for the probe that follows; on its second it is
     /// missing, so a spine is laid out at most twice. Either way the entry
@@ -146,11 +189,13 @@ where
         let placement = match entry.probe {
             ProbeStatus::Supported if entry.width > 0 && entry.height > 0 => {
                 let page_box = PageBox::for_portrait(portrait);
-                let (width, height) = fit_image(page_box, entry.width.into(), entry.height.into());
-                ImagePlacement::Block {
+                let (width, height) = (entry.width.into(), entry.height.into());
+                ImagePlacement::Shown {
                     slot,
-                    width,
-                    height,
+                    block: fit_image(page_box, width, height),
+                    inline: fits_inline(width, height)
+                        .then(|| fit_inline_image(page_box, width, height)),
+                    inline_marked: entry.inline,
                 }
             }
             ProbeStatus::Unprobed if first_pass => ImagePlacement::Unprobed { slot },
@@ -168,6 +213,27 @@ where
             write_image_state(io, &self.header, slot, &entry).map_err(|_| ())?;
         }
         Ok(placement)
+    }
+
+    /// Marks the image in `slot` as shown inside a line at a size other
+    /// than its block size (`ImageEntry::inline`), in one write, so it
+    /// decodes at its inline size from now on. A decode it already has at
+    /// its block size is forgotten in the same write, in each orientation
+    /// where the sizes differ (its record becomes an orphan in the pack),
+    /// and done again; true when one was. Err only when the card fails. Out
+    /// of line: its
+    /// entry buffers stay off the line builder's frames.
+    #[inline(never)]
+    pub(crate) fn mark_inline(&self, slot: u16) -> Result<bool, ()> {
+        let io = &mut CardIndex(&self.file);
+        let mut entry = match read_image(io, &self.header, slot) {
+            Ok(Some(entry)) if !entry.inline => entry,
+            Err(IndexError::Io) => return Err(()),
+            _ => return Ok(false),
+        };
+        let forgot = mark_entry_inline(&mut entry);
+        write_image_state(io, &self.header, slot, &entry).map_err(|_| ())?;
+        Ok(forgot)
     }
 
     /// Probes the images in `slots` that a chapter's first pass marked
@@ -282,8 +348,7 @@ where
         let mut live = 0u32;
         self.scan(buf, |_, entry| {
             if entry.decode(portrait).status == DecodeStatus::Decoded {
-                let page_box = PageBox::for_portrait(portrait);
-                let (width, height) = fit_image(page_box, entry.width.into(), entry.height.into());
+                let (width, height) = decoded_size(&entry, portrait);
                 let record = PackRecord::new(entry.path_hash, width, height);
                 live = live.saturating_add(record.map_or(0, |record| record.record_len()));
             }
