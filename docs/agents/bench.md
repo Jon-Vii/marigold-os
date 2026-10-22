@@ -74,6 +74,20 @@ fixture. It does not change the selected font or reading settings. Inspect
 `font_fixture`, `font_selftest`, and `serial_sleep` telemetry before interpreting
 a run, and repeat ordinary boot/sleep checks with the feature disabled.
 
+## Screen captures
+
+`bench-serial` builds also take `f`: the display task prints the framebuffer
+after its next render. `tools/bench/fb_dump.py` sends `f` plus navigation keys,
+collects the rows, and writes a PNG turned to the reading orientation:
+
+```sh
+python3 tools/bench/fb_dump.py --port /dev/cu.usbmodem101 --keys n --frame landscape --out target/bench/page.png
+```
+
+A capture shows exactly what reached the panel's buffer (image placement,
+dithering, clipping) without anyone looking at the device. It cannot show
+panel effects such as ghosting.
+
 ## Logs
 
 Raw bench logs are written under `target/bench/` by default and should not be

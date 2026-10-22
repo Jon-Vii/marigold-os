@@ -340,6 +340,16 @@ pub async fn run(
                         prestage_start.elapsed().as_millis(),
                         Instant::now().as_millis(),
                     );
+                    #[cfg(feature = "bench-serial")]
+                    if crate::tasks::bench_serial::FB_DUMP_ARMED
+                        .load(core::sync::atomic::Ordering::Relaxed)
+                    {
+                        // No atomic swap on this core; a lost race only
+                        // costs one dump.
+                        crate::tasks::bench_serial::FB_DUMP_ARMED
+                            .store(false, core::sync::atomic::Ordering::Relaxed);
+                        crate::tasks::bench_serial::dump_framebuffer(fb).await;
+                    }
                     // Keep the current chapter tracking the page just shown, past
                     // the reducer's 128-chapter cap. Cheap in-RAM check; only the
                     // loaded SD reader has an uncapped page map, so this no-ops on
