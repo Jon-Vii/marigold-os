@@ -62,7 +62,9 @@ pub const MAX_PIXELS: u64 = 1 << 24;
 /// Bytes [`probe`] needs: the signature and the whole IHDR chunk.
 pub const PROBE_BYTES: usize = 33;
 
-const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n'];
+/// A named static, not a `const`: an unnamed eight-byte constant joins the
+/// merged constant pools, which the ESP32-C3 build keeps in RAM.
+static SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n'];
 const MAX_CHUNK_LEN: u32 = 0x7FFF_FFFF;
 /// Distance from the row being inflated to the row above it.
 const ROW_GAP: usize = 512;
@@ -103,13 +105,15 @@ pub enum PngError {
     Sink(SinkError),
 }
 
+/// Each variant's value is its IHDR color type code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub enum ColorType {
-    Gray,
-    Rgb,
-    Palette,
-    GrayAlpha,
-    Rgba,
+    Gray = 0,
+    Rgb = 2,
+    Palette = 3,
+    GrayAlpha = 4,
+    Rgba = 6,
 }
 
 impl ColorType {
@@ -124,13 +128,15 @@ impl ColorType {
         }
     }
 
-    /// Samples per pixel.
+    /// Samples per pixel. From the code's bits (1 palette, 2 color, 4
+    /// alpha) rather than a `match`, which would compile to a lookup table
+    /// that the ESP32-C3 build keeps in RAM.
     pub fn samples(self) -> u32 {
-        match self {
-            Self::Gray | Self::Palette => 1,
-            Self::GrayAlpha => 2,
-            Self::Rgb => 3,
-            Self::Rgba => 4,
+        let code = self as u32;
+        if code & 1 != 0 {
+            1
+        } else {
+            1 + 2 * ((code >> 1) & 1) + ((code >> 2) & 1)
         }
     }
 }
@@ -808,12 +814,9 @@ impl<'a> PngDecoder<'a> {
         carved.fill(0);
         if info.color_type == ColorType::Gray && info.bit_depth <= 8 {
             // Gray levels stretch to 0..=255: 255 / (2^depth - 1) per level.
-            let (levels, scale) = match info.bit_depth {
-                1 => (2, 255),
-                2 => (4, 85),
-                4 => (16, 17),
-                _ => (256, 1),
-            };
+            // Worked out, not matched on the depth: see `samples`.
+            let levels = 1usize << info.bit_depth;
+            let scale = 255 / (levels - 1);
             let table = self.table_mut()?;
             for (level, entry) in table.iter_mut().take(levels).enumerate() {
                 *entry = (level * scale) as u8;
@@ -823,10 +826,12 @@ impl<'a> PngDecoder<'a> {
 
         let bits = info.color_type.samples() * u32::from(info.bit_depth);
         self.bpp = (bits as usize / 8).max(1);
-        self.unit = match self.bpp {
-            3 | 6 => 12,
-            8 => 8,
-            _ => 4,
+        // 12 for 3 and 6 bytes a pixel, 8 for 8, else 4 (worked out, as in
+        // `samples`).
+        self.unit = if self.bpp.is_multiple_of(3) {
+            12
+        } else {
+            4 << usize::from(self.bpp == 8)
         };
         self.stride = stride;
         self.height = info.height;

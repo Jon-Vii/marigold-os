@@ -45,8 +45,9 @@ pub enum SpiOp {
 
 /// Bit-reversal lookup. RV32IMC has no bit-manipulation extension, so
 /// `u8::reverse_bits` lowers to a shift/mask sequence; one rodata load
-/// per byte is cheaper across the 96 K transforms of a full flush.
-static REVERSE_BITS_LUT: [u8; 256] = {
+/// per byte is cheaper across the 96 K transforms of a full flush. Image
+/// blits into a flipped frame use it too.
+pub(crate) static REVERSE_BITS_LUT: [u8; 256] = {
     let mut lut = [0u8; 256];
     let mut i = 0;
     while i < 256 {

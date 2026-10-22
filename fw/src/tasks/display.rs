@@ -1,7 +1,9 @@
 use crate::display_flush::{self, Epd};
+use crate::image_decode::{IdleImageStep, IdleImageWork};
 use crate::reader_cache::{
-    self, Preparation, ReaderCacheScratch, READER_COMPRESSED_SCRATCH, READER_CONTAINER_SCRATCH,
-    READER_HEADER_SCRATCH, READER_OPF_SCRATCH, READER_TAIL_SCRATCH, READER_XHTML_SCRATCH,
+    self, ImagePass, Preparation, ReaderCacheScratch, READER_COMPRESSED_SCRATCH,
+    READER_CONTAINER_SCRATCH, READER_HEADER_SCRATCH, READER_OPF_SCRATCH, READER_TAIL_SCRATCH,
+    READER_XHTML_SCRATCH,
 };
 use crate::reader_store::{BookLoadStatus, ReaderStore};
 use crate::{
@@ -264,13 +266,14 @@ pub async fn run(
                     }
                 }
                 let layout_start = Instant::now();
-                if !render_custom_reader(
+                if !render_reader_from_card(
                     &mut epd,
                     &mut sd_cs,
                     fb,
                     request,
                     sd_library,
                     font_metrics,
+                    tx_band,
                 ) {
                     crate::views::render(fb, request, sd_library);
                 }
@@ -572,12 +575,17 @@ pub(crate) fn pending_reader_matches(command: StorageCommand, request: RenderReq
 
 /// Idle-time preparation of the rest of the open book: when it may next
 /// run, the button-press count it was armed at (a press since then means
-/// the reader is back), and a spine that failed, not retried until the
-/// book's preparation moves on some other way.
+/// the reader is back), a spine that failed, not retried until the book's
+/// preparation moves on some other way, and the image work done since the
+/// reader last did anything.
 struct IdlePreparation {
     at: Instant,
     presses: u32,
-    failed: Option<(usize, u16)>,
+    /// The book's catalog index and the spine. The index is kept as a u16,
+    /// as commands carry it, so `images` fits without growing the display
+    /// task's static state.
+    failed: Option<(u16, u16)>,
+    images: IdleImageWork,
 }
 
 impl IdlePreparation {
@@ -586,18 +594,35 @@ impl IdlePreparation {
             at: Instant::now() + IDLE_PREPARATION_DELAY,
             presses: BUTTON_PRESSES.load(Ordering::Relaxed),
             failed: None,
+            images: IdleImageWork::default(),
         }
     }
 
+    /// Any command: the reader is back, and may be on another page, so the
+    /// window around it is looked at again unless the store's note covers
+    /// it. What the note holds lasts.
     fn rearm(&mut self, delay: Duration) {
+        self.resume(delay);
+        self.images = IdleImageWork::default();
+    }
+
+    /// The next step after `delay`, picking up the image work where it is.
+    fn resume(&mut self, delay: Duration) {
         self.at = Instant::now() + delay;
         self.presses = BUTTON_PRESSES.load(Ordering::Relaxed);
     }
 
-    /// The page on screen and its book, while that book is only partly
-    /// prepared and nothing else needs the card: the reader is on a resident
-    /// page of it in the layout it was prepared for, and no sync session
-    /// holds the scratch.
+    /// Text layout still to do, short of a spine that failed.
+    fn layout_pending(&self, sd_library: &ReaderStore, index: usize) -> bool {
+        sd_library
+            .book_next_spine()
+            .is_some_and(|next_spine| self.failed != Some((index as u16, next_spine)))
+    }
+
+    /// The page on screen and its book, while that book has preparation
+    /// left (text layout, or images that may need decoding) and nothing
+    /// else needs the card: the reader is on a resident page of it in the
+    /// layout it was prepared for, and no sync session holds the scratch.
     fn target(
         &self,
         sd_library: &ReaderStore,
@@ -607,13 +632,14 @@ impl IdlePreparation {
     ) -> Option<(RenderRequest, usize)> {
         let request = last_request?;
         let index = ReaderSource::from_book_id(request.book_id).sd_index()? as usize;
-        let next_spine = sd_library.book_next_spine()?;
-        (last_reader_render_ready
+        let layout = self.layout_pending(sd_library, index);
+        let images = self.images.next(sd_library, request.page, layout) != IdleImageStep::Nothing;
+        ((layout || images)
+            && last_reader_render_ready
             && !sync_session.active()
             && sd_library.loaded_index == Some(index)
-            && sd_library.reader_status() == BookLoadStatus::Ready
-            && self.failed != Some((index, next_spine)))
-        .then_some((request, index))
+            && sd_library.reader_status() == BookLoadStatus::Ready)
+            .then_some((request, index))
     }
 }
 
@@ -648,9 +674,66 @@ fn prepare_while_idle(
         idle.rearm(IDLE_PREPARATION_DELAY);
         return;
     }
+    let scratch = ensure_epub_scratch(epub_scratch);
+    let layout = idle.layout_pending(sd_library, index);
+    // The pages around the one on screen first: their images are what the
+    // next page turn needs. A step that decoded some ends there, so a step
+    // stays within one session's budget, and so does one the budget cut
+    // short, whose window the next step goes on with.
+    if idle.images.next(sd_library, request.page, layout) == IdleImageStep::Window {
+        let pass = ImagePass::Window;
+        let end = reader_cache::decode_images_while_idle(
+            epd,
+            sd_cs,
+            sd_library,
+            index,
+            request.page,
+            scratch,
+            pass,
+            presses,
+        );
+        if end.pressed {
+            idle.rearm(IDLE_PREPARATION_DELAY);
+            return;
+        }
+        if end.finished {
+            idle.images.window_tried = true;
+        }
+        if end.worked || !end.finished {
+            idle.resume(Duration::from_millis(1));
+            return;
+        }
+    }
+    if !layout {
+        // The rest of the book's images, once its text is laid out.
+        if idle.images.next(sd_library, request.page, false) == IdleImageStep::Rest {
+            let pass = ImagePass::Rest;
+            let end = reader_cache::decode_images_while_idle(
+                epd,
+                sd_cs,
+                sd_library,
+                index,
+                request.page,
+                scratch,
+                pass,
+                presses,
+            );
+            if end.pressed {
+                idle.rearm(IDLE_PREPARATION_DELAY);
+                return;
+            }
+            // Through without settling the book and without decoding: a
+            // card fault. Not again until the reader does something.
+            if end.finished && !end.worked && !sd_library.book_images_settled() {
+                idle.images.rest_stuck = true;
+            }
+        }
+        crate::stack_probe::report("images");
+        idle.resume(Duration::from_millis(1));
+        return;
+    }
     let started = Instant::now();
     let next_spine = sd_library.book_next_spine();
-    let scratch = ensure_epub_scratch(epub_scratch);
     reader_cache::build_or_load_book_cache(
         epd,
         sd_cs,
@@ -689,17 +772,46 @@ fn prepare_while_idle(
         });
     }
     if !grew && !pressed {
-        idle.failed = next_spine.map(|spine| (index, spine));
+        idle.failed = next_spine.map(|spine| (index as u16, spine));
+    }
+    if grew {
+        // New pages around the reader, and the rest pass's to find.
+        idle.images = IdleImageWork::default();
     }
     // The page on screen is read back after every step; say whether it is
     // still resident for the next request.
     *last_reader_render_ready = sd_library.covers_global_page(index, request.page);
     crate::stack_probe::report("idle");
-    idle.rearm(if pressed {
-        IDLE_PREPARATION_DELAY
+    if pressed {
+        idle.rearm(IDLE_PREPARATION_DELAY);
     } else {
-        Duration::from_millis(1)
-    });
+        idle.resume(Duration::from_millis(1));
+    }
+}
+
+/// Decodes the images the page about to be answered shows, for its
+/// orientation (see `reader_cache::decode_page_images`). False when a press
+/// since `presses`, or a newer request than `request_id`, abandoned the
+/// wait. Out of line, so the storage dispatcher's frame, on the deepest
+/// build path, does not carry it.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn page_images_ready(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    sd_library: &mut ReaderStore,
+    epub_scratch: &mut Option<&'static mut ReaderCacheScratch<'static>>,
+    index: usize,
+    page: u32,
+    presses: u32,
+    request_id: u32,
+) -> bool {
+    match epub_scratch.as_deref_mut() {
+        Some(scratch) => reader_cache::decode_page_images(
+            epd, sd_cs, sd_library, index, page, scratch, presses, request_id,
+        ),
+        None => true,
+    }
 }
 
 fn send_library_event(event: &LibraryEvent) {
@@ -708,24 +820,28 @@ fn send_library_event(event: &LibraryEvent) {
     }
 }
 
-fn render_custom_reader(
+/// Draws a reading page that needs the card, in one SD session: one set in
+/// a custom face from the card, or one with images, whose rows stream from
+/// the book's packs through `band`. The band is the panel transfer buffer:
+/// flushes and prestages fill it a band at a time just before sending, so
+/// nothing in it outlives a transfer, and it is idle while a frame draws.
+/// False when the page needs no card, or the session cannot open; the
+/// caller then draws it from RAM, with the built-in face and image
+/// placeholders, and never leaves the previous frame up.
+fn render_reader_from_card(
     epd: &mut Epd,
     sd_cs: &mut Output<'static>,
     fb: &mut Framebuffer,
     request: RenderRequest,
     sd_library: &ReaderStore,
     font_metrics: &mut crate::custom_font::MetricCache,
+    band: &mut [u8; BAND_BYTES],
 ) -> bool {
-    if request.view != AppView::Reading
-        || !ReaderSource::from_book_id(request.book_id).is_sd()
-        || request.font_family != display::font::FontFamily::Custom
-        || display::font::builtin_custom_available()
-        || !sd_library.custom_font_available()
-    {
+    if !crate::views::reader_reads_card(request, sd_library) {
         return false;
     }
     crate::sd_session::with_root(epd, sd_cs, |root| {
-        crate::views::render_custom_reader_from_root(fb, request, sd_library, font_metrics, root)
+        crate::views::render_reader_from_root(fb, request, sd_library, font_metrics, root, band)
     })
     .unwrap_or(false)
 }
@@ -918,6 +1034,8 @@ fn handle_storage_command(
         } => {
             *pending_reader = None;
             let storage_start = Instant::now();
+            // A press from here on abandons a wait for the page's images.
+            let presses = BUTTON_PRESSES.load(Ordering::Relaxed);
             if request_id != LATEST_READER_REQUEST_ID.load(Ordering::Relaxed) {
                 esp_println::println!(
                     "storage: stale open skipped request={} latest={} book_id={} index={}",
@@ -1001,6 +1119,22 @@ fn handle_storage_command(
             // is already loaded; answering from RAM keeps ordinary page
             // turns free of card init, FAT, and cache-file traffic.
             if sd_library.covers_global_page(index as usize, target_pages as u32) {
+                if !reader_page_already_rendered
+                    && !page_images_ready(
+                        epd,
+                        sd_cs,
+                        sd_library,
+                        epub_scratch,
+                        index as usize,
+                        target_pages as u32,
+                        presses,
+                        request_id,
+                    )
+                {
+                    sd_library.end_reader_request();
+                    *pending_reader = command.retry_at_page(u32::from(target_pages));
+                    return;
+                }
                 sd_library.end_reader_request();
                 esp_println::println!(
                     "storage: open hit in RAM request={} book_id={} page={}",
@@ -1087,6 +1221,28 @@ fn handle_storage_command(
                 });
                 return;
             }
+            let page = sd_library.requested_page(target_pages as u32, None);
+            if let Some(resolved) = page.filter(|&page| {
+                !page_images_ready(
+                    epd,
+                    sd_cs,
+                    sd_library,
+                    epub_scratch,
+                    index as usize,
+                    page,
+                    presses,
+                    request_id,
+                )
+            }) {
+                // Retried unless a newer request replaces it, and at the
+                // page this one resolved to: the pins that resolved it (a
+                // first open's text start, the place a relayout kept) are
+                // spent here, and the page number asked for would land
+                // elsewhere without them.
+                sd_library.end_reader_request();
+                *pending_reader = command.retry_at_page(resolved);
+                return;
+            }
             send_loaded_library_event(&LibraryEvent::PrefixLoaded {
                 request_id,
                 book_id,
@@ -1095,7 +1251,7 @@ fn handle_storage_command(
                 current_chapter: sd_library.current_chapter(),
                 chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
                 complete: sd_library.book_next_spine().is_none(),
-                page: sd_library.requested_page(target_pages as u32, None),
+                page,
             });
             sd_library.end_reader_request();
             esp_println::println!(
@@ -1161,6 +1317,7 @@ fn handle_storage_command(
             portrait,
         } => {
             *pending_reader = None;
+            let presses = BUTTON_PRESSES.load(Ordering::Relaxed);
             if request_id != LATEST_READER_REQUEST_ID.load(Ordering::Relaxed) {
                 return;
             }
@@ -1202,6 +1359,25 @@ fn handle_storage_command(
                 *pending_reader = Some(command);
                 return;
             }
+            let page = sd_library.requested_page(target_page, requested_spine);
+            if let Some(resolved) = page.filter(|&page| {
+                sd_library.reader_status() != BookLoadStatus::Error
+                    && !page_images_ready(
+                        epd,
+                        sd_cs,
+                        sd_library,
+                        epub_scratch,
+                        index as usize,
+                        page,
+                        presses,
+                        request_id,
+                    )
+            }) {
+                // Retried at the chapter's page, as a request for it.
+                sd_library.end_reader_request();
+                *pending_reader = command.retry_at_page(resolved);
+                return;
+            }
             sd_library.end_reader_request();
             if sd_library.reader_status() == BookLoadStatus::Error {
                 send_loaded_library_event(&LibraryEvent::ReaderLoadFailed {
@@ -1218,7 +1394,7 @@ fn handle_storage_command(
                 current_chapter: sd_library.current_chapter(),
                 chapter_pages: crate::reader_store::chapter_pages_for_event(sd_library),
                 complete: sd_library.book_next_spine().is_none(),
-                page: sd_library.requested_page(target_page, requested_spine),
+                page,
             });
         }
         StorageCommand::ReceiveUpload => {

@@ -433,6 +433,16 @@ pub fn for_each_drawable_block(
     }
 }
 
+/// Whether `page` holds an image block, the only kind of block that needs
+/// more than RAM to draw: its pixels are on the card.
+pub fn page_has_images(source: &impl ReadingBlocks, page: PageRecord) -> bool {
+    (0..page.block_count as usize).any(|offset| {
+        source
+            .block(page.first_block as usize + offset)
+            .is_some_and(|record| record.is_image())
+    })
+}
+
 /// An image block's image, for a block starting at row `top`: centred in
 /// the column by the width its token records, below the top gap.
 fn place_image<'a>(
@@ -1688,6 +1698,26 @@ mod tests {
             });
             assert_eq!(blocks, 1);
         }
+    }
+
+    #[test]
+    fn only_pages_holding_an_image_block_have_images() {
+        let source = ImageBlocks::new(
+            &[None, None, Some((300, 400)), None],
+            TypeSettings::DEFAULT,
+            PageBox::LANDSCAPE,
+        );
+        let page = |first_block, block_count| PageRecord {
+            first_block,
+            block_count,
+        };
+        assert!(!page_has_images(&source, page(0, 2)));
+        assert!(page_has_images(&source, page(0, 3)));
+        assert!(page_has_images(&source, page(2, 1)));
+        assert!(!page_has_images(&source, page(3, 1)));
+        // A record past the blocks there are reads as none.
+        assert!(!page_has_images(&source, page(3, 40)));
+        assert!(!page_has_images(&source, page(0, 0)));
     }
 
     #[test]

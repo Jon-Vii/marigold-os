@@ -47,24 +47,55 @@ pub(crate) fn render(fb: &mut Framebuffer, request: RenderRequest, sd_library: &
     }
 }
 
-pub(crate) fn render_custom_reader_from_root(
+/// Whether a render of `request` draws from the card, inside an SD session:
+/// a reading page set in a custom face read from the card, or one whose
+/// blocks include images. Every other render draws from RAM ([`render`]).
+pub(crate) fn reader_reads_card(request: RenderRequest, sd_library: &ReaderStore) -> bool {
+    custom_face_on_card(request, sd_library) || reader_page_has_images(request, sd_library)
+}
+
+/// A reading page set in a custom face from the card's font pack. A face
+/// compiled into the firmware draws from flash, like the built-in ones.
+fn custom_face_on_card(request: RenderRequest, sd_library: &ReaderStore) -> bool {
+    request.view == AppView::Reading
+        && ReaderSource::from_book_id(request.book_id).is_sd()
+        && request.font_family == FontFamily::Custom
+        && !display::font::builtin_custom_available()
+        && sd_library.custom_font_available()
+}
+
+/// A reading page that will draw image blocks, whose rows are in the
+/// book's packs. A book without images stops at the first check.
+fn reader_page_has_images(request: RenderRequest, sd_library: &ReaderStore) -> bool {
+    sd_library.book_has_images()
+        && request.view == AppView::Reading
+        && ReaderSource::from_book_id(request.book_id).is_sd()
+        && sd_library.reader_status() == BookLoadStatus::Ready
+        && reading_buffer_ready(request, sd_library)
+        && ui::reading::page_has_images(
+            sd_library,
+            reader_layout::ReaderPagePlan::new(sd_library, request.page).page(),
+        )
+}
+
+/// Draws a page that [`reader_reads_card`], inside the SD session `root`
+/// belongs to, streaming its images through `band`, a buffer idle while a
+/// page draws. False, drawing nothing, for any other render.
+pub(crate) fn render_reader_from_root(
     fb: &mut Framebuffer,
     request: RenderRequest,
     sd_library: &ReaderStore,
     font_metrics: &mut crate::custom_font::MetricCache,
     root: &crate::sd_session::SdRoot<'_>,
+    band: &mut [u8],
 ) -> bool {
-    if request.view != AppView::Reading
-        || !ReaderSource::from_book_id(request.book_id).is_sd()
-        || request.font_family != FontFamily::Custom
-        || !sd_library.custom_font_available()
-    {
+    if !reader_reads_card(request, sd_library) {
         return false;
     }
 
     fb.set_frame(app_render::fb_frame(request.orientation));
     fb.clear(true);
-    draw_sd_reader_page_with_custom_font(fb, request, sd_library, font_metrics, root);
+    draw_sd_reader_page_from_card(fb, request, sd_library, font_metrics, root, band);
     true
 }
 
@@ -254,7 +285,9 @@ fn ui_library_status(status: LibraryScanStatus) -> UiLibraryStatus {
     }
 }
 
-fn draw_sd_reader_page(fb: &mut Framebuffer, request: RenderRequest, sd_library: &ReaderStore) {
+/// Whether the store holds `request`'s page ready to draw; until it does, a
+/// reading render shows the bookplate.
+fn reading_buffer_ready(request: RenderRequest, sd_library: &ReaderStore) -> bool {
     // A store paginated under different type settings is as unusable as an
     // unloaded one; show the loading plate until the relayout lands.
     let layout_current = sd_library.type_settings() == request.type_settings();
@@ -265,11 +298,17 @@ fn draw_sd_reader_page(fb: &mut Framebuffer, request: RenderRequest, sd_library:
     // The page box is part of the layout: blocks wrapped for the portrait
     // column must not paint into a landscape frame (they cover half the
     // panel); hold the bookplate until the rebuild lands.
-    let reading_buffer_ready = layout_current
+    layout_current
         && sd_library.portrait() == app_core::is_portrait(request.orientation)
         && sd_library.loaded_index == ReaderStore::selected_book_index(request.book_id)
-        && !sd_library.text_holds_toc();
-    match (sd_library.reader_status(), reading_buffer_ready) {
+        && !sd_library.text_holds_toc()
+}
+
+fn draw_sd_reader_page(fb: &mut Framebuffer, request: RenderRequest, sd_library: &ReaderStore) {
+    match (
+        sd_library.reader_status(),
+        reading_buffer_ready(request, sd_library),
+    ) {
         (_, false) | (BookLoadStatus::Empty | BookLoadStatus::Loading, _) => {
             draw_sd_reader_loading(fb, request, sd_library);
         }
@@ -290,22 +329,20 @@ fn draw_sd_reader_page(fb: &mut Framebuffer, request: RenderRequest, sd_library:
     }
 }
 
-fn draw_sd_reader_page_with_custom_font(
+/// [`draw_sd_reader_page`] inside an SD session: the body in the custom
+/// face when it is the one chosen, and images from the book's packs.
+fn draw_sd_reader_page_from_card(
     fb: &mut Framebuffer,
     request: RenderRequest,
     sd_library: &ReaderStore,
     font_metrics: &mut crate::custom_font::MetricCache,
     root: &crate::sd_session::SdRoot<'_>,
+    band: &mut [u8],
 ) {
-    let layout_current = sd_library.type_settings() == request.type_settings();
-    // The page box is part of the layout: blocks wrapped for the portrait
-    // column must not paint into a landscape frame (they cover half the
-    // panel); hold the bookplate until the rebuild lands.
-    let reading_buffer_ready = layout_current
-        && sd_library.portrait() == app_core::is_portrait(request.orientation)
-        && sd_library.loaded_index == ReaderStore::selected_book_index(request.book_id)
-        && !sd_library.text_holds_toc();
-    match (sd_library.reader_status(), reading_buffer_ready) {
+    match (
+        sd_library.reader_status(),
+        reading_buffer_ready(request, sd_library),
+    ) {
         (_, false) | (BookLoadStatus::Empty | BookLoadStatus::Loading, _) => {
             draw_sd_reader_loading(fb, request, sd_library);
         }
@@ -315,27 +352,56 @@ fn draw_sd_reader_page_with_custom_font(
         (BookLoadStatus::Ready, _) => {
             let plan = reader_layout::ReaderPagePlan::new(sd_library, request.page);
             let page_count = plan.page_count().max(1);
-            if !crate::custom_font::draw_reading_page_body(
+            let page = plan.page();
+            let custom = custom_face_on_card(request, sd_library);
+            crate::page_images::draw_page(
                 root,
-                fb,
                 sd_library,
-                font_metrics,
-                plan.page(),
-                ui::reading::draw_image_placeholder,
-            ) {
-                // The custom face may have painted part of the page before
-                // failing; start the built-in fallback from a clean frame.
-                fb.clear(true);
-                ui::reading::draw_reading_page_body(
-                    fb,
-                    sd_library,
-                    plan.page(),
-                    ui::reading::draw_image_placeholder,
-                );
-            }
+                request.book_id,
+                page,
+                band,
+                clock_micros,
+                |images| {
+                    if custom
+                        && crate::custom_font::draw_reading_page_body(
+                            root,
+                            fb,
+                            sd_library,
+                            font_metrics,
+                            page,
+                            &mut *images,
+                        )
+                    {
+                        return;
+                    }
+                    if custom {
+                        // The custom face may have painted part of the page
+                        // before failing; start the built-in fallback from a
+                        // clean frame.
+                        fb.clear(true);
+                    }
+                    draw_built_in_body(fb, sd_library, page, images);
+                },
+            );
             draw_reader_footer(fb, request, sd_library, page_count);
         }
     }
+}
+
+/// The page body in a built-in face, out of line so that a page in the
+/// custom face does not carry this draw's frame as well as its own.
+#[inline(never)]
+fn draw_built_in_body(
+    fb: &mut Framebuffer,
+    sd_library: &ReaderStore,
+    page: proto::cache::PageRecord,
+    images: &mut crate::page_images::ImageDrawer<'_>,
+) {
+    ui::reading::draw_reading_page_body(fb, sd_library, page, images);
+}
+
+fn clock_micros() -> u64 {
+    embassy_time::Instant::now().as_micros()
 }
 
 /// The reading page is full bleed; its only resident furniture is the

@@ -83,4 +83,20 @@ committed. Summarize them with:
 tools/bench/bench.py report target/bench/latest.jsonl
 ```
 
+Books with images add two lines. `bench: image_decode` reports each image
+decode: its index slot, the ZIP entry's size (`src_bytes`), the fitted size
+(`out`), the whole decode and, for a deflated image, its spool to the card
+(`ms`, `spool_ms`), and how it ended (`decoded`, `cancelled`, `failed`, or
+`retry`). `bench: image_session` reports each pass: `pass=window` and
+`pass=remaining` for idle work (the pages around the one on screen, then the
+rest of the book), and `pass=request` for a page turn that checked, and
+perhaps decoded, the images on its page before answering. A turn to a page
+whose images the store has noted as settled checks nothing and logs no
+line, and once a `remaining` pass finds nothing left, idle steps open no
+image session at all. `report` lists
+decode outcomes and times, spool times, page turns that waited for a decode
+(`image wait`), and page turns that only checked (`image check`). To time
+page turns over pages whose images are already decoded, leave the book idle
+on its first page until its `image_session` lines stop.
+
 Keep notable hardware findings in `.scratch/` issues or dated docs notes.

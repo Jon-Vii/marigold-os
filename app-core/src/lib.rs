@@ -406,6 +406,56 @@ pub enum StorageCommand {
     ReceiveUpload,
 }
 
+impl StorageCommand {
+    /// A reader request to try again for the page it resolved to, `page`,
+    /// once the request has been worked out but not yet answered (a press
+    /// abandoned the wait for the page's images). The page itself is asked
+    /// for, so the retry means what the request did even though the pins
+    /// that resolved it (the text start of a first open, the place a
+    /// relayout kept) are spent. `None` for commands that are not reader
+    /// requests.
+    pub fn retry_at_page(self, page: u32) -> Option<Self> {
+        let (request_id, book_id, index, chapter, type_settings, portrait) = match self {
+            Self::OpenBook {
+                request_id,
+                book_id,
+                index,
+                chapter,
+                type_settings,
+                portrait,
+                ..
+            }
+            | Self::ExtendSection {
+                request_id,
+                book_id,
+                index,
+                chapter,
+                type_settings,
+                portrait,
+                ..
+            }
+            | Self::JumpChapter {
+                request_id,
+                book_id,
+                index,
+                chapter,
+                type_settings,
+                portrait,
+            } => (request_id, book_id, index, chapter, type_settings, portrait),
+            _ => return None,
+        };
+        Some(Self::ExtendSection {
+            request_id,
+            book_id,
+            index,
+            chapter,
+            target_pages: page.min(u32::from(u16::MAX)) as u16,
+            type_settings,
+            portrait,
+        })
+    }
+}
+
 /// The sync session's storage-admission rules. Granting the loan is one-way:
 /// the EPUB scratch becomes radio heap, so every scratch-using storage command
 /// is refused from then on and only the session-ending software reset brings
@@ -3041,5 +3091,56 @@ mod tests {
         assert!(session.admits(&StorageCommand::ReceiveUpload));
         // Notably refused: a second loan of memory that is already gone.
         assert!(!session.admits(&StorageCommand::LoanSyncMemory));
+    }
+
+    #[test]
+    fn a_request_retries_at_the_page_it_resolved_to() {
+        let settings = TypeSettings::DEFAULT;
+        let retry = StorageCommand::ExtendSection {
+            request_id: 7,
+            book_id: 3,
+            index: 2,
+            chapter: 4,
+            target_pages: 97,
+            type_settings: settings,
+            portrait: true,
+        };
+        for request in [
+            StorageCommand::OpenBook {
+                request_id: 7,
+                book_id: 3,
+                index: 2,
+                chapter: 4,
+                target_pages: 0,
+                type_settings: settings,
+                portrait: true,
+            },
+            StorageCommand::ExtendSection {
+                request_id: 7,
+                book_id: 3,
+                index: 2,
+                chapter: 4,
+                target_pages: 120,
+                type_settings: settings,
+                portrait: true,
+            },
+            StorageCommand::JumpChapter {
+                request_id: 7,
+                book_id: 3,
+                index: 2,
+                chapter: 4,
+                type_settings: settings,
+                portrait: true,
+            },
+        ] {
+            assert_eq!(request.retry_at_page(97), Some(retry), "{request:?}");
+        }
+        let StorageCommand::ExtendSection { target_pages, .. } =
+            retry.retry_at_page(70_000).unwrap()
+        else {
+            panic!("a reader request");
+        };
+        assert_eq!(target_pages, u16::MAX);
+        assert_eq!(StorageCommand::RefreshCatalog.retry_at_page(1), None);
     }
 }

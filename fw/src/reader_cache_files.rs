@@ -1461,6 +1461,121 @@ where
     result
 }
 
+/// The index slots of the images page `page` of `section` shows, read from
+/// its section file without loading it into the store, which keeps the
+/// page on screen: the header, the page's record, its block records, and
+/// the head of each image block's token, a few small reads in all. For the
+/// pages near the reader's that the store does not hold. A section laid
+/// out for other settings (its page records would not be this layout's),
+/// or one that does not add up, lists nothing; the request for the page
+/// still decodes what it shows. `visit` returning false stops the list.
+pub(crate) fn read_section_page_images<D, T, const ND: usize, const NF: usize, const NV: usize>(
+    book_dir: &Directory<'_, D, T, ND, NF, NV>,
+    source_identity: (u32, u32),
+    library: &ReaderStore,
+    section: BookV2SectionRecord,
+    page: u32,
+    mut visit: impl FnMut(u16) -> bool,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let Ok(sections) = book_dir.open_dir(CACHE_SECTIONS_DIR) else {
+        return false;
+    };
+    let mut name = String::<CACHE_SECTION_FILE_BYTES>::new();
+    section_file_name(section.section, &mut name);
+    let Ok(file) = sections.open_file_in_dir(name.as_str(), Mode::ReadOnly) else {
+        return false;
+    };
+    let mut header_bytes = [0u8; SECTION_V2_HEADER_BYTES];
+    if read_exact_file(&file, &mut header_bytes).is_err() {
+        return false;
+    }
+    let Ok(header) = decode_section_v2_header(&header_bytes) else {
+        return false;
+    };
+    let expected = reader_layout::reader_layout_config(library.type_settings(), library.portrait());
+    let Some(local) = page
+        .checked_sub(section.start_page)
+        .filter(|&local| local < u32::from(header.page_count))
+    else {
+        return false;
+    };
+    if header.source_hash != source_identity.0
+        || header.source_size != source_identity.1
+        || header.spine != section.spine
+        || header.custom_font_identity != library.custom_font_identity()
+        || header.font_config != expected
+    {
+        return false;
+    }
+    let pages_at = SECTION_V2_HEADER_BYTES as u32;
+    let blocks_at = pages_at + u32::from(header.page_count) * PAGE_RECORD_BYTES as u32;
+    let text_at = blocks_at + u32::from(header.block_count) * (BLOCK_RECORD_BYTES as u32 + 1);
+    let mut stage = [0u8; RECORD_STAGE_BYTES];
+    let page_record = &mut stage[..PAGE_RECORD_BYTES];
+    if file
+        .seek_from_start(pages_at + local * PAGE_RECORD_BYTES as u32)
+        .is_err()
+        || read_exact_file(&file, page_record).is_err()
+    {
+        return false;
+    }
+    let Ok(page_record) = decode_page(page_record) else {
+        return false;
+    };
+    let first = u32::from(page_record.first_block);
+    let end = first + u32::from(page_record.block_count);
+    if end > u32::from(header.block_count) {
+        return false;
+    }
+    let per_batch = (RECORD_STAGE_BYTES / BLOCK_RECORD_BYTES) as u32;
+    let mut block = first;
+    while block < end {
+        let count = (end - block).min(per_batch);
+        let records = &mut stage[..count as usize * BLOCK_RECORD_BYTES];
+        if file
+            .seek_from_start(blocks_at + block * BLOCK_RECORD_BYTES as u32)
+            .is_err()
+            || read_exact_file(&file, records).is_err()
+        {
+            return false;
+        }
+        for bytes in records.chunks_exact(BLOCK_RECORD_BYTES) {
+            let Ok(record) = decode_block(bytes) else {
+                return false;
+            };
+            let head_end = record
+                .text_offset
+                .checked_add(proto::image::token::IMAGE_TOKEN_HEAD_BYTES as u32);
+            let head_at = text_at.checked_add(record.text_offset);
+            let (true, Some(head_at)) = (
+                record.is_image() && head_end.is_some_and(|end| end <= header.text_bytes),
+                head_at,
+            ) else {
+                continue;
+            };
+            let mut head = [0u8; proto::image::token::IMAGE_TOKEN_HEAD_BYTES];
+            if file.seek_from_start(head_at).is_err() || read_exact_file(&file, &mut head).is_err()
+            {
+                return false;
+            }
+            let token = core::str::from_utf8(&head)
+                .ok()
+                .and_then(proto::image::token::decode_image_token);
+            if let Some(token) = token {
+                if !visit(token.slot) {
+                    return true;
+                }
+            }
+        }
+        block += count;
+    }
+    true
+}
+
 fn open_or_make_dir<
     'a,
     D,
@@ -2242,7 +2357,15 @@ where
     true
 }
 
-fn read_exact_file<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+/// Fills `out` from the file's current position; anything short of that
+/// is an error. The one read loop every card file goes through.
+pub(crate) fn read_exact_file<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
     file: &File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     mut out: &mut [u8],
 ) -> Result<(), ()>

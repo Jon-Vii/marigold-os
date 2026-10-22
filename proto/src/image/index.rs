@@ -68,7 +68,9 @@
 //! | 32 | 1, 1 | landscape, portrait [`DecodeStatus`] |
 //! | 34 | 2 | reserved, zero |
 //! | 36 | 4, 4 | landscape, portrait pack offset |
-//! | 44 | 20 | reserved, zero (for the decode order's spine and page hints) |
+//! | 44 | 2 | where layout first met it ([`ImagePlace`]): spine + 1, 0 until met |
+//! | 46 | 2 | and how many images that spine met before it |
+//! | 48 | 16 | reserved, zero |
 //!
 //! Bytes 24 onward are the entry's state, which [`write_image_state`]
 //! rewrites in one write; bytes 0 to 23 never change after the build.
@@ -244,6 +246,19 @@ pub struct ImageEntry {
     pub height: u16,
     pub landscape: DecodeState,
     pub portrait: DecodeState,
+    /// Where layout first met the image, the earliest place in the book that
+    /// shows it; `None` until a chapter's layout has. The decode pass
+    /// orders by it, so images are decoded in reading order.
+    pub seen_at: Option<ImagePlace>,
+}
+
+/// A place in the book's reading order: a spine, and how many images that
+/// spine's layout met before this one there. It does not depend on type
+/// settings or orientation, so a relayout finds the same place again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ImagePlace {
+    pub spine: u16,
+    pub order: u16,
 }
 
 impl ImageEntry {
@@ -776,6 +791,12 @@ fn encode_entry(entry: &ImageEntry, out: &mut [u8]) {
     out[33] = entry.portrait.status as u8;
     put_u32(out, 36, entry.landscape.pack_offset);
     put_u32(out, 40, entry.portrait.pack_offset);
+    // A spine past the field's range keeps no place; nothing in a book
+    // comes near it (the spine cap is 1,024).
+    if let Some(place) = entry.seen_at.filter(|place| place.spine < u16::MAX) {
+        put_u16(out, 44, place.spine + 1);
+        put_u16(out, 46, place.order);
+    }
 }
 
 /// The check an entry keeps over its first 22 bytes: its path hash and
@@ -807,6 +828,7 @@ fn decode_entry(bytes: &[u8; IMAGE_ENTRY_BYTES]) -> Option<ImageEntry> {
         entry.height = state.height;
         entry.landscape = state.landscape;
         entry.portrait = state.portrait;
+        entry.seen_at = state.seen_at;
     }
     Some(entry)
 }
@@ -849,6 +871,10 @@ fn decode_state(bytes: &[u8; IMAGE_ENTRY_BYTES]) -> Option<ImageEntry> {
         height: u16_at(bytes, 30),
         landscape: decode(bytes[32], 36)?,
         portrait: decode(bytes[33], 40)?,
+        seen_at: u16_at(bytes, 44).checked_sub(1).map(|spine| ImagePlace {
+            spine,
+            order: u16_at(bytes, 46),
+        }),
         ..ImageEntry::default()
     })
 }
@@ -1197,6 +1223,10 @@ mod tests {
                 pack_offset: 0x0012_3456,
             },
         );
+        entry.seen_at = Some(ImagePlace {
+            spine: 0,
+            order: 517,
+        });
         // A careless caller cannot move the image in the ZIP.
         let mut careless = entry;
         careless.local_header_offset = 0;

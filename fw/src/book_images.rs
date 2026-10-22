@@ -20,10 +20,12 @@ use embedded_sdmmc::{Directory, File, Mode, TimeSource};
 use proto::cache::{CACHE_ROOT_DIR, CACHE_V2_DIR};
 use proto::epub::{EpubZipOps, OwnedZipEntry, ZipError, ZipInflateScratch};
 use proto::image::index::{
-    find_image, open_image_index, probe_image, scan_images, write_image_state, BuildStep,
-    DecodeStatus, ImageIndexBuilder, ImageIndexHeader, ImageIndexKey, ImageProbe, IndexError,
-    IndexIo, ProbeStatus, IMAGE_INDEX_FILE, IMAGE_PROBE_BYTES,
+    find_image, open_image_index, probe_image, read_image, scan_images, write_image_state,
+    BuildStep, DecodeState, DecodeStatus, ImageEntry, ImageIndexBuilder, ImageIndexHeader,
+    ImageIndexKey, ImagePlace, ImageProbe, IndexError, IndexIo, ProbeStatus, IMAGE_INDEX_FILE,
+    IMAGE_PROBE_BYTES,
 };
+use proto::image::pack::{pack_file, PackRecord, SPOOL_FILE};
 use proto::image::path::{path_hash, resolve_image_path};
 use ui::reading::{fit_image, PageBox};
 
@@ -112,19 +114,24 @@ where
     /// Finds the image `src` names in the chapter at ZIP path `chapter`,
     /// resolving it into `path` (the ZIP name scratch, idle while a chapter
     /// streams). A probed image the decoder takes becomes a block fitted to
-    /// `page_box`, and is marked wanted unless it is already decoded for
-    /// this orientation. On a spine's first pass an unprobed image is
+    /// the orientation's page box, and is marked wanted unless it is already
+    /// decoded for that orientation. On a spine's first pass an unprobed
+    /// image is
     /// marked wanted for the probe that follows; on its second it is
-    /// missing, so a spine is laid out at most twice. Each change to the
-    /// entry is one write. Err only when the card fails.
+    /// missing, so a spine is laid out at most twice. Either way the entry
+    /// keeps `at` when it comes before where layout met the image so far,
+    /// so the decode pass knows its place in reading order. Each change to
+    /// the entry is one write, and a relayout, which meets every image
+    /// where it did before, writes nothing new. Err only when the card
+    /// fails.
     pub(crate) fn place(
         &self,
         chapter: &str,
         src: &str,
         path: &mut [u8],
-        page_box: PageBox,
         portrait: bool,
         first_pass: bool,
+        at: ImagePlace,
     ) -> Result<ImagePlacement, ()> {
         let Ok(name) = resolve_image_path(chapter, src, path) else {
             return Ok(ImagePlacement::Missing);
@@ -136,29 +143,31 @@ where
             Err(IndexError::Io) => return Err(()),
             Err(_) => return Ok(ImagePlacement::Missing),
         };
-        match entry.probe {
+        let placement = match entry.probe {
             ProbeStatus::Supported if entry.width > 0 && entry.height > 0 => {
+                let page_box = PageBox::for_portrait(portrait);
                 let (width, height) = fit_image(page_box, entry.width.into(), entry.height.into());
-                // Wanted until it is decoded for this orientation.
-                if !entry.wanted && entry.decode(portrait).status == DecodeStatus::NotDecoded {
-                    entry.wanted = true;
-                    write_image_state(io, &self.header, slot, &entry).map_err(|_| ())?;
-                }
-                Ok(ImagePlacement::Block {
+                ImagePlacement::Block {
                     slot,
                     width,
                     height,
-                })
-            }
-            ProbeStatus::Unprobed if first_pass => {
-                if !entry.wanted {
-                    entry.wanted = true;
-                    write_image_state(io, &self.header, slot, &entry).map_err(|_| ())?;
                 }
-                Ok(ImagePlacement::Unprobed { slot })
             }
-            _ => Ok(ImagePlacement::Missing),
+            ProbeStatus::Unprobed if first_pass => ImagePlacement::Unprobed { slot },
+            _ => return Ok(ImagePlacement::Missing),
+        };
+        // Wanted until it is decoded for this orientation (or probed, for
+        // an unprobed one).
+        let wanted = entry.wanted
+            || entry.probe == ProbeStatus::Unprobed
+            || entry.decode(portrait).status == DecodeStatus::NotDecoded;
+        let seen_at = entry.seen_at.map_or(at, |known| known.min(at));
+        if wanted != entry.wanted || entry.seen_at != Some(seen_at) {
+            entry.wanted = wanted;
+            entry.seen_at = Some(seen_at);
+            write_image_state(io, &self.header, slot, &entry).map_err(|_| ())?;
         }
+        Ok(placement)
     }
 
     /// Probes the images in `slots` that a chapter's first pass marked
@@ -249,6 +258,103 @@ where
             None => Ok(probed),
         }
     }
+
+    /// The entry in `slot`, as an image token names it; `None` when it
+    /// fails its checks, and the image is then treated as missing. Err only
+    /// when the card fails.
+    pub(crate) fn read(&self, slot: u16) -> Result<Option<ImageEntry>, ()> {
+        match read_image(&mut CardIndex(&self.file), &self.header, slot) {
+            Ok(found) => Ok(found),
+            Err(IndexError::Io) => Err(()),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Stores an entry's state in one write.
+    pub(crate) fn write_state(&self, slot: u16, entry: &ImageEntry) -> Result<(), ()> {
+        write_image_state(&mut CardIndex(&self.file), &self.header, slot, entry).map_err(|_| ())
+    }
+
+    /// Bytes of the orientation's pack that decoded images' records take:
+    /// what a pack holding only them would be. Reads the index a run of
+    /// entries at a time through `buf`.
+    pub(crate) fn live_pack_bytes(&self, portrait: bool, buf: &mut [u8]) -> Result<u32, ()> {
+        let mut live = 0u32;
+        self.scan(buf, |_, entry| {
+            if entry.decode(portrait).status == DecodeStatus::Decoded {
+                let page_box = PageBox::for_portrait(portrait);
+                let (width, height) = fit_image(page_box, entry.width.into(), entry.height.into());
+                let record = PackRecord::new(entry.path_hash, width, height);
+                live = live.saturating_add(record.map_or(0, |record| record.record_len()));
+            }
+            true
+        })?;
+        Ok(live)
+    }
+
+    /// Marks every image decoded in the orientation as not decoded (and
+    /// wanted) again, one write each: before its pack is deleted, so nothing
+    /// is left pointing into it. Images that failed stay failed.
+    pub(crate) fn forget_decodes(&self, portrait: bool, buf: &mut [u8]) -> Result<(), ()> {
+        scan_images(
+            &mut CardIndex(&self.file),
+            &self.header,
+            0..self.header.entry_count,
+            buf,
+            |io, slot, mut entry| {
+                if entry.decode(portrait).status == DecodeStatus::Decoded {
+                    entry.set_decode(portrait, DecodeState::default());
+                    entry.wanted = true;
+                    write_image_state(io, &self.header, slot, &entry)?;
+                }
+                Ok(true)
+            },
+        )
+        .map_err(|_| ())
+    }
+
+    /// Calls `visit` with every entry that passes its checks, reading a run
+    /// of entries at a time through `buf`, until it returns false. Err only
+    /// when the card fails.
+    pub(crate) fn scan(
+        &self,
+        buf: &mut [u8],
+        mut visit: impl FnMut(u16, ImageEntry) -> bool,
+    ) -> Result<(), ()> {
+        scan_images(
+            &mut CardIndex(&self.file),
+            &self.header,
+            0..self.header.entry_count,
+            buf,
+            |_, slot, entry| Ok(visit(slot, entry)),
+        )
+        .map_err(|_| ())
+    }
+}
+
+/// Opens the book's image index in its cache directory `dir` to decode
+/// images, never building it: an index no build has written yet holds no
+/// image a decode could take, since only layout probes them.
+pub(crate) fn open_existing_book_images<
+    'd,
+    D,
+    T,
+    const ND: usize,
+    const NF: usize,
+    const NV: usize,
+>(
+    dir: &'d Directory<'_, D, T, ND, NF, NV>,
+    source: (u32, u32),
+) -> Option<BookImages<'d, D, T, ND, NF, NV>>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let file = dir
+        .open_file_in_dir(IMAGE_INDEX_FILE, Mode::ReadWriteAppend)
+        .ok()?;
+    let header = open_image_index(&mut CardIndex(&file), &image_index_key(source)).ok()?;
+    Some(BookImages { file, header })
 }
 
 /// The book's cache directory, which holds its image index. A session
@@ -275,7 +381,8 @@ where
 /// run of entries per read, and keeps its records in `scratch`: the
 /// compressed scratch and the XHTML window, idle before a session's first
 /// spine. Slots follow from the directory alone, so a rebuilt index names
-/// every image as before.
+/// every image as before, but every image is undecoded again: `rebuilt`
+/// says so.
 ///
 /// None when the ZIP cannot be read or the card cannot hold the index: the
 /// session then lays images out as alt text, as it always did.
@@ -286,6 +393,7 @@ pub(crate) fn open_book_images<'d, Z, D, T, const ND: usize, const NF: usize, co
     zip: &mut Z,
     walk: &mut [u8],
     scratch: &mut [u8],
+    rebuilt: &mut bool,
 ) -> Option<BookImages<'d, D, T, ND, NF, NV>>
 where
     Z: EpubZipOps,
@@ -300,6 +408,12 @@ where
         }
         // Not formatted with the error: its Debug table would sit in RAM.
         esp_println::println!("images: index unusable; rebuilding");
+    }
+    // Nothing in a new index points into the old packs, so every record in
+    // them would be an orphan: delete them first, and any spool a power cut
+    // left, so a cut part way leaves an index that is still rebuilt.
+    for name in [pack_file(false), pack_file(true), SPOOL_FILE] {
+        crate::sd_session::remove_file_reclaiming_clusters(dir, name);
     }
     let file = dir
         .open_file_in_dir(IMAGE_INDEX_FILE, Mode::ReadWriteCreateOrTruncate)
@@ -322,13 +436,15 @@ where
         header.entry_count,
         if header.truncated { ", truncated" } else { "" }
     );
+    *rebuilt = true;
     Some(BookImages { file, header })
 }
 
 /// `IMAGES.BIN` as the index reads and writes it: exact reads and writes
-/// at byte offsets in the open file.
-struct CardIndex<'f, 'v, D, T, const ND: usize, const NF: usize, const NV: usize>(
-    &'f File<'v, D, T, ND, NF, NV>,
+/// at byte offsets in the open file. A page's draw reads through it too,
+/// from a file it opened read-only.
+pub(crate) struct CardIndex<'f, 'v, D, T, const ND: usize, const NF: usize, const NV: usize>(
+    pub(crate) &'f File<'v, D, T, ND, NF, NV>,
 )
 where
     D: embedded_sdmmc::BlockDevice,
@@ -342,16 +458,9 @@ where
 {
     type Error = ();
 
-    fn read_at(&mut self, offset: u32, mut buf: &mut [u8]) -> Result<(), ()> {
+    fn read_at(&mut self, offset: u32, buf: &mut [u8]) -> Result<(), ()> {
         self.0.seek_from_start(offset).map_err(|_| ())?;
-        while !buf.is_empty() {
-            let read = self.0.read(buf).map_err(|_| ())?;
-            if read == 0 {
-                return Err(());
-            }
-            buf = &mut buf[read..];
-        }
-        Ok(())
+        crate::reader_cache_files::read_exact_file(self.0, buf)
     }
 
     fn write_at(&mut self, offset: u32, buf: &[u8]) -> Result<(), ()> {

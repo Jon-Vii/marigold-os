@@ -36,7 +36,35 @@ class BenchParserTests(unittest.TestCase):
         self.assertEqual(event["button"], "Next")
 
 
+    def test_parse_image_decode(self) -> None:
+        event = bench.parse_line(
+            "bench: image_decode slot=12 src_bytes=7198 out=310x436 ms=212 spool_ms=40 outcome=decoded",
+            "image",
+        )[0]
+        self.assertEqual(event["event"], "image_decode")
+        self.assertEqual(event["out"], "310x436")
+        self.assertEqual(event["ms"], 212)
+        self.assertEqual(event["outcome"], "decoded")
+
+
 class BenchReportTests(unittest.TestCase):
+    def test_image_summary_splits_decodes_spools_and_page_waits(self) -> None:
+        lines = [
+            "bench: image_decode slot=1 src_bytes=516 out=138x90 ms=14 spool_ms=0 outcome=decoded",
+            "bench: image_decode slot=2 src_bytes=9000 out=310x436 ms=900 spool_ms=300 outcome=decoded",
+            "bench: image_decode slot=3 src_bytes=9000 out=310x436 ms=50 spool_ms=0 outcome=cancelled",
+            "bench: image_session pass=request images=2 checked=2 decoded=1 failed=0 cancelled=0 retry=0 elapsed_ms=930 pressed=false t_ms=5",
+            "bench: image_session pass=request images=1 checked=1 decoded=0 failed=0 cancelled=0 retry=0 elapsed_ms=12 pressed=false t_ms=9",
+            "bench: image_session pass=window images=4 checked=4 decoded=2 failed=0 cancelled=0 retry=0 elapsed_ms=930 pressed=false t_ms=20",
+        ]
+        events = [event for line in lines for event in bench.parse_line(line, "image")]
+        summary = bench.image_summary(events)
+        self.assertEqual(summary["outcomes"], {"cancelled": 1, "decoded": 2})
+        self.assertEqual(summary["decode_ms"], [14, 900])
+        self.assertEqual(summary["spool_ms"], [300])
+        self.assertEqual(summary["wait_ms"], [930])
+        self.assertEqual(summary["check_ms"], [12])
+
     def test_page_turn_duration_pairs_input_with_next_reading_render(self) -> None:
         events = [
             {"suite": "page-turn", "event": "input", "button": "Next", "t_ms": 100},

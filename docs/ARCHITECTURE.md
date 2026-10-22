@@ -261,7 +261,12 @@ firmware images can coexist.
 `display::fb::Framebuffer` is the source of truth. White is bit `1`, black is
 bit `0`, row-major, `ROW_BYTES` per row (100 on the X4, 99 on the X3). Each
 framebuffer also carries its `FbFrame`, the drawing frame for how the device
-is held (see orientation below).
+is held (see orientation below). Glyphs and rules draw pixel by pixel;
+`Framebuffer::blit` draws a band of an image's 1 bpp rows, in the image pack
+layout, a byte at a time: whole rows shifted into place in the landscape
+frames (bit-reversed through the panel transform's table when flipped), and
+8 × 8 bit transposes in portrait. It leaves exactly what a `set_pixel` per
+pixel would, clipping included.
 
 On the X4, the SSD1677 path writes the current framebuffer to BW RAM
 (`0x24`). The first refresh after boot also writes the current framebuffer to
@@ -395,8 +400,9 @@ and the host preview tool:
 - `proto::image` for images in books: `path` resolves an image `src` against
   its chapter's ZIP path and hashes it, `index` owns the per-book
   `IMAGES.BIN` format (entries from the ZIP central directory, sorted by
-  path hash, probed and decoded state filled in place), and `token` is the
-  text an image block stores. An image block is a `BlockRecord` whose
+  path hash, probed and decoded state filled in place), `token` is the
+  text an image block stores, and `pack` is the record a decoded image
+  keeps in its orientation's pack. An image block is a `BlockRecord` whose
   `image_height` (the record's last two bytes, zero in caches before v28)
   is non-zero; `ui::reading` fits images with `fit_image`, gives the block
   gaps above and below so the neighbouring lines' descenders and tallest
@@ -589,11 +595,91 @@ take keeps its alt-text placeholder; an svg-wrapped image, which never had
 one, leaves nothing. The index does not depend on type settings, so it
 survives every relayout, and it goes with the book's cache directory.
 
+Each image is decoded once per orientation, at the size layout fitted it
+to, into an append-only pack in the book's cache directory (`IMGL.BIN`,
+which flipped landscape shares, and `IMGP.BIN`; `proto::image::pack`,
+`fw::image_decode`). A decode reads the image at the local-header offset
+its index entry keeps, after checking that the header names it, so no ZIP
+directory is opened. A stored image streams from the ZIP through the PNG
+decoder and the ditherer; a deflated one is first inflated to `SPOOL.TMP`
+beside the packs (refused past 4 MB by its declared size, as is a stream
+that outgrows it) and decoded from there, since the decoder's zlib stream
+needs the one inflater, and the spool is deleted after each image. Rows go
+to the pack behind a 16-byte record header through a write buffer, and
+only once the decode has finished and the pack's length is on the card
+does the index entry take the record's offset, in one write. A content
+fault (a corrupt PNG, one too wide for the window to hold its row, a
+damaged entry) marks that orientation failed for good. A card fault or a
+spent read budget records nothing, and a press cancels the image in hand
+(the spool asks between pieces of input as well as between chunks of
+output); either leaves at most an orphan tail in the pack that nothing
+points at. A pack that would pass its 64 MB cap is mostly orphans when the
+records images use, with the next, fill at most half of it: every decode in
+that orientation is then forgotten in the index, the pack deleted, and a
+new one begun, so images decode again as they are needed. A pack its
+images' own records fill fails the next image instead. An index that is
+built again (damaged, or for another copy of the book) first deletes both
+packs and any spool, whose records nothing in it would point at. The decoder, the ditherer and the packed row take the
+XHTML window, ZIP reads and the write buffer split the compressed
+scratch, work lists take the container scratch, and the inflater serves
+both layers in turn. All of them are idle outside a build session, and
+image work always runs in an SD session of its own, so decoding adds no
+static RAM.
+
+Images are decoded nearest the reader first. Layout records in each index
+entry where it first met the image, its spine and how many images that
+spine met before it, which no relayout changes. While the reader is idle,
+each step does one thing: the undecoded images on the next three pages and
+the page before (from the store for pages it holds, from their section
+files otherwise), then text layout as before, then the rest of the book's
+images, in reading order from the reader's place to the end and on from
+the start, a batch at a time from one read of the index. Steps keep the
+session budget, a press stops a decode between output rows (or pieces of
+input, a kilobyte each) and the rest pass between index entries, and any
+command from the app looks at the window again. A request for a page whose
+images are not decoded for the orientation decodes them before it is
+answered, so a page never shows a box its picture would later replace; a
+press during that wait, or a newer request, abandons the image in hand,
+and the request is retried for the page it resolved to (a first open's
+text start, a relaid page's place) unless a newer one replaces it.
+
+The store keeps a note of what is settled, decoded or failed, for the
+orientation (`ReaderStore::images_settled`, five bytes found by narrowing
+two counters): a run of pages that a request or a window pass found
+settled, and, once a rest pass finds nothing left in the index, the whole
+book. A request for a noted page answers without opening the card to
+check, and an idle step opens no image session for a window the note
+covers, or at all once the book is settled, so a fully decoded book reads
+nothing after a page turn but its pages' draws. Decode state only moves
+toward settled until the index is rebuilt, so the note lasts until the
+book, its layout or its index changes, or a fresh build numbers its pages
+anew; a spine laid out keeps the pages' note but unsettles the book. A
+book without images, or a page without image blocks, does none of this
+and reads nothing more. An orientation change decodes into the other pack
+as its pages are asked for and idle steps reach them; a change of type
+settings decodes nothing again.
+
 Caches from before image blocks (v27) are still read. The first load of
 such a book's index reads its ZIP's central directory once: without PNGs
 (a JPEG cover alone does not count) the index is written again as v28, as
 it stands, and with them the book rebuilds, pinned to the reader's place,
 so its images replace the alt text it was laid out with.
+
+A reading page draws its images from the book's packs (`fw::page_images`).
+Pages draw from RAM outside any SD session, as before, unless the book has
+images and the page holds an image block; such a page is drawn inside a
+session, as a page in a custom face from the card is. Each image block reads
+its index entry and, if the image is decoded for the orientation, its pack
+record's header, and draws only a record that is the image the block names,
+at the size layout fitted, lying inside the pack. The rows stream from the
+card a band at a time through the panel transfer band (only panel transfers
+fill it, so it is idle while a frame draws) into `Framebuffer::blit`, never
+reading past the record. Anything else draws the alt-text placeholder: a
+card error part way clears the rows drawn, and the page's later images draw
+placeholders without reading. If the session cannot open, the page is drawn
+from RAM with placeholders, never left as the previous frame. Each page that
+draws images logs `bench: image_draw` with its image and placeholder counts,
+row bytes, and time spent opening, reading and blitting.
 
 Cache paths use FAT 8.3-safe names because `embedded-sdmmc` operates on short
 file names in the firmware path. The library list is a windowed catalog
@@ -625,6 +711,8 @@ snapshot or a completed scan has no EPUBs.
 /XTEINK/CACHE2/E<hash>/TOC.BIN
 /XTEINK/CACHE2/E<hash>/COVER.BIN
 /XTEINK/CACHE2/E<hash>/IMAGES.BIN     (books with images)
+/XTEINK/CACHE2/E<hash>/IMGL.BIN       (decoded images, landscape; IMGP.BIN portrait)
+/XTEINK/CACHE2/E<hash>/SPOOL.TMP      (a deflated image while it decodes)
 /XTEINK/CACHE2/E<hash>/SECTIONS/S000.BIN
 /XTEINK/CACHE2/E<hash>/SECTIONS/S001.BIN
 /XTEINK/CACHE2/E<hash>/POSA.BIN       (per-book position, alternating with POSB.BIN)
@@ -856,6 +944,8 @@ fw::sd_session          SD session open/close and the upload write pump
 fw::reader_cache        EPUB-to-cache loading into bounded proto::cache records
 fw::reader_cache_files  cache/state/credential/label file records on the card
 fw::book_images         a book's IMAGES.BIN during a build: open/build, lookups, probes
+fw::image_decode        decoding images into the packs, nearest the reader first
+fw::page_images         a reading page's images, drawn from the book's packs
 ui::reading             Reader page plan: one page walk, wrapping, measurements, drawing
 fw::reader_layout       bounded page-index and TOC adapters over the shared page walk
 fw::reader_store        bounded loaded-book/library state shared by cache and views

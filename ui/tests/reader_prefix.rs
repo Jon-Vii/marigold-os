@@ -563,3 +563,92 @@ fn unknown_and_provisional_chapter_pages_go_unnumbered() {
     let pages: Vec<u32> = (0..3).map(|i| store.toc_item(i).unwrap().page).collect();
     assert_eq!(pages, [11, 0, 0]);
 }
+
+#[test]
+fn a_request_whose_image_wait_gives_way_retries_at_the_page_it_resolved_to() {
+    use app_core::StorageCommand;
+    // The display task, when a press abandons a request's wait for its
+    // page's images, spends the request's pins and asks again for the page
+    // it resolved to. That page is resident, so the retry answers from RAM,
+    // which resolves nothing: asking again for the number first asked for
+    // would land elsewhere.
+    let retry = |store: &mut ReaderStore, request: StorageCommand, asked: u32| {
+        let resolved = store.requested_page(asked, None).unwrap();
+        store.end_reader_request();
+        let Some(StorageCommand::ExtendSection { target_pages, .. }) =
+            request.retry_at_page(resolved)
+        else {
+            panic!("a reader request");
+        };
+        let page = store.settled_page(u32::from(target_pages));
+        assert!(store.covers_global_page(0, page), "answered from RAM");
+        (resolved, page, store.requested_page(asked, None))
+    };
+    let settings = TypeSettings::DEFAULT;
+
+    // A first open, waiting on the text start's image: the cover is page 0.
+    let mut store = anchored_store();
+    store.set_book_index(
+        40,
+        false,
+        &[
+            section(0, 0, 0, 1),
+            section(1, 1, 1, 1),
+            section(2, 2, 2, 3),
+            section(3, 3, 5, 20),
+            section(4, 4, 25, 15),
+        ],
+    );
+    store.set_text_start_spine(Some(3));
+    store.seek_text_start(ANCHOR_SOURCE);
+    store.set_current_section_range(5, 20);
+    store.page_count = 20;
+    store.finish_book_load(0, 0, BookLoadStatus::Ready);
+    let open = StorageCommand::OpenBook {
+        request_id: 1,
+        book_id: 2,
+        index: 0,
+        chapter: 0,
+        target_pages: 0,
+        type_settings: settings,
+        portrait: false,
+    };
+    assert_eq!(retry(&mut store, open, 0), (5, 5, Some(0)));
+
+    // A line-spacing change pinned page 20's place, which is page 29 now.
+    let mut store = anchored_store();
+    store.set_book_index(
+        35,
+        false,
+        &[
+            section(0, 0, 0, 10),
+            section(1, 1, 10, 12),
+            section(2, 1, 22, 8),
+            section(3, 2, 30, 5),
+        ],
+    );
+    store.anchor_resident_page(ANCHOR_SOURCE, 20);
+    store.set_book_index(
+        51,
+        false,
+        &[
+            section(0, 0, 0, 14),
+            section(1, 1, 14, 16),
+            section(2, 1, 30, 14),
+            section(3, 2, 44, 7),
+        ],
+    );
+    store.set_current_section_range(14, 16);
+    store.page_count = 16;
+    store.finish_book_load(0, 0, BookLoadStatus::Ready);
+    let extend = StorageCommand::ExtendSection {
+        request_id: 1,
+        book_id: 2,
+        index: 0,
+        chapter: 0,
+        target_pages: 20,
+        type_settings: settings,
+        portrait: false,
+    };
+    assert_eq!(retry(&mut store, extend, 20), (29, 29, Some(20)));
+}

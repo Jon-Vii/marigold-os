@@ -25,6 +25,9 @@ pub(crate) const MAX_OVERVIEW_CHAPTERS: usize = 256;
 const MAX_CURRENT_CHAPTER_TITLE: usize = 60;
 pub(crate) const MAX_CUSTOM_FONT_NAME: usize = proto::font_pack::FONT_PACK_MAX_NAME_BYTES;
 pub(crate) const MAX_CUSTOM_FONT_FACES: usize = 12;
+// The counts of both are kept in a byte.
+const _: () = assert!(MAX_CUSTOM_FONT_FACES <= u8::MAX as usize);
+const _: () = assert!(MAX_FIRMWARE_FILES <= u8::MAX as usize);
 // ~14 pages per 16 KB section at the default size, so 320 covers ~4,500
 // pages -- enough for very long books (e.g. HPMOR) to cache whole rather
 // than tripping book_partial partway. Every spine item takes at least one
@@ -435,6 +438,28 @@ pub(crate) struct TocItem<'a> {
     pub(crate) page: u32,
 }
 
+/// Which of the loaded book's images are known to need no decode in the
+/// current orientation, so a page turn need not open the card to check:
+/// those on pages `from..to`, or all of them. Decode state only ever moves
+/// from to-decode to decoded or failed, until the image index is rebuilt,
+/// so the note holds until the book, its layout, or its index changes; a
+/// book that grows keeps its pages' note but may have new images. It sits
+/// in the store's padding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ImageNote {
+    from: u16,
+    to: u16,
+    book_done: bool,
+}
+
+impl ImageNote {
+    const NOTHING: Self = Self {
+        from: 0,
+        to: 0,
+        book_done: false,
+    };
+}
+
 pub(crate) struct ReaderStore {
     pub(crate) status: LibraryScanStatus,
     /// Full book count across CATALOG.BIN (the source of truth), independent of
@@ -451,7 +476,8 @@ pub(crate) struct ReaderStore {
     active_entry: LibraryBookEntry,
     active_index: Option<usize>,
     firmware_files: [FirmwareFileEntry; MAX_FIRMWARE_FILES],
-    firmware_count: usize,
+    /// Up to `MAX_FIRMWARE_FILES`; a byte leaves room for `image_note`.
+    firmware_count: u8,
     pub(crate) current_index: Option<usize>,
     pub(crate) loaded_index: Option<usize>,
     pub(crate) loaded_chapter: u16,
@@ -476,6 +502,9 @@ pub(crate) struct ReaderStore {
     /// The loaded book has images an image index holds, as its index
     /// header or its build's look at the ZIP says.
     book_has_images: bool,
+    /// What the loaded book's image decoding is known to have settled in
+    /// this layout's orientation (see [`ImageNote`]).
+    image_note: ImageNote,
     pub(crate) book_sections: SectionTable,
     pub(crate) seed: SeedRun,
     /// Pin for the page a layout-changing load asked for, held across the
@@ -551,7 +580,8 @@ pub(crate) struct ReaderStore {
     custom_font_identity: u64,
     custom_font_name: String<MAX_CUSTOM_FONT_NAME>,
     custom_font_faces: [proto::font_pack::FontPackFaceRecord; MAX_CUSTOM_FONT_FACES],
-    custom_font_face_count: usize,
+    /// Up to `MAX_CUSTOM_FONT_FACES`; a byte, like `firmware_count`.
+    custom_font_face_count: u8,
 }
 
 impl ReaderStore {
@@ -588,6 +618,7 @@ impl ReaderStore {
             book_next_spine: None,
             book_generated_toc: false,
             book_has_images: false,
+            image_note: ImageNote::NOTHING,
             book_sections: SectionTable::new(),
             seed: SeedRun::new(),
             page_anchor: None,
@@ -638,7 +669,10 @@ impl ReaderStore {
     }
 
     pub(crate) fn push_firmware_file(&mut self, display_name: &str, open_name: &str, size: u32) {
-        let Some(entry) = self.firmware_files.get_mut(self.firmware_count) else {
+        let Some(entry) = self
+            .firmware_files
+            .get_mut(usize::from(self.firmware_count))
+        else {
             return;
         };
         entry.display_name.clear();
@@ -650,7 +684,7 @@ impl ReaderStore {
     }
 
     pub(crate) fn firmware_files(&self) -> &[FirmwareFileEntry] {
-        &self.firmware_files[..self.firmware_count]
+        &self.firmware_files[..usize::from(self.firmware_count)]
     }
 
     pub(crate) fn firmware_file(&self, index: usize) -> Option<&FirmwareFileEntry> {
@@ -668,11 +702,11 @@ impl ReaderStore {
             let _ = self.custom_font_name.push_str(name);
             self.custom_font_available = true;
             self.custom_font_identity = identity;
-            self.custom_font_face_count = faces.len().min(MAX_CUSTOM_FONT_FACES);
+            let count = faces.len().min(MAX_CUSTOM_FONT_FACES);
+            self.custom_font_face_count = count as u8;
             self.custom_font_faces =
                 [proto::font_pack::FontPackFaceRecord::EMPTY; MAX_CUSTOM_FONT_FACES];
-            self.custom_font_faces[..self.custom_font_face_count]
-                .copy_from_slice(&faces[..self.custom_font_face_count]);
+            self.custom_font_faces[..count].copy_from_slice(&faces[..count]);
         } else {
             self.custom_font_available = false;
             self.custom_font_identity = 0;
@@ -703,7 +737,7 @@ impl ReaderStore {
         size_px: u8,
         style: u8,
     ) -> Option<proto::font_pack::FontPackFaceRecord> {
-        self.custom_font_faces[..self.custom_font_face_count]
+        self.custom_font_faces[..usize::from(self.custom_font_face_count)]
             .iter()
             .copied()
             .find(|face| face.size_px == size_px && face.style == style)
@@ -730,6 +764,7 @@ impl ReaderStore {
         if self.type_settings == settings && self.portrait == portrait {
             return;
         }
+        self.forget_settled_images();
         self.type_settings = settings;
         self.portrait = portrait;
         self.page_count = 0;
@@ -1034,8 +1069,68 @@ impl ReaderStore {
     }
 
     pub(crate) fn set_cache_key(&mut self, key: &str) {
+        if self.cache_key.as_str() != key {
+            // Another book.
+            self.forget_settled_images();
+        }
         self.cache_key.clear();
         let _ = self.cache_key.push_str(key);
+    }
+
+    /// Whether `page` is laid out: in the prefix, or in the seed run.
+    pub(crate) fn page_exists(&self, page: u32) -> bool {
+        (page < self.book_total_pages || self.is_provisional(page))
+            && self.section_for_global_page(page).is_some()
+    }
+
+    /// Whether every image page `page` shows is known to need no decode in
+    /// this orientation: decoded, failed, or one the decoder does not take.
+    /// A request for such a page answers without opening the card.
+    pub(crate) fn images_settled(&self, page: u32) -> bool {
+        let note = self.image_note;
+        note.book_done || (u32::from(note.from)..u32::from(note.to)).contains(&page)
+    }
+
+    /// Whether every image in the book is known to need no decode in this
+    /// orientation, so idle image passes have nothing to do.
+    pub(crate) fn book_images_settled(&self) -> bool {
+        self.image_note.book_done
+    }
+
+    /// Notes that the images on pages `from..to` need no decode. Joins the
+    /// pages already noted when the two runs meet; otherwise replaces them.
+    pub(crate) fn note_settled_pages(&mut self, from: u32, to: u32) {
+        let (Ok(from), Ok(to)) = (u16::try_from(from), u16::try_from(to)) else {
+            return;
+        };
+        let note = &mut self.image_note;
+        if from >= to {
+            return;
+        }
+        if from <= note.to && note.from <= to && note.from < note.to {
+            note.from = note.from.min(from);
+            note.to = note.to.max(to);
+        } else {
+            note.from = from;
+            note.to = to;
+        }
+    }
+
+    /// Notes that no image in the book needs a decode in this orientation.
+    pub(crate) fn note_book_images_settled(&mut self) {
+        self.image_note.book_done = true;
+    }
+
+    /// The book grew: its new chapters may hold images still to decode. The
+    /// pages already noted keep their images.
+    pub(crate) fn note_book_grew(&mut self) {
+        self.image_note.book_done = false;
+    }
+
+    /// Forgets what is noted: the book, its layout, or its image index
+    /// changed.
+    pub(crate) fn forget_settled_images(&mut self) {
+        self.image_note = ImageNote::NOTHING;
     }
 
     pub(crate) fn set_book_labels(&mut self, title: &str, author: &str) {

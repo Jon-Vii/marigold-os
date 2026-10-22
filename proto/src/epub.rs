@@ -196,6 +196,13 @@ impl ZipInflateScratch {
             state: InflateState::new(DataFormat::Raw),
         }
     }
+
+    /// The inflater itself, lent to a decoder with a zlib stream of its own
+    /// (a PNG's image data) while no entry is being read. Every entry read
+    /// resets it first, so whatever the borrower leaves in it is harmless.
+    pub fn inflater(&mut self) -> &mut InflateState {
+        &mut self.state
+    }
 }
 
 impl Default for ZipInflateScratch {
@@ -573,26 +580,7 @@ where
         inflate_scratch: &mut ZipInflateScratch,
         input_cap: u32,
     ) -> Result<usize, ZipError> {
-        let end = self.reader.len().map_err(|_| ZipError::Io)?;
-        let within = |offset: u32, len: u32| offset.checked_add(len).filter(|&last| last <= end);
-        let name_at = within(entry.local_header_offset, 30).ok_or(ZipError::BadLocalHeader)?;
-        let mut header = [0u8; 30];
-        read_exact_at(&mut self.reader, entry.local_header_offset, &mut header)?;
-        if read_u32(&header, 0)? != 0x0403_4b50 {
-            return Err(ZipError::BadLocalHeader);
-        }
-        let name_len = read_u16(&header, 26)? as usize;
-        let extra_len = u32::from(read_u16(&header, 28)?);
-        let name = input.get_mut(..name_len).ok_or(ZipError::BadLocalHeader)?;
-        within(name_at, name_len as u32).ok_or(ZipError::BadLocalHeader)?;
-        read_exact_at(&mut self.reader, name_at, name)?;
-        if !is_name(name) {
-            return Err(ZipError::BadLocalHeader);
-        }
-        let payload = (name_at + name_len as u32)
-            .checked_add(extra_len)
-            .ok_or(ZipError::BadLocalHeader)?;
-        within(payload, entry.compressed_size).ok_or(ZipError::BadLocalHeader)?;
+        let payload = entry_payload_at(&mut self.reader, entry, input, is_name)?;
         match entry.compression_method {
             0 => {
                 let len = output
@@ -1298,6 +1286,76 @@ where
             return Err(ZipError::Inflate);
         }
     }
+}
+
+/// Where an entry found by its stored local-header offset starts its data,
+/// once the local header checks out: present, inside the archive with all
+/// of its data, and naming the entry (`is_name` says, given the header's
+/// name, read into `name`, which must hold it).
+///
+/// Only a failed read comes back as [`ZipError::Io`], which is worth
+/// retrying. A header that is missing, lies past the archive's end
+/// (checked against its length, so it never reads as a failed read), or
+/// names another entry is [`ZipError::BadLocalHeader`], the same every
+/// time. An image is read this way, by the offset its index entry keeps.
+pub fn entry_payload_at<R: ReadAt>(
+    reader: &mut R,
+    entry: OwnedZipEntry,
+    name: &mut [u8],
+    is_name: &mut dyn FnMut(&[u8]) -> bool,
+) -> Result<u32, ZipError> {
+    let end = reader.len().map_err(|_| ZipError::Io)?;
+    let within = |offset: u32, len: u32| offset.checked_add(len).filter(|&last| last <= end);
+    let name_at = within(entry.local_header_offset, 30).ok_or(ZipError::BadLocalHeader)?;
+    let mut header = [0u8; 30];
+    read_exact_at(reader, entry.local_header_offset, &mut header)?;
+    if read_u32(&header, 0)? != 0x0403_4b50 {
+        return Err(ZipError::BadLocalHeader);
+    }
+    let name_len = read_u16(&header, 26)? as usize;
+    let extra_len = u32::from(read_u16(&header, 28)?);
+    let name = name.get_mut(..name_len).ok_or(ZipError::BadLocalHeader)?;
+    within(name_at, name_len as u32).ok_or(ZipError::BadLocalHeader)?;
+    read_exact_at(reader, name_at, name)?;
+    if !is_name(name) {
+        return Err(ZipError::BadLocalHeader);
+    }
+    let payload = (name_at + name_len as u32)
+        .checked_add(extra_len)
+        .ok_or(ZipError::BadLocalHeader)?;
+    within(payload, entry.compressed_size).ok_or(ZipError::BadLocalHeader)?;
+    Ok(payload)
+}
+
+/// Fills `out` from `offset`; a short read is [`ZipError::Io`].
+pub fn read_payload_at<R: ReadAt>(
+    reader: &mut R,
+    offset: u32,
+    out: &mut [u8],
+) -> Result<(), ZipError> {
+    read_exact_at(reader, offset, out)
+}
+
+/// Fills a buffer with compressed bytes from an offset into an entry's data.
+pub type FetchAt<'a> = dyn FnMut(u32, &mut [u8]) -> Result<(), ZipError> + 'a;
+
+/// Inflates a deflated entry's `compressed_size` bytes of data and hands
+/// `emit` the output a full `output` at a time, as
+/// [`ZipStream::read_entry_to_sink`] does. `fetch` fills a buffer with the
+/// compressed bytes from an offset into the data (for an entry found by
+/// [`entry_payload_at`], a read of the archive at the payload plus that
+/// offset), a piece of `input` at a time. Either closure stops the inflate
+/// by returning an error, which comes back unchanged: `fetch` gives a
+/// caller a say between pieces even where the output never fills.
+pub fn inflate_to_sink(
+    fetch: &mut FetchAt<'_>,
+    compressed_size: u32,
+    input: &mut [u8],
+    output: &mut [u8],
+    inflate_scratch: &mut ZipInflateScratch,
+    emit: &mut dyn FnMut(&[u8]) -> Result<(), ZipError>,
+) -> Result<(), ZipError> {
+    inflate_chunks_to_sink(fetch, compressed_size, input, output, inflate_scratch, emit).map(|_| ())
 }
 
 /// What [`build_central_index`] made of the directory.

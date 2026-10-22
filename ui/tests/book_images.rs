@@ -50,7 +50,7 @@ mod sd_session {
 use book_images::{BookImages, ImagePlacement, ProbeStop};
 use embedded_sdmmc::{Mode, VolumeIdx, VolumeManager};
 use proto::epub::{ReadAt, ZipInflateScratch, ZipStream};
-use proto::image::index::IMAGE_INDEX_FILE;
+use proto::image::index::{ImagePlace, IMAGE_INDEX_FILE};
 use reader_store::ReaderStore;
 use std::cell::{Cell, RefCell};
 use ui::reading::PageBox;
@@ -156,16 +156,22 @@ where
     D: embedded_sdmmc::BlockDevice,
     T: embedded_sdmmc::TimeSource,
 {
+    place_at(images, src, first_pass, ImagePlace { spine: 0, order: 0 })
+}
+
+fn place_at<D, T, const ND: usize, const NF: usize, const NV: usize>(
+    images: &BookImages<'_, D, T, ND, NF, NV>,
+    src: &str,
+    first_pass: bool,
+    at: ImagePlace,
+) -> ImagePlacement
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: embedded_sdmmc::TimeSource,
+{
     let mut path = [0xa5u8; proto::epub::MAX_ENTRY_NAME_BYTES];
     images
-        .place(
-            CHAPTER,
-            src,
-            &mut path,
-            PageBox::LANDSCAPE,
-            false,
-            first_pass,
-        )
+        .place(CHAPTER, src, &mut path, false, first_pass, at)
         .expect("the card answers")
 }
 
@@ -197,9 +203,15 @@ fn a_session_builds_the_index_once_and_reads_no_image_to_do_it() {
     assert!(reads.borrow().is_empty(), "known from the open");
 
     let dir = book_images::book_cache_dir(&root, KEY).expect("cache directory");
-    let images =
-        book_images::open_book_images(&dir, ID, &mut zip, &mut scratch.walk, &mut scratch.window)
-            .expect("index built");
+    let images = book_images::open_book_images(
+        &dir,
+        ID,
+        &mut zip,
+        &mut scratch.walk,
+        &mut scratch.window,
+        &mut false,
+    )
+    .expect("index built");
     // Only the central directory: no local header and no image byte.
     let entries_end = spans.last().unwrap().1;
     assert!(!reads.borrow().is_empty());
@@ -215,9 +227,15 @@ fn a_session_builds_the_index_once_and_reads_no_image_to_do_it() {
 
     // The next session opens it without writing a byte.
     let writes = disk.writes.get();
-    let images =
-        book_images::open_book_images(&dir, ID, &mut zip, &mut scratch.walk, &mut scratch.window)
-            .expect("index opens");
+    let images = book_images::open_book_images(
+        &dir,
+        ID,
+        &mut zip,
+        &mut scratch.walk,
+        &mut scratch.window,
+        &mut false,
+    )
+    .expect("index opens");
     assert!(matches!(
         place(&images, "../images/small.png", true),
         ImagePlacement::Unprobed { .. }
@@ -256,6 +274,7 @@ fn a_session_builds_the_index_once_and_reads_no_image_to_do_it() {
                 &mut zip,
                 &mut scratch.walk,
                 &mut scratch.window,
+                &mut false,
             )
             .unwrap();
             slot(&images)
@@ -266,6 +285,7 @@ fn a_session_builds_the_index_once_and_reads_no_image_to_do_it() {
             &mut zip,
             &mut scratch.walk,
             &mut scratch.window,
+            &mut false,
         )
         .expect("rebuilt");
         assert_eq!(slot(&images), before, "{damage:?}");
@@ -301,9 +321,15 @@ fn a_first_pass_marks_images_the_probe_sorts_and_the_second_pass_shows() {
     .unwrap();
     let mut scratch = scratch();
     let dir = book_images::book_cache_dir(&root, KEY).unwrap();
-    let images =
-        book_images::open_book_images(&dir, ID, &mut zip, &mut scratch.walk, &mut scratch.window)
-            .unwrap();
+    let images = book_images::open_book_images(
+        &dir,
+        ID,
+        &mut zip,
+        &mut scratch.walk,
+        &mut scratch.window,
+        &mut false,
+    )
+    .unwrap();
 
     // Sources that name nothing in the book.
     for src in [

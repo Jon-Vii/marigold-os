@@ -1,5 +1,6 @@
 use crate::book_images::{BookImages, ImagePlacement, ProbeStop};
 use crate::display_flush::Epd;
+use crate::image_decode::{DecodeOutcome, ImageScratch, ImageSession, PageImages, SessionStats};
 use crate::reader_cache_files;
 use crate::reader_cache_files::{BookIndexLoadResult, CacheLoadResult};
 use crate::reader_layout;
@@ -22,6 +23,7 @@ use proto::epub::{
     XhtmlBlockStreamParser, XhtmlError, ZipInflateScratch, ZipStream, MAX_ENTRY_NAME_BYTES,
 };
 use proto::hyphen::{word_breaks, Hyphenation, WordBreak, MAX_WORD_BREAKS};
+use proto::image::index::ImagePlace;
 use proto::image::token::encode_image_token;
 use proto::text::{TextAlign, TextRole};
 use ui::reading::StyledInkCursor;
@@ -136,6 +138,29 @@ impl<'a> ReaderCacheScratch<'a> {
             xhtml,
             zip_inflate: ZipInflateScratch::new(),
         }
+    }
+}
+
+impl ReaderCacheScratch<'_> {
+    /// Lends the scratch to an image pass, and a work list for it. A pass
+    /// runs in an SD session of its own, never inside a build session, so
+    /// all of it is idle: no spine streams (the compressed scratch, the
+    /// XHTML window, the name scratch and the inflater), and no package is
+    /// parsed (the container scratch, which holds the list). The tail, the
+    /// header and the OPF arena stay unused: an image is read by the offset
+    /// its index entry keeps, so no ZIP directory is opened.
+    pub(crate) fn image_parts(&mut self) -> (ImageScratch<'_>, &mut [u8]) {
+        let (input, stage) = self.compressed.split_at_mut(READER_COMPRESSED_SCRATCH / 2);
+        (
+            ImageScratch {
+                input,
+                stage,
+                window: &mut self.xhtml[..],
+                name: &mut self.name[..],
+                inflate: &mut self.zip_inflate,
+            },
+            &mut self.container[..],
+        )
     }
 }
 
@@ -710,6 +735,336 @@ pub(crate) fn restore_book_page_count(
     .unwrap_or(0)
 }
 
+/// Which of an open book's images an idle image pass decodes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImagePass {
+    /// Those on the pages around the one on screen.
+    Window,
+    /// The rest of the book's, nearest the reader first.
+    Rest,
+}
+
+/// How an idle image pass ended.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ImagePassEnd {
+    /// A press stopped it.
+    pub(crate) pressed: bool,
+    /// It ran to its end rather than out of the session budget: the window
+    /// through its list, the rest pass until nothing was left or a card
+    /// fault stopped it.
+    pub(crate) finished: bool,
+    /// It decoded or failed an image.
+    pub(crate) worked: bool,
+}
+
+fn now_ms() -> u64 {
+    Instant::now().as_millis()
+}
+
+/// A button press has landed since `crate::BUTTON_PRESSES` read `presses`.
+fn pressed_since(presses: u32) -> bool {
+    crate::BUTTON_PRESSES.load(core::sync::atomic::Ordering::Relaxed) != presses
+}
+
+/// Decodes the open book's images while the reader is idle, for the
+/// orientation the page on screen is laid out in: one pass, in an SD
+/// session of its own, until it runs out of work, out of the session
+/// budget, or gives way to a press. Opens the book's EPUB only once an
+/// image needs reading, so a pass that finds nothing reads only the index
+/// (and, for the window, the section files of pages the store does not
+/// hold). What it finds settled goes into the store's note: the window's
+/// pages, or, when the rest pass finds nothing left, the whole book. Callers
+/// ask only for books with images.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_images_while_idle(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    library: &mut ReaderStore,
+    index: usize,
+    page: u32,
+    scratch: &mut ReaderCacheScratch<'_>,
+    pass: ImagePass,
+    presses: u32,
+) -> ImagePassEnd {
+    let started = Instant::now();
+    let gives_way = || pressed_since(presses);
+    let out_of_time = || started.elapsed().as_millis() >= SESSION_BUDGET_MS;
+    let (mut parts, list) = scratch.image_parts();
+    let store: &ReaderStore = library;
+    // What the pass can vouch for: the window's pages, or the whole book.
+    let mut settled = None;
+    let mut out_of_budget = false;
+    let (stats, images) = run_image_session(epd, sd_cs, store, index, |root, book| {
+        let dir = crate::book_images::book_cache_dir(root, book.key.as_str())?;
+        let images = crate::book_images::open_existing_book_images(&dir, book.source)?;
+        let books = core::cell::OnceCell::new();
+        let mut listed = 0;
+        let mut session = ImageSession::new(
+            &dir,
+            images,
+            epub_opener(root, &books, book.epub()),
+            store.portrait(),
+            now_ms,
+        );
+        match pass {
+            ImagePass::Window => {
+                let mut window = PageImages::new(list);
+                let pages = crate::image_decode::list_window_images(
+                    store,
+                    index,
+                    page,
+                    &dir,
+                    book.source,
+                    &mut window,
+                );
+                listed = window.len();
+                let mut whole = true;
+                for image in (0..window.len()).filter_map(|at| window.get(at)) {
+                    if gives_way() || out_of_time() {
+                        whole = false;
+                        out_of_budget = !gives_way();
+                        break;
+                    }
+                    if matches!(
+                        session.decode_page_image(image, &mut parts, &gives_way),
+                        Some(DecodeOutcome::Cancelled | DecodeOutcome::Retry)
+                    ) {
+                        whole = false;
+                        break;
+                    }
+                }
+                if whole {
+                    settled = pages;
+                }
+            }
+            ImagePass::Rest => {
+                let reader = crate::image_decode::reader_place(store, page, session.images());
+                if session.decode_nearest(reader, list, &mut parts, &gives_way, &out_of_time) {
+                    settled = Some((0, u32::MAX));
+                } else {
+                    out_of_budget = out_of_time();
+                }
+            }
+        }
+        Some((session.stats, listed))
+    })
+    .unwrap_or_default();
+    let pressed = gives_way();
+    if stats.pack_restarted {
+        library.forget_settled_images();
+    }
+    match settled {
+        Some((0, u32::MAX)) if !stats.pack_restarted => library.note_book_images_settled(),
+        Some((from, to)) if !stats.pack_restarted => library.note_settled_pages(from, to),
+        _ => {}
+    }
+    log_image_session(
+        match pass {
+            ImagePass::Window => "window",
+            // Not "rest": a four-byte string constant would sit in RAM on
+            // the ESP32-C3, as eight- and sixteen-byte ones do.
+            ImagePass::Rest => "remaining",
+        },
+        images,
+        stats,
+        started,
+        pressed,
+    );
+    ImagePassEnd {
+        pressed,
+        finished: !out_of_budget && !pressed,
+        worked: stats.decoded > 0 || stats.failed > 0,
+    }
+}
+
+/// Decodes the images the page about to be shown draws, for its
+/// orientation, before the request is answered, so the page never shows
+/// a placeholder that a picture would later replace. The page is resident
+/// by now; one without images, in a book without any, or that the store's
+/// note says is settled, costs nothing (no card access); one found settled
+/// is noted. False when the wait is abandoned, the image in hand dropped,
+/// so the press is handled at once: a press since `presses` was read, or a
+/// newer request than `request_id`.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_page_images(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    library: &mut ReaderStore,
+    index: usize,
+    page: u32,
+    scratch: &mut ReaderCacheScratch<'_>,
+    presses: u32,
+    request_id: u32,
+) -> bool {
+    if !library.book_has_images()
+        || !library.covers_global_page(index, page)
+        || library.images_settled(page)
+    {
+        return true;
+    }
+    let (mut parts, list) = scratch.image_parts();
+    let mut shown = PageImages::new(list);
+    let whole = crate::image_decode::resident_page_images(library, page, &mut shown);
+    if shown.is_empty() && whole {
+        return true;
+    }
+    let started = Instant::now();
+    let gives_way = || {
+        pressed_since(presses)
+            || crate::LATEST_READER_REQUEST_ID.load(core::sync::atomic::Ordering::Relaxed)
+                != request_id
+    };
+    if gives_way() {
+        return false;
+    }
+    let store: &ReaderStore = library;
+    let mut settled = whole;
+    let (stats, images) = run_image_session(epd, sd_cs, store, index, |root, book| {
+        let dir = crate::book_images::book_cache_dir(root, book.key.as_str())?;
+        let images = crate::book_images::open_existing_book_images(&dir, book.source)?;
+        let books = core::cell::OnceCell::new();
+        let mut session = ImageSession::new(
+            &dir,
+            images,
+            epub_opener(root, &books, book.epub()),
+            store.portrait(),
+            now_ms,
+        );
+        for image in (0..shown.len()).filter_map(|at| shown.get(at)) {
+            if gives_way() {
+                settled = false;
+                break;
+            }
+            if matches!(
+                session.decode_page_image(image, &mut parts, &gives_way),
+                Some(DecodeOutcome::Cancelled | DecodeOutcome::Retry)
+            ) {
+                settled = false;
+                if gives_way() {
+                    break;
+                }
+            }
+        }
+        Some((session.stats, shown.len()))
+    })
+    // No index to check against: nothing is vouched for.
+    .filter(|(stats, _)| stats.checked > 0 || shown.is_empty())
+    .unwrap_or_else(|| {
+        settled = false;
+        (SessionStats::default(), 0)
+    });
+    let pressed = gives_way();
+    if stats.pack_restarted {
+        library.forget_settled_images();
+    } else if settled && !pressed {
+        library.note_settled_pages(page, page + 1);
+    }
+    log_image_session("request", images, stats, started, pressed);
+    !pressed
+}
+
+/// The open book's files an image session reads: its cache key, its
+/// source identity, and where its EPUB is.
+struct BookFiles<'a> {
+    key: String<{ proto::cache::CACHE_KEY_BYTES }>,
+    source: (u32, u32),
+    name: &'a str,
+    in_books_dir: bool,
+}
+
+impl BookFiles<'_> {
+    fn epub(&self) -> EpubSource<'_> {
+        EpubSource {
+            name: self.name,
+            in_books_dir: self.in_books_dir,
+        }
+    }
+}
+
+/// Runs `pass` in an SD session for the book in catalog entry `index`,
+/// and returns what it reports: its stats and how many images it listed.
+/// `None` when the session, the cache directory or the index did not open.
+fn run_image_session<F>(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    library: &ReaderStore,
+    index: usize,
+    pass: F,
+) -> Option<(SessionStats, usize)>
+where
+    F: for<'r> FnOnce(
+        &crate::sd_session::SdRoot<'r>,
+        &BookFiles<'_>,
+    ) -> Option<(SessionStats, usize)>,
+{
+    let entry = library.catalog_entry(index)?;
+    let book = BookFiles {
+        key: proto::cache::cache_key_for(entry.display_name.as_str(), entry.byte_size),
+        source: (entry.source_hash, entry.byte_size),
+        name: entry.open_name.as_str(),
+        in_books_dir: entry.in_books_dir,
+    };
+    sd_session::with_root(epd, sd_cs, |root| pass(root, &book))
+        .ok()
+        .flatten()
+}
+
+fn log_image_session(
+    pass: &str,
+    images: usize,
+    stats: SessionStats,
+    started: Instant,
+    pressed: bool,
+) {
+    esp_println::println!(
+        "bench: image_session pass={} images={} checked={} decoded={} failed={} cancelled={} retry={} elapsed_ms={} pressed={} t_ms={}",
+        pass,
+        images,
+        stats.checked,
+        stats.decoded,
+        stats.failed,
+        stats.cancelled,
+        stats.retry,
+        started.elapsed().as_millis(),
+        pressed,
+        Instant::now().as_millis(),
+    );
+}
+
+/// Opens the book's EPUB the first time it is called, for reads at
+/// offsets: no ZIP directory is read. An EPUB in `/BOOKS` keeps that
+/// directory open in `books` for as long as the file is.
+fn epub_opener<'g, 'f: 'g, D, T, const ND: usize, const NF: usize, const NV: usize>(
+    root: &'f Directory<'_, D, T, ND, NF, NV>,
+    books: &'g core::cell::OnceCell<Directory<'f, D, T, ND, NF, NV>>,
+    epub: EpubSource<'g>,
+) -> impl FnMut() -> Option<SdFileReadAt<'g, D, T, ND, NF, NV>> + use<'g, 'f, D, T, ND, NF, NV>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    move || {
+        let dir = if epub.in_books_dir {
+            if books.get().is_none() {
+                let _ = books.set(root.open_dir("BOOKS").ok()?);
+            }
+            books.get()?
+        } else {
+            root
+        };
+        let file = dir.open_file_in_dir(epub.name, Mode::ReadOnly).ok()?;
+        let len = file.length();
+        Some(SdFileReadAt {
+            file,
+            len,
+            read_ops: 0,
+            read_bytes: 0,
+        })
+    }
+}
+
 /// Where a catalog entry's EPUB file is on the card.
 #[derive(Clone, Copy)]
 struct EpubSource<'a> {
@@ -1227,6 +1582,11 @@ where
         reader_cache_files::prepare_book_replacement(root, cache_key)
             .ok_or(ReaderCacheError::CacheWrite)?
     };
+    if !resuming {
+        // A fresh build numbers the pages anew, so what is noted of their
+        // images goes.
+        library.forget_settled_images();
+    }
     let seed_base = crate::reader_store::seed_section_base(section_base);
     let io_start = crate::sd_session::sd_stats::snapshot();
     let mut section_write_micros: u64 = 0;
@@ -1379,6 +1739,7 @@ where
         found
     };
     let images_dir;
+    let mut rebuilt = false;
     let images = if has_images {
         images_dir = crate::book_images::book_cache_dir(root, cache_key);
         images_dir.as_ref().and_then(|dir| {
@@ -1388,11 +1749,16 @@ where
                 &mut zip,
                 &mut scratch.compressed[..],
                 &mut scratch.xhtml[..],
+                &mut rebuilt,
             )
         })
     } else {
         None
     };
+    if rebuilt {
+        // A new index: every image is undecoded again.
+        library.forget_settled_images();
+    }
     let mut spine_scratch = SpineScratch {
         header: &mut *scratch.header,
         name: &mut *scratch.name,
@@ -1751,6 +2117,8 @@ fn note_book_progress(
     let total_pages = library.book_sections.end_page();
     library.commit_book_index(total_pages, *book_partial);
     library.set_book_next_spine(next_spine);
+    // The spine may have met images no decode has reached.
+    library.note_book_grew();
     // Chapter starts move with every spine laid out, seeded ones included
     // (which leave the prefix cursor where it was): reread the map.
     library.chapter_page_count = 0;
@@ -1907,6 +2275,7 @@ where
             image_path: &mut *scratch.name,
             first_pass,
             unprobed: None,
+            images_met: 0,
         };
         // Stream the whole member through the resumable block parser in
         // bounded windows: spine XHTML of any size decodes completely, with
@@ -2434,6 +2803,8 @@ struct LibraryBlockSink<
     /// met. Once set, the pass is only looking for more: the spine is laid
     /// out again after they are probed.
     unprobed: Option<(u16, u16)>,
+    /// Images this pass has looked up so far.
+    images_met: u16,
 }
 
 /// What `<img>` or an svg image comes to, once the book's index has had a
@@ -2752,14 +3123,20 @@ where
             self.interrupted = true;
             return ImagePush::Stop;
         }
-        let page_box = self.library.page_box();
+        // Every pass meets the spine's images in the same order, whatever
+        // the layout, so this is the image's place in reading order.
+        let at = ImagePlace {
+            spine: self.spine_index,
+            order: self.images_met,
+        };
+        self.images_met = self.images_met.saturating_add(1);
         let placement = images.place(
             self.chapter,
             src,
             &mut self.image_path[..],
-            page_box,
             self.library.portrait(),
             self.first_pass,
+            at,
         );
         match placement {
             Err(()) => {

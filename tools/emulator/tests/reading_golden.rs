@@ -29,7 +29,8 @@ use ui::reading::{
     PageBox, ReaderImage, ReadingBlocks,
 };
 use ui::reading::{
-    draw_image_placeholder, draw_reading_page_body, draw_reading_page_counter, page_record_at,
+    draw_image_placeholder, draw_reading_page_body, draw_reading_page_counter,
+    draw_reading_page_counter_aligned, page_record_at,
 };
 
 struct FixtureBlock {
@@ -489,10 +490,13 @@ fn image_fixture(portrait: bool) -> FixtureBlocks {
     }
 }
 
-/// Draws a marker into the rect layout reserved, through the decoder the
-/// firmware uses: `PngDecoder` at exactly the rect's size (never fitted
-/// again), Floyd-Steinberg dithered to 1 bpp, rows copied in.
+/// Draws a marker into the rect layout reserved, through the decoder and
+/// the draw the firmware uses: `PngDecoder` at exactly the rect's size
+/// (never fitted again), Floyd-Steinberg dithered to 1 bpp rows as the
+/// pack stores them, and those blitted into the frame a band at a time, as
+/// the firmware streams them from the pack through its band buffer.
 fn draw_marker(fb: &mut Framebuffer, image: &ReaderImage<'_>) {
+    use display::fb::ImageRows;
     use proto::image::dither::Ditherer;
     use proto::image::png::{probe, PngDecoder};
     use proto::image::SinkError;
@@ -504,19 +508,33 @@ fn draw_marker(fb: &mut Framebuffer, image: &ReaderImage<'_>) {
     let mut scratch = vec![0xA5u8; info.scratch_bytes(width)];
     let mut dither_scratch = vec![0xA5u8; Ditherer::scratch_bytes(width)];
     let mut ditherer = Ditherer::new(&mut dither_scratch, width).expect("ditherer");
-    let mut packed = vec![0u8; Ditherer::packed_len(width)];
+    let stride = Ditherer::packed_len(width);
+    let band_rows = display::BAND_BYTES / stride;
+    let mut band = vec![0xA5u8; band_rows * stride];
     let mut inflate = Box::new(miniz_oxide::inflate::stream::InflateState::new(
         miniz_oxide::DataFormat::Zlib,
     ));
     let mut decoder = PngDecoder::new(&mut scratch, width, height).expect("decoder");
     let mut rows = 0;
     let mut sink = |y: u32, luma: &[u8]| -> Result<(), SinkError> {
-        ditherer.row(luma, &mut packed).expect("dither row");
-        for x in 0..width as usize {
-            let white = packed[x / 8] & (0x80 >> (x % 8)) != 0;
-            fb.set_pixel(image.x as usize + x, image.y as usize + y as usize, white);
-        }
+        let y = y as usize;
+        let at = y % band_rows;
+        ditherer
+            .row(luma, &mut band[at * stride..][..stride])
+            .expect("dither row");
         rows += 1;
+        if at + 1 == band_rows || rows == height {
+            fb.blit(
+                i32::from(image.x),
+                i32::from(image.y),
+                ImageRows {
+                    width: width as usize,
+                    stride,
+                    first_row: y - at,
+                    bits: &band[..(at + 1) * stride],
+                },
+            );
+        }
         Ok(())
     };
     for chunk in png.chunks(1024) {
@@ -567,24 +585,30 @@ fn assert_text_clears_image(
     }
 }
 
-/// Image pages in both orientations, on whichever panel this build is for:
-/// page 0 holds text with descenders directly over the small marker, shown
-/// at its own size; page 1 the full marker, fitted to the page box. Both are
+/// Image pages in every hold, on whichever panel this build is for: page 0
+/// holds text with descenders directly over the small marker, shown at its
+/// own size; page 1 the full marker, fitted to the page box. Both are
 /// centred in the column and sit below the gap that keeps the line above
-/// clear of them.
+/// clear of them. Flipped landscape lays out as landscape does, and its
+/// frame lands in the buffer mirrored left to right, so its goldens are the
+/// landscape ones mirrored, apart from the counter, which that hold sets at
+/// the left. Portrait goldens are stored turned a quarter.
 #[test]
 fn image_pages_match_goldens() {
-    for (portrait, orientation) in [(false, "landscape"), (true, "portrait")] {
+    use display::fb::FbFrame;
+    for (frame, orientation) in [
+        (FbFrame::Native, "landscape"),
+        (FbFrame::Portrait, "portrait"),
+        (FbFrame::LandscapeFlipped, "landscape-flipped"),
+    ] {
+        let portrait = frame == FbFrame::Portrait;
         let source = image_fixture(portrait);
         let pages = paginate_block_pages(&source);
         assert!(pages >= 2, "{orientation}: {pages} pages");
         for page_index in 0..2 {
             let page = page_record_at(&source, page_index);
             let mut fb = Framebuffer::new();
-            if portrait {
-                fb.set_frame(display::fb::FbFrame::Portrait);
-                fb.clear(true);
-            }
+            fb.set_frame(frame);
             // Text first, then the images: so the check below sees the
             // lines on both sides of each image before it is drawn.
             let mut images = Vec::new();
@@ -600,7 +624,11 @@ fn image_pages_match_goldens() {
                 }
                 true
             });
-            draw_reading_page_counter(&mut fb, &format!("{}/{pages}", page_index + 1));
+            draw_reading_page_counter_aligned(
+                &mut fb,
+                &format!("{}/{pages}", page_index + 1),
+                frame == FbFrame::LandscapeFlipped,
+            );
             assert_eq!(images.len(), 1, "{orientation} page {page_index}");
             let (x, _, width, height) = images[0];
             let page_box = PageBox::for_portrait(portrait);
