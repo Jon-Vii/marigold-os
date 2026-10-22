@@ -242,6 +242,23 @@ Projected cost of a 1600×1200 RGB figure, fitted to 601×451, stored entry:
 - Tiny images (*Euclid*'s 516-byte median): pixel work is negligible, so the
   per-image card operations dominate. Keep them to a handful per image.
 
+Phase 1 decoder (`proto::image`, commit 308beb9) on the X4, the same 640×480
+diagram fitted to 586×440, fed in 4 KB pieces over a dirty borrowed window:
+**374 ms**. That is inflate 135, unfilter 35, accumulate 74, row shift 7,
+output rows 53, dither 61 (ms). Inflate is the floor. The first version took
+885 ms; the review-fix commit alone brought it to 438 ms, so code changes can
+swing time 2× through the 16 KB flash cache. Time every decoder change on the
+device. Code: about 13 KB on riscv32; deepest frame 224 B.
+
+Scaled to a 1600×1200 diagram-like PNG: about 1.7 s to decode plus 0.6 s to
+read it from the card, so **~2.3 s per large figure**.
+
+The ESP32-C3 ROM `memmove` (which `esp-rom-sys` links) copies backward a byte at
+a time: 77 ns per byte. The decoder now shifts rows by words itself. Other
+large overlapping copies in the firmware (`reader_store.rs` `carry_last_page`,
+`epub.rs` text buffer) copy forward, which may not be affected; time them
+before assuming either way.
+
 Code size: today's firmware leaves ~200 KB in the C3's 4 MB flash-mapped
 window for code plus read-only data, which bounds the decoders.
 

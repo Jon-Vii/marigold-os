@@ -92,7 +92,8 @@ fw/        boot, Embassy executor, task wiring, board-owned peripherals
            (esp-hal 1.1, esp-rtos, and esp-radio, pinned in fw/Cargo.toml)
 ui/        shared shell rendering plus ui::reading, the reader page-plan seam
            (page bounds, ink measurement, wrapping) used by fw and host tools
-proto/     bounded book/storage/text/cache models plus ZIP/EPUB/XHTML parser pieces
+proto/     bounded book/storage/text/cache models plus ZIP/EPUB/XHTML parser pieces,
+           and book images (proto::image: streaming PNG decode, dithering)
 tools/emulator/ host-side development emulator and scenario runner
 tools/cargo.sh  rustup Cargo wrapper on the toolchain pinned in rust-toolchain.toml
 tools/bench/    serial bench harness for hardware timing, storage/cache,
