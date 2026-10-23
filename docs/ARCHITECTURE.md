@@ -1043,7 +1043,7 @@ is still read); there is no flash copy.
 | Cold-boot full refresh | 3.5 s |
 | Reopen a cached book | tens of milliseconds |
 | RAM | 400 KB SRAM, no PSRAM |
-| Main stack | linked region about 35.9 KB on X4; the link fails below 27 KB (`fw/build.rs`) |
+| Main stack | linked region about 44.7 KB on X4 (36.1 KB on X3); the link fails below 27 KB (`fw/build.rs`) |
 | Framebuffers | two (current + previous frame), 48 KB each on X4, 1 bit per pixel |
 
 ## Bring-up checklist

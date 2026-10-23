@@ -15,4 +15,15 @@ rustflags = [
 [build]
 target = "riscv32imc-unknown-none-elf"
 
+[env]
+# esp-hal defaults to copying switch tables, `.rodata.cst*` constant pools and
+# its interrupt-dispatch lookup tables into DRAM: lookups skip the flash cache,
+# and code running while flash is unreadable can still reach them. On the C3
+# every static byte comes off the main stack (fw/build.rs gives the stack
+# whatever DRAM is left), and the X3 stack sits close to its 27 KB floor, so
+# keep them in flash for about 5 KB more stack. Nothing reads them while flash
+# is busy: the only flash writes (fw::ota_update through esp-storage) run ROM
+# routines from RAM with interrupts disabled. An exported value still wins.
+ESP_HAL_CONFIG_PLACE_SWITCH_TABLES_IN_RAM = "false"
+
 # Radio buffer sizing lives in the ControllerConfig in fw/src/tasks/wifi.rs.
