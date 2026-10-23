@@ -44,10 +44,15 @@ lookahead state. The caller's existing byte buffer is borrowed as transparent
 `Block` storage; its alignment remains one byte. Direct reads invalidate the
 single-sector cache and advance file position only after a successful batch.
 
-This is an experiment until matched hardware measurements justify enabling it.
-Host transaction counts are not hardware throughput claims. Keep feature-off
-builds as the baseline and verify both X4/X3 stack links, cold/warm book reads,
-writes, and sleep/wake before enabling it in release builds.
+The crate keeps the feature off by default. Since October 2026 the firmware
+turns it on, and so does `ui`, so its host tests build the same FAT code
+(their 8 MiB test disk has one-sector clusters, so no read there forms a
+batch; the tests in this crate cover batching). On an X4 bench build it took a sector from about 528 µs to
+443 µs in a 2 KiB read loop (the command and the wait for the first data token
+are paid once per run), image decodes 3-6% and spacing reflows about 5%; the
+measurements are in the pull request that enabled it. Only the X4 sends CMD18:
+no X3 has run it, so `fw::sd_session::CountingDevice` splits each batch into
+single-sector reads there.
 
 ## Verification
 

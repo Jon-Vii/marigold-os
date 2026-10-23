@@ -113,19 +113,35 @@ pub(crate) mod sd_stats {
     }
 }
 
+/// The FAT layer hands a run of whole sectors within a cluster to one read
+/// call, which the X4 sends as a single multi-block read (CMD18). No X3 has
+/// run CMD18 yet, so the X3 still reads such a run one CMD17 per sector,
+/// exactly as it did before batching.
+const SINGLE_BLOCK_READS: bool = cfg!(feature = "device-x3");
+
 /// Counts physical block transactions on their way to the SD card, so bench
-/// telemetry can report exact CMD17/CMD24-level traffic per workload.
+/// telemetry can report exact CMD17/CMD18/CMD24-level traffic per workload.
 pub(crate) struct CountingDevice<B>(B);
 
 impl<B: BlockDevice> BlockDevice for CountingDevice<B> {
     type Error = B::Error;
 
     fn read(&self, blocks: &mut [Block], start_block_idx: BlockIdx) -> Result<(), Self::Error> {
-        sd_stats::bump(&sd_stats::READ_CALLS, 1);
+        let commands = if SINGLE_BLOCK_READS { blocks.len() } else { 1 };
+        sd_stats::bump(&sd_stats::READ_CALLS, commands as u32);
         sd_stats::bump(&sd_stats::READ_BLOCKS, blocks.len() as u32);
         #[cfg(feature = "bench-serial")]
         let started = embassy_time::Instant::now();
-        let result = self.0.read(blocks, start_block_idx);
+        let result = if SINGLE_BLOCK_READS {
+            blocks
+                .iter_mut()
+                .zip(start_block_idx.0..)
+                .try_for_each(|(block, idx)| {
+                    self.0.read(core::slice::from_mut(block), BlockIdx(idx))
+                })
+        } else {
+            self.0.read(blocks, start_block_idx)
+        };
         #[cfg(feature = "bench-serial")]
         {
             sd_stats::bump(&sd_stats::READ_MICROS, started.elapsed().as_micros() as u32);
