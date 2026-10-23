@@ -10,15 +10,16 @@ use display::font::FontStyle;
 use embedded_sdmmc::{Directory, File, Mode, TimeSource};
 use heapless::String;
 use proto::cache::{
-    book_v2_predates_images, decode_block, decode_book_v2_header, decode_book_v2_section,
-    decode_cover_header, decode_page, decode_section_v2_header, decode_toc, decode_toc_chapter,
-    decode_toc_file_header, encode_block, encode_book_v2_header, encode_book_v2_section,
-    encode_page, encode_section_v2_header, encode_toc, encode_toc_file_header, section_file_name,
-    BookV2Header, BookV2SectionRecord, SectionV2Header, TocFileHeader, BLOCK_RECORD_BYTES,
-    BOOK_V2_HEADER_BYTES, BOOK_V2_SECTION_RECORD_BYTES, CACHE_BOOK_FILE, CACHE_COVER_FILE,
-    CACHE_ROOT_DIR, CACHE_SECTIONS_DIR, CACHE_SECTION_FILE_BYTES, CACHE_STATE_FILE, CACHE_TOC_FILE,
-    CACHE_V2_DIR, COVER_HEADER_BYTES, PAGE_RECORD_BYTES, SECTION_V2_HEADER_BYTES,
-    TOC_CHAPTER_RECORD_BYTES, TOC_FILE_HEADER_BYTES, TOC_RECORD_BYTES,
+    book_v2_predates_images, book_v2_title_offset, decode_block, decode_book_v2_header,
+    decode_book_v2_section, decode_cover_header, decode_page, decode_section_v2_header, decode_toc,
+    decode_toc_chapter, decode_toc_file_header, encode_block, encode_book_v2_header,
+    encode_book_v2_section, encode_page, encode_section_v2_header, encode_toc,
+    encode_toc_file_header, section_file_name, BookV2Header, BookV2SectionRecord, SectionV2Header,
+    TocFileHeader, BLOCK_RECORD_BYTES, BOOK_V2_HEADER_BYTES, BOOK_V2_SECTION_RECORD_BYTES,
+    CACHE_BOOK_FILE, CACHE_COVER_FILE, CACHE_ROOT_DIR, CACHE_SECTIONS_DIR,
+    CACHE_SECTION_FILE_BYTES, CACHE_STATE_FILE, CACHE_TOC_FILE, CACHE_V2_DIR, COVER_HEADER_BYTES,
+    PAGE_RECORD_BYTES, SECTION_V2_HEADER_BYTES, TOC_CHAPTER_RECORD_BYTES, TOC_FILE_HEADER_BYTES,
+    TOC_RECORD_BYTES,
 };
 use proto::font_pack::{
     decode_font_pack_name, FontPackFaceRecord, FontPackHeader, FONT_PACK_DIR,
@@ -1110,13 +1111,9 @@ where
     {
         return false;
     }
-    // The title text sits after the header, the section records, and the
-    // TOC block (records + text) -- the same body order write_v2_book_index
-    // lays down and load_v2_book_index reads through.
-    let title_offset = BOOK_V2_HEADER_BYTES as u32
-        + header.section_count as u32 * BOOK_V2_SECTION_RECORD_BYTES as u32
-        + header.toc_count as u32 * TOC_RECORD_BYTES as u32
-        + header.toc_text_bytes;
+    // The same body order write_v2_book_index lays down and
+    // load_v2_book_index reads through, seed records included.
+    let title_offset = book_v2_title_offset(header) as u32;
     if file.seek_from_start(title_offset).is_err() {
         return false;
     }
