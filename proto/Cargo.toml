@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# Byte scratch viewed as u32 accumulators and i16 error rows, without unsafe.
+bytemuck = { version = "1.25.0", default-features = false }
 heapless = "0.9.0"
 miniz_oxide = { version = "0.9.1", default-features = false }
 # SHA-256 for OTA image validation (no_std, no heap). asm is off so it builds
@@ -16,3 +18,9 @@ crc = "3.2.1"
 [dev-dependencies]
 # Tests deflate their own fixtures; firmware builds never see this feature.
 miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"] }
+# Reference encoder and decoder for the image decoder's tests.
+png = "0.17.16"
+# Reference JPEG encoder and decoder for the JPEG decoder's tests.
+jpeg-encoder = "0.6.1"
+zune-core = "0.5.3"
+zune-jpeg = "0.5.15"

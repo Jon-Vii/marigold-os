@@ -25,10 +25,36 @@ pub const CACHE_VERSION: u16 = 1;
 //
 // Bumped 26 -> 27 when the book header's unused viewport bytes began to
 // describe the seed run (spines laid out ahead of the prefix), whose records
-// follow the prefix's. A v26 index reads as having no run, so its pages can
-// still pin a reader's place across a relayout.
-pub const CACHE_V2_VERSION: u16 = 27;
-const CACHE_V2_COMPAT_VERSION: u16 = 26;
+// follow the prefix's.
+//
+// Bumped 27 -> 28 when sections began to hold image blocks: a block record's
+// formerly unused bytes 10-11 carry `image_height`, and the block's text is
+// an image token (`proto::image::token`) rather than a line of prose. A v27
+// section simply contains no image blocks: those bytes were written as zero,
+// so every v27 block reads as text, and v27 data is still accepted as is.
+// Whether a v27 book that has images must rebuild so they replace their
+// alt-text placeholders is the firmware's decision, not the decoder's. A
+// v28 book header also says whether the book has images (flag bit 4,
+// which v27 writers left clear).
+//
+// Bumped 28 -> 29 when lines began to hold inline images: a line's text
+// carries a token per image (`proto::image::token`), and the top bit of its
+// record's `image_height` marks it, with the tallest image's height in the
+// low bits (`BlockRecord::INLINE_IMAGES`). v28 caches existed only on
+// development devices and are rebuilt. v27 is still accepted as before:
+// its records hold no image of either kind, and the firmware's one-time
+// check stamps a book without images as the current version.
+//
+// Bumped 29 -> 30 when JPEGs became images (`proto::image::jpeg`): a book
+// laid out with a JPEG as its alt text must be laid out again to show it.
+// v28 and v29 never shipped, so they are rebuilt. v27 keeps its one-time
+// check, which now counts JPEGs as well as PNGs, except a lone image whose
+// file name says `cover`: nearly every book has a JPEG cover, so a v27 book
+// with only that is stamped 30, keeping its cover page's v27 layout until
+// a fresh build shows the cover. A v27 book with any other image rebuilds,
+// and one with none is stamped 30.
+pub const CACHE_V2_VERSION: u16 = 30;
+const CACHE_V2_COMPAT_VERSION: u16 = 27;
 pub const CACHE_ROOT_DIR: &str = "XTEINK";
 pub const CACHE_DIR: &str = "CACHE";
 pub const CACHE_V2_DIR: &str = "CACHE2";
@@ -171,6 +197,9 @@ pub struct BookV2Header {
     pub seed_reaches_end: bool,
     /// The seed run could not hold its next spine and grows no further.
     pub seed_capped: bool,
+    /// The book has images an image index holds (`proto::image::index`),
+    /// so its builds open one. Clear in a book without, and in a v27 index.
+    pub has_images: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -227,7 +256,52 @@ pub struct BlockRecord {
     pub role: TextRole,
     pub style: FontStyle,
     pub align: TextAlign,
+    /// Rows the block's image takes at its fitted size; 0 for a text block.
+    /// An image block's text is an image token (`proto::image::token`), and
+    /// its `line_count` is 1. A line of text that holds inline images has
+    /// [`BlockRecord::INLINE_IMAGES`] set here instead, with its tallest
+    /// image's height in the low bits; its text carries their tokens. A
+    /// block image is never as tall as that bit (it fits a page). Stored in
+    /// the record's last two bytes, which cache versions before 28 wrote as
+    /// zero, so their blocks read as text.
+    pub image_height: u16,
 }
+
+impl BlockRecord {
+    /// The `image_height` bit that marks a line holding inline images.
+    pub const INLINE_IMAGES: u16 = 0x8000;
+
+    /// An image block: its text is an image token, and `image_height` its
+    /// image's rows.
+    pub const fn is_image(&self) -> bool {
+        self.image_height != 0 && self.image_height & Self::INLINE_IMAGES == 0
+    }
+
+    /// A line of text with images inside it.
+    pub const fn has_inline_images(&self) -> bool {
+        self.image_height & Self::INLINE_IMAGES != 0
+    }
+
+    /// The tallest inline image's height, as recorded, for a line that
+    /// [`BlockRecord::has_inline_images`]; 0 otherwise.
+    pub const fn inline_image_height(&self) -> u16 {
+        if self.has_inline_images() {
+            self.image_height & !Self::INLINE_IMAGES
+        } else {
+            0
+        }
+    }
+
+    /// The `image_height` a line whose tallest inline image is `height`
+    /// rows records.
+    pub const fn inline_image_field(height: u16) -> u16 {
+        Self::INLINE_IMAGES | (height & !Self::INLINE_IMAGES)
+    }
+}
+
+// Firmware keeps hundreds of these resident: the image height must live in
+// what used to be padding, never grow the record.
+const _: () = assert!(core::mem::size_of::<BlockRecord>() == BLOCK_RECORD_BYTES);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CoverCacheHeader {
@@ -515,7 +589,8 @@ pub fn encode_book_v2_header(header: BookV2Header, out: &mut [u8]) -> Result<usi
     out[7] = u8::from(header.next_spine.is_some())
         | (u8::from(header.generated_toc) << 1)
         | (u8::from(header.seed_reaches_end) << 2)
-        | (u8::from(header.seed_capped) << 3);
+        | (u8::from(header.seed_capped) << 3)
+        | (u8::from(header.has_images) << 4);
     write_u32(out, 8, header.source_hash);
     write_u32(out, 12, header.source_size);
     write_u32(out, 16, header.total_pages);
@@ -557,8 +632,7 @@ pub fn decode_book_v2_header(input: &[u8]) -> Result<BookV2Header, CacheError> {
     if !valid_cache_v2_version(version) {
         return Err(CacheError::BadVersion);
     }
-    // Before v27 these bytes held the viewport size, and no index had a run.
-    let seeded = version >= 27 && read_u16(input, 28)? != 0;
+    let seeded = read_u16(input, 28)? != 0;
     Ok(BookV2Header {
         next_spine: if input[7] & 1 != 0 {
             Some(read_u16(input, 26)?)
@@ -587,6 +661,7 @@ pub fn decode_book_v2_header(input: &[u8]) -> Result<BookV2Header, CacheError> {
         seed_section_count: if seeded { read_u16(input, 30)? } else { 0 },
         seed_reaches_end: seeded && input[7] & 4 != 0,
         seed_capped: seeded && input[7] & 8 != 0,
+        has_images: input[7] & 16 != 0,
     })
 }
 
@@ -618,6 +693,15 @@ pub fn decode_book_v2_section(input: &[u8]) -> Result<BookV2SectionRecord, Cache
 
 fn valid_cache_v2_version(version: u16) -> bool {
     version == CACHE_V2_VERSION || version == CACHE_V2_COMPAT_VERSION
+}
+
+/// Whether a book index header that [`decode_book_v2_header`] accepts was
+/// written before sections held image blocks (cache v27). Such a book was
+/// laid out with its images as alt text; the firmware checks whether it
+/// has any before using the index, and writes it again (as the current
+/// version) or rebuilds the book.
+pub fn book_v2_predates_images(input: &[u8]) -> bool {
+    read_u16(input, 4) == Ok(CACHE_V2_COMPAT_VERSION)
 }
 
 pub fn decode_page_header(input: &[u8]) -> Result<PageCacheHeader, CacheError> {
@@ -709,7 +793,7 @@ pub fn encode_block(record: BlockRecord, out: &mut [u8]) -> Result<usize, CacheE
     out[7] = role_byte(record.role);
     out[8] = style_byte(record.style);
     out[9] = align_byte(record.align);
-    write_u16(out, 10, 0);
+    write_u16(out, 10, record.image_height);
     Ok(BLOCK_RECORD_BYTES)
 }
 
@@ -722,6 +806,7 @@ pub fn decode_block(input: &[u8]) -> Result<BlockRecord, CacheError> {
         role: role_from_byte(input[7])?,
         style: style_from_byte(input[8])?,
         align: align_from_byte(input[9])?,
+        image_height: read_u16(input, 10)?,
     })
 }
 
@@ -1003,6 +1088,7 @@ mod tests {
             role: TextRole::Heading2,
             style: FontStyle::BoldItalic,
             align: TextAlign::Center,
+            image_height: 0,
         };
 
         let mut bytes = [0u8; 48];
@@ -1035,6 +1121,57 @@ mod tests {
             .unwrap(),
             block
         );
+    }
+
+    #[test]
+    fn image_blocks_keep_their_height_in_the_former_padding() {
+        let image = BlockRecord {
+            text_offset: 7,
+            text_len: 14,
+            line_count: 1,
+            role: TextRole::Body,
+            style: FontStyle::Regular,
+            align: TextAlign::Center,
+            image_height: 0x01c3,
+        };
+        let mut bytes = [0xA5u8; BLOCK_RECORD_BYTES];
+        encode_block(image, &mut bytes).expect("image block encodes");
+        assert_eq!(&bytes[10..12], &[0xc3, 0x01]);
+        assert_eq!(decode_block(&bytes).unwrap(), image);
+        assert!(image.is_image());
+
+        assert!(!image.has_inline_images());
+        assert_eq!(image.inline_image_height(), 0);
+
+        // A line with inline images: the top bit, and the tallest's height.
+        let line = BlockRecord {
+            image_height: BlockRecord::inline_image_field(64),
+            align: TextAlign::Justify,
+            ..image
+        };
+        encode_block(line, &mut bytes).expect("inline line encodes");
+        assert_eq!(&bytes[10..12], &[0x40, 0x80]);
+        let read = decode_block(&bytes).unwrap();
+        assert_eq!(read, line);
+        assert!(read.has_inline_images() && !read.is_image());
+        assert_eq!(read.inline_image_height(), 64);
+        // The flag never eats into a height, nor a height into the flag.
+        assert_eq!(BlockRecord::inline_image_field(0xFFFF), 0xFFFF);
+        assert_eq!(
+            BlockRecord {
+                image_height: BlockRecord::inline_image_field(0x7FFF),
+                ..image
+            }
+            .inline_image_height(),
+            0x7FFF
+        );
+
+        // A v27 writer left bytes 10-11 zero: its blocks read as text.
+        bytes[10..12].fill(0);
+        let text = decode_block(&bytes).unwrap();
+        assert_eq!(text.image_height, 0);
+        assert!(!text.is_image() && !text.has_inline_images());
+        assert_eq!(core::mem::size_of::<BlockRecord>(), 12);
     }
 
     #[test]
@@ -1224,6 +1361,7 @@ mod tests {
             seed_section_count: 3,
             seed_reaches_end: false,
             seed_capped: true,
+            has_images: true,
         };
         let section = BookV2SectionRecord {
             section: 1,
@@ -1248,15 +1386,25 @@ mod tests {
         let old = decode_book_v2_header(&legacy).unwrap();
         assert_eq!(old.next_spine, None);
         assert_eq!(old.text_start_spine, None);
-        // A v26 index held the viewport size where the run is described:
-        // it reads as having none.
+        assert!(!old.has_images, "v27 writers left the images flag clear");
+        // v27 indexes stay readable as they are; v26 ones rebuild.
+        let mut v27 = header_bytes;
+        v27[4..6].copy_from_slice(&27u16.to_le_bytes());
+        assert_eq!(decode_book_v2_header(&v27).unwrap(), header);
+        assert!(book_v2_predates_images(&v27));
+        assert!(!book_v2_predates_images(&header_bytes));
         let mut v26 = header_bytes;
         v26[4..6].copy_from_slice(&26u16.to_le_bytes());
-        v26[28..32].copy_from_slice(&[0x20, 0x03, 0xe0, 0x01]);
-        let v26 = decode_book_v2_header(&v26).unwrap();
-        assert_eq!((v26.seed_first_spine, v26.seed_section_count), (None, 0));
-        assert!(!v26.seed_capped && !v26.seed_reaches_end);
-        assert_eq!(v26.total_pages, header.total_pages);
+        assert_eq!(decode_book_v2_header(&v26), Err(CacheError::BadVersion));
+        // v28 and v29 lived only on development devices, laid out without
+        // inline images or without JPEGs: they rebuild.
+        for version in [28u16, 29] {
+            let mut old = header_bytes;
+            old[4..6].copy_from_slice(&version.to_le_bytes());
+            assert_eq!(decode_book_v2_header(&old), Err(CacheError::BadVersion));
+            assert!(!book_v2_predates_images(&old));
+        }
+        assert_eq!(CACHE_V2_VERSION, 30);
         assert!(!old.generated_toc);
         assert!(old.partial);
         assert_eq!(old.total_pages, header.total_pages);

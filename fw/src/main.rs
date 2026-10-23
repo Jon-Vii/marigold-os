@@ -111,12 +111,16 @@ use esp_rtos::embassy::InterruptExecutor;
 use static_cell::StaticCell;
 use tasks::input::InputPins;
 
+mod block_sink;
+mod book_images;
 pub mod catalog;
 mod custom_font;
 mod display_flush;
 mod firmware_files;
+mod image_decode;
 mod library_sd;
 mod ota_update;
+mod page_images;
 mod reader_cache;
 mod reader_cache_files;
 mod reader_layout;

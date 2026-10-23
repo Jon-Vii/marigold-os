@@ -493,6 +493,8 @@ def summarize_paths(
         ),
     )
 
+    print_images(events)
+
     modes: dict[str, int] = {}
     for event in renders:
         mode = str(event.get("mode", "unknown"))
@@ -514,6 +516,42 @@ def summarize_paths(
         for warning in suite_warnings:
             print(f"  {warning}")
     return budget_warnings + suite_warnings
+
+
+def image_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Decode times, spool times, and page waits from the image decode pass."""
+    decodes = [event for event in events if event.get("event") == "image_decode"]
+    outcomes: dict[str, int] = {}
+    for event in decodes:
+        outcome = str(event.get("outcome", "unknown"))
+        outcomes[outcome] = outcomes.get(outcome, 0) + 1
+    waits = [
+        event
+        for event in events
+        if event.get("event") == "image_session" and event.get("pass") == "request"
+    ]
+    return {
+        "outcomes": outcomes,
+        "decode_ms": values([event for event in decodes if event.get("outcome") == "decoded"], "ms"),
+        "spool_ms": values([event for event in decodes if event.get("spool_ms")], "spool_ms"),
+        "wait_ms": values([event for event in waits if event.get("decoded")], "elapsed_ms"),
+        "check_ms": values([event for event in waits if not event.get("decoded")], "elapsed_ms"),
+    }
+
+
+def print_images(events: list[dict[str, Any]]) -> None:
+    summary = image_summary(events)
+    if not summary["outcomes"] and not summary["check_ms"]:
+        return
+    if summary["outcomes"]:
+        print(
+            "image decodes: "
+            + ", ".join(f"{k}={v}" for k, v in sorted(summary["outcomes"].items()))
+        )
+    print_duration("image decode", summary["decode_ms"])
+    print_duration("image spool", summary["spool_ms"])
+    print_duration("image wait", summary["wait_ms"])
+    print_duration("image check", summary["check_ms"])
 
 
 def read_events(path: Path) -> list[dict[str, Any]]:

@@ -296,6 +296,7 @@ dependencies = [
 name = "proto"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "crc",
  "heapless",
  "miniz_oxide 0.9.1",

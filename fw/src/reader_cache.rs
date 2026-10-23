@@ -1,28 +1,33 @@
+#[cfg(feature = "bench-serial")]
+use crate::block_sink::build_profile;
+pub(crate) use crate::block_sink::Preparation;
+use crate::block_sink::{LibraryBlockSink, LineInkCursor, LowerAscii, PendingImages, SpineRun};
+#[cfg(feature = "bench-serial")]
+use crate::block_sink::{HYPHEN_LOOKUPS, HYPHEN_LOOKUP_MICROS};
+use crate::book_images::{BookImages, ProbeStop};
 use crate::display_flush::Epd;
+use crate::image_decode::{DecodeOutcome, ImageScratch, ImageSession, PageImages, SessionStats};
 use crate::reader_cache_files;
 use crate::reader_cache_files::{BookIndexLoadResult, CacheLoadResult};
 use crate::reader_layout;
 use crate::reader_store::{
-    source_hash, BookLoadStatus, ReaderStore, MAX_BOOK_SECTIONS, MAX_READER_BLOCK_TEXT,
-    MAX_READER_PAGES, MAX_SEED_SECTIONS,
+    source_hash, BookLoadStatus, ReaderStore, MAX_BOOK_SECTIONS, MAX_SEED_SECTIONS,
 };
 use crate::sd_session::{self, SdSessionError};
-use display::font::{fixed_ceil, fixed_round, FontFamily, FontStyle, TypeSettings};
+use display::font::FontStyle;
 use embassy_time::Instant;
 use embedded_sdmmc::{Directory, File, Mode, TimeSource};
 use esp_hal::gpio::Output;
 use hal_ext::nvm::AppStateRecord;
 use heapless::String;
 use proto::book::BookId;
-use proto::cache::BookV2SectionRecord;
 use proto::epub::{
     parse_opf_streamed, strip_fragment, Epub3NavStreamParser, EpubTocSink, EpubZipOps,
-    NcxStreamParser, ReadAt, StreamingXmlTokenizer, TocError, XhtmlBlockSink,
-    XhtmlBlockStreamParser, XhtmlError, ZipInflateScratch, ZipStream, MAX_ENTRY_NAME_BYTES,
+    NcxStreamParser, ReadAt, StreamingXmlTokenizer, TocError, XhtmlBlockStreamParser, XhtmlError,
+    ZipInflateScratch, ZipStream, MAX_ENTRY_NAME_BYTES,
 };
-use proto::hyphen::{word_breaks, Hyphenation, WordBreak, MAX_WORD_BREAKS};
+use proto::hyphen::Hyphenation;
 use proto::text::{TextAlign, TextRole};
-use ui::reading::StyledInkCursor;
 
 pub(crate) const READER_TAIL_SCRATCH: usize = 4096;
 pub(crate) const READER_HEADER_SCRATCH: usize = 46;
@@ -137,6 +142,29 @@ impl<'a> ReaderCacheScratch<'a> {
     }
 }
 
+impl ReaderCacheScratch<'_> {
+    /// Lends the scratch to an image pass, and a work list for it. A pass
+    /// runs in an SD session of its own, never inside a build session, so
+    /// all of it is idle: no spine streams (the compressed scratch, the
+    /// XHTML window, the name scratch and the inflater), and no package is
+    /// parsed (the container scratch, which holds the list). The tail, the
+    /// header and the OPF arena stay unused: an image is read by the offset
+    /// its index entry keeps, so no ZIP directory is opened.
+    pub(crate) fn image_parts(&mut self) -> (ImageScratch<'_>, &mut [u8]) {
+        let (input, stage) = self.compressed.split_at_mut(READER_COMPRESSED_SCRATCH / 2);
+        (
+            ImageScratch {
+                input,
+                stage,
+                window: &mut self.xhtml[..],
+                name: &mut self.name[..],
+                inflate: &mut self.zip_inflate,
+            },
+            &mut self.container[..],
+        )
+    }
+}
+
 /// Tears the built scratch down into the raw regions the sync session
 /// loans to the radio. One-way: the regions alias the scratch's borrowed
 /// arrays and its own struct storage (the inflate state is the bulk of
@@ -178,30 +206,6 @@ pub(crate) fn dismantle_scratch(
             http_b: core::slice::from_raw_parts_mut(tail_ptr, READER_TAIL_SCRATCH),
             wifi: None,
             catalog_len: 0,
-        }
-    }
-}
-
-/// What a call to `build_or_load_book_cache` is for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Preparation {
-    /// A reader request: answer it as soon as the prepared prefix holds
-    /// its page, preparing one more spine per call until it does.
-    Request,
-    /// Idle-time growth of the open book: prepare its next spine, keep the
-    /// requested page (the one on screen) resident, and give way the moment
-    /// a button press lands after `presses` was read from
-    /// `crate::BUTTON_PRESSES`.
-    Idle { presses: u32 },
-}
-
-impl Preparation {
-    fn gives_way(self) -> bool {
-        match self {
-            Self::Request => false,
-            Self::Idle { presses } => {
-                crate::BUTTON_PRESSES.load(core::sync::atomic::Ordering::Relaxed) != presses
-            }
         }
     }
 }
@@ -318,6 +322,10 @@ where
         "epub: stage TryV2BookIndexFast page={}",
         target_pages as u32
     );
+    let epub = EpubSource {
+        name: open_name.as_str(),
+        in_books_dir,
+    };
     if try_load_v2_book_cache(
         root,
         cache_key.as_str(),
@@ -327,7 +335,8 @@ where
         library,
         Instant::now(),
         "fast",
-        scratch.xhtml,
+        epub,
+        scratch,
         preparation,
     ) {
         return BookLoadStatus::Ready;
@@ -419,7 +428,8 @@ where
             library,
             Instant::now(),
             "resume",
-            scratch.xhtml,
+            epub,
+            scratch,
             Preparation::Request,
         ) {
             return BookLoadStatus::Ready;
@@ -702,6 +712,345 @@ pub(crate) fn restore_book_page_count(
     .unwrap_or(0)
 }
 
+/// Which of an open book's images an idle image pass decodes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImagePass {
+    /// Those on the pages around the one on screen.
+    Window,
+    /// The rest of the book's, nearest the reader first.
+    Rest,
+}
+
+/// How an idle image pass ended.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ImagePassEnd {
+    /// A press stopped it.
+    pub(crate) pressed: bool,
+    /// It ran to its end rather than out of the session budget: the window
+    /// through its list, the rest pass until nothing was left or a card
+    /// fault stopped it.
+    pub(crate) finished: bool,
+    /// It decoded or failed an image.
+    pub(crate) worked: bool,
+}
+
+fn now_ms() -> u64 {
+    Instant::now().as_millis()
+}
+
+/// A button press has landed since `crate::BUTTON_PRESSES` read `presses`.
+fn pressed_since(presses: u32) -> bool {
+    crate::BUTTON_PRESSES.load(core::sync::atomic::Ordering::Relaxed) != presses
+}
+
+/// Decodes the open book's images while the reader is idle, for the
+/// orientation the page on screen is laid out in: one pass, in an SD
+/// session of its own, until it runs out of work, out of the session
+/// budget, or gives way to a press. Opens the book's EPUB only once an
+/// image needs reading, so a pass that finds nothing reads only the index
+/// (and, for the window, the section files of pages the store does not
+/// hold). What it finds settled goes into the store's note: the window's
+/// pages, or, when the rest pass finds nothing left, the whole book. Callers
+/// ask only for books with images.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_images_while_idle(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    library: &mut ReaderStore,
+    index: usize,
+    page: u32,
+    scratch: &mut ReaderCacheScratch<'_>,
+    pass: ImagePass,
+    presses: u32,
+) -> ImagePassEnd {
+    let started = Instant::now();
+    let gives_way = || pressed_since(presses);
+    let out_of_time = || started.elapsed().as_millis() >= SESSION_BUDGET_MS;
+    let (mut parts, list) = scratch.image_parts();
+    let store: &ReaderStore = library;
+    // What the pass can vouch for: the window's pages, or the whole book.
+    let mut settled = None;
+    let mut out_of_budget = false;
+    let (stats, images) = run_image_session(epd, sd_cs, store, index, |root, book| {
+        let dir = crate::book_images::book_cache_dir(root, book.key.as_str())?;
+        let images = crate::book_images::open_existing_book_images(&dir, book.source)?;
+        let books = core::cell::OnceCell::new();
+        let mut listed = 0;
+        let mut session = ImageSession::new(
+            &dir,
+            images,
+            epub_opener(root, &books, book.epub()),
+            store.portrait(),
+            now_ms,
+        );
+        match pass {
+            ImagePass::Window => {
+                let mut window = PageImages::new(list);
+                let pages = crate::image_decode::list_window_images(
+                    store,
+                    index,
+                    page,
+                    &dir,
+                    book.source,
+                    &mut window,
+                );
+                listed = window.len();
+                let mut whole = true;
+                for image in (0..window.len()).filter_map(|at| window.get(at)) {
+                    if gives_way() || out_of_time() {
+                        whole = false;
+                        out_of_budget = !gives_way();
+                        break;
+                    }
+                    if matches!(
+                        session.decode_page_image(image, &mut parts, &gives_way),
+                        Some(DecodeOutcome::Cancelled | DecodeOutcome::Retry)
+                    ) {
+                        whole = false;
+                        break;
+                    }
+                }
+                if whole {
+                    settled = pages;
+                }
+            }
+            ImagePass::Rest => {
+                let reader = crate::image_decode::reader_place(store, page, session.images());
+                if session.decode_nearest(reader, list, &mut parts, &gives_way, &out_of_time) {
+                    settled = Some((0, u32::MAX));
+                } else {
+                    out_of_budget = out_of_time();
+                }
+            }
+        }
+        Some((session.stats, listed))
+    })
+    .unwrap_or_default();
+    let pressed = gives_way();
+    if stats.forgot_decodes() {
+        library.forget_settled_images();
+    }
+    match settled {
+        Some((0, u32::MAX)) if !stats.forgot_decodes() => library.note_book_images_settled(),
+        Some((from, to)) if !stats.forgot_decodes() => library.note_settled_pages(from, to),
+        _ => {}
+    }
+    log_image_session(
+        match pass {
+            ImagePass::Window => "window",
+            // Not "rest": a four-byte string constant would sit in RAM on
+            // the ESP32-C3, as eight- and sixteen-byte ones do.
+            ImagePass::Rest => "remaining",
+        },
+        images,
+        stats,
+        started,
+        pressed,
+    );
+    ImagePassEnd {
+        pressed,
+        finished: !out_of_budget && !pressed,
+        worked: stats.decoded > 0 || stats.failed > 0,
+    }
+}
+
+/// Decodes the images the page about to be shown draws, for its
+/// orientation, before the request is answered, so the page never shows
+/// a placeholder that a picture would later replace. The page is resident
+/// by now; one without images, in a book without any, or that the store's
+/// note says is settled, costs nothing (no card access); one found settled
+/// is noted. False when the wait is abandoned, the image in hand dropped,
+/// so the press is handled at once: a press since `presses` was read, or a
+/// newer request than `request_id`.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_page_images(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    library: &mut ReaderStore,
+    index: usize,
+    page: u32,
+    scratch: &mut ReaderCacheScratch<'_>,
+    presses: u32,
+    request_id: u32,
+) -> bool {
+    if !library.book_has_images()
+        || !library.covers_global_page(index, page)
+        || library.images_settled(page)
+    {
+        return true;
+    }
+    let (mut parts, list) = scratch.image_parts();
+    let mut shown = PageImages::new(list);
+    let whole = crate::image_decode::resident_page_images(library, page, &mut shown);
+    if shown.is_empty() && whole {
+        return true;
+    }
+    let started = Instant::now();
+    let gives_way = || {
+        pressed_since(presses)
+            || crate::LATEST_READER_REQUEST_ID.load(core::sync::atomic::Ordering::Relaxed)
+                != request_id
+    };
+    if gives_way() {
+        return false;
+    }
+    let store: &ReaderStore = library;
+    let mut settled = whole;
+    let (stats, images) = run_image_session(epd, sd_cs, store, index, |root, book| {
+        let dir = crate::book_images::book_cache_dir(root, book.key.as_str())?;
+        let images = crate::book_images::open_existing_book_images(&dir, book.source)?;
+        let books = core::cell::OnceCell::new();
+        let mut session = ImageSession::new(
+            &dir,
+            images,
+            epub_opener(root, &books, book.epub()),
+            store.portrait(),
+            now_ms,
+        );
+        for image in (0..shown.len()).filter_map(|at| shown.get(at)) {
+            if gives_way() {
+                settled = false;
+                break;
+            }
+            if matches!(
+                session.decode_page_image(image, &mut parts, &gives_way),
+                Some(DecodeOutcome::Cancelled | DecodeOutcome::Retry)
+            ) {
+                settled = false;
+                if gives_way() {
+                    break;
+                }
+            }
+        }
+        Some((session.stats, shown.len()))
+    })
+    // No index to check against: nothing is vouched for.
+    .filter(|(stats, _)| stats.checked > 0 || shown.is_empty())
+    .unwrap_or_else(|| {
+        settled = false;
+        (SessionStats::default(), 0)
+    });
+    let pressed = gives_way();
+    if stats.forgot_decodes() {
+        library.forget_settled_images();
+    } else if settled && !pressed {
+        library.note_settled_pages(page, page + 1);
+    }
+    log_image_session("request", images, stats, started, pressed);
+    !pressed
+}
+
+/// The open book's files an image session reads: its cache key, its
+/// source identity, and where its EPUB is.
+struct BookFiles<'a> {
+    key: String<{ proto::cache::CACHE_KEY_BYTES }>,
+    source: (u32, u32),
+    name: &'a str,
+    in_books_dir: bool,
+}
+
+impl BookFiles<'_> {
+    fn epub(&self) -> EpubSource<'_> {
+        EpubSource {
+            name: self.name,
+            in_books_dir: self.in_books_dir,
+        }
+    }
+}
+
+/// Runs `pass` in an SD session for the book in catalog entry `index`,
+/// and returns what it reports: its stats and how many images it listed.
+/// `None` when the session, the cache directory or the index did not open.
+fn run_image_session<F>(
+    epd: &mut Epd,
+    sd_cs: &mut Output<'static>,
+    library: &ReaderStore,
+    index: usize,
+    pass: F,
+) -> Option<(SessionStats, usize)>
+where
+    F: for<'r> FnOnce(
+        &crate::sd_session::SdRoot<'r>,
+        &BookFiles<'_>,
+    ) -> Option<(SessionStats, usize)>,
+{
+    let entry = library.catalog_entry(index)?;
+    let book = BookFiles {
+        key: proto::cache::cache_key_for(entry.display_name.as_str(), entry.byte_size),
+        source: (entry.source_hash, entry.byte_size),
+        name: entry.open_name.as_str(),
+        in_books_dir: entry.in_books_dir,
+    };
+    sd_session::with_root(epd, sd_cs, |root| pass(root, &book))
+        .ok()
+        .flatten()
+}
+
+fn log_image_session(
+    pass: &str,
+    images: usize,
+    stats: SessionStats,
+    started: Instant,
+    pressed: bool,
+) {
+    esp_println::println!(
+        "bench: image_session pass={} images={} checked={} decoded={} failed={} cancelled={} retry={} elapsed_ms={} pressed={} t_ms={}",
+        pass,
+        images,
+        stats.checked,
+        stats.decoded,
+        stats.failed,
+        stats.cancelled,
+        stats.retry,
+        started.elapsed().as_millis(),
+        pressed,
+        Instant::now().as_millis(),
+    );
+}
+
+/// Opens the book's EPUB the first time it is called, for reads at
+/// offsets: no ZIP directory is read. An EPUB in `/BOOKS` keeps that
+/// directory open in `books` for as long as the file is.
+fn epub_opener<'g, 'f: 'g, D, T, const ND: usize, const NF: usize, const NV: usize>(
+    root: &'f Directory<'_, D, T, ND, NF, NV>,
+    books: &'g core::cell::OnceCell<Directory<'f, D, T, ND, NF, NV>>,
+    epub: EpubSource<'g>,
+) -> impl FnMut() -> Option<SdFileReadAt<'g, D, T, ND, NF, NV>> + use<'g, 'f, D, T, ND, NF, NV>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    move || {
+        let dir = if epub.in_books_dir {
+            if books.get().is_none() {
+                let _ = books.set(root.open_dir("BOOKS").ok()?);
+            }
+            books.get()?
+        } else {
+            root
+        };
+        let file = dir.open_file_in_dir(epub.name, Mode::ReadOnly).ok()?;
+        let len = file.length();
+        Some(SdFileReadAt {
+            file,
+            len,
+            read_ops: 0,
+            read_bytes: 0,
+        })
+    }
+}
+
+/// Where a catalog entry's EPUB file is on the card.
+#[derive(Clone, Copy)]
+struct EpubSource<'a> {
+    /// The FAT name it opens by.
+    name: &'a str,
+    /// In `/BOOKS`, else the card root.
+    in_books_dir: bool,
+}
+
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn try_load_v2_book_cache<
@@ -719,7 +1068,8 @@ fn try_load_v2_book_cache<
     library: &mut ReaderStore,
     started: Instant,
     label: &str,
-    reflow_scratch: &mut [u8],
+    epub: EpubSource<'_>,
+    scratch: &mut ReaderCacheScratch<'_>,
     preparation: Preparation,
 ) -> bool
 where
@@ -728,6 +1078,29 @@ where
 {
     let mut result =
         reader_cache_files::load_v2_book_index(root, cache_key, source_identity, library);
+    if let BookIndexLoadResult::BeforeImages { spacing_changed } = result {
+        // Laid out before image blocks existed. The ZIP's central directory
+        // says whether that matters: once per book, as whatever follows
+        // writes the index as the current version. A lone cover does not.
+        let checked = Instant::now();
+        let has_images = epub_has_images_beyond_a_cover(root, epub, scratch);
+        esp_println::println!(
+            "epub: v27 book index; images={:?} checked in {} ms",
+            has_images,
+            checked.elapsed().as_millis()
+        );
+        result = reader_cache_files::settle_index_before_images(
+            root,
+            cache_key,
+            source_identity,
+            library,
+            has_images,
+            spacing_changed,
+            requested_global_page,
+            requested_spine,
+        );
+    }
+    let reflow_scratch = &mut scratch.xhtml[..];
     if result == BookIndexLoadResult::SpacingMismatch {
         // The resident sections are still the old spacing's pages.
         if requested_spine.is_none() {
@@ -810,7 +1183,9 @@ where
                 }
             }
         }
-        BookIndexLoadResult::Invalid | BookIndexLoadResult::SpacingMismatch => {
+        BookIndexLoadResult::Invalid
+        | BookIndexLoadResult::SpacingMismatch
+        | BookIndexLoadResult::BeforeImages { .. } => {
             esp_println::println!("epub: v2 {label} book index invalid");
             false
         }
@@ -819,6 +1194,45 @@ where
             false
         }
     }
+}
+
+/// Whether the book's ZIP has image entries beyond a lone cover
+/// (`book_images::book_has_images_beyond_a_cover`), from its central
+/// directory alone: the open reads the end record and the directory (or
+/// indexes it), and the check walks it once more, from RAM when the open
+/// cached it and through the idle compressed scratch otherwise. No image
+/// is read. None when the book cannot be opened; a directory damaged past
+/// the open counts as no images, as it does for a build.
+#[inline(never)]
+fn epub_has_images_beyond_a_cover<D, T, const ND: usize, const NF: usize, const NV: usize>(
+    root: &Directory<'_, D, T, ND, NF, NV>,
+    epub: EpubSource<'_>,
+    scratch: &mut ReaderCacheScratch<'_>,
+) -> Option<bool>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let books;
+    let dir = if epub.in_books_dir {
+        books = root.open_dir("BOOKS").ok()?;
+        &books
+    } else {
+        root
+    };
+    let file = dir.open_file_in_dir(epub.name, Mode::ReadOnly).ok()?;
+    let len = file.length();
+    let reader = SdFileReadAt {
+        file,
+        len,
+        read_ops: 0,
+        read_bytes: 0,
+    };
+    let mut zip = ZipStream::new(reader, scratch.tail).ok()?;
+    Some(crate::book_images::book_has_images_beyond_a_cover(
+        &mut zip,
+        scratch.compressed,
+    ))
 }
 
 fn generated_toc_is_current<D, T, const ND: usize, const NF: usize, const NV: usize>(
@@ -1146,6 +1560,11 @@ where
         reader_cache_files::prepare_book_replacement(root, cache_key)
             .ok_or(ReaderCacheError::CacheWrite)?
     };
+    if !resuming {
+        // A fresh build numbers the pages anew, so what is noted of their
+        // images goes.
+        library.forget_settled_images();
+    }
     let seed_base = crate::reader_store::seed_section_base(section_base);
     let io_start = crate::sd_session::sd_stats::snapshot();
     let mut section_write_micros: u64 = 0;
@@ -1157,8 +1576,12 @@ where
         scratch.container,
         &mut *scratch.zip_inflate,
     )?;
-    let container_xml = core::str::from_utf8(&scratch.container[..container_len])
-        .map_err(|_| ReaderCacheError::Utf8)?;
+    // The rest of the container scratch is idle once the package is found:
+    // the block sink holds images there while a spine is laid out.
+    let (container_text, pending_room) = scratch
+        .container
+        .split_at_mut(container_len.min(READER_CONTAINER_SCRATCH));
+    let container_xml = core::str::from_utf8(container_text).map_err(|_| ReaderCacheError::Utf8)?;
     let opf_path = find_full_path(container_xml).ok_or(ReaderCacheError::MissingOpfPath)?;
 
     let opf_entry = zip.find_entry(opf_path, scratch.header, scratch.name)?;
@@ -1283,12 +1706,48 @@ where
     // (see ReaderStore::requested_page), and paging back or the Contents
     // still reach the cover, title, and foreword pages.
     let mut prefix_next = next_eligible_spine(&package, resume_next.map_or(0, usize::from));
+    // A book with images keeps an index of them beside its book index,
+    // built once from the central directory through the compressed scratch
+    // and the XHTML window, both idle until the first spine. A fresh build
+    // learns whether the book has any from the ZIP's open (walking only a
+    // directory too big for its index pass), and the book index keeps the
+    // answer for the sessions that resume it. A book without them never
+    // touches the index.
+    let has_images = if resuming {
+        library.book_has_images()
+    } else {
+        let found = crate::book_images::book_has_images(&mut zip, &mut scratch.compressed[..]);
+        library.set_book_has_images(found);
+        found
+    };
+    let images_dir;
+    let mut rebuilt = false;
+    let images = if has_images {
+        images_dir = crate::book_images::book_cache_dir(root, cache_key);
+        images_dir.as_ref().and_then(|dir| {
+            crate::book_images::open_book_images(
+                dir,
+                source_identity,
+                &mut zip,
+                &mut scratch.compressed[..],
+                &mut scratch.xhtml[..],
+                &mut rebuilt,
+            )
+        })
+    } else {
+        None
+    };
+    if rebuilt {
+        // A new index: every image is undecoded again.
+        library.forget_settled_images();
+    }
     let mut spine_scratch = SpineScratch {
         header: &mut *scratch.header,
         name: &mut *scratch.name,
         compressed: &mut *scratch.compressed,
         xhtml: &mut *scratch.xhtml,
         zip_inflate: &mut *scratch.zip_inflate,
+        pending: pending_room,
     };
     // One session lays out spines until the request is answered, a button
     // is pressed, the budget is spent, or the book is done, committing the
@@ -1320,23 +1779,39 @@ where
             esp_println::println!("epub: laying out spine {} ahead of the prefix", spine_index);
         }
         let seed_len = library.seed.sections.len();
-        let outcome = lay_out_spine(
-            &mut zip,
-            root,
-            source_identity,
-            &package,
-            opf_path,
-            spine_index,
-            run,
-            run_base,
-            library,
-            font_metrics,
-            preparation,
-            generate_toc_from_headings && run == SpineRun::Prefix,
-            &mut book_partial,
-            &mut section_write_micros,
-            &mut spine_scratch,
-        )?;
+        // A spine that meets images no probe has read is laid out twice; see
+        // `lay_out_spine`. Nothing commits in between: the book index is
+        // written below, after the second pass.
+        let mut first_pass = true;
+        let outcome = loop {
+            let laid = lay_out_spine(
+                &mut zip,
+                root,
+                source_identity,
+                &package,
+                opf_path,
+                spine_index,
+                run,
+                run_base,
+                library,
+                font_metrics,
+                preparation,
+                generate_toc_from_headings && run == SpineRun::Prefix,
+                &mut book_partial,
+                &mut section_write_micros,
+                images.as_ref(),
+                first_pass,
+                &mut spine_scratch,
+            )?;
+            match laid {
+                SpinePass::Laid(outcome) => break outcome,
+                SpinePass::Again if first_pass => first_pass = false,
+                // A second pass never waits for a probe. Were one to, its
+                // sections are already taken back: fail the step, which
+                // commits nothing, rather than move past the spine.
+                SpinePass::Again => return Err(ReaderCacheError::CacheWrite),
+            }
+        };
         spines_laid += 1;
         let after = next_eligible_spine(&package, spine_index + 1);
         match run {
@@ -1483,13 +1958,6 @@ const SEED_MIN_GAP_BYTES: u32 = 64 * 1024;
 /// the run's table and be laid out for nothing.
 const SEED_MAX_SPINE_BYTES: u32 = 2 * 1024 * 1024;
 
-/// Which section table a spine's sections join.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SpineRun {
-    Prefix,
-    Seed,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SpineOutcome {
     Laid,
@@ -1505,6 +1973,10 @@ struct SpineScratch<'a> {
     compressed: &'a mut [u8; READER_COMPRESSED_SCRATCH],
     xhtml: &'a mut [u8; READER_XHTML_SCRATCH],
     zip_inflate: &'a mut ZipInflateScratch,
+    /// Where the block sink holds the images met at a paragraph's start
+    /// until it knows whether text follows: the container scratch past
+    /// `container.xml`, idle while spines are laid out.
+    pending: &'a mut [u8],
 }
 
 /// First spine at or after `from` that holds content to lay out.
@@ -1625,6 +2097,8 @@ fn note_book_progress(
     let total_pages = library.book_sections.end_page();
     library.commit_book_index(total_pages, *book_partial);
     library.set_book_next_spine(next_spine);
+    // The spine may have met images no decode has reached.
+    library.note_book_grew();
     // Chapter starts move with every spine laid out, seeded ones included
     // (which leave the prefix cursor where it was): reread the map.
     library.chapter_page_count = 0;
@@ -1675,6 +2149,17 @@ where
 }
 
 /// Lay out one spine into `run`'s table, writing its sections as they fill.
+///
+/// A spine whose first pass meets images no probe has read is laid out
+/// twice: the first pass marks them in the image index and stops laying
+/// out at the first of them, then probes them, and the second pass lays
+/// the whole spine out with their sizes. Nothing commits between the
+/// passes (the session writes the book index only after the second), and
+/// the first is taken back before the second (`take_back_first_pass`): its
+/// sections leave the run's table, and its generated TOC record goes. Its
+/// section files are a prefix of what the second pass writes under the
+/// same ids, since both lay the spine out identically up to the first
+/// unprobed image, so the second overwrites every one of them.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn lay_out_spine<Z, D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
@@ -1692,15 +2177,17 @@ fn lay_out_spine<Z, D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const M
     generate_toc_from_headings: bool,
     book_partial: &mut bool,
     write_micros: &mut u64,
+    images: Option<&BookImages<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>,
+    first_pass: bool,
     scratch: &mut SpineScratch<'_>,
-) -> Result<SpineOutcome, ReaderCacheError>
+) -> Result<SpinePass, ReaderCacheError>
 where
     Z: EpubZipOps,
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
     let Some(spine) = package.spine.get(spine_index) else {
-        return Ok(SpineOutcome::Skipped);
+        return Ok(SpinePass::Laid(SpineOutcome::Skipped));
     };
     let cache_key = library.cache_key.clone();
     library.clear_lines();
@@ -1718,7 +2205,7 @@ where
                 xhtml_path.as_str(),
                 err
             );
-            return Ok(SpineOutcome::Skipped);
+            return Ok(SpinePass::Laid(SpineOutcome::Skipped));
         }
     };
     esp_println::println!(
@@ -1763,6 +2250,16 @@ where
             generated_toc_for_spine: false,
             pages_dirty: true,
             write_failed: false,
+            images,
+            chapter: xhtml_path.as_str(),
+            image_path: &mut *scratch.name,
+            first_pass,
+            unprobed: None,
+            images_met: 0,
+            pending: PendingImages::new(&mut *scratch.pending),
+            paragraph_has_text: false,
+            line_image_height: 0,
+            line_unindented: false,
         };
         // Stream the whole member through the resumable block parser in
         // bounded windows: spine XHTML of any size decodes completely, with
@@ -1840,18 +2337,104 @@ where
                 *sink.book_partial = true;
             }
         }
+        if sink.write_failed {
+            return Err(ReaderCacheError::CacheWrite);
+        }
+        if let (Some((first, last)), Some(images)) = (sink.unprobed, images) {
+            let generated_toc = sink.generated_toc_for_spine;
+            take_back_first_pass(library, run, spine_index, generated_toc);
+            probe_spine_images(images, zip, first..=last, scratch, preparation, spine_index)?;
+            return Ok(SpinePass::Again);
+        }
         if !sink.run_full {
             sink.finish_spine(false);
         }
         if sink.write_failed {
             return Err(ReaderCacheError::CacheWrite);
         }
-        Ok(if sink.run_full {
+        Ok(SpinePass::Laid(if sink.run_full {
             SpineOutcome::RunFull
         } else {
             SpineOutcome::Laid
-        })
+        }))
     })
+}
+
+/// Probes the images a spine's first pass marked, between its passes.
+/// Out of line, so the spine's own frame, which the parse runs beneath,
+/// does not carry this one's.
+#[inline(never)]
+fn probe_spine_images<Z, D, T, const ND: usize, const NF: usize, const NV: usize>(
+    images: &BookImages<'_, D, T, ND, NF, NV>,
+    zip: &mut Z,
+    slots: core::ops::RangeInclusive<u16>,
+    scratch: &mut SpineScratch<'_>,
+    preparation: Preparation,
+    spine_index: usize,
+) -> Result<(), ReaderCacheError>
+where
+    Z: EpubZipOps,
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let started = Instant::now();
+    let probed = images
+        .probe_marked(
+            zip,
+            slots,
+            &mut scratch.compressed[..],
+            &mut scratch.xhtml[..],
+            scratch.zip_inflate,
+            || preparation.gives_way(),
+        )
+        .map_err(|stop| match stop {
+            ProbeStop::Interrupted => ReaderCacheError::Interrupted,
+            // A failed read of the book is worth retrying, as for a spine.
+            ProbeStop::Archive => proto::epub::ZipError::Io.into(),
+            ProbeStop::Index => ReaderCacheError::CacheWrite,
+        })?;
+    esp_println::println!(
+        "epub: spine {} probed {} image(s) in {} ms; laying it out again",
+        spine_index,
+        probed,
+        started.elapsed().as_millis()
+    );
+    Ok(())
+}
+
+/// Takes back what a spine's first pass added outside its section files,
+/// before the second: nothing it added needs remembering beforehand. A
+/// spine's sections are the tail of its run's table (a session lays each
+/// spine out once, in order), and the TOC record a pass generates from a
+/// heading is the list's last. The book's partial mark needs no undoing:
+/// it only ever goes true, and the second pass, identical up to the first
+/// pass's first unprobed image and adding nothing after it, sets it
+/// wherever the first did.
+fn take_back_first_pass(
+    library: &mut ReaderStore,
+    run: SpineRun,
+    spine_index: usize,
+    generated_toc: bool,
+) {
+    let spine = spine_index.min(u16::MAX as usize) as u16;
+    match run {
+        SpineRun::Prefix => library.book_sections.drop_trailing_spine(spine),
+        SpineRun::Seed => library.seed.sections.drop_trailing_spine(spine),
+    }
+    if generated_toc && library.toc_count > 0 {
+        library.toc_count -= 1;
+        library.toc_text_len = library.toc[library.toc_count].title_offset as usize;
+    }
+    library.clear_lines();
+}
+
+/// How one layout pass over a spine ended.
+#[derive(Clone, Copy)]
+enum SpinePass {
+    Laid(SpineOutcome),
+    /// The pass met images no probe had read; they are probed now, and the
+    /// pass taken back: lay the spine out again.
+    Again,
 }
 
 fn spine_item_is_navigation(
@@ -2128,1152 +2711,4 @@ fn resolve_epub_href(
     let href_no_fragment = href.split('#').next().unwrap_or(href);
     out.push_str(href_no_fragment)
         .map_err(|_| ReaderCacheError::EntryNameTooLong)
-}
-
-struct LibraryBlockSink<
-    'a,
-    'r,
-    D,
-    T,
-    const MAX_DIRS: usize,
-    const MAX_FILES: usize,
-    const MAX_VOLUMES: usize,
-> where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    library: &'a mut ReaderStore,
-    root: &'r Directory<'r, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    /// The book's SECTIONS directory, opened once for the whole build.
-    /// `None` when the cache directories could not be created — section
-    /// writes then fail per section and the book publishes as partial.
-    sections_dir: Option<&'r Directory<'r, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>>,
-    source_identity: (u32, u32),
-    /// Id the run's first section takes.
-    section_base: u16,
-    /// The table this spine's sections join.
-    run: SpineRun,
-    /// The run's table filled before the spine was through.
-    run_full: bool,
-    font_metrics: &'a mut crate::custom_font::MetricCache,
-    book_partial: &'a mut bool,
-    /// Accumulated wall time spent writing section files, for the
-    /// `bench: storage_build` line.
-    write_micros: &'a mut u64,
-    spine_index: u16,
-    line: String<MAX_READER_BLOCK_TEXT>,
-    /// Running ink width of `line`. `line` always starts with a style
-    /// marker (or is empty), so the cursor's default font never shows
-    /// through and the running width matches a from-scratch measure.
-    line_ink: LineInkCursor,
-    line_role: TextRole,
-    line_align: TextAlign,
-    line_style: FontStyle,
-    pending_space: bool,
-    dropping_paragraph: bool,
-    /// Patterns for the book's language; soft hyphens and dashes break in
-    /// any language.
-    hyphenation: Hyphenation,
-    /// Lines in a row that ended in a hyphen, and whether the line in
-    /// progress will.
-    hyphen_run: u8,
-    line_hyphenated: bool,
-    stopped: bool,
-    /// An idle-time step stops at the next block once a button is pressed,
-    /// and says so here: unlike `stopped`, nothing it built is kept.
-    preparation: Preparation,
-    interrupted: bool,
-    target_pages: usize,
-    generate_toc_from_headings: bool,
-    generated_toc_for_spine: bool,
-    /// Only appends and final paragraph-end marks occur between updates.
-    /// Completed pages stay valid; the dirty trailing page is repaginated.
-    pages_dirty: bool,
-    write_failed: bool,
-}
-
-#[derive(Clone, Copy)]
-enum LineInkCursor {
-    BuiltIn(StyledInkCursor),
-    Custom(CustomLineInkCursor),
-}
-
-impl LineInkCursor {
-    fn new(settings: TypeSettings, default_style: FontStyle) -> Self {
-        if settings.family == FontFamily::Custom && !display::font::builtin_custom_available() {
-            Self::Custom(CustomLineInkCursor::new(settings, default_style))
-        } else {
-            Self::BuiltIn(StyledInkCursor::new(settings, default_style))
-        }
-    }
-
-    fn width(&self) -> i16 {
-        match self {
-            Self::BuiltIn(cursor) => cursor.width(),
-            Self::Custom(cursor) => cursor.width(),
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct CustomLineInkCursor {
-    advance_fp: i32,
-    right: i16,
-    settings: TypeSettings,
-    style: FontStyle,
-}
-
-impl CustomLineInkCursor {
-    const fn new(settings: TypeSettings, default_style: FontStyle) -> Self {
-        Self {
-            advance_fp: 0,
-            right: 0,
-            settings,
-            style: default_style,
-        }
-    }
-
-    fn reset_pair(&mut self) {}
-
-    fn push_metric(&mut self, metric: display::font::GlyphMetric) {
-        let advance = fixed_round(self.advance_fp);
-        let glyph_right = advance + metric.x_offset as i16 + metric.width as i16;
-        self.right = self.right.max(glyph_right);
-        self.advance_fp += metric.advance_fp as i32;
-    }
-
-    fn push_fallback(&mut self) {
-        self.advance_fp += 8 << 4;
-        self.right = self.right.max(fixed_ceil(self.advance_fp));
-    }
-
-    fn width(&self) -> i16 {
-        self.right.max(fixed_ceil(self.advance_fp))
-    }
-}
-
-impl<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>
-    LibraryBlockSink<'_, '_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>
-where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    fn reset_line_ink(&mut self) {
-        self.line_ink = LineInkCursor::new(self.library.type_settings(), FontStyle::Regular);
-    }
-
-    fn push_line_ink_str(&mut self, text: &str) {
-        match &mut self.line_ink {
-            LineInkCursor::BuiltIn(cursor) => cursor.push_str(text),
-            LineInkCursor::Custom(cursor) => {
-                crate::custom_font::for_each_metric(
-                    self.root,
-                    self.library,
-                    &mut *self.font_metrics,
-                    cursor.settings.size,
-                    cursor.settings.weight,
-                    cursor.style,
-                    text,
-                    |style, metric| {
-                        if cursor.style != style {
-                            cursor.reset_pair();
-                            cursor.style = style;
-                        }
-                        if let Some(metric) = metric {
-                            cursor.push_metric(metric);
-                        } else {
-                            cursor.push_fallback();
-                        }
-                    },
-                );
-            }
-        }
-    }
-
-    fn line_ink_width(&self) -> i16 {
-        self.line_ink.width()
-    }
-
-    fn rebuild_pages_if_dirty(&mut self) {
-        if self.pages_dirty {
-            #[cfg(feature = "bench-serial")]
-            let _span = build_profile::Span::new(&build_profile::PAGES);
-            reader_layout::extend_page_index(self.library);
-            self.pages_dirty = false;
-        }
-    }
-
-    fn finish_spine(&mut self, partial: bool) {
-        flush_styled_preview_line(self, true);
-        self.flush_section(partial || self.stopped, false);
-    }
-
-    fn flush_section(&mut self, partial: bool, carry_incomplete: bool) -> bool {
-        self.rebuild_pages_if_dirty();
-        if self.library.block_count() == 0 || self.library.page_count == 0 {
-            self.library.clear_lines();
-            self.pages_dirty = true;
-            return true;
-        }
-        let (section_id, start_page, full) = match self.run {
-            SpineRun::Prefix => {
-                let table = &self.library.book_sections;
-                let (id, start) = table.next_slot(self.section_base, 0);
-                (id, start, table.is_full())
-            }
-            SpineRun::Seed => {
-                let table = &self.library.seed.sections;
-                let (id, start) = table.next_slot(
-                    self.section_base,
-                    crate::reader_store::PROVISIONAL_PAGE_BASE,
-                );
-                // Provisional pages must stay u16 page requests.
-                let room = start + MAX_READER_PAGES as u32 <= u32::from(u16::MAX);
-                (id, start, table.is_full() || !room)
-            }
-        };
-        if full {
-            match self.run {
-                SpineRun::Prefix => *self.book_partial = true,
-                SpineRun::Seed => self.run_full = true,
-            }
-            self.stopped = true;
-            return false;
-        }
-        if partial {
-            *self.book_partial = true;
-        }
-
-        self.library.set_cached_spine(self.spine_index);
-        self.library.set_section_partial(partial);
-        let write_started = Instant::now();
-        #[cfg(feature = "bench-serial")]
-        let reads_before = crate::sd_session::sd_stats::snapshot().read_blocks;
-        let mut written_pages = 0;
-        let wrote = reader_layout::flush_page_window(self.library, carry_incomplete, |window| {
-            written_pages = window.page_count;
-            match self.sections_dir {
-                Some(sections) => reader_cache_files::write_v2_section_cache_in(
-                    sections,
-                    self.source_identity,
-                    section_id,
-                    window,
-                ),
-                None => false,
-            }
-        });
-        *self.write_micros += write_started.elapsed().as_micros();
-        #[cfg(feature = "bench-serial")]
-        build_profile::SECTION_WRITE_READS.fetch_add(
-            crate::sd_session::sd_stats::snapshot()
-                .read_blocks
-                .wrapping_sub(reads_before),
-            portable_atomic::Ordering::Relaxed,
-        );
-        if !wrote {
-            self.write_failed = true;
-            self.stopped = true;
-            return false;
-        }
-        let record = BookV2SectionRecord {
-            section: section_id,
-            spine: self.spine_index,
-            start_page,
-            page_count: written_pages.min(u16::MAX as usize) as u16,
-            partial,
-        };
-        let pushed = match self.run {
-            SpineRun::Prefix => self.library.book_sections.push(record),
-            SpineRun::Seed => self.library.seed.sections.push(record),
-        };
-        if !pushed {
-            match self.run {
-                SpineRun::Prefix => *self.book_partial = true,
-                SpineRun::Seed => self.run_full = true,
-            }
-            self.stopped = true;
-            return false;
-        }
-        self.pages_dirty = false;
-        true
-    }
-
-    fn flush_if_full(&mut self) {
-        self.rebuild_pages_if_dirty();
-        if self.library.page_count >= self.target_pages
-            || self.library.block_count() >= self.library.block_capacity().saturating_sub(4)
-            || self.library.text_capacity_reached()
-        {
-            // The line still being filled is not pushed here: the section
-            // carries its unfinished last page forward, and the line keeps
-            // collecting words until it wraps naturally. Pushing it early
-            // ended a line mid-paragraph at most section boundaries.
-            self.flush_section(false, true);
-        }
-    }
-}
-
-impl<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize> XhtmlBlockSink
-    for LibraryBlockSink<'_, '_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>
-where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    fn push_block(
-        &mut self,
-        text: &str,
-        role: TextRole,
-        style: proto::text::FontStyle,
-        align: TextAlign,
-        paragraph_end: bool,
-    ) -> Result<(), XhtmlError> {
-        #[cfg(feature = "bench-serial")]
-        let _span = build_profile::Span::new(&build_profile::PARAGRAPHS);
-        if self.stopped || self.interrupted {
-            return Err(XhtmlError::TooManyRuns);
-        }
-        if self.preparation.gives_way() {
-            self.interrupted = true;
-            return Err(XhtmlError::TooManyRuns);
-        }
-        self.flush_if_full();
-        push_styled_preview_fragment(
-            self,
-            text,
-            preview_style_for_proto_style(style, role),
-            role,
-            align,
-            paragraph_end,
-        );
-        self.flush_if_full();
-        Ok(())
-    }
-}
-
-fn preview_style_for_proto_style(style: proto::text::FontStyle, role: TextRole) -> FontStyle {
-    match style {
-        proto::text::FontStyle::BoldItalic => FontStyle::BoldItalic,
-        proto::text::FontStyle::Bold => FontStyle::Bold,
-        proto::text::FontStyle::Italic => FontStyle::Italic,
-        proto::text::FontStyle::Regular => {
-            if matches!(
-                role,
-                TextRole::Heading1 | TextRole::Heading2 | TextRole::Heading3
-            ) {
-                FontStyle::Bold
-            } else {
-                FontStyle::Regular
-            }
-        }
-    }
-}
-
-fn push_styled_preview_fragment<
-    D,
-    T,
-    const MAX_DIRS: usize,
-    const MAX_FILES: usize,
-    const MAX_VOLUMES: usize,
->(
-    sink: &mut LibraryBlockSink<'_, '_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    text: &str,
-    style: FontStyle,
-    role: TextRole,
-    align: TextAlign,
-    paragraph_end: bool,
-) where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    if sink.dropping_paragraph {
-        if paragraph_end {
-            sink.dropping_paragraph = false;
-            sink.pending_space = false;
-        }
-        return;
-    }
-    let starts_with_space = text
-        .chars()
-        .next()
-        .map(|ch| ch.is_ascii_whitespace())
-        .unwrap_or(false);
-    let ends_with_space = text
-        .chars()
-        .next_back()
-        .map(|ch| ch.is_ascii_whitespace())
-        .unwrap_or(false);
-    let mut normalized = String::<MAX_READER_BLOCK_TEXT>::new();
-    push_normalized(text, &mut normalized);
-    trim_trailing_space(&mut normalized);
-    // A fragment with no visible text only carries spacing. Handle it before
-    // the paragraph sanitizer, which treats an empty block as "drop the rest
-    // of this paragraph".
-    if normalized.is_empty() {
-        sink.pending_space |= starts_with_space || ends_with_space;
-        if paragraph_end {
-            flush_styled_preview_line(sink, true);
-        }
-        return;
-    }
-    if !sanitize_preview_block(&mut normalized) {
-        sink.dropping_paragraph = !paragraph_end;
-        sink.pending_space = false;
-        return;
-    }
-
-    normalize_decorative_separator(&mut normalized);
-    let align = reader_layout::effective_align(
-        block_align_for(align, normalized.as_str(), role),
-        sink.library.type_settings(),
-    );
-    let page_box = sink.library.page_box();
-    let x = page_box.x_for(role);
-    let max_x = page_box.right;
-    // Book-style first-line indent: a Body paragraph's opening line wraps
-    // against a narrower column. Only Left/Justify Body takes it, matching
-    // `ui::reading::block_first_line_indent`, so the built line breaks agree
-    // with how the page later draws them.
-    let indent = if matches!(role, TextRole::Body)
-        && matches!(align, TextAlign::Left | TextAlign::Justify)
-    {
-        reader_layout::paragraph_indent(sink.library.type_settings().size)
-    } else {
-        0
-    };
-
-    if !sink.line.is_empty() && (sink.line_role != role || sink.line_align != align) {
-        flush_styled_preview_line(sink, false);
-    }
-    if sink.line.is_empty() {
-        sink.line_role = role;
-        sink.line_align = align;
-        sink.line_style = FontStyle::Regular;
-    }
-
-    // Hyphenation fills justified prose lines; headings, centred and ragged
-    // text break only where a word is wider than the whole line.
-    let justified_body = matches!(role, TextRole::Body) && align == TextAlign::Justify;
-    let mut first_word = true;
-    // ASCII whitespace only: a no-break space joins its neighbours into one
-    // unbreakable word.
-    let mut words = normalized.split_ascii_whitespace().peekable();
-    while let Some(word) = words.next() {
-        let attach = is_leading_punctuation_word(word) && !sink.line.is_empty();
-        let mut leading_space = !sink.line.is_empty()
-            && !attach
-            && (sink.pending_space || !first_word || starts_with_space);
-        // A paragraph's last word is never split: its tail would sit alone
-        // on the last line.
-        let may_hyphenate = justified_body && !(paragraph_end && words.peek().is_none());
-        let mut piece = word;
-        while let Placement::Continue(rest) = place_word_piece(
-            sink,
-            piece,
-            WordPlacement {
-                style,
-                role,
-                align,
-                leading_space,
-                may_hyphenate,
-                x,
-                indent,
-                max_x,
-            },
-        ) {
-            piece = rest;
-            leading_space = false;
-        }
-        first_word = false;
-    }
-
-    // A run ending in a space owes the next run (the next styled span, or
-    // the next chunk the parser streams) that space.
-    sink.pending_space |= ends_with_space;
-    if paragraph_end {
-        flush_styled_preview_line(sink, true);
-    }
-}
-
-/// Character boundaries measured for one word at a line end; a head never
-/// holds more letters than a line does.
-const HEAD_WIDTH_SLOTS: usize = 64;
-
-/// Where build time goes, for the bench: each span adds its wall time to a
-/// counter (spans nest: a paragraph's time includes its lines' and pages').
-#[cfg(feature = "bench-serial")]
-mod build_profile {
-    use portable_atomic::{AtomicU32, Ordering};
-    pub(super) static PARAGRAPHS: AtomicU32 = AtomicU32::new(0);
-    pub(super) static LINES: AtomicU32 = AtomicU32::new(0);
-    pub(super) static PAGES: AtomicU32 = AtomicU32::new(0);
-    pub(super) static COMMITS: AtomicU32 = AtomicU32::new(0);
-    /// A spine's whole read: inflating, parsing, and laying out.
-    pub(super) static SPINE_READS: AtomicU32 = AtomicU32::new(0);
-    /// Parsing and laying out, fed inflated windows.
-    pub(super) static FEEDS: AtomicU32 = AtomicU32::new(0);
-    /// Block reads made while writing sections (FAT and partial blocks).
-    pub(super) static SECTION_WRITE_READS: AtomicU32 = AtomicU32::new(0);
-
-    pub(super) struct Span(&'static AtomicU32, embassy_time::Instant);
-
-    impl Span {
-        pub(super) fn new(counter: &'static AtomicU32) -> Self {
-            Self(counter, embassy_time::Instant::now())
-        }
-    }
-
-    impl Drop for Span {
-        fn drop(&mut self) {
-            self.0
-                .fetch_add(self.1.elapsed().as_micros() as u32, Ordering::Relaxed);
-        }
-    }
-
-    pub(super) fn take_ms(counter: &AtomicU32) -> u32 {
-        counter.swap(0, Ordering::Relaxed) / 1000
-    }
-}
-
-#[cfg(feature = "bench-serial")]
-static HYPHEN_LOOKUPS: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
-#[cfg(feature = "bench-serial")]
-static HYPHEN_LOOKUP_MICROS: portable_atomic::AtomicU32 = portable_atomic::AtomicU32::new(0);
-
-/// Where a word piece went: onto the current line, or (its tail, or the
-/// whole piece after a line break) still waiting for the next line.
-enum Placement<'w> {
-    Done,
-    Continue(&'w str),
-}
-
-#[derive(Clone, Copy)]
-struct WordPlacement {
-    style: FontStyle,
-    role: TextRole,
-    align: TextAlign,
-    leading_space: bool,
-    may_hyphenate: bool,
-    x: i16,
-    indent: i16,
-    max_x: i16,
-}
-
-/// Puts `piece` (a word, or the tail of one split at the last line end) on
-/// the line. When it does not fit, a line worth hyphenating takes the
-/// longest head of it that does; otherwise the line flushes and the piece
-/// waits for the next. A piece wider than a whole line breaks wherever it
-/// can, and overflows only when it cannot. Out of line: its temporaries
-/// must not ride the EPUB build's deepest frame.
-#[inline(never)]
-fn place_word_piece<
-    'w,
-    D,
-    T,
-    const MAX_DIRS: usize,
-    const MAX_FILES: usize,
-    const MAX_VOLUMES: usize,
->(
-    sink: &mut LibraryBlockSink<'_, '_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    piece: &'w str,
-    placement: WordPlacement,
-) -> Placement<'w>
-where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    let WordPlacement {
-        style,
-        role,
-        align,
-        leading_space,
-        may_hyphenate,
-        x,
-        indent,
-        max_x,
-    } = placement;
-    let kept_len = sink.line.len();
-    let kept_ink = sink.line_ink;
-    let line_was_empty = sink.line.is_empty();
-    if append_styled_word(&mut sink.line, piece, style, sink.line_style, leading_space).is_err() {
-        // The line's text buffer is full: the piece starts the next line.
-        sink.line.truncate(kept_len);
-        flush_styled_preview_line(sink, false);
-        if line_was_empty {
-            return Placement::Done;
-        }
-        return Placement::Continue(piece);
-    }
-    let mut measure = String::<MAX_READER_BLOCK_TEXT>::new();
-    let _ = measure.push_str(&sink.line[kept_len..]);
-    sink.push_line_ink_str(measure.as_str());
-
-    // The line in progress opens a paragraph while no line of it has
-    // flushed yet: the previous block still closes a paragraph. Once the
-    // first line flushes (as a non-end block) this goes false and the
-    // continuation lines wrap at the full width.
-    let opens_paragraph = sink.library.block_count == 0
-        || sink
-            .library
-            .block_paragraph_end
-            .get(sink.library.block_count.wrapping_sub(1))
-            .copied()
-            .unwrap_or(true);
-    let x_eff = if opens_paragraph { x + indent } else { x };
-    let limit = max_x - reader_layout::READER_WRAP_SAFETY;
-    if sink.line_ink_width() + x_eff <= limit {
-        sink.line_role = role;
-        sink.line_align = align;
-        sink.line_style = style;
-        sink.pending_space = false;
-        return Placement::Done;
-    }
-
-    let worth_splitting = line_was_empty
-        || may_hyphenate && {
-            let kept_width = match kept_ink {
-                LineInkCursor::BuiltIn(cursor) => cursor.width(),
-                LineInkCursor::Custom(cursor) => cursor.width(),
-            };
-            let slack = limit - (x_eff + kept_width);
-            // The word's own average letter, from the width just measured: a
-            // line end with room for under about three of them (two letters
-            // and a hyphen) cannot take a head, so it skips the glyph-by-glyph
-            // measure and the pattern lookup.
-            let piece_width = sink.line_ink_width() - kept_width;
-            let average = piece_width / piece.chars().count().max(1) as i16;
-            slack >= 3 * average
-                && ui::reading::worth_hyphenating(
-                    slack,
-                    ui::reading::justify_gap_count(&sink.line[..kept_len]),
-                    ui::reading::word_space_width(sink.library.type_settings(), style),
-                    sink.hyphen_run,
-                )
-        };
-    sink.line.truncate(kept_len);
-    sink.line_ink = kept_ink;
-    if worth_splitting {
-        if let Some(rest) = split_word_at_line_end(sink, piece, kept_len, placement, x_eff, limit) {
-            return Placement::Continue(rest);
-        }
-    }
-    if line_was_empty {
-        // Wider than any line and unbreakable: it overflows, as before.
-        let _ = append_styled_word(&mut sink.line, piece, style, sink.line_style, leading_space);
-        measure.clear();
-        let _ = measure.push_str(sink.line.as_str());
-        sink.push_line_ink_str(measure.as_str());
-        sink.line_role = role;
-        sink.line_align = align;
-        sink.line_style = style;
-        sink.pending_space = false;
-        return Placement::Done;
-    }
-    flush_styled_preview_line(sink, false);
-    Placement::Continue(piece)
-}
-
-/// Ends the line with the longest head of `piece` that fits before `limit`
-/// (plus its hyphen), flushes it, and returns where the piece resumes.
-/// None, with the line as it was, when no break fits.
-///
-/// The piece is measured first, one glyph at a time, recording the head's
-/// width at each character until it overruns the line: the glyph tables are
-/// already cached from measuring every word, while the hyphenation patterns
-/// are cold by the time a line ends, so they are only consulted when at
-/// least a two-letter head and its hyphen fit, and only for that head.
-#[inline(never)]
-fn split_word_at_line_end<
-    'w,
-    D,
-    T,
-    const MAX_DIRS: usize,
-    const MAX_FILES: usize,
-    const MAX_VOLUMES: usize,
->(
-    sink: &mut LibraryBlockSink<'_, '_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    piece: &'w str,
-    kept_len: usize,
-    placement: WordPlacement,
-    x_eff: i16,
-    limit: i16,
-) -> Option<&'w str>
-where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    let kept_ink = sink.line_ink;
-    // What `append_styled_word` puts before the word: its space and, when
-    // the run changes style, the style marker.
-    let mut lead = String::<4>::new();
-    if placement.leading_space {
-        let _ = lead.push(' ');
-    }
-    if placement.style != sink.line_style {
-        let _ = append_style_marker(&mut lead, placement.style);
-    }
-    sink.push_line_ink_str(lead.as_str());
-    let hyphen_width = {
-        let before = sink.line_ink_width();
-        let head_ink = sink.line_ink;
-        sink.push_line_ink_str("-");
-        let width = sink.line_ink_width() - before;
-        sink.line_ink = head_ink;
-        width
-    };
-    // Head width (with its hyphen) at each character boundary that still
-    // fits; `fits_to` ends up at the longest head that does.
-    let mut head_widths = heapless::Vec::<(u16, i16), HEAD_WIDTH_SLOTS>::new();
-    let mut fits_to = 0;
-    let mut encoded = [0u8; 4];
-    for (index, ch) in piece.char_indices() {
-        let with_hyphen = sink.line_ink_width() + hyphen_width;
-        if with_hyphen + x_eff > limit || head_widths.is_full() {
-            break;
-        }
-        let _ = head_widths.push((index as u16, with_hyphen));
-        fits_to = index;
-        if ch != SOFT_HYPHEN {
-            sink.push_line_ink_str(ch.encode_utf8(&mut encoded));
-        }
-    }
-    sink.line_ink = kept_ink;
-    if piece[..fits_to]
-        .chars()
-        .filter(|ch| ch.is_alphanumeric())
-        .count()
-        < 2
-    {
-        // Not even a two-letter head fits: nothing to look up.
-        return None;
-    }
-    let mut breaks = heapless::Vec::<WordBreak, MAX_WORD_BREAKS>::new();
-    #[cfg(feature = "bench-serial")]
-    let lookup_started = Instant::now();
-    word_breaks(piece, sink.hyphenation, fits_to, &mut breaks);
-    #[cfg(feature = "bench-serial")]
-    {
-        use portable_atomic::Ordering;
-        HYPHEN_LOOKUPS.fetch_add(1, Ordering::Relaxed);
-        HYPHEN_LOOKUP_MICROS.fetch_add(
-            lookup_started.elapsed().as_micros() as u32,
-            Ordering::Relaxed,
-        );
-    }
-    // The longest break whose head fits; a dash break draws no hyphen.
-    let item = breaks.iter().rev().copied().find(|item| {
-        head_widths
-            .iter()
-            .find(|(offset, _)| usize::from(*offset) == item.head_end)
-            .is_some_and(|(_, with_hyphen)| {
-                let width = if item.hyphen {
-                    *with_hyphen
-                } else {
-                    with_hyphen - hyphen_width
-                };
-                width + x_eff <= limit
-            })
-    })?;
-    if append_styled_word(
-        &mut sink.line,
-        &piece[..item.head_end],
-        placement.style,
-        sink.line_style,
-        placement.leading_space,
-    )
-    .is_err()
-        || (item.hyphen && sink.line.push('-').is_err())
-    {
-        sink.line.truncate(kept_len);
-        return None;
-    }
-    sink.line_role = placement.role;
-    sink.line_align = placement.align;
-    sink.line_style = placement.style;
-    sink.pending_space = false;
-    sink.line_hyphenated = item.hyphen;
-    flush_styled_preview_line(sink, false);
-    Some(&piece[item.tail_start..])
-}
-
-fn append_styled_word<const N: usize>(
-    line: &mut String<N>,
-    word: &str,
-    style: FontStyle,
-    current_style: FontStyle,
-    leading_space: bool,
-) -> Result<(), ()> {
-    if leading_space {
-        line.push(' ').map_err(|_| ())?;
-    }
-    // Emit a style marker only when the run actually changes. Plain prose
-    // (the bulk of a book) then carries no markers at all -- ~25-30% more
-    // text per section and proportionally fewer chunks against the same
-    // 16 KB arena. The draw and measure paths both key off the running
-    // font, so a dropped redundant marker is a no-op; and because each line
-    // draws from a Regular default and `current_style` is reset to Regular
-    // on every flush, a continuation line still re-marks a non-Regular
-    // opening word.
-    if style != current_style {
-        append_style_marker(line, style)?;
-    }
-    // Soft hyphens only mark where a word may break; the fonts would draw
-    // them, so they never reach a stored line.
-    for ch in word.chars().filter(|ch| *ch != SOFT_HYPHEN) {
-        line.push(ch).map_err(|_| ())?;
-    }
-    Ok(())
-}
-
-fn append_style_marker<const N: usize>(line: &mut String<N>, style: FontStyle) -> Result<(), ()> {
-    line.push(reader_layout::STYLE_MARKER).map_err(|_| ())?;
-    line.push(reader_layout::style_marker_code(style))
-        .map_err(|_| ())
-}
-
-fn flush_styled_preview_line<
-    D,
-    T,
-    const MAX_DIRS: usize,
-    const MAX_FILES: usize,
-    const MAX_VOLUMES: usize,
->(
-    sink: &mut LibraryBlockSink<'_, '_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
-    paragraph_end: bool,
-) where
-    D: embedded_sdmmc::BlockDevice,
-    T: TimeSource,
-{
-    #[cfg(feature = "bench-serial")]
-    let _span = build_profile::Span::new(&build_profile::LINES);
-    if sink.line.is_empty() {
-        if paragraph_end {
-            sink.hyphen_run = 0;
-            sink.library.mark_last_block_paragraph_end();
-            // Height-only change: the trailing paragraph gap moved without
-            // block_count moving, so the page index is stale all the same.
-            sink.pages_dirty = true;
-        }
-        return;
-    }
-
-    let line = sink.line.clone();
-    let role = sink.line_role;
-    let align = sink.line_align;
-    let style = reader_layout::first_styled_line_style(line.as_str()).unwrap_or(FontStyle::Regular);
-    if sink.generate_toc_from_headings
-        && !sink.generated_toc_for_spine
-        && matches!(
-            role,
-            TextRole::Heading1 | TextRole::Heading2 | TextRole::Heading3
-        )
-    {
-        let mut title = String::<160>::new();
-        push_plain_styled_text(line.as_str(), &mut title);
-        trim_trailing_space(&mut title);
-        if !title.is_empty()
-            && sink.library.push_toc_record(
-                title.as_str(),
-                heading_toc_level(role),
-                sink.spine_index as i16,
-            )
-        {
-            sink.generated_toc_for_spine = true;
-        }
-    }
-    if !sink.library.push_line_block(
-        line.as_str(),
-        style,
-        role,
-        align,
-        paragraph_end,
-        sink.spine_index,
-    ) {
-        // The section arena (text bytes or the block table) just filled.
-        // Flush what we have to a section file and retry the line into a
-        // fresh arena, so a long chapter chunks and continues instead of
-        // losing its tail. (At the book-wide section ceiling flush_section
-        // refuses and sets book_partial; the line is then genuinely
-        // dropped, which is the separate whole-book limit.)
-        sink.flush_section(false, true);
-        let _ = sink.library.push_line_block(
-            line.as_str(),
-            style,
-            role,
-            align,
-            paragraph_end,
-            sink.spine_index,
-        );
-    }
-    sink.pages_dirty = true;
-    sink.hyphen_run = if sink.line_hyphenated && !paragraph_end {
-        sink.hyphen_run.saturating_add(1)
-    } else {
-        0
-    };
-    sink.line_hyphenated = false;
-    sink.line.clear();
-    sink.reset_line_ink();
-    sink.line_style = FontStyle::Regular;
-    sink.pending_space = false;
-}
-
-fn heading_toc_level(role: TextRole) -> u8 {
-    match role {
-        TextRole::Heading1 => 1,
-        TextRole::Heading2 => 2,
-        TextRole::Heading3 => 3,
-        TextRole::Body | TextRole::BlockQuote => 1,
-    }
-}
-
-fn push_plain_styled_text<const N: usize>(styled: &str, out: &mut String<N>) {
-    let mut skip_style_code = false;
-    for ch in styled.chars() {
-        if skip_style_code {
-            skip_style_code = false;
-            continue;
-        }
-        if ch == reader_layout::STYLE_MARKER {
-            skip_style_code = true;
-            continue;
-        }
-        let _ = out.push(ch);
-    }
-}
-
-fn is_leading_punctuation_word(word: &str) -> bool {
-    word.chars()
-        .next()
-        .map(|ch| {
-            matches!(
-                ch,
-                ',' | '.' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '\u{2019}' | '\u{201D}'
-            )
-        })
-        .unwrap_or(false)
-}
-
-fn block_align_for(run_align: TextAlign, block: &str, role: TextRole) -> TextAlign {
-    if run_align == TextAlign::Center
-        || matches!(
-            role,
-            TextRole::Heading1 | TextRole::Heading2 | TextRole::Heading3
-        )
-        || is_decorative_separator(block)
-    {
-        TextAlign::Center
-    } else {
-        run_align
-    }
-}
-
-fn normalize_decorative_separator<const N: usize>(block: &mut String<N>) {
-    if !is_decorative_separator(block.as_str()) {
-        return;
-    }
-    block.clear();
-    let _ = block.push_str("* * *");
-}
-
-fn is_decorative_separator(text: &str) -> bool {
-    let mut saw_mark = false;
-    let mut mark_count = 0u8;
-    for ch in text.chars() {
-        if ch == '*' {
-            saw_mark = true;
-            mark_count = mark_count.saturating_add(1);
-            continue;
-        }
-        if ch.is_whitespace() {
-            continue;
-        }
-        return false;
-    }
-    saw_mark && mark_count >= 3
-}
-
-/// Collapse ASCII whitespace and drop invisible format characters. Entities
-/// were already decoded by the XHTML parser; decoding again here turned
-/// literal text such as `&lt;` (from `&amp;lt;`) into markup characters.
-fn push_normalized<const N: usize>(text: &str, out: &mut String<N>) {
-    let mut previous_space = true;
-    for ch in text.chars() {
-        if ch.is_ascii_whitespace() {
-            if !previous_space && out.push(' ').is_err() {
-                break;
-            }
-            previous_space = true;
-        } else if ch == SOFT_HYPHEN {
-            // Kept inside words as a break hint; stripped when stored.
-            if out.push(ch).is_err() {
-                break;
-            }
-        } else if is_invisible_format_char(ch) {
-            continue;
-        } else if push_normalized_char(ch, out).is_err() {
-            break;
-        } else {
-            previous_space = false;
-        }
-    }
-}
-
-const SOFT_HYPHEN: char = '\u{00AD}';
-
-/// Characters with no glyph and no width: soft hyphen, zero-width
-/// space/joiners, word joiner, byte-order mark. Without this they render as
-/// missing-glyph boxes in the middle of words.
-fn is_invisible_format_char(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{00AD}' | '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' | '\u{FEFF}'
-    )
-}
-
-fn push_normalized_char<const N: usize>(ch: char, out: &mut String<N>) -> Result<(), ()> {
-    match ch {
-        ch if ch as u32 <= u16::MAX as u32 => out.push(ch).map_err(|_| ()),
-        _ => out.push('?').map_err(|_| ()),
-    }
-}
-
-fn is_epub_titlepage_label(text: &str) -> bool {
-    let lower = LowerAscii::<128>::new(text);
-    lower.starts_with(": ")
-        || lower.eq("title")
-        || lower.eq("author")
-        || lower.eq("creator")
-        || lower.eq("language")
-        || lower.eq("english")
-        || lower.eq("english:")
-        || lower.eq("release date")
-        || lower.eq("original publication")
-        || lower.starts_with("most recently updated")
-        || lower.starts_with("other information")
-        || lower.starts_with("other formats")
-        || lower.starts_with("credits")
-        || lower.starts_with("produced by")
-        || lower.starts_with("transcribed from")
-        || lower.starts_with("project gutenberg")
-        || lower.starts_with("the project gutenberg")
-}
-
-fn sanitize_preview_block<const N: usize>(block: &mut String<N>) -> bool {
-    trim_trailing_space(block);
-    trim_leading_space(block);
-    if block.is_empty() {
-        return false;
-    }
-    if is_epub_titlepage_label(block) || contains_gutenberg_metadata(block.as_str()) {
-        return false;
-    }
-    if is_decorative_separator(block.as_str()) {
-        normalize_decorative_separator(block);
-        return true;
-    }
-    if let Some(rest) = decorative_prefix_rest(block.as_str()) {
-        if rest.is_empty() {
-            normalize_decorative_separator(block);
-            return true;
-        }
-        if is_epub_titlepage_label(rest) || contains_gutenberg_metadata(rest) {
-            return false;
-        }
-    }
-    true
-}
-
-fn decorative_prefix_rest(text: &str) -> Option<&str> {
-    let mut mark_count = 0u8;
-    let mut end = 0usize;
-    for (index, ch) in text.char_indices() {
-        if ch == '*' {
-            mark_count = mark_count.saturating_add(1);
-            end = index + ch.len_utf8();
-            continue;
-        }
-        if ch.is_whitespace() {
-            end = index + ch.len_utf8();
-            continue;
-        }
-        break;
-    }
-    if mark_count >= 3 {
-        Some(text[end..].trim())
-    } else {
-        None
-    }
-}
-
-fn contains_gutenberg_metadata(text: &str) -> bool {
-    let lower = LowerAscii::<160>::new(text);
-    lower.contains("most recently updated")
-        || lower.contains("project gutenberg ebook")
-        || lower.contains("start of the project gutenberg")
-        || lower.contains("end of the project gutenberg")
-        || lower.contains("other information and formats")
-        || lower.contains("this ebook is for the use of anyone")
-        || lower.contains("project gutenberg license")
-        || lower.contains("www.gutenberg.org")
-        || lower.contains("laws of the country where you are located")
-}
-
-fn trim_trailing_space<const N: usize>(text: &mut String<N>) {
-    while text.as_str().as_bytes().last().copied() == Some(b' ') {
-        text.pop();
-    }
-}
-
-fn trim_leading_space<const N: usize>(text: &mut String<N>) {
-    let trim_len = text
-        .as_str()
-        .char_indices()
-        .find(|(_, ch)| !ch.is_ascii_whitespace())
-        .map(|(index, _)| index)
-        .unwrap_or(text.len());
-    if trim_len == 0 {
-        return;
-    }
-    let mut trimmed = String::<N>::new();
-    let _ = trimmed.push_str(&text.as_str()[trim_len..]);
-    *text = trimmed;
-}
-
-struct LowerAscii<const N: usize> {
-    text: String<N>,
-}
-
-impl<const N: usize> LowerAscii<N> {
-    fn new(input: &str) -> Self {
-        let mut text = String::new();
-        for byte in input.bytes() {
-            if text.push((byte as char).to_ascii_lowercase()).is_err() {
-                break;
-            }
-        }
-        Self { text }
-    }
-
-    fn eq(&self, other: &str) -> bool {
-        self.text.as_str() == other
-    }
-
-    fn starts_with(&self, other: &str) -> bool {
-        self.text.as_str().starts_with(other)
-    }
-
-    fn ends_with(&self, other: &str) -> bool {
-        self.text.as_str().ends_with(other)
-    }
-
-    fn contains(&self, other: &str) -> bool {
-        self.text.as_str().contains(other)
-    }
-
-    fn word_eq(&self, other: &str) -> bool {
-        self.text
-            .as_str()
-            .split_ascii_whitespace()
-            .any(|word| word == other)
-    }
 }

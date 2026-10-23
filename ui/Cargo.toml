@@ -10,4 +10,6 @@ proto = { path = "../proto" }
 
 [dev-dependencies]
 heapless = "0.9.0"
+# Encodes the JPEGs the firmware image tests probe and decode.
+jpeg-encoder = "0.6.1"
 embedded-sdmmc = { git = "https://github.com/Jon-Vii/embedded-sdmmc-rs.git", rev = "329b3a53a55fb527f62a7813557b420817e831d8", default-features = false }

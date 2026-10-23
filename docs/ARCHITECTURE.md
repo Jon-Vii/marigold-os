@@ -92,7 +92,9 @@ fw/        boot, Embassy executor, task wiring, board-owned peripherals
            (esp-hal 1.1, esp-rtos, and esp-radio, pinned in fw/Cargo.toml)
 ui/        shared shell rendering plus ui::reading, the reader page-plan seam
            (page bounds, ink measurement, wrapping) used by fw and host tools
-proto/     bounded book/storage/text/cache models plus ZIP/EPUB/XHTML parser pieces
+proto/     bounded book/storage/text/cache models plus ZIP/EPUB/XHTML parser pieces,
+           and book images (proto::image: the IMAGES.BIN index, image paths,
+           image tokens, streaming PNG and JPEG decode, dithering)
 tools/emulator/ host-side development emulator and scenario runner
 tools/cargo.sh  rustup Cargo wrapper on the toolchain pinned in rust-toolchain.toml
 tools/bench/    serial bench harness for hardware timing, storage/cache,
@@ -259,7 +261,12 @@ firmware images can coexist.
 `display::fb::Framebuffer` is the source of truth. White is bit `1`, black is
 bit `0`, row-major, `ROW_BYTES` per row (100 on the X4, 99 on the X3). Each
 framebuffer also carries its `FbFrame`, the drawing frame for how the device
-is held (see orientation below).
+is held (see orientation below). Glyphs and rules draw pixel by pixel;
+`Framebuffer::blit` draws a band of an image's 1 bpp rows, in the image pack
+layout, a byte at a time: whole rows shifted into place in the landscape
+frames (bit-reversed through the panel transform's table when flipped), and
+8 × 8 bit transposes in portrait. It leaves exactly what a `set_pixel` per
+pixel would, clipping included.
 
 On the X4, the SSD1677 path writes the current framebuffer to BW RAM
 (`0x24`). The first refresh after boot also writes the current framebuffer to
@@ -386,7 +393,33 @@ and the host preview tool:
   the arena, marks the package `spine_truncated`, and the book's last page
   says it was cut short.
 - `xhtml_blocks_to_sink` with `TextRole`, `FontStyle`, and `TextAlign` as the
-  single XHTML extraction path feeding bounded block records.
+  single XHTML extraction path feeding bounded block records. Images reach
+  the sink through `XhtmlBlockSink::push_image` as raw `src`/`alt` slices
+  (and, for a sink that asks, the first `<image>` of each `<svg>`); the
+  default pushes the alt-text placeholder. The parser ends the paragraph
+  before an `<img>` unless the sink `wants_inline_images`: then it ends only
+  the open run, the image belongs to the paragraph, and one in a block that
+  floats left goes to `push_floated_image`.
+- `proto::image` for images in books: `path` resolves an image `src` against
+  its chapter's ZIP path and hashes it, `index` owns the per-book
+  `IMAGES.BIN` format (entries from the ZIP central directory, sorted by
+  path hash, probed and decoded state filled in place), `token` is the
+  text an image block stores and the 15-byte token (U+FFFC, slot, width,
+  height) a line carries for each image inside it, `pack` is the record
+  a decoded image keeps in its orientation's pack, and `png` and `jpeg`
+  decode an image, fed in pieces of any size, to gray rows at the size
+  layout fitted (`jpeg` at a reduced DCT scale where that still covers
+  it, luma only). An image block is a
+  `BlockRecord` whose `image_height` (the record's last two bytes, zero in
+  caches before v28) is non-zero and under `BlockRecord::INLINE_IMAGES`
+  (0x8000); a line holding images has that bit set and its tallest image's
+  height in the low bits. `ui::reading` fits block images with `fit_image`
+  and inline ones with `fit_inline_image` (at most 64 rows,
+  `INLINE_IMAGE_MAX_HEIGHT`, whatever the type settings), gives a block
+  image gaps above and below so the neighbouring lines' descenders and
+  tallest marks clear it by a row, grows a line holding images by the same
+  gaps (`inline_line_ascent`) with each image standing on its baseline, and
+  hands every image's rect to the page's image drawer.
 - `hyphen::word_breaks` for where a word may break at a line end: the book's
   soft hyphens (the only breaks when present), dashes already in a compound,
   and for English (`dc:language` `en*`), Liang's algorithm over the US English
@@ -401,7 +434,8 @@ and the host preview tool:
   `SectionHeader`, `PageCacheHeader`, `LineRecord`, and `WordRecord` remain in
   `proto::cache` only for the disabled V1 migration path.
 
-The firmware's line builder wraps greedily at word spaces. When a word no
+The firmware's line builder (`fw::block_sink`, the XHTML block sink a
+spine's layout streams into) wraps greedily at word spaces. When a word no
 longer fits a justified body line, `ui::reading::worth_hyphenating` decides
 whether moving it would leave the line loose (each gap growing by more than
 half a space; after two hyphenated lines in a row, by more than a whole
@@ -416,7 +450,10 @@ paragraph's last word is never split, and a word wider than
 a whole line breaks wherever it can. At draw time, `justify_extra` leaves a
 line at natural spacing rather than open gaps past one and a half spaces, as
 well as lines under two thirds of the measure. Soft hyphens survive
-normalisation as break hints and are stripped from stored lines.
+normalisation as break hints and are stripped from stored lines. An image
+inside a line is one unit of its fitted width, measured as an object
+(`StyledInkCursor::push_object`) and never split or hyphenated; justified
+gaps stretch around it as around a word.
 
 All of this applies to text the book sets justified, which is the body
 default. The Alignment setting's Left choice turns that text left-aligned
@@ -545,6 +582,165 @@ building. The pin stays in the `ReaderStore` across the rebuild's steps,
 spine is laid out, and the completed load spends it. This covers a type or
 orientation change mid-book and opening a book last read under other settings.
 
+Images get an index of their own. A build session whose ZIP has image
+entries opens the book's `IMAGES.BIN` before its first spine, building it
+from the central directory when there is no valid one (`fw::book_images`).
+The index holds PNGs and JPEGs (by extension; the probe goes by magic
+bytes), and an index from before JPEGs (version 1) is built again. A
+fresh build learns whether
+there are any from the ZIP open's own pass over the central directory
+(only a directory of more than about 200 entries, too many for that pass's
+index, is walked once more), and records it in the book index, where every
+later session reads it. A directory damaged past the entries a build looks
+up counts as having none, so the book still builds, and a book without
+images never touches the index. The compressed scratch and the XHTML
+window are idle then, and lend the build its buffers. No image is read:
+each is probed the first time a chapter's layout meets it. A spine that
+meets images no probe has read marks them wanted in the index and stops
+laying out at the first, probes them from their stored ZIP offsets, and
+is laid out again with their fitted sizes; an idle session's probes give
+way to a press between images. A probe reads until it can judge the
+image (`proto::image::index::ImageProber`): a PNG's first 33 bytes, or a
+JPEG's segments up to its frame header, which may follow 64 KB of EXIF.
+A stored image is read a card block at a time and seeks past every
+segment the probe does not read; a deflated one is inflated through the
+idle inflater and the skipped bytes dropped. Either way at most 256 KB
+are read or inflated, and an image that has not said what it is by then
+is failed. A
+probe whose local header is missing, lies past the archive's end, or
+names another file marks the image failed for good; a read that fails
+records nothing and fails the step, so the image is probed again.
+Nothing commits between the two passes, the first pass's sections leave
+the run's table before the second, and the second rewrites every section
+file the first wrote, so the discarded pass leaves nothing behind. Only
+spines with newly met images pay for it. An image the decoder does not
+take keeps its alt-text placeholder; an svg-wrapped image, which never had
+one, leaves nothing. The index does not depend on type settings, so it
+survives every relayout, and it goes with the book's cache directory.
+
+An `<img>` whose paragraph also holds text goes inside that paragraph's
+lines (`fw::block_sink`); one alone in its paragraph, every svg image, and
+every illustration (taller than 128 rows alone in a paragraph in either
+orientation, `ui::reading::fits_inline`) stays an image block, an
+illustration ending the paragraph around it. For such a sink `<figure>` and
+`<figcaption>` are blocks. The parser streams, so an image met before any of
+its paragraph's text is held back, as a small record in the idle tail of
+the container scratch (its slot, both fitted sizes, and its block token or
+alt text): the paragraph's first text places the images held inline ahead
+of it, and a paragraph that ends without text sends them out as blocks.
+Spacing among held images is held with them, in order, and text the
+sanitizer drops does not count. An inline image that cannot be shown
+leaves its alt text in the line in italics. A drop cap that Project Gutenberg floats in a block of its own
+(class `figleft`, a single-letter alt) carries into the next paragraph, when
+that is body text beginning with a letter, and opens its first line in place
+of the indent. A line holding images is justified whenever it fills two
+thirds of the measure (`justify_inline_extra`). An image shown inside a line
+at a size other than its block size (one taller than 64 rows) gets the
+index entry's sticky `inline` mark and decodes at its inline size from
+then on, once per orientation; a block-size decode it had is forgotten in
+the same write wherever the two sizes differ, and its block uses draw the
+smaller decode centred in their box. A page asking for an unmarked image at
+its inline size marks it again before decoding.
+
+Each image is decoded once per orientation, at the size layout fitted it
+to, into an append-only pack in the book's cache directory (`IMGL.BIN`,
+which flipped landscape shares, and `IMGP.BIN`; `proto::image::pack`,
+`fw::image_decode`). A decode reads the image at the local-header offset
+its index entry keeps, after checking that the header names it, so no ZIP
+directory is opened. A stored image streams from the ZIP through the
+decoder for its format and the ditherer. A deflated JPEG streams through
+the ZIP's inflater straight into the JPEG decoder, which needs no
+inflater. A deflated PNG is first inflated to `SPOOL.TMP` beside the
+packs and decoded from there, since the PNG decoder's zlib stream needs
+the one inflater, and the spool is deleted after each image. A deflated
+image of either kind past 4 MB by its declared size is refused, as is a
+stream that outgrows its declared size. Rows go
+to the pack behind a 16-byte record header through a write buffer, and
+only once the decode has finished and the pack's length is on the card
+does the index entry take the record's offset, in one write. A content
+fault (a corrupt image, a PNG too wide for the window to hold its row, a
+damaged entry) marks that orientation failed for good. A card fault or a
+spent read budget records nothing, and a press cancels the image in hand
+(an inflate, to the spool or into the JPEG decoder, asks between pieces
+of input as well as between chunks of output); either leaves at most an
+orphan tail in the pack that nothing points at. A pack that would pass
+its 64 MB cap is mostly orphans when the records images use, with the
+next, fill at most half of it: every decode in that orientation is then
+forgotten in the index, the pack deleted, and a new one begun, so images
+decode again as they are needed. A pack its images' own records fill
+fails the next image instead. An index that is built again (damaged, for
+another copy of the book, or from before JPEGs) first deletes both packs
+and any spool, whose records nothing in it would point at. The decoder,
+the ditherer and the packed row take the XHTML window (with a deflated
+JPEG's inflate output), ZIP reads and the write buffer split the
+compressed scratch, work lists take the container scratch, and the
+inflater serves a deflated PNG's two layers in turn. All of them are idle
+outside a build session, and image work always runs in an SD session of
+its own, so decoding adds no static RAM.
+
+Images are decoded nearest the reader first. Layout records in each index
+entry where it first met the image, its spine and how many images that
+spine met before it, which no relayout changes. While the reader is idle,
+each step does one thing: the undecoded images on the next three pages and
+the page before (from the store for pages it holds, from their section
+files otherwise), then text layout as before, then the rest of the book's
+images, in reading order from the reader's place to the end and on from
+the start, a batch at a time from one read of the index. Steps keep the
+session budget, a press stops a decode between output rows (or pieces of
+input, a kilobyte each) and the rest pass between index entries, and any
+command from the app looks at the window again. A request for a page whose
+images are not decoded for the orientation decodes them before it is
+answered, so a page never shows a box its picture would later replace; a
+press during that wait, or a newer request, abandons the image in hand,
+and the request is retried for the page it resolved to (a first open's
+text start, a relaid page's place) unless a newer one replaces it.
+
+The store keeps a note of what is settled, decoded or failed, for the
+orientation (`ReaderStore::images_settled`, five bytes found by narrowing
+two counters): a run of pages that a request or a window pass found
+settled, and, once a rest pass finds nothing left in the index, the whole
+book. A request for a noted page answers without opening the card to
+check, and an idle step opens no image session for a window the note
+covers, or at all once the book is settled, so a fully decoded book reads
+nothing after a page turn but its pages' draws. Decode state only moves
+toward settled until the index is rebuilt, so the note lasts until the
+book, its layout or its index changes, or a fresh build numbers its pages
+anew; a spine laid out keeps the pages' note but unsettles the book. A
+book without images, or a page without images, does none of this
+and reads nothing more. A page's images include those inside its lines,
+found by walking their tokens (in the store, or a section file's line text
+64 bytes at a time). An orientation change decodes into the other pack
+as its pages are asked for and idle steps reach them; a change of type
+settings decodes nothing again.
+
+Caches from before image blocks (v27) are still read. The first load of
+such a book's index reads its ZIP's central directory once: without PNGs
+or JPEGs beyond a lone image whose file name says `cover`, the index is
+written again as the current version (v30), as it stands, and the cover
+page keeps its v27 layout until a fresh build shows it; with any other
+image the book rebuilds, pinned to the reader's place, so its images
+replace the alt text it was laid out with. v28 and v29 caches, which only development builds wrote
+before images went inside lines and before JPEGs, rebuild.
+
+A reading page draws its images from the book's packs (`fw::page_images`).
+Pages draw from RAM outside any SD session, as before, unless the book has
+images and the page holds an image block or a line with images inside it;
+such a page is drawn inside a session, as a page in a custom face from the
+card is. Each image reads its index entry and, if the image is decoded for
+the orientation, its pack record's header, and draws only a record that is
+the image the page names, no larger than the rect layout reserved (a block
+whose image is also shown inside a line draws its smaller decode centred),
+lying inside the pack. An inline image that cannot be drawn shows the
+outline of its rect. The rows stream from the
+card a band at a time through the panel transfer band (only panel transfers
+fill it, so it is idle while a frame draws) into `Framebuffer::blit`, never
+reading past the record. Anything else draws the alt-text placeholder: a
+card error part way clears the rows drawn, and the page's later images draw
+placeholders without reading. If the session cannot open, the page is drawn
+from RAM with placeholders, never left as the previous frame. Each page that
+draws images logs `bench: image_draw` with its image and placeholder counts,
+row bytes, and time spent opening, reading and blitting.
+
 Cache paths use FAT 8.3-safe names because `embedded-sdmmc` operates on short
 file names in the firmware path. The library list is a windowed catalog
 snapshot at `/XTEINK/CATALOG.BIN` (v4: `X4CT` magic, u16 book count, 92-byte
@@ -574,6 +770,9 @@ snapshot or a completed scan has no EPUBs.
 /XTEINK/CACHE2/E<hash>/BOOK.BIN       (legacy fallback)
 /XTEINK/CACHE2/E<hash>/TOC.BIN
 /XTEINK/CACHE2/E<hash>/COVER.BIN
+/XTEINK/CACHE2/E<hash>/IMAGES.BIN     (books with images)
+/XTEINK/CACHE2/E<hash>/IMGL.BIN       (decoded images, landscape; IMGP.BIN portrait)
+/XTEINK/CACHE2/E<hash>/SPOOL.TMP      (a deflated PNG while it decodes)
 /XTEINK/CACHE2/E<hash>/SECTIONS/S000.BIN
 /XTEINK/CACHE2/E<hash>/SECTIONS/S001.BIN
 /XTEINK/CACHE2/E<hash>/POSA.BIN       (per-book position, alternating with POSB.BIN)
@@ -601,7 +800,10 @@ make a fallback index point into partially overwritten sections. The two banks
 provide recovery space, not a doubled active-section limit.
 
 Section files hold a `SectionV2Header`, page records, block records, per-block
-paragraph flags, and the UTF-8 text blob of pre-wrapped lines. `TOC.BIN` is a
+paragraph flags, and the UTF-8 text blob of pre-wrapped lines. A line carries a
+style marker only where its style changes, and opens in Regular unless a marker
+leads it (`ui::reading::line_opening_style`); a block record's style styles
+only a line without markers. `TOC.BIN` is a
 per-book chapter-list sidecar for the Chapters overview, distinct from the
 records inside the book index. Generated TOC metadata is carried across prefix
 commits; a missing or stale sidecar can be repaired from the committed index.
@@ -804,6 +1006,9 @@ fw::library_sd          FAT scan, SD chip-select handling, and file discovery
 fw::sd_session          SD session open/close and the upload write pump
 fw::reader_cache        EPUB-to-cache loading into bounded proto::cache records
 fw::reader_cache_files  cache/state/credential/label file records on the card
+fw::book_images         a book's IMAGES.BIN during a build: open/build, lookups, probes
+fw::image_decode        decoding images into the packs, nearest the reader first
+fw::page_images         a reading page's images, drawn from the book's packs
 ui::reading             Reader page plan: one page walk, wrapping, measurements, drawing
 fw::reader_layout       bounded page-index and TOC adapters over the shared page walk
 fw::reader_store        bounded loaded-book/library state shared by cache and views

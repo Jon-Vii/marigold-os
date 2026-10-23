@@ -417,7 +417,12 @@ impl WebEmulator {
         }
         let store = self.store.as_ref().unwrap();
         let page = store.page(request.page);
-        ui::reading::draw_reading_page_body(&mut self.fb, store, page);
+        ui::reading::draw_reading_page_body(
+            &mut self.fb,
+            store,
+            page,
+            ui::reading::draw_image_placeholder,
+        );
 
         let (current, total) = store.chapter_page_position(request.page);
         let label = format!("{}/{}", current, total);

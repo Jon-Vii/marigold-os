@@ -74,6 +74,20 @@ fixture. It does not change the selected font or reading settings. Inspect
 `font_fixture`, `font_selftest`, and `serial_sleep` telemetry before interpreting
 a run, and repeat ordinary boot/sleep checks with the feature disabled.
 
+## Screen captures
+
+`bench-serial` builds also take `f`: the display task prints the framebuffer
+after its next render. `tools/bench/fb_dump.py` sends `f` plus navigation keys,
+collects the rows, and writes a PNG turned to the reading orientation:
+
+```sh
+python3 tools/bench/fb_dump.py --port /dev/cu.usbmodem101 --keys n --frame landscape --out target/bench/page.png
+```
+
+A capture shows exactly what reached the panel's buffer (image placement,
+dithering, clipping) without anyone looking at the device. It cannot show
+panel effects such as ghosting.
+
 ## Logs
 
 Raw bench logs are written under `target/bench/` by default and should not be
@@ -82,5 +96,21 @@ committed. Summarize them with:
 ```sh
 tools/bench/bench.py report target/bench/latest.jsonl
 ```
+
+Books with images add two lines. `bench: image_decode` reports each image
+decode: its index slot, the ZIP entry's size (`src_bytes`), the fitted size
+(`out`), the whole decode and, for a deflated image, its spool to the card
+(`ms`, `spool_ms`), and how it ended (`decoded`, `cancelled`, `failed`, or
+`retry`). `bench: image_session` reports each pass: `pass=window` and
+`pass=remaining` for idle work (the pages around the one on screen, then the
+rest of the book), and `pass=request` for a page turn that checked, and
+perhaps decoded, the images on its page before answering. A turn to a page
+whose images the store has noted as settled checks nothing and logs no
+line, and once a `remaining` pass finds nothing left, idle steps open no
+image session at all. `report` lists
+decode outcomes and times, spool times, page turns that waited for a decode
+(`image wait`), and page turns that only checked (`image check`). To time
+page turns over pages whose images are already decoded, leave the book idle
+on its first page until its `image_session` lines stop.
 
 Keep notable hardware findings in `.scratch/` issues or dated docs notes.

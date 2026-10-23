@@ -10,15 +10,15 @@ use display::font::FontStyle;
 use embedded_sdmmc::{Directory, File, Mode, TimeSource};
 use heapless::String;
 use proto::cache::{
-    decode_block, decode_book_v2_header, decode_book_v2_section, decode_cover_header, decode_page,
-    decode_section_v2_header, decode_toc, decode_toc_chapter, decode_toc_file_header, encode_block,
-    encode_book_v2_header, encode_book_v2_section, encode_page, encode_section_v2_header,
-    encode_toc, encode_toc_file_header, section_file_name, BookV2Header, BookV2SectionRecord,
-    SectionV2Header, TocFileHeader, BLOCK_RECORD_BYTES, BOOK_V2_HEADER_BYTES,
-    BOOK_V2_SECTION_RECORD_BYTES, CACHE_BOOK_FILE, CACHE_COVER_FILE, CACHE_ROOT_DIR,
-    CACHE_SECTIONS_DIR, CACHE_SECTION_FILE_BYTES, CACHE_STATE_FILE, CACHE_TOC_FILE, CACHE_V2_DIR,
-    COVER_HEADER_BYTES, PAGE_RECORD_BYTES, SECTION_V2_HEADER_BYTES, TOC_CHAPTER_RECORD_BYTES,
-    TOC_FILE_HEADER_BYTES, TOC_RECORD_BYTES,
+    book_v2_predates_images, decode_block, decode_book_v2_header, decode_book_v2_section,
+    decode_cover_header, decode_page, decode_section_v2_header, decode_toc, decode_toc_chapter,
+    decode_toc_file_header, encode_block, encode_book_v2_header, encode_book_v2_section,
+    encode_page, encode_section_v2_header, encode_toc, encode_toc_file_header, section_file_name,
+    BookV2Header, BookV2SectionRecord, SectionV2Header, TocFileHeader, BLOCK_RECORD_BYTES,
+    BOOK_V2_HEADER_BYTES, BOOK_V2_SECTION_RECORD_BYTES, CACHE_BOOK_FILE, CACHE_COVER_FILE,
+    CACHE_ROOT_DIR, CACHE_SECTIONS_DIR, CACHE_SECTION_FILE_BYTES, CACHE_STATE_FILE, CACHE_TOC_FILE,
+    CACHE_V2_DIR, COVER_HEADER_BYTES, PAGE_RECORD_BYTES, SECTION_V2_HEADER_BYTES,
+    TOC_CHAPTER_RECORD_BYTES, TOC_FILE_HEADER_BYTES, TOC_RECORD_BYTES,
 };
 use proto::font_pack::{
     decode_font_pack_name, FontPackFaceRecord, FontPackHeader, FONT_PACK_DIR,
@@ -188,6 +188,13 @@ pub(crate) enum CacheLoadResult {
 pub(crate) enum BookIndexLoadResult {
     Hit,
     SpacingMismatch,
+    /// A valid index written before sections held image blocks (cache
+    /// v27), loaded like a hit (or, with `spacing_changed`, a spacing
+    /// mismatch). Its book's images, if it has any, were laid out as alt
+    /// text: see `settle_index_before_images`.
+    BeforeImages {
+        spacing_changed: bool,
+    },
     Miss,
     Invalid,
 }
@@ -946,14 +953,88 @@ where
         library.commit_book_index(header.total_pages, header.partial);
         library.set_book_next_spine(header.next_spine);
         library.set_book_generated_toc(header.generated_toc);
+        library.set_book_has_images(header.has_images);
         library.set_text_start_spine(header.text_start_spine);
-        if spacing_changed {
+        if book_v2_predates_images(&header_bytes) {
+            BookIndexLoadResult::BeforeImages { spacing_changed }
+        } else if spacing_changed {
             BookIndexLoadResult::SpacingMismatch
         } else {
             BookIndexLoadResult::Hit
         }
     })
     .unwrap_or(BookIndexLoadResult::Miss)
+}
+
+/// Settles a book index loaded as `BookIndexLoadResult::BeforeImages`,
+/// once the book's ZIP has been checked for image entries beyond a lone
+/// cover (`book_images::book_has_images_beyond_a_cover`; `None` when it
+/// could not be read). This runs once per book: whatever it decides, the
+/// book's next index is written as the current version.
+///
+/// - No images, or only a cover: the index is written again unchanged but
+///   for its version, through the usual generation-safe write, and is a
+///   hit; with the spacing changed, the reflow that follows writes it
+///   instead. Nothing is rebuilt. The book's flag says it has no images,
+///   so its sessions open no image index; a cover keeps its v27 layout
+///   until a fresh build, which checks the ZIP again and shows it.
+/// - Other images (PNG or JPEG entries): `page` is pinned in the old
+///   pagination and the index is dropped, so the book rebuilds into the
+///   other bank (the old index stays on the card until the new one
+///   commits) and its images replace the alt text it was laid out with.
+/// - Unread: a complete book is read as it stands and checked again at its
+///   next open; one that would be built on (a prefix, or a spacing reflow)
+///   rebuilds instead, so nothing ever extends an unchecked index.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn settle_index_before_images<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
+    root: &Directory<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
+    key: &str,
+    source_identity: (u32, u32),
+    library: &mut ReaderStore,
+    has_images: Option<bool>,
+    spacing_changed: bool,
+    page: u32,
+    spine: Option<u16>,
+) -> BookIndexLoadResult
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    if has_images == Some(false) {
+        library.set_book_has_images(false);
+    }
+    match has_images {
+        Some(false) if spacing_changed => BookIndexLoadResult::SpacingMismatch,
+        Some(false) => {
+            if !write_v2_book_index(
+                root,
+                key,
+                source_identity,
+                library.book_total_pages,
+                &library.book_sections,
+                library,
+                library.book_cache_partial,
+            ) {
+                // Still readable as it is; the next open tries again.
+                esp_println::println!("cache: v27 index kept; the rewrite failed key={}", key);
+            }
+            BookIndexLoadResult::Hit
+        }
+        None if !spacing_changed && library.book_next_spine().is_none() => BookIndexLoadResult::Hit,
+        Some(true) | None => {
+            if spine.is_none() {
+                library.anchor_resident_page(source_identity, page);
+            }
+            library.clear_book_index();
+            BookIndexLoadResult::Invalid
+        }
+    }
 }
 
 /// Read just the stored EPUB title from a book's v2 cache index, skipping the
@@ -1278,6 +1359,7 @@ where
             seed_section_count: seed.sections.len() as u16,
             seed_reaches_end: seed.first_spine.is_some() && seed.next_spine.is_none(),
             seed_capped: seed.capped,
+            has_images: library.book_has_images(),
         };
         let mut bytes = [0u8; BOOK_V2_HEADER_BYTES];
         if encode_book_v2_header(header, &mut bytes).is_err() {
@@ -1380,6 +1462,184 @@ where
         }
     }
     result
+}
+
+/// The index slots of the images page `page` of `section` shows, read from
+/// its section file without loading it into the store, which keeps the
+/// page on screen: the header, the page's record, its block records, the
+/// head of each image block's token, and the text of each line holding
+/// images (a few dozen bytes at a time), a few small reads in all. For the
+/// pages near the reader's that the store does not hold. A section laid
+/// out for other settings (its page records would not be this layout's),
+/// or one that does not add up, lists nothing; the request for the page
+/// still decodes what it shows. `visit` returning false stops the list.
+pub(crate) fn read_section_page_images<D, T, const ND: usize, const NF: usize, const NV: usize>(
+    book_dir: &Directory<'_, D, T, ND, NF, NV>,
+    source_identity: (u32, u32),
+    library: &ReaderStore,
+    section: BookV2SectionRecord,
+    page: u32,
+    mut visit: impl FnMut(u16) -> bool,
+) -> bool
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let Ok(sections) = book_dir.open_dir(CACHE_SECTIONS_DIR) else {
+        return false;
+    };
+    let mut name = String::<CACHE_SECTION_FILE_BYTES>::new();
+    section_file_name(section.section, &mut name);
+    let Ok(file) = sections.open_file_in_dir(name.as_str(), Mode::ReadOnly) else {
+        return false;
+    };
+    let mut header_bytes = [0u8; SECTION_V2_HEADER_BYTES];
+    if read_exact_file(&file, &mut header_bytes).is_err() {
+        return false;
+    }
+    let Ok(header) = decode_section_v2_header(&header_bytes) else {
+        return false;
+    };
+    let expected = reader_layout::reader_layout_config(library.type_settings(), library.portrait());
+    let Some(local) = page
+        .checked_sub(section.start_page)
+        .filter(|&local| local < u32::from(header.page_count))
+    else {
+        return false;
+    };
+    if header.source_hash != source_identity.0
+        || header.source_size != source_identity.1
+        || header.spine != section.spine
+        || header.custom_font_identity != library.custom_font_identity()
+        || header.font_config != expected
+    {
+        return false;
+    }
+    let pages_at = SECTION_V2_HEADER_BYTES as u32;
+    let blocks_at = pages_at + u32::from(header.page_count) * PAGE_RECORD_BYTES as u32;
+    let text_at = blocks_at + u32::from(header.block_count) * (BLOCK_RECORD_BYTES as u32 + 1);
+    let mut stage = [0u8; RECORD_STAGE_BYTES];
+    let page_record = &mut stage[..PAGE_RECORD_BYTES];
+    if file
+        .seek_from_start(pages_at + local * PAGE_RECORD_BYTES as u32)
+        .is_err()
+        || read_exact_file(&file, page_record).is_err()
+    {
+        return false;
+    }
+    let Ok(page_record) = decode_page(page_record) else {
+        return false;
+    };
+    let first = u32::from(page_record.first_block);
+    let end = first + u32::from(page_record.block_count);
+    if end > u32::from(header.block_count) {
+        return false;
+    }
+    let per_batch = (RECORD_STAGE_BYTES / BLOCK_RECORD_BYTES) as u32;
+    let mut block = first;
+    while block < end {
+        let count = (end - block).min(per_batch);
+        let records = &mut stage[..count as usize * BLOCK_RECORD_BYTES];
+        if file
+            .seek_from_start(blocks_at + block * BLOCK_RECORD_BYTES as u32)
+            .is_err()
+            || read_exact_file(&file, records).is_err()
+        {
+            return false;
+        }
+        for bytes in records.chunks_exact(BLOCK_RECORD_BYTES) {
+            let Ok(record) = decode_block(bytes) else {
+                return false;
+            };
+            if record.has_inline_images() {
+                match visit_line_images(&file, text_at, header.text_bytes, record, &mut visit) {
+                    Some(true) => continue,
+                    Some(false) => return true,
+                    None => return false,
+                }
+            }
+            let head_end = record
+                .text_offset
+                .checked_add(proto::image::token::IMAGE_TOKEN_HEAD_BYTES as u32);
+            let head_at = text_at.checked_add(record.text_offset);
+            let (true, Some(head_at)) = (
+                record.is_image() && head_end.is_some_and(|end| end <= header.text_bytes),
+                head_at,
+            ) else {
+                continue;
+            };
+            let mut head = [0u8; proto::image::token::IMAGE_TOKEN_HEAD_BYTES];
+            if file.seek_from_start(head_at).is_err() || read_exact_file(&file, &mut head).is_err()
+            {
+                return false;
+            }
+            let token = core::str::from_utf8(&head)
+                .ok()
+                .and_then(proto::image::token::decode_image_token);
+            if let Some(token) = token {
+                if !visit(token.slot) {
+                    return true;
+                }
+            }
+        }
+        block += count;
+    }
+    true
+}
+
+/// Calls `visit` with the slot of each image inside a line of a section
+/// file whose text starts at `text_at` (`text_bytes` long), reading the
+/// line a few dozen bytes at a time. `Some(false)` when `visit` stopped,
+/// `None` when the line does not lie inside the text or a read fails.
+fn visit_line_images<D, T, const ND: usize, const NF: usize, const NV: usize>(
+    file: &File<'_, D, T, ND, NF, NV>,
+    text_at: u32,
+    text_bytes: u32,
+    record: proto::cache::BlockRecord,
+    visit: &mut impl FnMut(u16) -> bool,
+) -> Option<bool>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    use proto::image::token::{inline_image_token_at, INLINE_IMAGE_TOKEN_BYTES};
+    const PIECE: usize = 64;
+    let end = record.text_offset.checked_add(u32::from(record.text_len))?;
+    if end > text_bytes {
+        return None;
+    }
+    let mut piece = [0u8; PIECE];
+    let mut at = record.text_offset;
+    while at < end {
+        let len = (end - at).min(PIECE as u32) as usize;
+        let bytes = &mut piece[..len];
+        file.seek_from_start(text_at.checked_add(at)?).ok()?;
+        read_exact_file(file, bytes).ok()?;
+        // Read on from where a token could still begin, so one cut by the
+        // piece's end is read whole with the next.
+        let last = end - at <= PIECE as u32;
+        let scan = if last {
+            len
+        } else {
+            len - (INLINE_IMAGE_TOKEN_BYTES - 1)
+        };
+        let mut index = 0;
+        let mut next = scan;
+        while index < scan {
+            match inline_image_token_at(&bytes[index..]) {
+                Some(token) => {
+                    if !visit(token.slot) {
+                        return Some(false);
+                    }
+                    index += INLINE_IMAGE_TOKEN_BYTES;
+                    next = next.max(index);
+                }
+                None => index += 1,
+            }
+        }
+        at += next as u32;
+    }
+    Some(true)
 }
 
 fn open_or_make_dir<
@@ -2163,7 +2423,15 @@ where
     true
 }
 
-fn read_exact_file<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES: usize>(
+/// Fills `out` from the file's current position; anything short of that
+/// is an error. The one read loop every card file goes through.
+pub(crate) fn read_exact_file<
+    D,
+    T,
+    const MAX_DIRS: usize,
+    const MAX_FILES: usize,
+    const MAX_VOLUMES: usize,
+>(
     file: &File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     mut out: &mut [u8],
 ) -> Result<(), ()>
@@ -2414,6 +2682,8 @@ where
                 {
                     return false;
                 }
+                // An image keeps its size, which no spacing changes.
+                library.blocks[next].image_height = block.image_height;
                 // The old section may start in the middle of a paragraph.
                 library.block_paragraph_start[next] = flags & 2 != 0;
                 reader_layout::extend_page_index(library);

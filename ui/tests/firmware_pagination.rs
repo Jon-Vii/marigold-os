@@ -22,6 +22,7 @@ fn append_block(store: &mut ReaderStore, role: TextRole) {
         role,
         style: FontStyle::Regular,
         align: TextAlign::Left,
+        image_height: 0,
     };
     store.block_paragraph_end[index] = true;
     store.block_count += 1;

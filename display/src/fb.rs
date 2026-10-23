@@ -1,5 +1,8 @@
 use crate::{FB_BYTES, HEIGHT, ROW_BYTES, WIDTH};
 
+mod blit;
+pub use blit::ImageRows;
+
 /// The upright drawing frame for one render: which way the device is held.
 /// `set_pixel`/`pixel` take coordinates in this frame — x rightward, y
 /// downward, exactly as the reader sees the screen — and map them onto the

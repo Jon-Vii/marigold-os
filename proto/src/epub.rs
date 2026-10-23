@@ -174,6 +174,9 @@ pub struct ZipStream<'a, R> {
     central_offset: u32,
     entry_count: u16,
     lookup: CentralLookup<'a>,
+    /// Whether any entry's name looks like an image, once known: the index
+    /// pass learns it as the names stream by, and a walk otherwise.
+    image_entries: Option<bool>,
 }
 
 pub struct ZipLocalStream<R> {
@@ -192,6 +195,13 @@ impl ZipInflateScratch {
         Self {
             state: InflateState::new(DataFormat::Raw),
         }
+    }
+
+    /// The inflater itself, lent to a decoder with a zlib stream of its own
+    /// (a PNG's image data) while no entry is being read. Every entry read
+    /// resets it first, so whatever the borrower leaves in it is harmless.
+    pub fn inflater(&mut self) -> &mut InflateState {
+        &mut self.state
     }
 }
 
@@ -450,13 +460,22 @@ where
             }
             chunk_end = chunk_start + ZIP_EOCD_OVERLAP_BYTES;
         };
+        let mut image_entries = None;
         let lookup = if central_size as usize <= tail_scratch.len() {
             let central = &mut tail_scratch[..central_size as usize];
             read_exact_at(&mut reader, central_offset, central)?;
             CentralLookup::Cached(&central[..])
         } else {
             match build_central_index(&mut reader, central_offset, entry_count, tail_scratch) {
-                Ok((records, complete)) => CentralLookup::Indexed { records, complete },
+                Ok(index) => {
+                    // An image among the indexed names settles it; without
+                    // one, only an index of every entry rules images out.
+                    image_entries = (index.images || index.complete).then_some(index.images);
+                    CentralLookup::Indexed {
+                        records: index.records,
+                        complete: index.complete,
+                    }
+                }
                 Err(_) => CentralLookup::Walk,
             }
         };
@@ -465,7 +484,164 @@ where
             central_offset,
             entry_count,
             lookup,
+            image_entries,
         })
+    }
+
+    /// Calls `visit` with each central-directory entry, in order, until it
+    /// returns false. A directory the tail scratch caches is walked in RAM;
+    /// otherwise it streams from storage through `buf`, a run of entries
+    /// per read. An entry whose header and name do not fit `buf` together,
+    /// or whose name is not UTF-8, is passed over: nothing could look it up
+    /// by name either.
+    pub fn for_each_entry(
+        &mut self,
+        buf: &mut [u8],
+        visit: &mut dyn FnMut(&ZipEntry<'_>) -> bool,
+    ) -> Result<(), ZipError> {
+        if let CentralLookup::Cached(central) = self.lookup {
+            let mut cursor = 0usize;
+            for _ in 0..self.entry_count {
+                let header = CentralHeader::parse(central.get(cursor..).unwrap_or(&[]))?;
+                let name_at = cursor + CENTRAL_HEADER_BYTES;
+                let name = central
+                    .get(name_at..name_at + header.name_len)
+                    .ok_or(ZipError::BadCentralDirectory)?;
+                if let Ok(name) = core::str::from_utf8(name) {
+                    if !visit(&header.entry(name)) {
+                        return Ok(());
+                    }
+                }
+                cursor = usize::try_from(header.next(cursor as u32)?)
+                    .map_err(|_| ZipError::BadCentralDirectory)?;
+            }
+            return Ok(());
+        }
+        let end = self.reader.len().map_err(|_| ZipError::Io)?;
+        let mut window = CentralWindow { at: 0, held: 0 };
+        let mut cursor = self.central_offset;
+        for _ in 0..self.entry_count {
+            if !window.cover(&mut self.reader, buf, end, cursor, CENTRAL_HEADER_BYTES)? {
+                return Err(ZipError::BadCentralDirectory);
+            }
+            let header = CentralHeader::parse(window.bytes(buf, cursor))?;
+            let named = CENTRAL_HEADER_BYTES + header.name_len;
+            if window.cover(&mut self.reader, buf, end, cursor, named)? {
+                let name = &window.bytes(buf, cursor)[CENTRAL_HEADER_BYTES..named];
+                if let Ok(name) = core::str::from_utf8(name) {
+                    if !visit(&header.entry(name)) {
+                        return Ok(());
+                    }
+                }
+            }
+            cursor = header.next(cursor)?;
+        }
+        Ok(())
+    }
+
+    /// Whether any entry's name looks like an image
+    /// ([`crate::image::index::is_image_path`]). Known without a read when
+    /// the directory is cached, or when the index pass saw every name (or
+    /// an image) on the way; otherwise the directory is walked through
+    /// `buf` once, and the answer kept.
+    pub fn has_image_entries(&mut self, buf: &mut [u8]) -> Result<bool, ZipError> {
+        if let Some(known) = self.image_entries {
+            return Ok(known);
+        }
+        let mut found = false;
+        self.for_each_entry(buf, &mut |entry| {
+            found = crate::image::index::is_image_path(entry.name);
+            !found
+        })?;
+        self.image_entries = Some(found);
+        Ok(found)
+    }
+
+    /// Reads the start of an entry found by its stored local-header offset
+    /// rather than by name, as an image probe does, handing `visitor` its
+    /// bytes from the first until it has what it needs or the entry ends.
+    /// A stored entry is read a piece of `input` at a time, and what the
+    /// visitor would pass over unread ([`EntryVisitor::skippable`]) is not
+    /// read at all. A deflated one is inflated through `output`, its
+    /// compressed bytes a piece of `input` at a time, and what the visitor
+    /// passes over is inflated and dropped. Either way no more than `cap`
+    /// bytes of the entry are read, nor, from a deflated one, inflated: a
+    /// stream of a few KB can inflate to hundreds of MB.
+    ///
+    /// Only a failed read comes back as [`ZipError::Io`], which is worth
+    /// retrying. Anything wrong with the archive itself is another error,
+    /// the same every time: a local header that is missing, lies past the
+    /// archive's end (checked against its length, so it never reads as a
+    /// failed read), or names another entry (`is_name` says, given the
+    /// header's name, which must fit `input`), data past the end, an
+    /// unknown method, or a stream that does not inflate, or that reaches
+    /// `cap` (read or inflated) before the visitor has what it needs. A
+    /// stored entry that reaches `cap` first just ends, and the visitor
+    /// judges what it has.
+    #[allow(clippy::too_many_arguments)]
+    pub fn visit_entry_start(
+        &mut self,
+        entry: OwnedZipEntry,
+        is_name: &mut dyn FnMut(&[u8]) -> bool,
+        input: &mut [u8],
+        output: &mut [u8],
+        inflate_scratch: &mut ZipInflateScratch,
+        cap: u32,
+        visitor: &mut dyn EntryVisitor,
+    ) -> Result<(), ZipError> {
+        let payload = entry_payload_at(&mut self.reader, entry, input, is_name)?;
+        match entry.compression_method {
+            0 => {
+                let size = entry.uncompressed_size.min(entry.compressed_size);
+                let (mut at, mut read) = (0u32, 0u32);
+                while at < size && read < cap && !input.is_empty() {
+                    let len = (size - at).min(cap - read).min(input.len() as u32);
+                    let piece = &mut input[..len as usize];
+                    read_exact_at(&mut self.reader, payload + at, piece)?;
+                    at += len;
+                    read += len;
+                    if !visitor.take(piece) {
+                        return Ok(());
+                    }
+                    let skip = visitor.skippable().min(size - at);
+                    if skip > 0 {
+                        at += skip;
+                        visitor.skip(skip);
+                    }
+                }
+                Ok(())
+            }
+            8 => {
+                let reader = &mut self.reader;
+                let mut stopped = false;
+                let mut inflated_len = 0u32;
+                let inflated = inflate_chunks_to_sink(
+                    |fetched, buf| read_exact_at(reader, payload + fetched, buf),
+                    entry.compressed_size.min(cap),
+                    input,
+                    output,
+                    inflate_scratch,
+                    |chunk| {
+                        if !visitor.take(chunk) {
+                            stopped = true;
+                            return Err(ZipError::OutputTooSmall);
+                        }
+                        inflated_len = inflated_len.saturating_add(chunk.len() as u32);
+                        if inflated_len >= cap {
+                            // Inflated as far as a probe may go, still
+                            // wanting more: the visitor has failed.
+                            return Err(ZipError::OutputTooSmall);
+                        }
+                        Ok(())
+                    },
+                );
+                if stopped {
+                    return Ok(());
+                }
+                inflated.map(|_| ())
+            }
+            _ => Err(ZipError::UnsupportedCompression),
+        }
     }
 
     pub fn find_entry(
@@ -800,6 +976,64 @@ pub trait EpubZipOps {
         inflate_scratch: &mut ZipInflateScratch,
         emit: &mut dyn FnMut(&[u8]) -> Result<(), ZipError>,
     ) -> Result<(), ZipError>;
+
+    /// Visits the central directory's entries; see
+    /// [`ZipStream::for_each_entry`]. A forward-only reader cannot go back
+    /// to the directory, and visits none.
+    fn for_each_entry(
+        &mut self,
+        buf: &mut [u8],
+        visit: &mut dyn FnMut(&ZipEntry<'_>) -> bool,
+    ) -> Result<(), ZipError> {
+        let _ = (buf, visit);
+        Ok(())
+    }
+
+    /// Whether the archive has image entries; see
+    /// [`ZipStream::has_image_entries`]. A forward-only reader says no: an
+    /// image is read back by its offset, which it cannot do.
+    fn has_image_entries(&mut self, buf: &mut [u8]) -> Result<bool, ZipError> {
+        let _ = buf;
+        Ok(false)
+    }
+
+    /// Reads the start of an entry by its stored offset; see
+    /// [`ZipStream::visit_entry_start`]. A forward-only reader cannot go
+    /// back, and finds nothing there.
+    #[allow(clippy::too_many_arguments)]
+    fn visit_entry_start(
+        &mut self,
+        entry: OwnedZipEntry,
+        is_name: &mut dyn FnMut(&[u8]) -> bool,
+        input: &mut [u8],
+        output: &mut [u8],
+        inflate_scratch: &mut ZipInflateScratch,
+        cap: u32,
+        visitor: &mut dyn EntryVisitor,
+    ) -> Result<(), ZipError> {
+        let _ = (entry, is_name, input, output, inflate_scratch, cap, visitor);
+        Err(ZipError::EntryNotFound)
+    }
+}
+
+/// Takes an entry's bytes from its start, as
+/// [`ZipStream::visit_entry_start`] reads them.
+pub trait EntryVisitor {
+    /// Takes the entry's next bytes; false once it needs no more.
+    fn take(&mut self, bytes: &[u8]) -> bool;
+
+    /// How many of the bytes right after those taken it would pass over
+    /// unread. A reader that can seek does not read them, and says so with
+    /// [`EntryVisitor::skip`].
+    fn skippable(&self) -> u32 {
+        0
+    }
+
+    /// The reader passed over `n` bytes, at most what
+    /// [`EntryVisitor::skippable`] said.
+    fn skip(&mut self, n: u32) {
+        let _ = n;
+    }
 }
 
 impl<R> EpubZipOps for ZipStream<'_, R>
@@ -856,6 +1090,40 @@ where
             output_window,
             inflate_scratch,
             emit,
+        )
+    }
+
+    fn for_each_entry(
+        &mut self,
+        buf: &mut [u8],
+        visit: &mut dyn FnMut(&ZipEntry<'_>) -> bool,
+    ) -> Result<(), ZipError> {
+        ZipStream::for_each_entry(self, buf, visit)
+    }
+
+    fn has_image_entries(&mut self, buf: &mut [u8]) -> Result<bool, ZipError> {
+        ZipStream::has_image_entries(self, buf)
+    }
+
+    fn visit_entry_start(
+        &mut self,
+        entry: OwnedZipEntry,
+        is_name: &mut dyn FnMut(&[u8]) -> bool,
+        input: &mut [u8],
+        output: &mut [u8],
+        inflate_scratch: &mut ZipInflateScratch,
+        cap: u32,
+        visitor: &mut dyn EntryVisitor,
+    ) -> Result<(), ZipError> {
+        ZipStream::visit_entry_start(
+            self,
+            entry,
+            is_name,
+            input,
+            output,
+            inflate_scratch,
+            cap,
+            visitor,
         )
     }
 }
@@ -1083,18 +1351,98 @@ where
     }
 }
 
+/// Where an entry found by its stored local-header offset starts its data,
+/// once the local header checks out: present, inside the archive with all
+/// of its data, and naming the entry (`is_name` says, given the header's
+/// name, read into `name`, which must hold it).
+///
+/// Only a failed read comes back as [`ZipError::Io`], which is worth
+/// retrying. A header that is missing, lies past the archive's end
+/// (checked against its length, so it never reads as a failed read), or
+/// names another entry is [`ZipError::BadLocalHeader`], the same every
+/// time. An image is read this way, by the offset its index entry keeps.
+pub fn entry_payload_at<R: ReadAt>(
+    reader: &mut R,
+    entry: OwnedZipEntry,
+    name: &mut [u8],
+    is_name: &mut dyn FnMut(&[u8]) -> bool,
+) -> Result<u32, ZipError> {
+    let end = reader.len().map_err(|_| ZipError::Io)?;
+    let within = |offset: u32, len: u32| offset.checked_add(len).filter(|&last| last <= end);
+    let name_at = within(entry.local_header_offset, 30).ok_or(ZipError::BadLocalHeader)?;
+    let mut header = [0u8; 30];
+    read_exact_at(reader, entry.local_header_offset, &mut header)?;
+    if read_u32(&header, 0)? != 0x0403_4b50 {
+        return Err(ZipError::BadLocalHeader);
+    }
+    let name_len = read_u16(&header, 26)? as usize;
+    let extra_len = u32::from(read_u16(&header, 28)?);
+    let name = name.get_mut(..name_len).ok_or(ZipError::BadLocalHeader)?;
+    within(name_at, name_len as u32).ok_or(ZipError::BadLocalHeader)?;
+    read_exact_at(reader, name_at, name)?;
+    if !is_name(name) {
+        return Err(ZipError::BadLocalHeader);
+    }
+    let payload = (name_at + name_len as u32)
+        .checked_add(extra_len)
+        .ok_or(ZipError::BadLocalHeader)?;
+    within(payload, entry.compressed_size).ok_or(ZipError::BadLocalHeader)?;
+    Ok(payload)
+}
+
+/// Fills `out` from `offset`; a short read is [`ZipError::Io`].
+pub fn read_payload_at<R: ReadAt>(
+    reader: &mut R,
+    offset: u32,
+    out: &mut [u8],
+) -> Result<(), ZipError> {
+    read_exact_at(reader, offset, out)
+}
+
+/// Fills a buffer with compressed bytes from an offset into an entry's data.
+pub type FetchAt<'a> = dyn FnMut(u32, &mut [u8]) -> Result<(), ZipError> + 'a;
+
+/// Inflates a deflated entry's `compressed_size` bytes of data and hands
+/// `emit` the output a full `output` at a time, as
+/// [`ZipStream::read_entry_to_sink`] does. `fetch` fills a buffer with the
+/// compressed bytes from an offset into the data (for an entry found by
+/// [`entry_payload_at`], a read of the archive at the payload plus that
+/// offset), a piece of `input` at a time. Either closure stops the inflate
+/// by returning an error, which comes back unchanged: `fetch` gives a
+/// caller a say between pieces even where the output never fills.
+pub fn inflate_to_sink(
+    fetch: &mut FetchAt<'_>,
+    compressed_size: u32,
+    input: &mut [u8],
+    output: &mut [u8],
+    inflate_scratch: &mut ZipInflateScratch,
+    emit: &mut dyn FnMut(&[u8]) -> Result<(), ZipError>,
+) -> Result<(), ZipError> {
+    inflate_chunks_to_sink(fetch, compressed_size, input, output, inflate_scratch, emit).map(|_| ())
+}
+
+/// What [`build_central_index`] made of the directory.
+struct CentralIndex<'a> {
+    records: &'a [u8],
+    /// Every entry fit.
+    complete: bool,
+    /// An indexed entry's name looks like an image.
+    images: bool,
+}
+
 /// One sequential pass over a central directory too large for the tail
 /// scratch, emitting bounded `(name hash, entry)` records into `scratch`.
-/// Returns the encoded records and whether every entry fit. Sequential
-/// reads are the access pattern storage likes; afterwards each lookup is
-/// a RAM scan plus one local-header verification read, instead of a
-/// per-lookup walk of the whole directory on storage.
+/// Returns the encoded records, whether every entry fit, and whether any
+/// indexed name looks like an image. Sequential reads are the access
+/// pattern storage likes; afterwards each lookup is a RAM scan plus one
+/// local-header verification read, instead of a per-lookup walk of the
+/// whole directory on storage.
 fn build_central_index<'a, R>(
     reader: &mut R,
     central_offset: u32,
     entry_count: u16,
     scratch: &'a mut [u8],
-) -> Result<(&'a [u8], bool), ZipError>
+) -> Result<CentralIndex<'a>, ZipError>
 where
     R: ReadAt,
 {
@@ -1103,6 +1451,7 @@ where
     let mut cursor = central_offset;
     let mut header = [0u8; 46];
     let mut name_chunk = [0u8; 64];
+    let mut images = false;
     for slot in 0..indexed {
         read_exact_at(reader, cursor, &mut header)?;
         if read_u32(&header, 0)? != 0x0201_4b50 {
@@ -1121,15 +1470,31 @@ where
             .checked_add(46)
             .ok_or(ZipError::BadCentralDirectory)?;
         let mut remaining = name_len;
+        // The first read takes what is left over past whole chunks, so the
+        // last holds the name's end, where an image's extension is.
+        let mut take = match name_len as usize % name_chunk.len() {
+            0 => name_chunk.len(),
+            rest => rest,
+        };
+        let mut last = 0;
+        let mut utf8 = Utf8Pieces::new();
         while remaining > 0 {
-            let take = (remaining as usize).min(name_chunk.len());
+            take = take.min(remaining as usize);
             read_exact_at(reader, name_cursor, &mut name_chunk[..take])?;
             hash = fnv1a_update(hash, &name_chunk[..take]);
+            utf8.push(&name_chunk[..take]);
             name_cursor = name_cursor
                 .checked_add(take as u32)
                 .ok_or(ZipError::BadCentralDirectory)?;
             remaining -= take as u32;
+            last = take;
+            take = name_chunk.len();
         }
+        // A tail of a longer name still holds the extension and the byte
+        // before its dot, which is all the check looks at. A name that is
+        // not UTF-8 is passed over, as a walk passes it over: nothing could
+        // look it up.
+        images |= utf8.whole() && crate::image::index::is_image_name(&name_chunk[..last]);
 
         let record = &mut scratch
             [slot * CENTRAL_INDEX_RECORD_BYTES..(slot + 1) * CENTRAL_INDEX_RECORD_BYTES];
@@ -1147,10 +1512,164 @@ where
             .and_then(|value| value.checked_add(comment_len))
             .ok_or(ZipError::BadCentralDirectory)?;
     }
-    Ok((
-        &scratch[..indexed * CENTRAL_INDEX_RECORD_BYTES],
-        indexed == entry_count as usize,
-    ))
+    Ok(CentralIndex {
+        records: &scratch[..indexed * CENTRAL_INDEX_RECORD_BYTES],
+        complete: indexed == entry_count as usize,
+        images,
+    })
+}
+
+/// Checks that a name read in pieces is UTF-8, though a character may
+/// straddle two pieces: a piece's unfinished last character is held over
+/// and finished with the next piece's first bytes.
+struct Utf8Pieces {
+    held: [u8; 4],
+    held_len: usize,
+    valid: bool,
+}
+
+impl Utf8Pieces {
+    fn new() -> Self {
+        Self {
+            held: [0; 4],
+            held_len: 0,
+            valid: true,
+        }
+    }
+
+    fn push(&mut self, mut piece: &[u8]) {
+        if !self.valid {
+            return;
+        }
+        if self.held_len > 0 {
+            // The held bytes start a character that from_utf8 found
+            // unfinished, so its first byte gives its length.
+            let width = match self.held[0] {
+                0xC0..=0xDF => 2,
+                0xE0..=0xEF => 3,
+                _ => 4,
+            };
+            let take = (width - self.held_len).min(piece.len());
+            self.held[self.held_len..self.held_len + take].copy_from_slice(&piece[..take]);
+            self.held_len += take;
+            piece = &piece[take..];
+            if self.held_len < width {
+                return;
+            }
+            self.valid = core::str::from_utf8(&self.held[..width]).is_ok();
+            self.held_len = 0;
+            if !self.valid {
+                return;
+            }
+        }
+        match core::str::from_utf8(piece) {
+            Ok(_) => {}
+            Err(error) if error.error_len().is_none() => {
+                let rest = &piece[error.valid_up_to()..];
+                self.held[..rest.len()].copy_from_slice(rest);
+                self.held_len = rest.len();
+            }
+            Err(_) => self.valid = false,
+        }
+    }
+
+    /// The pieces so far make a whole UTF-8 string.
+    fn whole(&self) -> bool {
+        self.valid && self.held_len == 0
+    }
+}
+
+const CENTRAL_HEADER_BYTES: usize = 46;
+
+/// A central-directory entry's fixed 46-byte header.
+struct CentralHeader {
+    method: u16,
+    compressed_size: u32,
+    uncompressed_size: u32,
+    local_header_offset: u32,
+    name_len: usize,
+    /// Extra field and comment, which follow the name.
+    trailer_len: u32,
+}
+
+impl CentralHeader {
+    fn parse(bytes: &[u8]) -> Result<Self, ZipError> {
+        if read_u32(bytes, 0)? != 0x0201_4b50 {
+            return Err(ZipError::BadCentralDirectory);
+        }
+        Ok(Self {
+            method: read_u16(bytes, 10)?,
+            compressed_size: read_u32(bytes, 20)?,
+            uncompressed_size: read_u32(bytes, 24)?,
+            name_len: usize::from(read_u16(bytes, 28)?),
+            trailer_len: u32::from(read_u16(bytes, 30)?) + u32::from(read_u16(bytes, 32)?),
+            local_header_offset: read_u32(bytes, 42)?,
+        })
+    }
+
+    fn entry<'n>(&self, name: &'n str) -> ZipEntry<'n> {
+        ZipEntry {
+            name,
+            compression_method: self.method,
+            compressed_size: self.compressed_size,
+            uncompressed_size: self.uncompressed_size,
+            local_header_offset: self.local_header_offset,
+        }
+    }
+
+    /// Where the next entry starts, for this one at `at`.
+    fn next(&self, at: u32) -> Result<u32, ZipError> {
+        at.checked_add(CENTRAL_HEADER_BYTES as u32 + self.name_len as u32)
+            .and_then(|end| end.checked_add(self.trailer_len))
+            .ok_or(ZipError::BadCentralDirectory)
+    }
+}
+
+/// The stretch of the archive a walk's buffer holds: `held` bytes from
+/// offset `at`.
+struct CentralWindow {
+    at: u32,
+    held: usize,
+}
+
+impl CentralWindow {
+    /// Makes the buffer hold `len` bytes from `offset`, reading a buffer's
+    /// worth from there when it does not already. False when `len` is more
+    /// than the buffer holds.
+    fn cover<R: ReadAt>(
+        &mut self,
+        reader: &mut R,
+        buf: &mut [u8],
+        end: u32,
+        offset: u32,
+        len: usize,
+    ) -> Result<bool, ZipError> {
+        if len > buf.len() {
+            return Ok(false);
+        }
+        let start = offset.wrapping_sub(self.at) as usize;
+        if offset >= self.at && start + len <= self.held {
+            return Ok(true);
+        }
+        let available = end
+            .checked_sub(offset)
+            .ok_or(ZipError::BadCentralDirectory)? as usize;
+        if available < len {
+            return Err(ZipError::BadCentralDirectory);
+        }
+        let take = buf.len().min(available);
+        self.held = 0;
+        read_exact_at(reader, offset, &mut buf[..take])?;
+        (self.at, self.held) = (offset, take);
+        Ok(true)
+    }
+
+    /// The held bytes from `offset`, which [`CentralWindow::cover`] made
+    /// sure of.
+    fn bytes<'b>(&self, buf: &'b [u8], offset: u32) -> &'b [u8] {
+        let start = offset.wrapping_sub(self.at) as usize;
+        buf.get(start..self.held).unwrap_or(&[])
+    }
 }
 
 fn find_entry_in_central_cache(
@@ -1329,6 +1848,145 @@ pub trait XhtmlBlockSink {
         align: TextAlign,
         paragraph_end: bool,
     ) -> Result<(), XhtmlError>;
+
+    /// An `<img>` in the chapter. The parser has already ended the open
+    /// paragraph, unless the sink [`XhtmlBlockSink::wants_inline_images`]:
+    /// then it has ended only the open run (pushed as a block that does not
+    /// end its paragraph, a lone space included), and the image belongs to
+    /// the paragraph, between that run and the next.
+    ///
+    /// Both values are raw attribute slices borrowed from the parser's
+    /// input, entities and percent-escapes intact: `src` is empty when the
+    /// tag has none, and `alt` is `None` when the tag has no `alt`. Resolve
+    /// `src` with [`crate::image::path::resolve_image_path`]; nothing is
+    /// copied here, because this runs at the deepest point of a book build.
+    ///
+    /// The default pushes the alt-text placeholder the reader has always
+    /// shown, through [`push_image_placeholder`].
+    fn push_image(&mut self, src: &str, alt: Option<&str>) -> Result<(), XhtmlError> {
+        let _ = src;
+        push_image_placeholder(self, alt)
+    }
+
+    /// An `<img>` in a block whose start tag floats it left (class
+    /// `figleft`, or a `float: left` style), for a sink that
+    /// [`XhtmlBlockSink::wants_inline_images`]: Project Gutenberg's markup
+    /// for a drop cap set beside the paragraph it starts. Otherwise as
+    /// [`XhtmlBlockSink::push_image`], which the default calls.
+    fn push_floated_image(&mut self, src: &str, alt: Option<&str>) -> Result<(), XhtmlError> {
+        self.push_image(src, alt)
+    }
+
+    /// Whether an `<img>` stays in its paragraph. The default, false, ends
+    /// the paragraph before every image, as the parser always did, so a
+    /// sink that does not lay images out inside lines sees no change.
+    fn wants_inline_images(&self) -> bool {
+        false
+    }
+
+    /// The `<image>` inside an `<svg>` wrapper, for a sink whose
+    /// [`XhtmlBlockSink::wants_svg_images`] says so. The parser has already
+    /// ended the open paragraph. `href` is the raw `href` or `xlink:href`,
+    /// as `src` is for [`XhtmlBlockSink::push_image`]; an svg image has no
+    /// alt. The default pushes nothing: an svg image never had a
+    /// placeholder, so one that cannot be shown leaves no trace.
+    fn push_svg_image(&mut self, href: &str) -> Result<(), XhtmlError> {
+        let _ = href;
+        Ok(())
+    }
+
+    /// Whether the first `<image>` with an `href` or `xlink:href` inside
+    /// each `<svg>` (the markup most covers use) reaches
+    /// [`XhtmlBlockSink::push_svg_image`]. The rest of the svg is skipped
+    /// either way. The default, false, keeps svg subtrees skipped whole with
+    /// no calls at all, as before images had hooks, so the paragraph around
+    /// an svg is not ended early either.
+    fn wants_svg_images(&self) -> bool {
+        false
+    }
+}
+
+/// The placeholder an image has always become: its `alt` with entities
+/// decoded and whitespace collapsed, or `[Image]` when it has none, as one
+/// italic centred paragraph of at most 160 bytes. An empty `alt` pushes an
+/// empty paragraph, which sinks drop.
+///
+/// The default [`XhtmlBlockSink::push_image`]; a sink that shows images
+/// calls it for the ones it cannot show.
+// Kept out of line so its 160-byte buffer stays off the parser's own frame,
+// which every block of every chapter passes through: on the X3 that frame
+// is 64 bytes with this out of line and 208 with it inlined.
+#[inline(never)]
+pub fn push_image_placeholder<S: XhtmlBlockSink + ?Sized>(
+    sink: &mut S,
+    alt: Option<&str>,
+) -> Result<(), XhtmlError> {
+    let mut placeholder = heapless::String::<160>::new();
+    append_owned_text(&mut placeholder, alt.unwrap_or("[Image]"));
+    sink.push_block(
+        placeholder.as_str(),
+        TextRole::Body,
+        FontStyle::Italic,
+        TextAlign::Center,
+        true,
+    )
+}
+
+/// The text the placeholder of an image that cannot be shown carries, as
+/// [`push_image_placeholder`] builds it (its `alt` with entities decoded
+/// and HTML whitespace collapsed, or `[Image]` when it has none), written
+/// into `out` and cut on a character boundary where `out` ends. Returns its
+/// length. A sink that holds an image back before deciding where it goes
+/// keeps this instead of the borrowed attribute.
+pub fn image_alt_text(alt: Option<&str>, out: &mut [u8]) -> usize {
+    let text = alt.unwrap_or("[Image]");
+    let mut len = 0usize;
+    let mut previous_space = false;
+    let mut cursor = 0usize;
+    while cursor < text.len() {
+        let rest = &text[cursor..];
+        let (ch, advance) = if let Some(decoded) = decode_html_entity(rest) {
+            (decoded, rest.find(';').map(|index| index + 1).unwrap_or(1))
+        } else {
+            let Some(ch) = rest.chars().next() else {
+                break;
+            };
+            (ch, ch.len_utf8())
+        };
+        let ch = if is_html_space(ch) {
+            if previous_space {
+                cursor += advance;
+                continue;
+            }
+            ' '
+        } else {
+            ch
+        };
+        let Some(room) = out.get_mut(len..len + ch.len_utf8()) else {
+            break;
+        };
+        len += ch.encode_utf8(room).len();
+        previous_space = ch == ' ';
+        cursor += advance;
+    }
+    len
+}
+
+/// Whether an image's `alt` (the raw attribute) names a single letter,
+/// optionally after an opening quote: how Project Gutenberg labels a drop
+/// cap set as an image (`alt="T"`, `alt="&quot;C"`).
+pub fn alt_is_initial(alt: &str) -> bool {
+    let mut out = [0u8; 16];
+    let len = image_alt_text(Some(alt), &mut out);
+    let text = core::str::from_utf8(&out[..len]).unwrap_or("").trim();
+    let mut chars = text.chars();
+    match (chars.next(), chars.next(), chars.next()) {
+        (Some(letter), None, None) => letter.is_alphabetic(),
+        (Some(quote), Some(letter), None) => {
+            !quote.is_alphanumeric() && !quote.is_whitespace() && letter.is_alphabetic()
+        }
+        _ => false,
+    }
 }
 
 pub trait EpubTocSink {
@@ -2332,6 +2990,11 @@ pub struct XhtmlBlockStreamParser {
     list_marker_pending: bool,
     table_align_stack: [TextAlign; 4],
     table_depth: usize,
+    /// Inside an `<svg>` whose image the sink wants and has not had yet.
+    svg_image_pending: bool,
+    /// The open block's start tag floats it left: an image in it goes to
+    /// [`XhtmlBlockSink::push_floated_image`].
+    float_left_block: bool,
 }
 
 impl XhtmlBlockStreamParser {
@@ -2354,6 +3017,8 @@ impl XhtmlBlockStreamParser {
             list_marker_pending: false,
             table_align_stack: [TextAlign::Justify; 4],
             table_depth: 0,
+            svg_image_pending: false,
+            float_left_block: false,
         }
     }
 
@@ -2365,6 +3030,13 @@ impl XhtmlBlockStreamParser {
     ) -> Result<(), XhtmlError> {
         let self_closing = tag.trim_end().ends_with('/');
         if self.skip_depth > 0 {
+            if self.svg_image_pending && tag_name_is(tag, "image") {
+                if let Some(href) = svg_image_href(tag) {
+                    self.svg_image_pending = false;
+                    self.flush(sink)?;
+                    sink.push_svg_image(href)?;
+                }
+            }
             // Count nested elements of the skipped name so the skip ends at
             // the matching close tag, not the first inner one.
             if !self_closing && self.skip_tag_matches(tag) {
@@ -2401,6 +3073,8 @@ impl XhtmlBlockStreamParser {
             if !tag_is_void(tag) {
                 self.skip_tag = tag_local_name(tag).map(bounded_skip_name);
                 self.skip_depth = self.skip_depth.saturating_add(1);
+                self.svg_image_pending =
+                    self.in_body && tag_name_is(tag, "svg") && sink.wants_svg_images();
             }
             return Ok(());
         }
@@ -2430,19 +3104,13 @@ impl XhtmlBlockStreamParser {
                 true,
             )?;
         } else if tag_name_is(tag, "img") {
-            self.flush(sink)?;
-            let mut placeholder = heapless::String::<160>::new();
-            match attr_value(tag, "alt") {
-                Some(alt) => append_owned_text(&mut placeholder, alt),
-                None => append_owned_text(&mut placeholder, "[Image]"),
+            let (src, alt) = (attr_value(tag, "src").unwrap_or(""), attr_value(tag, "alt"));
+            if sink.wants_inline_images() {
+                self.push_inline_image(src, alt, sink)?;
+            } else {
+                self.flush(sink)?;
+                sink.push_image(src, alt)?;
             }
-            sink.push_block(
-                placeholder.as_str(),
-                TextRole::Body,
-                FontStyle::Italic,
-                TextAlign::Center,
-                true,
-            )?;
         } else if tag_name_is(tag, "ul") || tag_name_is(tag, "ol") {
             self.flush(sink)?;
             if self.list_depth < self.list_kind_stack.len() {
@@ -2454,10 +3122,12 @@ impl XhtmlBlockStreamParser {
                 self.list_count_stack[self.list_depth] = 0;
                 self.list_depth += 1;
             }
-        } else if tag_starts_block(tag) {
+        } else if tag_starts_block(tag) || (tag_is_figure(tag) && sink.wants_inline_images()) {
             if !self.list_marker_pending || tag_name_is(tag, "li") {
                 self.flush(sink)?;
             }
+            // Only a sink that keeps images in their lines asks.
+            self.float_left_block = sink.wants_inline_images() && tag_floats_left(tag);
             self.align = block_align_for_tag(tag, css)
                 .or_else(|| current_table_align(&self.table_align_stack, self.table_depth))
                 .unwrap_or(TextAlign::Justify);
@@ -2518,6 +3188,7 @@ impl XhtmlBlockStreamParser {
             self.skip_depth = self.skip_depth.saturating_sub(1);
             if self.skip_depth == 0 {
                 self.skip_tag = None;
+                self.svg_image_pending = false;
             }
             return Ok(());
         }
@@ -2552,7 +3223,7 @@ impl XhtmlBlockStreamParser {
         } else if tag_is_italic(tag) {
             self.flush_continue(sink)?;
             self.italic_depth = self.italic_depth.saturating_sub(1);
-        } else if tag_ends_block(tag) {
+        } else if tag_ends_block(tag) || (tag_is_figure(tag) && sink.wants_inline_images()) {
             self.flush(sink)?;
             self.align = TextAlign::Justify;
         }
@@ -2586,12 +3257,52 @@ impl XhtmlBlockStreamParser {
 
     fn flush(&mut self, sink: &mut impl XhtmlBlockSink) -> Result<(), XhtmlError> {
         self.list_marker_pending = false;
+        self.float_left_block = false;
         flush_sink_block(
             &mut self.block,
             self.role,
             style_for(self.bold_depth, self.italic_depth),
             self.align,
             sink,
+        )
+    }
+
+    /// An image that joins its paragraph: the open run ends, and the image
+    /// goes to the sink. Out of line, so a book whose sink keeps images out
+    /// of its lines parses in the frames it always did.
+    #[inline(never)]
+    fn push_inline_image(
+        &mut self,
+        src: &str,
+        alt: Option<&str>,
+        sink: &mut impl XhtmlBlockSink,
+    ) -> Result<(), XhtmlError> {
+        self.end_run_before_image(sink)?;
+        if self.float_left_block {
+            sink.push_floated_image(src, alt)
+        } else {
+            sink.push_image(src, alt)
+        }
+    }
+
+    /// Ends the open run, not its paragraph, ahead of an image that joins
+    /// the paragraph. A run of nothing but spaces still goes to the sink as
+    /// one space, so the space stays before the image rather than moving
+    /// after it, as it would between two styled runs.
+    fn end_run_before_image(&mut self, sink: &mut impl XhtmlBlockSink) -> Result<(), XhtmlError> {
+        if !is_html_blank(self.block.as_str()) {
+            return self.flush_continue(sink);
+        }
+        if self.block.is_empty() {
+            return Ok(());
+        }
+        self.block.clear();
+        sink.push_block(
+            " ",
+            self.role,
+            style_for(self.bold_depth, self.italic_depth),
+            self.align,
+            false,
         )
     }
 
@@ -3587,6 +4298,14 @@ fn tag_starts_skip(tag: &str) -> bool {
         || tag_is_pagebreak(tag)
 }
 
+/// Where an svg `<image>` points: `href` (SVG 2) or `xlink:href` (SVG 1.1,
+/// what EPUB 2 covers use). An empty value counts as none.
+fn svg_image_href(tag: &str) -> Option<&str> {
+    attr_value(tag, "href")
+        .or_else(|| attr_value(tag, "xlink:href"))
+        .filter(|href| !href.trim().is_empty())
+}
+
 fn tag_is_hidden(tag: &str) -> bool {
     tag_contains_style_value(tag, "display", "none")
         || tag_contains_style_value(tag, "visibility", "hidden")
@@ -3781,6 +4500,19 @@ fn tag_contains_style_value(tag: &str, property: &str, expected: &str) -> bool {
                 .map(|value| value.eq_ignore_ascii_case(expected))
                 .unwrap_or(false)
     })
+}
+
+/// `<figure>` and `<figcaption>`: blocks for a sink that keeps images in
+/// their lines, so a figure's caption is never its image's paragraph text.
+/// A sink that does not has always seen them as inline, and still does.
+fn tag_is_figure(tag: &str) -> bool {
+    tag_name_is(tag, "figure") || tag_name_is(tag, "figcaption")
+}
+
+/// A block start tag that floats its block left: Project Gutenberg's
+/// `figleft`, or an inline `float: left`.
+fn tag_floats_left(tag: &str) -> bool {
+    tag_contains_class_word(tag, "figleft") || tag_contains_style_value(tag, "float", "left")
 }
 
 fn tag_starts_block(tag: &str) -> bool {
@@ -6025,6 +6757,408 @@ mod tests {
         assert_eq!(text, "Text one\n");
     }
 
+    /// Images as books mark them up, for the hook tests below: alt text
+    /// with entities and runs of whitespace, no alt, an empty or blank alt,
+    /// an image inside a paragraph, and the two `<svg>` wrappers covers use.
+    const IMAGE_MARKUP: &str = concat!(
+        r#"<body><p>Before</p>"#,
+        r#"<img src="images/a%20b.png#frag" alt="Caf&eacute;  &amp;&#10;  tea"/>"#,
+        r#"<img src="b.png"/>"#,
+        r#"<img src="c.png" alt=""/>"#,
+        r#"<img src="d.png" alt="   "/>"#,
+        r#"<p>mid <img alt="x" src="e.png"/> tail</p>"#,
+        r#"<div><svg xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 9 9">"#,
+        r#"<title>Cover</title><image width="9" height="9" xlink:href="cover.png"/>"#,
+        r#"<image href="second.png"/><text>skipped</text></svg></div>"#,
+        r#"<p>text <svg><g><image/><image href="i.png"></image></g></svg> more</p>"#,
+        r#"<p>After</p></body>"#,
+    );
+
+    /// What the parser pushed for [`IMAGE_MARKUP`] before images had hooks,
+    /// recorded from that parser: a sink that overrides nothing must keep
+    /// receiving exactly this. `true` marks an image placeholder (italic,
+    /// centred); the rest are body text, justified. Every push ends its
+    /// paragraph.
+    fn image_markup_placeholders() -> StdVec<Fragment> {
+        [
+            ("", false),
+            ("Before", false),
+            ("", false),
+            ("Caf\u{e9} & tea", true),
+            ("", false),
+            ("[Image]", true),
+            ("", false),
+            ("", true),
+            ("", false),
+            (" ", true),
+            ("", false),
+            ("mid ", false),
+            ("x", true),
+            (" tail", false),
+            ("", false),
+            ("", false),
+            ("", false),
+            ("text more", false),
+            ("", false),
+            ("After", false),
+            ("", false),
+            ("", false),
+        ]
+        .into_iter()
+        .map(|(text, image)| {
+            let (style, align) = if image {
+                (FontStyle::Italic, TextAlign::Center)
+            } else {
+                (FontStyle::Regular, TextAlign::Justify)
+            };
+            (text.into(), TextRole::Body, style, align, true)
+        })
+        .collect()
+    }
+
+    #[test]
+    fn sinks_without_image_hooks_get_the_placeholders_they_always_did() {
+        assert_eq!(parse_both_ways(IMAGE_MARKUP), image_markup_placeholders());
+    }
+
+    #[test]
+    fn image_hooks_get_raw_sources_in_document_order() {
+        #[derive(Default)]
+        struct Images(StdVec<std::string::String>);
+        impl XhtmlBlockSink for Images {
+            fn push_block(
+                &mut self,
+                text: &str,
+                _: TextRole,
+                _: FontStyle,
+                _: TextAlign,
+                paragraph_end: bool,
+            ) -> Result<(), XhtmlError> {
+                if !text.trim().is_empty() {
+                    self.0
+                        .push(std::format!("text {:?} {paragraph_end}", text.trim()));
+                }
+                Ok(())
+            }
+            fn push_image(&mut self, src: &str, alt: Option<&str>) -> Result<(), XhtmlError> {
+                self.0.push(std::format!("image {src:?} {alt:?}"));
+                Ok(())
+            }
+            fn push_svg_image(&mut self, href: &str) -> Result<(), XhtmlError> {
+                self.0.push(std::format!("svg image {href:?}"));
+                Ok(())
+            }
+            fn wants_svg_images(&self) -> bool {
+                true
+            }
+        }
+        let run = |xhtml: &str| {
+            let mut whole = Images::default();
+            xhtml_blocks_to_sink(xhtml, None, &mut whole).expect("whole parse");
+            for chunk_len in [1usize, 3, 7, 4096] {
+                let mut streamed = Images::default();
+                let mut tokenizer = StreamingXmlTokenizer::new();
+                let mut parser = XhtmlBlockStreamParser::new(false);
+                for chunk in xhtml.as_bytes().chunks(chunk_len) {
+                    tokenizer
+                        .feed_xhtml_blocks(chunk, &mut parser, None, &mut streamed)
+                        .expect("chunk feeds");
+                }
+                tokenizer
+                    .finish_xhtml_blocks(&mut parser, &mut streamed)
+                    .expect("finish");
+                assert_eq!(whole.0, streamed.0, "chunk size {chunk_len}");
+            }
+            whole.0
+        };
+        assert_eq!(
+            run(IMAGE_MARKUP),
+            [
+                r#"text "Before" true"#,
+                r#"image "images/a%20b.png#frag" Some("Caf&eacute;  &amp;&#10;  tea")"#,
+                r#"image "b.png" None"#,
+                r#"image "c.png" Some("")"#,
+                r#"image "d.png" Some("   ")"#,
+                // The open paragraph ends before the image, as it always has.
+                r#"text "mid" true"#,
+                r#"image "e.png" Some("x")"#,
+                r#"text "tail" true"#,
+                // Only the first svg image with a reference; its title, the
+                // second image and the svg's text stay skipped.
+                r#"svg image "cover.png""#,
+                r#"text "text" true"#,
+                r#"svg image "i.png""#,
+                r#"text "more" true"#,
+                r#"text "After" true"#,
+            ]
+        );
+        // An svg outside the body, or nested in a skipped element, reports
+        // nothing; a sink that does not ask for svg images hears nothing of
+        // them (see the placeholder test above).
+        assert_eq!(
+            run(concat!(
+                r#"<html><head><svg><image href="head.png"/></svg></head>"#,
+                r#"<body><div style="display:none"><svg><image href="hidden.png"/></svg></div>"#,
+                r#"<p>Only text</p></body></html>"#,
+            )),
+            [r#"text "Only text" true"#]
+        );
+    }
+
+    /// Everything a sink that keeps images in their paragraphs hears, in
+    /// order, for a whole parse and for streamed ones at several chunk sizes
+    /// (which must agree).
+    fn inline_image_events(xhtml: &str) -> StdVec<std::string::String> {
+        #[derive(Default)]
+        struct Inline(StdVec<std::string::String>);
+        impl XhtmlBlockSink for Inline {
+            fn push_block(
+                &mut self,
+                text: &str,
+                _: TextRole,
+                style: FontStyle,
+                _: TextAlign,
+                paragraph_end: bool,
+            ) -> Result<(), XhtmlError> {
+                self.0
+                    .push(std::format!("text {text:?} {style:?} {paragraph_end}"));
+                Ok(())
+            }
+            fn push_image(&mut self, src: &str, alt: Option<&str>) -> Result<(), XhtmlError> {
+                self.0.push(std::format!("image {src:?} {alt:?}"));
+                Ok(())
+            }
+            fn push_floated_image(
+                &mut self,
+                src: &str,
+                alt: Option<&str>,
+            ) -> Result<(), XhtmlError> {
+                self.0.push(std::format!("floated image {src:?} {alt:?}"));
+                Ok(())
+            }
+            fn push_svg_image(&mut self, href: &str) -> Result<(), XhtmlError> {
+                self.0.push(std::format!("svg image {href:?}"));
+                Ok(())
+            }
+            fn wants_svg_images(&self) -> bool {
+                true
+            }
+            fn wants_inline_images(&self) -> bool {
+                true
+            }
+        }
+        let mut whole = Inline::default();
+        xhtml_blocks_to_sink(xhtml, None, &mut whole).expect("whole parse");
+        for chunk_len in [1usize, 3, 7, 4096] {
+            let mut streamed = Inline::default();
+            let mut tokenizer = StreamingXmlTokenizer::new();
+            let mut parser = XhtmlBlockStreamParser::new(false);
+            for chunk in xhtml.as_bytes().chunks(chunk_len) {
+                tokenizer
+                    .feed_xhtml_blocks(chunk, &mut parser, None, &mut streamed)
+                    .expect("chunk feeds");
+            }
+            tokenizer
+                .finish_xhtml_blocks(&mut parser, &mut streamed)
+                .expect("finish");
+            assert_eq!(whole.0, streamed.0, "chunk size {chunk_len}");
+        }
+        // The empty pushes that end a paragraph, unless one ends nothing
+        // but another: drop runs of them to keep the expectations legible.
+        let mut events: StdVec<std::string::String> = StdVec::new();
+        for event in whole.0 {
+            if event == r#"text "" Regular true"#
+                && events.last().is_some_and(|last| last.ends_with("true"))
+            {
+                continue;
+            }
+            events.push(event);
+        }
+        events
+    }
+
+    #[test]
+    fn inline_image_sinks_keep_images_in_their_paragraph() {
+        // Mid-sentence: the run before ends without ending the paragraph,
+        // with its space, and the text after keeps its own.
+        assert_eq!(
+            inline_image_events(
+                r#"<body><p>Complete the <img alt="PICT" src="t12x.png"/> AEBG.</p></body>"#
+            ),
+            [
+                r#"text "" Regular true"#,
+                r#"text "Complete the " Regular false"#,
+                r#"image "t12x.png" Some("PICT")"#,
+                r#"text " AEBG." Regular true"#,
+            ]
+        );
+        // At the paragraph's start, and at its end.
+        assert_eq!(
+            inline_image_events(
+                r#"<body><p><img src="a.png"/>Start</p><p>End <img src="e.png"/></p></body>"#
+            ),
+            [
+                r#"text "" Regular true"#,
+                r#"image "a.png" None"#,
+                r#"text "Start" Regular true"#,
+                r#"text "End " Regular false"#,
+                r#"image "e.png" None"#,
+                r#"text "" Regular true"#,
+            ]
+        );
+        // A paragraph of images alone, and a lone space between styled
+        // runs and an image, which stays before the image.
+        assert_eq!(
+            inline_image_events(
+                r#"<body><p><img src="x.png"/> <img src="y.png"/></p><p><i>a</i> <img src="z.png"/>b</p></body>"#
+            ),
+            [
+                r#"text "" Regular true"#,
+                r#"image "x.png" None"#,
+                r#"text " " Regular false"#,
+                r#"image "y.png" None"#,
+                r#"text "" Regular true"#,
+                r#"text "a" Italic false"#,
+                r#"text " " Regular false"#,
+                r#"image "z.png" None"#,
+                r#"text "b" Regular true"#,
+            ]
+        );
+        // svg images still end their paragraph.
+        assert_eq!(
+            inline_image_events(
+                r#"<body><p>text <svg><image href="i.png"/></svg> more</p></body>"#
+            ),
+            [
+                r#"text "" Regular true"#,
+                r#"text "text " Regular true"#,
+                r#"svg image "i.png""#,
+                r#"text " more" Regular true"#,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_figure_s_caption_is_a_paragraph_of_its_own() {
+        let figure = concat!(
+            r#"<body><figure><img alt="A plate" src="plate.png"/>"#,
+            r#"<figcaption>The plate, a caption.</figcaption></figure></body>"#,
+        );
+        assert_eq!(
+            inline_image_events(figure),
+            [
+                r#"text "" Regular true"#,
+                r#"image "plate.png" Some("A plate")"#,
+                r#"text "" Regular true"#,
+                r#"text "The plate, a caption." Regular true"#,
+            ]
+        );
+        // A sink that keeps images out of its lines hears what it always
+        // did: the figure is no block to it.
+        let fragments = parse_both_ways(figure);
+        assert_eq!(reading_text(&fragments), "A plate\nThe plate, a caption.\n");
+    }
+
+    #[test]
+    fn images_in_left_floated_blocks_say_so() {
+        // Rackham's Alice: a drop cap floated in a block of its own, then
+        // the paragraph it starts.
+        assert_eq!(
+            inline_image_events(concat!(
+                r#"<body><div class="chapter">CHAPTER III</div>"#,
+                r#"<div class="figleft" style="width: 75px;">"#,
+                "
+",
+                r#"<img alt="T" src="t.png" title="" id="img_images_t.png"/>"#,
+                "
+",
+                r#"</div><div class="unindent">HEY were indeed</div></body>"#,
+            )),
+            [
+                r#"text "" Regular true"#,
+                r#"text "CHAPTER III" Regular true"#,
+                // The line break before the image is a space, and a space
+                // at a block's start is the sink's to drop.
+                r#"text " " Regular false"#,
+                r#"floated image "t.png" Some("T")"#,
+                r#"text "" Regular true"#,
+                r#"text "HEY were indeed" Regular true"#,
+            ]
+        );
+        // A float in the style says so too; the float ends with its block.
+        assert_eq!(
+            inline_image_events(concat!(
+                r#"<body><p style="float: left"><img alt="A" src="a.png"/></p>"#,
+                r#"<p class="figcenter"><img alt="A" src="a.png"/></p></body>"#,
+            )),
+            [
+                r#"text "" Regular true"#,
+                r#"floated image "a.png" Some("A")"#,
+                r#"text "" Regular true"#,
+                r#"image "a.png" Some("A")"#,
+                r#"text "" Regular true"#,
+            ]
+        );
+    }
+
+    #[test]
+    fn held_alt_text_is_the_placeholder_text() {
+        #[derive(Default)]
+        struct Placeholder(std::string::String);
+        impl XhtmlBlockSink for Placeholder {
+            fn push_block(
+                &mut self,
+                text: &str,
+                _: TextRole,
+                _: FontStyle,
+                _: TextAlign,
+                _: bool,
+            ) -> Result<(), XhtmlError> {
+                self.0 = text.into();
+                Ok(())
+            }
+        }
+        let long = "é and &amp; ".repeat(30);
+        for alt in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("Caf&eacute;  &amp;&#10;  tea"),
+            Some(" lead and trail "),
+            Some("&bogus; &#x2014;"),
+            Some(long.as_str()),
+        ] {
+            let mut sink = Placeholder::default();
+            push_image_placeholder(&mut sink, alt).unwrap();
+            let mut out = [0u8; 160];
+            let len = image_alt_text(alt, &mut out);
+            assert_eq!(
+                core::str::from_utf8(&out[..len]).unwrap(),
+                sink.0,
+                "{alt:?}"
+            );
+        }
+        // A short buffer cuts on a character boundary.
+        let mut out = [0u8; 5];
+        let len = image_alt_text(Some("abcé"), &mut out);
+        assert_eq!(&out[..len], "abcé".as_bytes());
+        let mut out = [0u8; 4];
+        let len = image_alt_text(Some("abcé"), &mut out);
+        assert_eq!(&out[..len], b"abc");
+    }
+
+    #[test]
+    fn drop_cap_alts_are_a_letter() {
+        for alt in ["T", "&quot;C", "\"Y", "'A", " T ", "\u{201C}H", "\u{C9}"] {
+            assert!(alt_is_initial(alt), "{alt:?}");
+        }
+        for alt in [
+            "", " ", "TH", "1", "\"1", "Alice", "A cat", "[Image]", "--", "T.",
+        ] {
+            assert!(!alt_is_initial(alt), "{alt:?}");
+        }
+    }
+
     #[test]
     fn non_ascii_attribute_values_survive() {
         let fragments = parse_both_ways(r#"<body><img src="x.png" alt="Café Ægir"/></body>"#);
@@ -6263,6 +7397,596 @@ mod tests {
                 .err(),
             Some(ZipError::EntryNotFound)
         );
+    }
+
+    /// A reader that counts its reads, for the walk tests below.
+    struct CountingReader<'a> {
+        bytes: &'a [u8],
+        reads: usize,
+    }
+
+    impl ReadAt for CountingReader<'_> {
+        type Error = ();
+
+        fn len(&mut self) -> Result<u32, Self::Error> {
+            Ok(self.bytes.len() as u32)
+        }
+
+        fn read_at(&mut self, offset: u32, out: &mut [u8]) -> Result<usize, Self::Error> {
+            self.reads += 1;
+            SliceReader { bytes: self.bytes }.read_at(offset, out)
+        }
+    }
+
+    /// A book's worth of entries: chapters, a stylesheet, a JPEG cover
+    /// (which the index does not hold), and `images` PNGs (one with a name
+    /// longer than the index pass's 64-byte chunk) after them, as Gutenberg
+    /// orders its ZIPs.
+    fn book_zip(chapters: usize, images: usize) -> StdVec<u8> {
+        let mut names: StdVec<std::string::String> = (0..chapters)
+            .map(|index| std::format!("OEBPS/text/chapter-{index:03}.xhtml"))
+            .collect();
+        names.push("OEBPS/style.css".into());
+        // Not an image the index holds.
+        names.push("OEBPS/images/cover.svg".into());
+        names.extend((0..images).map(|index| {
+            if index == 0 {
+                std::format!("OEBPS/images/{}-plate.PNG", "long".repeat(20))
+            } else if index == 1 {
+                "OEBPS/images/photo.jpeg".into()
+            } else {
+                std::format!("OEBPS/images/fig{index:03}.png")
+            }
+        }));
+        let files: StdVec<(&str, &[u8])> = names
+            .iter()
+            .map(|name| (name.as_str(), name.as_bytes()))
+            .collect();
+        stored_zip(&files)
+    }
+
+    #[test]
+    fn a_walk_visits_every_entry_whether_cached_indexed_or_streamed() {
+        let zip = book_zip(40, 3);
+        for tail_len in [8192usize, 1024, 200] {
+            let mut tail = std::vec![0u8; tail_len];
+            let mut stream =
+                ZipStream::new(SliceReader { bytes: &zip }, &mut tail).expect("zip opens");
+            let cached = tail_len == 8192;
+            for buf_len in [46 + 60, 300, 4096] {
+                let mut buf = std::vec![0xA5u8; buf_len];
+                let mut names = StdVec::new();
+                stream
+                    .for_each_entry(&mut buf, &mut |entry| {
+                        names.push(std::string::String::from(entry.name));
+                        let found = stream_entry_matches(&zip, entry);
+                        assert!(found, "{} is where the walk says", entry.name);
+                        true
+                    })
+                    .expect("walk");
+                // Every entry, except the long image name when its header
+                // and name (149 bytes) do not fit a streaming walk's buffer.
+                let expected = if cached || buf_len >= 149 { 45 } else { 44 };
+                assert_eq!(names.len(), expected, "tail {tail_len} buf {buf_len}");
+                assert_eq!(names[0], "OEBPS/text/chapter-000.xhtml");
+            }
+            let mut stops = 0;
+            stream
+                .for_each_entry(&mut [0u8; 512], &mut |_| {
+                    stops += 1;
+                    stops < 5
+                })
+                .unwrap();
+            assert_eq!(stops, 5, "the walk stops when told");
+        }
+    }
+
+    /// Whether `entry` matches the local header its offset names.
+    fn stream_entry_matches(zip: &[u8], entry: &ZipEntry<'_>) -> bool {
+        let at = entry.local_header_offset as usize;
+        let name_len = u16::from_le_bytes([zip[at + 26], zip[at + 27]]) as usize;
+        &zip[at + 30..at + 30 + name_len] == entry.name.as_bytes()
+            && u32::from_le_bytes(zip[at + 18..at + 22].try_into().unwrap())
+                == entry.compressed_size
+    }
+
+    #[test]
+    fn image_entries_are_known_from_the_open_unless_the_index_was_cut_short() {
+        // Cached: answered from RAM, no read beyond the open's.
+        for (images, expected) in [(0, false), (2, true)] {
+            let zip = book_zip(10, images);
+            let mut tail = [0u8; 4096];
+            let reader = CountingReader {
+                bytes: &zip,
+                reads: 0,
+            };
+            let mut stream = ZipStream::new(reader, &mut tail).unwrap();
+            assert_eq!(stream.has_image_entries(&mut [0u8; 64]), Ok(expected));
+            assert_eq!(stream.reader.reads, 2, "the EOCD and the directory");
+        }
+        // Indexed: the index pass saw every name, including the long one
+        // read in pieces.
+        for (images, expected) in [(0, false), (1, true), (3, true)] {
+            let zip = book_zip(60, images);
+            let mut tail = [0u8; 2048];
+            let reader = CountingReader {
+                bytes: &zip,
+                reads: 0,
+            };
+            let mut stream = ZipStream::new(reader, &mut tail).unwrap();
+            let opened = stream.reader.reads;
+            assert_eq!(stream.has_image_entries(&mut [0u8; 64]), Ok(expected));
+            assert_eq!(stream.reader.reads, opened, "no read past the open");
+        }
+        // An index cut short knows only an image it saw; otherwise one walk
+        // settles it, through the caller's buffer, and is not repeated.
+        for (images, expected) in [(0, false), (2, true)] {
+            let zip = book_zip(60, images);
+            let mut tail = [0u8; 400];
+            let reader = CountingReader {
+                bytes: &zip,
+                reads: 0,
+            };
+            let mut stream = ZipStream::new(reader, &mut tail).unwrap();
+            let opened = stream.reader.reads;
+            let mut buf = [0u8; 2048];
+            assert_eq!(stream.has_image_entries(&mut buf), Ok(expected));
+            let walked = stream.reader.reads - opened;
+            assert!((1..=4).contains(&walked), "{walked} reads");
+            assert_eq!(stream.has_image_entries(&mut buf), Ok(expected));
+            assert_eq!(stream.reader.reads - opened, walked);
+        }
+        // A forward-only reader cannot read an image back: it has none.
+        let zip = book_zip(3, 2);
+        let mut local = ZipLocalStream::new(SliceStream {
+            bytes: &zip,
+            cursor: 0,
+        });
+        assert_eq!(
+            EpubZipOps::has_image_entries(&mut local, &mut [0u8; 64]),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn a_damaged_directory_fails_the_walk_without_panicking() {
+        let zip = book_zip(30, 2);
+        let central = zip.len()
+            - 22
+            - u32::from_le_bytes(zip[zip.len() - 10..zip.len() - 6].try_into().unwrap()) as usize;
+        for (at, value) in [(central, 0u8), (central + 28, 0xff), (central + 29, 0xff)] {
+            let mut damaged = zip.clone();
+            damaged[at] = value;
+            for tail_len in [8192usize, 300] {
+                let mut tail = std::vec![0u8; tail_len];
+                let Ok(mut stream) = ZipStream::new(SliceReader { bytes: &damaged }, &mut tail)
+                else {
+                    continue;
+                };
+                let result = stream.for_each_entry(&mut [0u8; 256], &mut |_| true);
+                assert!(result.is_err(), "byte {at} tail {tail_len}");
+            }
+        }
+    }
+
+    /// Whether the index pass, which sees each name in 64-byte pieces,
+    /// finds an image among `names` without any read past the open.
+    fn indexed_images(names: &[&str]) -> bool {
+        let files: StdVec<(&str, &[u8])> = names.iter().map(|name| (*name, &b"x"[..])).collect();
+        let zip = stored_zip(&files);
+        // Too small to cache the directory, big enough to index it whole.
+        let mut tail = [0u8; 200];
+        let reader = CountingReader {
+            bytes: &zip,
+            reads: 0,
+        };
+        let mut stream = ZipStream::new(reader, &mut tail).unwrap();
+        assert!(
+            matches!(stream.lookup, CentralLookup::Indexed { complete: true, .. }),
+            "the index pass saw every name"
+        );
+        let opened = stream.reader.reads;
+        let found = stream.has_image_entries(&mut [0u8; 64]).unwrap();
+        assert_eq!(stream.reader.reads, opened);
+        // A walk, which reads each name whole, agrees.
+        let mut walked = false;
+        stream
+            .for_each_entry(&mut [0u8; 512], &mut |entry| {
+                walked |= crate::image::index::is_image_path(entry.name);
+                true
+            })
+            .unwrap();
+        assert_eq!(found, walked, "{names:?}");
+        found
+    }
+
+    #[test]
+    fn the_index_pass_finds_an_extension_across_its_name_pieces() {
+        let filler = [
+            "OEBPS/a.xhtml",
+            "OEBPS/b.xhtml",
+            "OEBPS/c.xhtml",
+            "OEBPS/d.xhtml",
+        ];
+        // 65 to 67 bytes: a 64-byte first piece would leave only "g",
+        // "ng" or "png" for the last.
+        for extra in 0..3 {
+            let name = std::format!("OEBPS/images/{}.png", "p".repeat(48 + extra));
+            assert_eq!(name.len(), 65 + extra);
+            let mut names = filler.to_vec();
+            names.push(&name);
+            assert!(indexed_images(&names), "{} bytes", name.len());
+        }
+        // A character split across two pieces is still UTF-8.
+        // 130 bytes: pieces of 2, 64 and 64, the é at 65 and 66.
+        let accented = std::format!("OEBPS/images/{}é{}.png", "a".repeat(52), "b".repeat(59));
+        assert_eq!(accented.len(), 130);
+        assert!(core::str::from_utf8(&accented.as_bytes()[2..66]).is_err());
+        let mut names = filler.to_vec();
+        names.push(&accented);
+        assert!(indexed_images(&names));
+        assert!(!indexed_images(&filler));
+    }
+
+    #[test]
+    fn a_name_that_is_not_utf8_is_no_image_to_the_open_or_the_walk() {
+        for prefix_len in [3usize, 60, 70] {
+            let mut name = b"OEBPS/".to_vec();
+            name.extend(std::iter::repeat_n(b'x', prefix_len));
+            name.push(0xff);
+            name.extend_from_slice(b".png");
+            let zip = {
+                let names = ["OEBPS/a.xhtml", "OEBPS/b.xhtml", "OEBPS/c.xhtml"];
+                let mut files: StdVec<(&str, &[u8])> =
+                    names.iter().map(|name| (*name, &b"x"[..])).collect();
+                // stored_zip takes names as text; write the bad name after.
+                files.push(("OEBPS/z", &b"x"[..]));
+                let mut zip = stored_zip(&files);
+                let at = zip.windows(7).rposition(|w| w == b"OEBPS/z").unwrap();
+                let mut patched = zip[..at].to_vec();
+                // Only the central copy needs the bad name: the open and
+                // the walk read nothing else. Keep its length in step.
+                let length_at = at - 46 + 28;
+                patched[length_at..length_at + 2]
+                    .copy_from_slice(&(name.len() as u16).to_le_bytes());
+                patched.extend_from_slice(&name);
+                let rest = zip.split_off(at + 7);
+                let central_size_at = rest.len() - 22 + 12;
+                let mut rest = rest;
+                let size = u32::from_le_bytes(
+                    rest[central_size_at..central_size_at + 4]
+                        .try_into()
+                        .unwrap(),
+                ) + name.len() as u32
+                    - 7;
+                rest[central_size_at..central_size_at + 4].copy_from_slice(&size.to_le_bytes());
+                patched.extend_from_slice(&rest);
+                patched
+            };
+            for tail_len in [4096usize, 300] {
+                let mut tail = std::vec![0u8; tail_len];
+                let mut stream = ZipStream::new(SliceReader { bytes: &zip }, &mut tail).unwrap();
+                assert_eq!(
+                    stream.has_image_entries(&mut [0u8; 512]),
+                    Ok(false),
+                    "prefix {prefix_len} tail {tail_len}"
+                );
+            }
+        }
+    }
+
+    /// A reader whose reads starting in `fails` fail, as a card's can.
+    struct FailingReader<'a> {
+        bytes: &'a [u8],
+        fails: core::ops::Range<u32>,
+    }
+
+    impl ReadAt for FailingReader<'_> {
+        type Error = ();
+
+        fn len(&mut self) -> Result<u32, Self::Error> {
+            Ok(self.bytes.len() as u32)
+        }
+
+        fn read_at(&mut self, offset: u32, out: &mut [u8]) -> Result<usize, Self::Error> {
+            if self.fails.contains(&offset) {
+                return Err(());
+            }
+            SliceReader { bytes: self.bytes }.read_at(offset, out)
+        }
+    }
+
+    #[test]
+    fn reading_an_entry_by_offset_tells_damage_from_a_failed_read() {
+        let png = b"\x89PNG\r\n\x1a\n0123456789abcdefghijklmnopqrstuvwxyz";
+        let mut deflated = std::vec![0x01, png.len() as u8, 0, !(png.len() as u8), 0xff];
+        deflated.extend_from_slice(png);
+        // Empty stored blocks that never finish: a stream that reads on
+        // and on without producing a byte.
+        let endless: StdVec<u8> = std::iter::repeat_n([0u8, 0, 0, 0xff, 0xff], 2000)
+            .flatten()
+            .collect();
+        let zip = zip_with_methods(&[
+            ("a.png", 0, png, png),
+            ("b.png", 8, &deflated, png),
+            ("c.png", 8, &endless, png),
+            ("d.png", 9, png, png),
+        ]);
+        let mut tail = [0u8; 4096];
+        let mut stream = ZipStream::new(SliceReader { bytes: &zip }, &mut tail).unwrap();
+        let entry = |stream: &mut ZipStream<'_, SliceReader<'_>>, name: &str| {
+            stream
+                .find_entry(name, &mut [0u8; 46], &mut [0u8; 64])
+                .unwrap()
+        };
+        let read =
+            |stream: &mut ZipStream<'_, SliceReader<'_>>, entry: OwnedZipEntry, name: &str| {
+                let mut input = [0xa5u8; 512];
+                let mut output = [0xa5u8; 33];
+                let mut inflate = ZipInflateScratch::new();
+                let mut prefix = Prefix {
+                    bytes: StdVec::new(),
+                    want: 33,
+                };
+                stream
+                    .visit_entry_start(
+                        entry,
+                        &mut |found| found == name.as_bytes(),
+                        &mut input,
+                        &mut output,
+                        &mut inflate,
+                        4096,
+                        &mut prefix,
+                    )
+                    .map(|()| prefix.bytes)
+            };
+        for name in ["a.png", "b.png"] {
+            let found = entry(&mut stream, name);
+            assert_eq!(
+                read(&mut stream, found, name).unwrap(),
+                &png[..33],
+                "{name}"
+            );
+        }
+        let c = entry(&mut stream, "c.png");
+        assert_eq!(read(&mut stream, c, "c.png"), Err(ZipError::Inflate));
+        let d = entry(&mut stream, "d.png");
+        assert_eq!(
+            read(&mut stream, d, "d.png"),
+            Err(ZipError::UnsupportedCompression)
+        );
+        // The header names another entry, or the offset or the data runs
+        // past the archive's end: damage, not a failed read.
+        let a = entry(&mut stream, "a.png");
+        assert_eq!(read(&mut stream, a, "b.png"), Err(ZipError::BadLocalHeader));
+        for damaged in [
+            OwnedZipEntry {
+                local_header_offset: zip.len() as u32 - 10,
+                ..a
+            },
+            OwnedZipEntry {
+                local_header_offset: u32::MAX - 4,
+                ..a
+            },
+            OwnedZipEntry {
+                compressed_size: zip.len() as u32,
+                ..a
+            },
+            OwnedZipEntry {
+                local_header_offset: a.local_header_offset + 1,
+                ..a
+            },
+        ] {
+            assert_eq!(
+                read(&mut stream, damaged, "a.png"),
+                Err(ZipError::BadLocalHeader),
+                "{damaged:?}"
+            );
+        }
+        // A read that fails is only that, worth trying again.
+        let b = entry(&mut stream, "b.png");
+        let mut tail = [0u8; 4096];
+        let mut failing = ZipStream::new(
+            FailingReader {
+                bytes: &zip,
+                fails: b.local_header_offset..b.local_header_offset + 64,
+            },
+            &mut tail,
+        )
+        .unwrap();
+        let mut input = [0u8; 512];
+        let mut output = [0u8; 33];
+        let mut inflate = ZipInflateScratch::new();
+        let mut prefix = Prefix {
+            bytes: StdVec::new(),
+            want: 33,
+        };
+        assert_eq!(
+            failing.visit_entry_start(
+                b,
+                &mut |_| true,
+                &mut input,
+                &mut output,
+                &mut inflate,
+                4096,
+                &mut prefix,
+            ),
+            Err(ZipError::Io)
+        );
+    }
+
+    /// Collects an entry's first `want` bytes.
+    struct Prefix {
+        bytes: StdVec<u8>,
+        want: usize,
+    }
+
+    impl EntryVisitor for Prefix {
+        fn take(&mut self, bytes: &[u8]) -> bool {
+            let n = (self.want - self.bytes.len()).min(bytes.len());
+            self.bytes.extend_from_slice(&bytes[..n]);
+            self.bytes.len() < self.want
+        }
+    }
+
+    /// Takes 4 bytes at every 1,000th offset and passes over the rest.
+    struct Sampler {
+        seen: StdVec<(u32, u8)>,
+        at: u32,
+        skip: u32,
+    }
+
+    impl EntryVisitor for Sampler {
+        fn take(&mut self, bytes: &[u8]) -> bool {
+            for &byte in bytes {
+                if self.skip > 0 {
+                    self.skip -= 1;
+                } else {
+                    self.seen.push((self.at, byte));
+                    if self.at % 1000 == 3 {
+                        self.skip = 996;
+                    }
+                }
+                self.at += 1;
+            }
+            self.seen.len() < 40
+        }
+
+        fn skippable(&self) -> u32 {
+            self.skip
+        }
+
+        fn skip(&mut self, n: u32) {
+            self.skip -= n;
+            self.at += n;
+        }
+    }
+
+    /// A reader that records where each read starts.
+    struct LoggingReader<'a> {
+        bytes: &'a [u8],
+        reads: &'a core::cell::RefCell<StdVec<u32>>,
+    }
+
+    impl ReadAt for LoggingReader<'_> {
+        type Error = ();
+
+        fn len(&mut self) -> Result<u32, Self::Error> {
+            Ok(self.bytes.len() as u32)
+        }
+
+        fn read_at(&mut self, offset: u32, out: &mut [u8]) -> Result<usize, Self::Error> {
+            self.reads.borrow_mut().push(offset);
+            SliceReader { bytes: self.bytes }.read_at(offset, out)
+        }
+    }
+
+    /// A JPEG of nothing but maximal APP1 segments deflates about 1,000
+    /// to 1: under a 256 KB cap on compressed bytes it would inflate to a
+    /// quarter of a GB. The cap holds for inflated bytes too, and the
+    /// probe fails there.
+    #[test]
+    fn a_deflated_probe_stops_at_the_cap_on_inflated_bytes() {
+        let mut bomb = std::vec![0xFF, 0xD8];
+        for _ in 0..64 {
+            bomb.extend_from_slice(&[0xFF, 0xE1, 0xFF, 0xFF]);
+            bomb.extend(std::iter::repeat_n(0u8, 65_533));
+        }
+        let deflated = miniz_oxide::deflate::compress_to_vec(&bomb, 9);
+        assert!(deflated.len() * 500 < bomb.len(), "{}", deflated.len());
+        let zip = zip_with_methods(&[("bomb.jpg", 8, &deflated, &bomb)]);
+        let mut tail = [0u8; 4096];
+        let mut stream = ZipStream::new(SliceReader { bytes: &zip }, &mut tail).unwrap();
+        let entry = stream
+            .find_entry("bomb.jpg", &mut [0u8; 46], &mut [0u8; 64])
+            .unwrap();
+        struct Counting(crate::image::index::ImageProber, usize);
+        impl EntryVisitor for Counting {
+            fn take(&mut self, bytes: &[u8]) -> bool {
+                self.1 += bytes.len();
+                self.0.take(bytes)
+            }
+        }
+        let mut prober = Counting(crate::image::index::ImageProber::new(), 0);
+        let cap = 256 * 1024;
+        let result = stream.visit_entry_start(
+            entry,
+            &mut |_| true,
+            &mut [0u8; 512],
+            &mut [0u8; 512],
+            &mut ZipInflateScratch::new(),
+            cap,
+            &mut prober,
+        );
+        assert_eq!(result, Err(ZipError::OutputTooSmall));
+        assert!(
+            (cap as usize..cap as usize + 512).contains(&prober.1),
+            "{}",
+            prober.1
+        );
+        assert_eq!(
+            prober.0.finish().status,
+            crate::image::index::ProbeStatus::Failed
+        );
+    }
+
+    #[test]
+    fn a_stored_entry_is_not_read_where_the_visitor_skips() {
+        let data: StdVec<u8> = (0..20_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let mut deflated = StdVec::new();
+        for piece in data.chunks(65_535) {
+            deflated.push(0);
+            deflated.extend_from_slice(&(piece.len() as u16).to_le_bytes());
+            deflated.extend_from_slice(&(!(piece.len() as u16)).to_le_bytes());
+            deflated.extend_from_slice(piece);
+        }
+        deflated.extend_from_slice(&[1, 0, 0, 0xff, 0xff]);
+        let zip = zip_with_methods(&[("s.bin", 0, &data, &data), ("d.bin", 8, &deflated, &data)]);
+        let expected: StdVec<(u32, u8)> = (0..10u32)
+            .flat_map(|k| (0..4).map(move |i| k * 1000 + i))
+            .map(|at| (at, data[at as usize]))
+            .collect();
+        for name in ["s.bin", "d.bin"] {
+            let reads = core::cell::RefCell::new(StdVec::new());
+            let mut tail = [0u8; 4096];
+            let mut stream = ZipStream::new(
+                LoggingReader {
+                    bytes: &zip,
+                    reads: &reads,
+                },
+                &mut tail,
+            )
+            .unwrap();
+            let entry = stream
+                .find_entry(name, &mut [0u8; 46], &mut [0u8; 64])
+                .unwrap();
+            reads.borrow_mut().clear();
+            let mut sampler = Sampler {
+                seen: StdVec::new(),
+                at: 0,
+                skip: 0,
+            };
+            stream
+                .visit_entry_start(
+                    entry,
+                    &mut |found| found == name.as_bytes(),
+                    &mut [0u8; 64],
+                    &mut [0u8; 100],
+                    &mut ZipInflateScratch::new(),
+                    1 << 20,
+                    &mut sampler,
+                )
+                .unwrap();
+            assert_eq!(sampler.seen, expected, "{name}");
+            let data_reads = reads.borrow().len();
+            if name == "s.bin" {
+                // The local header, its name, then one read per sample.
+                assert_eq!(data_reads, 2 + 10, "{:?}", reads.borrow());
+            } else {
+                // Deflated: everything up to the last sample is read.
+                assert!(data_reads > 100, "{data_reads}");
+            }
+        }
     }
 
     fn stored_zip(files: &[(&str, &[u8])]) -> StdVec<u8> {
