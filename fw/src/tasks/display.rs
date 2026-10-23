@@ -1,5 +1,7 @@
 use crate::display_flush::{self, Epd};
 use crate::image_decode::{IdleImageStep, IdleImageWork};
+#[cfg(not(feature = "device-x3"))]
+use crate::next_page::{NextPage, StageUse};
 use crate::reader_cache::{
     self, ImagePass, Preparation, ReaderCacheScratch, READER_COMPRESSED_SCRATCH,
     READER_CONTAINER_SCRATCH, READER_HEADER_SCRATCH, READER_OPF_SCRATCH, READER_TAIL_SCRATCH,
@@ -160,6 +162,10 @@ pub async fn run(
     // this bit separate so a RAM reply only skips a proven body-page redraw.
     let mut last_reader_render_ready = false;
     let mut idle = IdlePreparation::new();
+    // The page a Next press is expected to ask for, drawn into `fb` and BW
+    // RAM while the reader reads (see `crate::next_page`).
+    #[cfg(not(feature = "device-x3"))]
+    let mut next_page = NextPage::new();
     loop {
         let idle_at = idle
             .target(
@@ -173,7 +179,13 @@ pub async fn run(
             (Some(progress_at), Some(idle_at)) => Some(progress_at.min(idle_at)),
             (progress_at, idle_at) => progress_at.or(idle_at),
         };
-        let incoming = if pending_reader.is_some() {
+        #[cfg(not(feature = "device-x3"))]
+        let stage_due = next_page.due(idle_at.is_some());
+        #[cfg(feature = "device-x3")]
+        let stage_due = false;
+        // Queued commands go first; a reader continuation or a page to
+        // stage runs once a millisecond passes without one.
+        let incoming = if pending_reader.is_some() || stage_due {
             match select(
                 select(DISPLAY_COMMANDS.receive(), STORAGE_COMMANDS.receive()),
                 embassy_time::Timer::after_millis(1),
@@ -181,7 +193,7 @@ pub async fn run(
             .await
             {
                 Either::First(command) => Some(command),
-                Either::Second(()) => Some(Either::Second(pending_reader.take().unwrap())),
+                Either::Second(()) => pending_reader.take().map(Either::Second),
             }
         } else if let Some(due) = wake {
             match select(
@@ -215,9 +227,41 @@ pub async fn run(
                     &sync_session,
                     &mut idle,
                 );
+                #[cfg(not(feature = "device-x3"))]
+                next_page.idle_ran(sd_library);
+            } else if stage_due {
+                #[cfg(not(feature = "device-x3"))]
+                {
+                    // The panel shows a settled frame that prev_fb and RED
+                    // RAM both hold, and the reader pipeline is the task's.
+                    if !next_page
+                        .stage(
+                            &mut epd,
+                            fb,
+                            tx_band,
+                            sd_library,
+                            panel_ready
+                                && refresh_planner.screen_on()
+                                && prev_prestaged
+                                && !sync_session.active(),
+                        )
+                        .await
+                    {
+                        prev_prestaged = false;
+                    }
+                    crate::stack_probe::report("stage");
+                }
             }
             continue;
         };
+        // An offer to stage the next page is the app's, not the reader's:
+        // it arrives once the last render settles and must not hold back
+        // idle preparation.
+        #[cfg(not(feature = "device-x3"))]
+        if let Either::First(DisplayCommand::StageNext { request, presses }) = incoming {
+            next_page.offer(request, presses);
+            continue;
+        }
         // Any command means the reader is active again.
         idle.rearm(IDLE_PREPARATION_DELAY);
         match incoming {
@@ -266,15 +310,25 @@ pub async fn run(
                     }
                 }
                 let layout_start = Instant::now();
-                if !render_reader_from_card(
-                    &mut epd,
-                    &mut sd_cs,
-                    fb,
-                    request,
-                    sd_library,
-                    font_metrics,
-                    tx_band,
-                ) {
+                // A page staged while the reader read the one before: fb and
+                // BW RAM already hold this render's frame.
+                #[cfg(not(feature = "device-x3"))]
+                let stage = next_page.take(request, sd_library, panel_ready);
+                #[cfg(not(feature = "device-x3"))]
+                let staged = stage == StageUse::Hit;
+                #[cfg(feature = "device-x3")]
+                let staged = false;
+                if !staged
+                    && !render_reader_from_card(
+                        &mut epd,
+                        &mut sd_cs,
+                        fb,
+                        request,
+                        sd_library,
+                        font_metrics,
+                        tx_band,
+                    )
+                {
                     crate::views::render(fb, request, sd_library);
                 }
                 let layout_ms = layout_start.elapsed().as_millis();
@@ -302,7 +356,32 @@ pub async fn run(
                     );
                 }
                 let flush_start = Instant::now();
-                if display_flush::flush(
+                #[cfg(not(feature = "device-x3"))]
+                let flushed = if staged {
+                    display_flush::flush_staged(
+                        &mut epd,
+                        fb,
+                        prev_fb,
+                        tx_band,
+                        refresh_planner.screen_on(),
+                        mode,
+                        prev_prestaged,
+                    )
+                    .await
+                } else {
+                    display_flush::flush(
+                        &mut epd,
+                        fb,
+                        prev_fb,
+                        tx_band,
+                        refresh_planner.screen_on(),
+                        mode,
+                        prev_prestaged,
+                    )
+                    .await
+                };
+                #[cfg(feature = "device-x3")]
+                let flushed = display_flush::flush(
                     &mut epd,
                     fb,
                     prev_fb,
@@ -311,9 +390,8 @@ pub async fn run(
                     mode,
                     prev_prestaged,
                 )
-                .await
-                .is_ok()
-                {
+                .await;
+                if flushed.is_ok() {
                     let flush_ms = flush_start.elapsed().as_millis();
                     refresh_planner.record_render(request, mode);
                     last_reader_render_ready = request.view == AppView::Reading
@@ -329,12 +407,20 @@ pub async fn run(
                     prev_prestaged = display_flush::prestage_previous(&mut epd, fb, tx_band)
                         .await
                         .is_ok();
+                    #[cfg(not(feature = "device-x3"))]
+                    let stage_note = stage.label();
+                    #[cfg(feature = "device-x3")]
+                    let stage_note = "none";
+                    // On a staged page layout_ms is the check that it still
+                    // holds and flush_ms has no BW write in it.
                     esp_println::println!(
-                        "bench: render view={:?} mode={:?} page={} chapter={} layout_ms={} flush_ms={} prestage_ms={} t_ms={}",
+                        "bench: render view={:?} mode={:?} page={} chapter={} staged={} stage={} layout_ms={} flush_ms={} prestage_ms={} t_ms={}",
                         request.view,
                         mode,
                         request.page,
                         request.chapter,
+                        staged,
+                        stage_note,
                         layout_ms,
                         flush_ms,
                         prestage_start.elapsed().as_millis(),
@@ -349,6 +435,11 @@ pub async fn run(
                         crate::tasks::bench_serial::FB_DUMP_ARMED
                             .store(false, core::sync::atomic::Ordering::Relaxed);
                         crate::tasks::bench_serial::dump_framebuffer(fb).await;
+                    }
+                    // Draw the staged page again from scratch and compare.
+                    #[cfg(all(feature = "bench-serial", not(feature = "device-x3")))]
+                    if staged {
+                        crate::next_page::check_staged(fb, prev_fb, request, sd_library);
                     }
                     // Keep the current chapter tracking the page just shown, past
                     // the reducer's 128-chapter cap. Cheap in-RAM check; only the
@@ -379,8 +470,13 @@ pub async fn run(
                     let _ = POWER_EVENTS.try_send(power_event);
                 }
             }
+            // Taken before `idle.rearm` above on the X4; the X3 never
+            // stages.
+            Either::First(DisplayCommand::StageNext { .. }) => {}
             Either::First(DisplayCommand::Sleep) => {
                 pending_reader = None;
+                #[cfg(not(feature = "device-x3"))]
+                next_page.forget();
                 let sleep_start = Instant::now();
                 esp_println::println!(
                     "bench: sleep phase=requested screen_on={} t_ms={}",
@@ -508,6 +604,8 @@ pub async fn run(
                         refresh_planner.last_request(),
                         last_reader_render_ready,
                     ) {
+                        #[cfg(not(feature = "device-x3"))]
+                        next_page.forget();
                         crate::views::render(fb, loading_request, sd_library);
                         let mode = refresh_planner.mode_for(loading_request);
                         if display_flush::flush(

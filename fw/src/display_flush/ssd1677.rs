@@ -40,6 +40,52 @@ pub(crate) async fn flush(
         mode,
         bw_start.elapsed().as_millis()
     );
+    refresh(epd, fb, prev_fb, tx_band, screen_on, mode, prev_staged).await
+}
+
+/// [`flush`] for a frame [`stage_frame`] already wrote to BW RAM, while
+/// the reader was still on the page before: the refresh starts without
+/// streaming the frame again. RED RAM is handled as [`flush`] handles it,
+/// so every mode works: Full and FastClean write `fb` (the staged frame)
+/// there too.
+pub(crate) async fn flush_staged(
+    epd: &mut Epd,
+    fb: &Framebuffer,
+    prev_fb: &Framebuffer,
+    tx_band: &mut [u8; BAND_BYTES],
+    screen_on: bool,
+    mode: RefreshMode,
+    prev_staged: bool,
+) -> Result<(), PanelError> {
+    esp_println::println!("display: BW RAM already holds the staged page");
+    refresh(epd, fb, prev_fb, tx_band, screen_on, mode, prev_staged).await
+}
+
+/// Write `fb` to BW RAM ahead of the refresh that will show it, asking
+/// `go_on` before each band. Ok(false) when it said no: BW RAM is then part
+/// written, which nothing relies on, since every flush but
+/// [`flush_staged`] writes BW in full. RED RAM, which holds the frame on
+/// screen, is not touched, and neither is the panel image.
+pub(crate) async fn stage_frame(
+    epd: &mut Epd,
+    fb: &Framebuffer,
+    tx_band: &mut [u8; BAND_BYTES],
+    go_on: impl FnMut() -> bool,
+) -> Result<bool, PanelError> {
+    write_ram_while(epd, CMD_WRITE_RAM_BW, fb, tx_band, go_on).await
+}
+
+/// The rest of a flush once BW RAM holds `fb`: RED RAM as the mode needs
+/// it, then the waveform.
+async fn refresh(
+    epd: &mut Epd,
+    fb: &Framebuffer,
+    prev_fb: &Framebuffer,
+    tx_band: &mut [u8; BAND_BYTES],
+    screen_on: bool,
+    mode: RefreshMode,
+    prev_staged: bool,
+) -> Result<(), PanelError> {
     if mode == RefreshMode::Fast {
         if prev_staged {
             // The previous frame was prestaged into RED RAM right after the
@@ -137,6 +183,20 @@ async fn write_ram(
     fb: &Framebuffer,
     tx_band: &mut [u8; BAND_BYTES],
 ) -> Result<(), PanelError> {
+    write_ram_while(epd, ram_command, fb, tx_band, || true)
+        .await
+        .map(|_| ())
+}
+
+/// Stream `fb` into one RAM plane a band at a time, asking `go_on` before
+/// each band. Ok(false) when it said no and the write stopped part way.
+async fn write_ram_while(
+    epd: &mut Epd,
+    ram_command: u8,
+    fb: &Framebuffer,
+    tx_band: &mut [u8; BAND_BYTES],
+    mut go_on: impl FnMut() -> bool,
+) -> Result<bool, PanelError> {
     let rect = Rect::FULL;
     epd.command(CMD_SET_RAM_X_RANGE, &ram_x_range(rect)).await?;
     epd.command(CMD_SET_RAM_Y_RANGE, &ram_y_range(rect)).await?;
@@ -147,8 +207,12 @@ async fn write_ram(
 
     epd.begin_ram_write(ram_command).await?;
     let mut y = 0;
-    let mut result = Ok(());
+    let mut result = Ok(true);
     while y < HEIGHT {
+        if !go_on() {
+            result = Ok(false);
+            break;
+        }
         let len = fill_transformed_band(fb, y, tx_band);
         // One DMA transfer per band: SpiDmaBus chunks internally against
         // its 8000-byte buffer, which dma_buffers!(8000) sized to match.

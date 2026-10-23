@@ -119,6 +119,8 @@ mod display_flush;
 mod firmware_files;
 mod image_decode;
 mod library_sd;
+#[cfg(not(feature = "device-x3"))]
+mod next_page;
 mod ota_update;
 mod page_images;
 mod reader_cache;

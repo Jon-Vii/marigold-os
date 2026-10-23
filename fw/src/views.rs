@@ -20,31 +20,76 @@ const SHOW_INPUT_DEBUG: bool = false;
 const MAX_UI_CHAPTERS: usize = 256;
 
 pub(crate) fn render(fb: &mut Framebuffer, request: RenderRequest, sd_library: &ReaderStore) {
-    fb.set_frame(app_render::fb_frame(request.orientation));
     if request.view == AppView::Reading && ReaderSource::from_book_id(request.book_id).is_sd() {
-        fb.clear(true);
-        draw_sd_reader_page(fb, request, sd_library);
-    } else {
-        let mut library_entries = [""; LIBRARY_WINDOW];
-        let mut firmware_entries = [""; MAX_FIRMWARE_FILES];
-        let mut chapters = [UiTocItem {
-            title: "",
-            level: 1,
-            page: 0,
-        }; MAX_UI_CHAPTERS];
-        let model = ui_model(
-            request,
-            sd_library,
-            &mut library_entries,
-            &mut firmware_entries,
-            &mut chapters,
-        );
-        app_render::render_request(fb, request, &model);
+        render_sd_reading_while(fb, request, sd_library, || true);
+        return;
     }
+    fb.set_frame(app_render::fb_frame(request.orientation));
+    let mut library_entries = [""; LIBRARY_WINDOW];
+    let mut firmware_entries = [""; MAX_FIRMWARE_FILES];
+    let mut chapters = [UiTocItem {
+        title: "",
+        level: 1,
+        page: 0,
+    }; MAX_UI_CHAPTERS];
+    let model = ui_model(
+        request,
+        sd_library,
+        &mut library_entries,
+        &mut firmware_entries,
+        &mut chapters,
+    );
+    app_render::render_request(fb, request, &model);
 
     if SHOW_INPUT_DEBUG {
         draw_input_sample(fb, request);
     }
+}
+
+/// The reading page of a card book as [`render`] draws it from RAM, asking
+/// `go_on` before each line and stopping part way when it says no. False
+/// when it stopped, leaving the frame incomplete. [`render`] draws every
+/// such page through here, so a page drawn ahead of a press
+/// (`crate::next_page`) is the frame the press's own render would draw.
+/// That holds because the page reads nothing from `request` beyond the
+/// fields of `app_core::ReadingPageKey` (keep that list current when this
+/// draw starts reading another field) and nothing else outside the store.
+pub(crate) fn render_sd_reading_while(
+    fb: &mut Framebuffer,
+    request: RenderRequest,
+    sd_library: &ReaderStore,
+    go_on: impl FnMut() -> bool,
+) -> bool {
+    fb.set_frame(app_render::fb_frame(request.orientation));
+    fb.clear(true);
+    let finished = draw_sd_reader_page(fb, request, sd_library, go_on);
+    if SHOW_INPUT_DEBUG {
+        draw_input_sample(fb, request);
+    }
+    finished
+}
+
+/// Whether `request`'s page can be drawn ahead of the press that will ask
+/// for it: a reading page of the loaded card book whose page is resident
+/// in the store, laid out as the request says, that [`render`] draws from
+/// RAM alone. A page with images, or set in the custom face from the card,
+/// draws inside an SD session and is left to its own render, as is any
+/// page while the input debug overlay (which draws per-press fields) is
+/// compiled in.
+#[cfg(not(feature = "device-x3"))]
+pub(crate) fn page_can_be_staged(request: RenderRequest, sd_library: &ReaderStore) -> bool {
+    let Some(index) = ReaderSource::from_book_id(request.book_id).sd_index() else {
+        return false;
+    };
+    !SHOW_INPUT_DEBUG
+        && request.view == AppView::Reading
+        && sd_library.covers_global_page(usize::from(index), request.page)
+        && reading_buffer_ready(request, sd_library)
+        && !reader_reads_card(request, sd_library)
+        && !ui::reading::page_has_images(
+            sd_library,
+            reader_layout::ReaderPagePlan::new(sd_library, request.page).page(),
+        )
 }
 
 /// Whether a render of `request` draws from the card, inside an SD session:
@@ -304,7 +349,13 @@ fn reading_buffer_ready(request: RenderRequest, sd_library: &ReaderStore) -> boo
         && !sd_library.text_holds_toc()
 }
 
-fn draw_sd_reader_page(fb: &mut Framebuffer, request: RenderRequest, sd_library: &ReaderStore) {
+/// False when `go_on` stopped the page body part way.
+fn draw_sd_reader_page(
+    fb: &mut Framebuffer,
+    request: RenderRequest,
+    sd_library: &ReaderStore,
+    go_on: impl FnMut() -> bool,
+) -> bool {
     match (
         sd_library.reader_status(),
         reading_buffer_ready(request, sd_library),
@@ -318,15 +369,19 @@ fn draw_sd_reader_page(fb: &mut Framebuffer, request: RenderRequest, sd_library:
         (BookLoadStatus::Ready, _) => {
             let plan = reader_layout::ReaderPagePlan::new(sd_library, request.page);
             let page_count = plan.page_count().max(1);
-            ui::reading::draw_reading_page_body(
+            if !ui::reading::draw_reading_page_body_while(
                 fb,
                 sd_library,
                 plan.page(),
                 ui::reading::draw_image_placeholder,
-            );
+                go_on,
+            ) {
+                return false;
+            }
             draw_reader_footer(fb, request, sd_library, page_count);
         }
     }
+    true
 }
 
 /// [`draw_sd_reader_page`] inside an SD session: the body in the custom
