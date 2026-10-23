@@ -47,9 +47,13 @@ tools/cargo.sh build -p fw --release --features device-x3
 Linking `fw` runs the RAM-layout assertions emitted by `fw/build.rs`: the
 previous-frame buffer must match the display crate's framebuffer size, and the
 main stack region must be at least 27 KB (`27 * 1024` bytes). The X3 build has
-far less margin above that floor than the X4 (as of October 2026, 28,048 bytes
-linked on X3 versus 36,720 on X4, because both X3 framebuffers are larger);
+less margin above that floor than the X4 (as of late October 2026, 36,080 bytes
+linked on X3 versus 44,656 on X4, because both X3 framebuffers are larger);
 re-check the EPUB-open path with `-Zemit-stack-sizes` before deepening it.
+About 5 KB of each comes from `ESP_HAL_CONFIG_PLACE_SWITCH_TABLES_IN_RAM =
+"false"` in `.cargo/config.toml`, which keeps esp-hal's switch tables and
+constant pools in flash; exporting the variable as `true` brings back the
+old layout for comparison.
 
 ## Golden frames
 
