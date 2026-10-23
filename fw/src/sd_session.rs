@@ -47,6 +47,28 @@ pub(crate) mod sd_stats {
     pub(crate) static READ_MICROS: AtomicU32 = AtomicU32::new(0);
     #[cfg(feature = "bench-serial")]
     pub(crate) static WRITE_MICROS: AtomicU32 = AtomicU32::new(0);
+    /// SPI transactions on the card (bench builds only), split at
+    /// `SHORT_TXN_BYTES`: short ones carry command bytes and the R1, busy,
+    /// data-token and CRC polls; the rest move data blocks and registers.
+    /// Their wall time against READ_MICROS separates bus work from the
+    /// driver's own CPU time.
+    #[cfg(feature = "bench-serial")]
+    pub(crate) static SPI_SHORT_TXNS: AtomicU32 = AtomicU32::new(0);
+    #[cfg(feature = "bench-serial")]
+    pub(crate) static SPI_SHORT_MICROS: AtomicU32 = AtomicU32::new(0);
+    #[cfg(feature = "bench-serial")]
+    pub(crate) static SPI_DATA_TXNS: AtomicU32 = AtomicU32::new(0);
+    #[cfg(feature = "bench-serial")]
+    pub(crate) static SPI_DATA_BYTES: AtomicU32 = AtomicU32::new(0);
+    #[cfg(feature = "bench-serial")]
+    pub(crate) static SPI_DATA_MICROS: AtomicU32 = AtomicU32::new(0);
+    #[cfg(feature = "bench-serial")]
+    pub(crate) const SHORT_TXN_BYTES: usize = 8;
+    /// Block reads and writes that returned an error (bench builds only).
+    #[cfg(feature = "bench-serial")]
+    pub(crate) static READ_ERRORS: AtomicU32 = AtomicU32::new(0);
+    #[cfg(feature = "bench-serial")]
+    pub(crate) static WRITE_ERRORS: AtomicU32 = AtomicU32::new(0);
 
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub(crate) struct Snapshot {
@@ -105,7 +127,18 @@ impl<B: BlockDevice> BlockDevice for CountingDevice<B> {
         let started = embassy_time::Instant::now();
         let result = self.0.read(blocks, start_block_idx);
         #[cfg(feature = "bench-serial")]
-        sd_stats::bump(&sd_stats::READ_MICROS, started.elapsed().as_micros() as u32);
+        {
+            sd_stats::bump(&sd_stats::READ_MICROS, started.elapsed().as_micros() as u32);
+            if let Err(err) = &result {
+                sd_stats::bump(&sd_stats::READ_ERRORS, 1);
+                esp_println::println!(
+                    "bench: sd_error op=read block={} blocks={} err={:?}",
+                    start_block_idx.0,
+                    blocks.len(),
+                    err
+                );
+            }
+        }
         result
     }
 
@@ -116,10 +149,21 @@ impl<B: BlockDevice> BlockDevice for CountingDevice<B> {
         let started = embassy_time::Instant::now();
         let result = self.0.write(blocks, start_block_idx);
         #[cfg(feature = "bench-serial")]
-        sd_stats::bump(
-            &sd_stats::WRITE_MICROS,
-            started.elapsed().as_micros() as u32,
-        );
+        {
+            sd_stats::bump(
+                &sd_stats::WRITE_MICROS,
+                started.elapsed().as_micros() as u32,
+            );
+            if let Err(err) = &result {
+                sd_stats::bump(&sd_stats::WRITE_ERRORS, 1);
+                esp_println::println!(
+                    "bench: sd_error op=write block={} blocks={} err={:?}",
+                    start_block_idx.0,
+                    blocks.len(),
+                    err
+                );
+            }
+        }
         result
     }
 
@@ -187,10 +231,12 @@ where
     CS: OutputPin,
 {
     fn transaction(&mut self, operations: &mut [Operation<'_, u8>]) -> Result<(), Self::Error> {
+        #[cfg(feature = "bench-serial")]
+        let started = embassy_time::Instant::now();
         let _ = self.cs.set_low();
         let mut result = Ok(());
 
-        for operation in operations {
+        for operation in operations.iter_mut() {
             result = match operation {
                 Operation::Read(buffer) => self.read_with_sd_clocks(buffer),
                 Operation::Write(buffer) => self.write_chunked(buffer),
@@ -209,6 +255,28 @@ where
 
         let _ = self.spi.flush();
         let _ = self.cs.set_high();
+        #[cfg(feature = "bench-serial")]
+        {
+            let micros = started.elapsed().as_micros() as u32;
+            let bytes: usize = operations
+                .iter()
+                .map(|operation| match operation {
+                    Operation::Read(buffer) => buffer.len(),
+                    Operation::Write(buffer) => buffer.len(),
+                    Operation::Transfer(read, write) => read.len().max(write.len()),
+                    Operation::TransferInPlace(buffer) => buffer.len(),
+                    Operation::DelayNs(_) => 0,
+                })
+                .sum();
+            if bytes <= sd_stats::SHORT_TXN_BYTES {
+                sd_stats::bump(&sd_stats::SPI_SHORT_TXNS, 1);
+                sd_stats::bump(&sd_stats::SPI_SHORT_MICROS, micros);
+            } else {
+                sd_stats::bump(&sd_stats::SPI_DATA_TXNS, 1);
+                sd_stats::bump(&sd_stats::SPI_DATA_BYTES, bytes as u32);
+                sd_stats::bump(&sd_stats::SPI_DATA_MICROS, micros);
+            }
+        }
         result
     }
 }
