@@ -32,6 +32,8 @@ sha2 = "0.10"
 [features]
 # Experimental, enabled only for matched SD throughput bench builds.
 contiguous-file-read = []
+# Experimental: batch whole-sector file writes into multi-block (CMD25) writes.
+contiguous-file-write = []
 default = ["log"]
 defmt-log = ["dep:defmt"]
 log = ["dep:log"]

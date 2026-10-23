@@ -38,6 +38,18 @@ impl Block {
         }
     }
 
+    /// Borrow complete sectors in caller-owned storage for a direct write.
+    #[cfg(feature = "contiguous-file-write")]
+    pub(crate) fn from_bytes(bytes: &[u8]) -> &[Self] {
+        assert_eq!(bytes.len() % Self::LEN, 0);
+        // SAFETY: Block is repr(transparent) over [u8; 512], hence size 512,
+        // alignment 1, and every bit pattern is valid. The slice has an exact
+        // number of blocks, and this shared borrow keeps the input's lifetime.
+        unsafe {
+            core::slice::from_raw_parts(bytes.as_ptr().cast::<Self>(), bytes.len() / Self::LEN)
+        }
+    }
+
     /// Sometimes we want `LEN` as a `u32` and the casts don't look nice.
     pub const LEN_U32: u32 = 512;
 

@@ -1027,6 +1027,45 @@ where
                 }
                 Err(e) => return Err(e),
             };
+            #[cfg(feature = "contiguous-file-write")]
+            if block_offset == 0 {
+                // `current_cluster` now holds the cluster containing
+                // `current_offset`, allocated and linked above if the file
+                // had to grow. FAT guarantees adjacent sectors only inside
+                // that cluster, so a batch stops at its end; the next
+                // iteration follows (or extends) the chain as usual.
+                let bytes_per_cluster = match &data.open_volumes[volume_idx].volume_type {
+                    VolumeType::Fat(fat) => fat.bytes_per_cluster(),
+                };
+                let cluster_remaining = bytes_per_cluster - (current_offset - current_cluster.0);
+                let available = (bytes_to_write - written)
+                    .min(cluster_remaining as usize)
+                    .min(16 * Block::LEN);
+                let count = available / Block::LEN;
+                if count > 1 {
+                    let byte_count = count * Block::LEN;
+                    let blocks = Block::from_bytes(&buffer[written..written + byte_count]);
+                    trace!("Writing {} blocks from {:?}", count, block_idx);
+                    // Direct access invalidates the single-sector cache, so it
+                    // can never hold a stale copy of a sector written here. A
+                    // device error leaves the file offset and length at this
+                    // batch's start, so callers can seek and retry.
+                    data.block_cache
+                        .block_device()
+                        .write(blocks, block_idx)
+                        .map_err(Error::DeviceError)?;
+                    written += byte_count;
+                    data.open_files[file_idx].current_cluster = current_cluster;
+                    let new_offset = current_offset + byte_count as u32;
+                    if new_offset > data.open_files[file_idx].entry.size {
+                        data.open_files[file_idx].update_length(new_offset);
+                    }
+                    data.open_files[file_idx]
+                        .seek_from_start(new_offset)
+                        .unwrap();
+                    continue;
+                }
+            }
             let to_copy = core::cmp::min(block_avail, bytes_to_write - written);
             let block = if (block_offset == 0) && (to_copy == block_avail) {
                 // we're replacing the whole Block, so the previous contents
