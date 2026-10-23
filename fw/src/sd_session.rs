@@ -47,6 +47,28 @@ pub(crate) mod sd_stats {
     pub(crate) static READ_MICROS: AtomicU32 = AtomicU32::new(0);
     #[cfg(feature = "bench-serial")]
     pub(crate) static WRITE_MICROS: AtomicU32 = AtomicU32::new(0);
+    /// SPI transactions on the card (bench builds only), split at
+    /// `SHORT_TXN_BYTES`: short ones carry command bytes and the R1, busy,
+    /// data-token and CRC polls; the rest move data blocks and registers.
+    /// Their wall time against READ_MICROS separates bus work from the
+    /// driver's own CPU time.
+    #[cfg(feature = "bench-serial")]
+    pub(crate) static SPI_SHORT_TXNS: AtomicU32 = AtomicU32::new(0);
+    #[cfg(feature = "bench-serial")]
+    pub(crate) static SPI_SHORT_MICROS: AtomicU32 = AtomicU32::new(0);
+    #[cfg(feature = "bench-serial")]
+    pub(crate) static SPI_DATA_TXNS: AtomicU32 = AtomicU32::new(0);
+    #[cfg(feature = "bench-serial")]
+    pub(crate) static SPI_DATA_BYTES: AtomicU32 = AtomicU32::new(0);
+    #[cfg(feature = "bench-serial")]
+    pub(crate) static SPI_DATA_MICROS: AtomicU32 = AtomicU32::new(0);
+    #[cfg(feature = "bench-serial")]
+    pub(crate) const SHORT_TXN_BYTES: usize = 8;
+    /// Block reads and writes that returned an error (bench builds only).
+    #[cfg(feature = "bench-serial")]
+    pub(crate) static READ_ERRORS: AtomicU32 = AtomicU32::new(0);
+    #[cfg(feature = "bench-serial")]
+    pub(crate) static WRITE_ERRORS: AtomicU32 = AtomicU32::new(0);
 
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub(crate) struct Snapshot {
@@ -91,35 +113,83 @@ pub(crate) mod sd_stats {
     }
 }
 
+/// The FAT layer hands a run of whole sectors within a cluster to one read
+/// or write call, which the X4 sends as a single multi-block command (CMD18
+/// or CMD25). No X3 has run either yet, so the X3 still moves such a run one
+/// CMD17 or CMD24 per sector, exactly as it did before batching.
+const SINGLE_BLOCK_IO: bool = cfg!(feature = "device-x3");
+
 /// Counts physical block transactions on their way to the SD card, so bench
-/// telemetry can report exact CMD17/CMD24-level traffic per workload.
+/// telemetry can report exact CMD17/CMD18/CMD24-level traffic per workload.
 pub(crate) struct CountingDevice<B>(B);
 
 impl<B: BlockDevice> BlockDevice for CountingDevice<B> {
     type Error = B::Error;
 
     fn read(&self, blocks: &mut [Block], start_block_idx: BlockIdx) -> Result<(), Self::Error> {
-        sd_stats::bump(&sd_stats::READ_CALLS, 1);
+        let commands = if SINGLE_BLOCK_IO { blocks.len() } else { 1 };
+        sd_stats::bump(&sd_stats::READ_CALLS, commands as u32);
         sd_stats::bump(&sd_stats::READ_BLOCKS, blocks.len() as u32);
         #[cfg(feature = "bench-serial")]
         let started = embassy_time::Instant::now();
-        let result = self.0.read(blocks, start_block_idx);
+        let result = if SINGLE_BLOCK_IO {
+            blocks
+                .iter_mut()
+                .zip(start_block_idx.0..)
+                .try_for_each(|(block, idx)| {
+                    self.0.read(core::slice::from_mut(block), BlockIdx(idx))
+                })
+        } else {
+            self.0.read(blocks, start_block_idx)
+        };
         #[cfg(feature = "bench-serial")]
-        sd_stats::bump(&sd_stats::READ_MICROS, started.elapsed().as_micros() as u32);
+        {
+            sd_stats::bump(&sd_stats::READ_MICROS, started.elapsed().as_micros() as u32);
+            if let Err(err) = &result {
+                sd_stats::bump(&sd_stats::READ_ERRORS, 1);
+                esp_println::println!(
+                    "bench: sd_error op=read block={} blocks={} err={:?}",
+                    start_block_idx.0,
+                    blocks.len(),
+                    err
+                );
+            }
+        }
         result
     }
 
     fn write(&self, blocks: &[Block], start_block_idx: BlockIdx) -> Result<(), Self::Error> {
-        sd_stats::bump(&sd_stats::WRITE_CALLS, 1);
+        let commands = if SINGLE_BLOCK_IO { blocks.len() } else { 1 };
+        sd_stats::bump(&sd_stats::WRITE_CALLS, commands as u32);
         sd_stats::bump(&sd_stats::WRITE_BLOCKS, blocks.len() as u32);
         #[cfg(feature = "bench-serial")]
         let started = embassy_time::Instant::now();
-        let result = self.0.write(blocks, start_block_idx);
+        let result = if SINGLE_BLOCK_IO {
+            blocks
+                .iter()
+                .zip(start_block_idx.0..)
+                .try_for_each(|(block, idx)| {
+                    self.0.write(core::slice::from_ref(block), BlockIdx(idx))
+                })
+        } else {
+            self.0.write(blocks, start_block_idx)
+        };
         #[cfg(feature = "bench-serial")]
-        sd_stats::bump(
-            &sd_stats::WRITE_MICROS,
-            started.elapsed().as_micros() as u32,
-        );
+        {
+            sd_stats::bump(
+                &sd_stats::WRITE_MICROS,
+                started.elapsed().as_micros() as u32,
+            );
+            if let Err(err) = &result {
+                sd_stats::bump(&sd_stats::WRITE_ERRORS, 1);
+                esp_println::println!(
+                    "bench: sd_error op=write block={} blocks={} err={:?}",
+                    start_block_idx.0,
+                    blocks.len(),
+                    err
+                );
+            }
+        }
         result
     }
 
@@ -159,8 +229,9 @@ pub(crate) struct SdSpiDevice<'a, SPI, CS> {
 }
 
 /// Also sizes the shared bus's RX DMA buffer in main.rs: SD traffic is the
-/// only read path on SPI2 (the EPD is write-only), and every SD operation
-/// bounces through one of these chunks.
+/// only read path on SPI2 (the EPD is write-only), and the bus moves every
+/// SD transfer through its DMA buffers in pieces this size. Writes also
+/// bounce through one of these chunks on the way.
 /// X4 transfers a full sector per DMA operation. X3 retains the smaller
 /// buffer because its static stack region is close to the link-time floor.
 pub(crate) const SD_SPI_CHUNK_BYTES: usize = if cfg!(feature = "device-x3") { 64 } else { 512 };
@@ -187,10 +258,12 @@ where
     CS: OutputPin,
 {
     fn transaction(&mut self, operations: &mut [Operation<'_, u8>]) -> Result<(), Self::Error> {
+        #[cfg(feature = "bench-serial")]
+        let started = embassy_time::Instant::now();
         let _ = self.cs.set_low();
         let mut result = Ok(());
 
-        for operation in operations {
+        for operation in operations.iter_mut() {
             result = match operation {
                 Operation::Read(buffer) => self.read_with_sd_clocks(buffer),
                 Operation::Write(buffer) => self.write_chunked(buffer),
@@ -209,6 +282,28 @@ where
 
         let _ = self.spi.flush();
         let _ = self.cs.set_high();
+        #[cfg(feature = "bench-serial")]
+        {
+            let micros = started.elapsed().as_micros() as u32;
+            let bytes: usize = operations
+                .iter()
+                .map(|operation| match operation {
+                    Operation::Read(buffer) => buffer.len(),
+                    Operation::Write(buffer) => buffer.len(),
+                    Operation::Transfer(read, write) => read.len().max(write.len()),
+                    Operation::TransferInPlace(buffer) => buffer.len(),
+                    Operation::DelayNs(_) => 0,
+                })
+                .sum();
+            if bytes <= sd_stats::SHORT_TXN_BYTES {
+                sd_stats::bump(&sd_stats::SPI_SHORT_TXNS, 1);
+                sd_stats::bump(&sd_stats::SPI_SHORT_MICROS, micros);
+            } else {
+                sd_stats::bump(&sd_stats::SPI_DATA_TXNS, 1);
+                sd_stats::bump(&sd_stats::SPI_DATA_BYTES, bytes as u32);
+                sd_stats::bump(&sd_stats::SPI_DATA_MICROS, micros);
+            }
+        }
         result
     }
 }
@@ -217,20 +312,22 @@ impl<SPI, CS> SdSpiDevice<'_, SPI, CS>
 where
     SPI: BlockingSpiBus<u8>,
 {
+    // Every operation goes out as a full-duplex transfer_in_place, which the
+    // DMA bus copies through its own buffers in SD_SPI_CHUNK_BYTES pieces.
+    // Clocking straight from the caller's buffer spares each one-byte poll
+    // a block-sized fill, and each data block two copies.
+
     fn read_with_sd_clocks(&mut self, buffer: &mut [u8]) -> Result<(), SPI::Error> {
-        for chunk in buffer.chunks_mut(SD_SPI_CHUNK_BYTES) {
-            let mut bounce = AlignedSdChunk([0xFF; SD_SPI_CHUNK_BYTES]);
-            self.spi.transfer_in_place(&mut bounce.0[..chunk.len()])?;
-            chunk.copy_from_slice(&bounce.0[..chunk.len()]);
-        }
-        Ok(())
+        buffer.fill(0xFF);
+        self.spi.transfer_in_place(buffer)
     }
 
     fn write_chunked(&mut self, buffer: &[u8]) -> Result<(), SPI::Error> {
         for chunk in buffer.chunks(SD_SPI_CHUNK_BYTES) {
             let mut bounce = AlignedSdChunk([0xFF; SD_SPI_CHUNK_BYTES]);
-            bounce.0[..chunk.len()].copy_from_slice(chunk);
-            self.spi.transfer_in_place(&mut bounce.0[..chunk.len()])?;
+            let bounce = &mut bounce.0[..chunk.len()];
+            bounce.copy_from_slice(chunk);
+            self.spi.transfer_in_place(bounce)?;
         }
         Ok(())
     }
@@ -240,16 +337,8 @@ where
         let (read_common, read_tail) = read.split_at_mut(common);
         let (write_common, write_tail) = write.split_at(common);
 
-        for (read_chunk, write_chunk) in read_common
-            .chunks_mut(SD_SPI_CHUNK_BYTES)
-            .zip(write_common.chunks(SD_SPI_CHUNK_BYTES))
-        {
-            let mut bounce = AlignedSdChunk([0xFF; SD_SPI_CHUNK_BYTES]);
-            bounce.0[..write_chunk.len()].copy_from_slice(write_chunk);
-            self.spi
-                .transfer_in_place(&mut bounce.0[..write_chunk.len()])?;
-            read_chunk.copy_from_slice(&bounce.0[..read_chunk.len()]);
-        }
+        read_common.copy_from_slice(write_common);
+        self.spi.transfer_in_place(read_common)?;
         if !read_tail.is_empty() {
             self.read_with_sd_clocks(read_tail)?;
         }
@@ -260,13 +349,7 @@ where
     }
 
     fn transfer_in_place_chunked(&mut self, buffer: &mut [u8]) -> Result<(), SPI::Error> {
-        for chunk in buffer.chunks_mut(SD_SPI_CHUNK_BYTES) {
-            let mut bounce = AlignedSdChunk([0xFF; SD_SPI_CHUNK_BYTES]);
-            bounce.0[..chunk.len()].copy_from_slice(chunk);
-            self.spi.transfer_in_place(&mut bounce.0[..chunk.len()])?;
-            chunk.copy_from_slice(&bounce.0[..chunk.len()]);
-        }
-        Ok(())
+        self.spi.transfer_in_place(buffer)
     }
 }
 

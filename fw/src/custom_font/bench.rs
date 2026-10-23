@@ -4,6 +4,7 @@
 //! invalidates temporary metric entries, then removes its verified fixture.
 
 use super::*;
+use crate::sd_session::sd_stats as stats;
 use proto::font_pack::{FontPackHeader, FONT_PACK_FACE_RECORD_BYTES, FONT_PACK_HEADER_BYTES};
 
 const NAME: &str = "FNTBENCH.BIN";
@@ -43,6 +44,7 @@ where
         );
         return false;
     }
+    memcpy_bench();
     let bulk_ok = sequential_read_bench(root);
     let result = exercise(root, fb, store, metrics) && bulk_ok;
     let removed = cleanup(root);
@@ -71,7 +73,12 @@ where
         return false;
     };
     let mut bytes = [0u8; 2048];
-    let before = crate::sd_session::sd_stats::snapshot();
+    let spi = spi_counters();
+    for counter in spi {
+        stats::take(counter);
+    }
+    stats::take(&stats::READ_MICROS);
+    let before = stats::snapshot();
     let started = embassy_time::Instant::now();
     let mut completed = 0;
     for _ in 0..ITERATIONS {
@@ -84,7 +91,9 @@ where
         completed += 1;
     }
     let elapsed_us = started.elapsed().as_micros();
-    let after = crate::sd_session::sd_stats::snapshot();
+    let after = stats::snapshot();
+    let read_us = stats::take(&stats::READ_MICROS);
+    let [short, short_us, data, data_bytes, data_us] = spi.map(stats::take);
     let ok = completed == ITERATIONS;
     esp_println::println!(
         "bench: sd_read_bulk ok={} bytes=2048 iterations={} expected_iterations={} elapsed_us={} rd_calls={} rd_blocks={}",
@@ -95,7 +104,61 @@ where
         after.read_calls.wrapping_sub(before.read_calls),
         after.read_blocks.wrapping_sub(before.read_blocks),
     );
+    // Where the read time went: short transactions (commands and polls),
+    // data transactions, and what the driver spent outside both.
+    esp_println::println!(
+        "bench: sd_spi read_us={} short_txns={} short_us={} data_txns={} data_bytes={} data_us={} rd_errors={}",
+        read_us,
+        short,
+        short_us,
+        data,
+        data_bytes,
+        data_us,
+        stats::READ_ERRORS.load(core::sync::atomic::Ordering::Relaxed),
+    );
     ok
+}
+
+/// Times the linked `memcpy` (the chip ROM's) on one card block, word-
+/// aligned and not, since every SD block is copied several times between
+/// the card and its reader.
+#[inline(never)]
+fn memcpy_bench() {
+    #[repr(align(4))]
+    struct Aligned([u8; 516]);
+    const ROUNDS: u32 = 64;
+    let mut src = Aligned([0; 516]);
+    let mut dst = Aligned([0; 516]);
+    for (i, byte) in src.0.iter_mut().enumerate() {
+        *byte = i as u8;
+    }
+    let mut time = |offset: usize| {
+        let started = embassy_time::Instant::now();
+        for _ in 0..ROUNDS {
+            let from = core::hint::black_box(&src.0[offset..offset + 512]);
+            dst.0[..512].copy_from_slice(from);
+            core::hint::black_box(&mut dst.0);
+        }
+        started.elapsed().as_micros()
+    };
+    let aligned = time(0);
+    let unaligned = time(1);
+    esp_println::println!(
+        "bench: memcpy bytes=512 rounds={} aligned_us={} unaligned_us={}",
+        ROUNDS,
+        aligned,
+        unaligned
+    );
+}
+
+fn spi_counters() -> [&'static core::sync::atomic::AtomicU32; 5] {
+    [
+        &stats::SPI_SHORT_TXNS,
+        &stats::SPI_SHORT_MICROS,
+        &stats::SPI_DATA_TXNS,
+        &stats::SPI_DATA_BYTES,
+        &stats::SPI_DATA_MICROS,
+    ]
 }
 
 fn reset_metrics(cache: &mut MetricCache) {

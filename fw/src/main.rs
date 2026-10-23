@@ -348,7 +348,7 @@ fn main() -> ! {
 
     // One display band must fit a single TX DMA buffer (X4 fills it
     // exactly; the X3's 99-byte rows leave 80 bytes slack). The RX side
-    // only ever carries the SD session's bounce chunk - the EPD is
+    // only ever carries SD traffic, a chunk at a time - the EPD is
     // write-only - so it stays at chunk size; every byte saved in .bss
     // is main-stack headroom now (see build.rs).
     const _: () = assert!(display::BAND_BYTES <= 8000);

@@ -18,3 +18,12 @@ The same validation found a separate directory-end lookup bug, fixed and
 measured in the follow-up documented in the performance report.
 
 Report: `docs/plans/2026-09-12-reader-performance.md`.
+
+## Comments
+
+2026-10-23: enabled on the `perf/sd-reads` branch, with a write-side
+counterpart (`contiguous-file-write`, CMD25). Cached opens still take the same
+time, but X4 image decodes got 5-16% faster, Euclid spacing reflows about 15%
+and browser uploads about 23%, with pixel-identical pages and no card errors on
+the one card tested. The X3 keeps single-block commands until it is tested.
+Numbers are in that branch's pull request.

@@ -262,15 +262,55 @@ where
             // wait for card to be ready before sending the next command
             self.wait_not_busy(Delay::new_write())?;
 
-            // Start a multi-block write
-            self.card_command(CMD25, start_idx)?;
-            for block in blocks.iter() {
-                self.wait_not_busy(Delay::new_write())?;
-                self.write_data(WRITE_MULTIPLE_TOKEN, &block.contents)?;
+            // Start a multi-block write. Any R1 error bit means the card did
+            // not enter the receive state, so send no data tokens it could
+            // misparse as commands, and there is no stream to stop.
+            if self.card_command(CMD25, start_idx)? != 0x00 {
+                return Err(Error::WriteError);
             }
-            // Stop the write
-            self.wait_not_busy(Delay::new_write())?;
-            self.write_byte(STOP_TRAN_TOKEN)?;
+            let write_result = blocks.iter().try_for_each(|block| {
+                self.wait_not_busy(Delay::new_write())?;
+                self.write_data(WRITE_MULTIPLE_TOKEN, &block.contents)
+            });
+            // Always end an accepted CMD25, including after a rejected data
+            // response, a busy timeout, or an SPI error. Otherwise the card
+            // stays in its receive state and a retry or the next command is
+            // swallowed as block data. Preserve the data error if the cleanup
+            // fails too, as the CMD18 path does.
+            let stop_result = self.stop_multiple_write();
+            write_result?;
+            stop_result?;
+        }
+        Ok(())
+    }
+
+    /// End a CMD25 stream and report the outcome of the programming.
+    ///
+    /// SPI mode ends a multiple-block write with the Stop Tran token in place
+    /// of the next start token (SD Physical Layer spec, 7.2.4). The spec's
+    /// data-response section (7.3.3.1) also asks for CMD12 after a rejected
+    /// block; we follow Linux `mmc_spi` and FatFs instead, which send the
+    /// token after a rejected block too. The card clocks out one byte (N_BR)
+    /// before raising busy, so skip it before polling, or a 0xFF there would
+    /// end the wait while the card is still programming.
+    ///
+    /// Each data response only says that block was received; whether the
+    /// card managed to program it (notably the last block) is known only once
+    /// busy ends. As on the single-block path, CMD13 then returns R1 and the
+    /// second R2 byte, both zero on success (7.3.2.3). Both bytes are always
+    /// read so the bus stays in step. On the error path the caller discards
+    /// this result, but the status read still clears the card's clear-on-read
+    /// error bits, which Linux also does after a failed SPI write, so a stale
+    /// flag cannot fail a later single-block write's own CMD13 check.
+    fn stop_multiple_write(&mut self) -> Result<(), Error> {
+        self.wait_not_busy(Delay::new_write())?;
+        self.write_byte(STOP_TRAN_TOKEN)?;
+        let _n_br = self.read_byte()?;
+        self.wait_not_busy(Delay::new_write())?;
+        let r1 = self.card_command(CMD13, 0)?;
+        let status = self.read_byte()?;
+        if r1 != 0x00 || status != 0x00 {
+            return Err(Error::WriteError);
         }
         Ok(())
     }
@@ -755,12 +795,21 @@ mod read_tests {
     use embedded_hal::spi::{ErrorKind, ErrorType, Operation, SpiDevice};
     use std::collections::VecDeque;
 
-    enum Step {
+    // Shared with `write_tests`: each step is one expected SPI operation.
+    pub(super) enum Step {
+        /// A 6-byte command frame for this command; `true` fails the SPI op.
         Command(u8, bool),
+        /// A one-byte read (host clocks out 0xFF); the card answers this byte.
         Byte(u8),
+        /// A data-block read of this length.
         Data(usize),
+        /// A one-byte write of this token (not 0xFF); `true` fails the SPI op.
+        Token(u8, bool),
+        /// A multi-byte write of this length, every byte equal to the given
+        /// value; `true` fails the SPI op.
+        Payload(usize, u8, bool),
     }
-    struct ScriptSpi(VecDeque<Step>);
+    pub(super) struct ScriptSpi(pub(super) VecDeque<Step>);
     impl ErrorType for ScriptSpi {
         type Error = ErrorKind;
     }
@@ -787,13 +836,28 @@ mod read_tests {
                         assert_eq!(bytes.len(), length);
                         bytes.fill(0);
                     }
+                    (Operation::Transfer(receive, transmit), Step::Token(token, fails)) => {
+                        assert_eq!(*transmit, &[token]);
+                        assert_eq!(receive.len(), 1);
+                        if fails {
+                            return Err(ErrorKind::Other);
+                        }
+                        receive[0] = 0xFF;
+                    }
+                    (Operation::Write(bytes), Step::Payload(length, value, fails)) => {
+                        assert_eq!(bytes.len(), length);
+                        assert!(bytes.iter().all(|&byte| byte == value));
+                        if fails {
+                            return Err(ErrorKind::Other);
+                        }
+                    }
                     _ => panic!("unexpected SPI operation kind"),
                 }
             }
             Ok(())
         }
     }
-    struct NoDelay;
+    pub(super) struct NoDelay;
     impl embedded_hal::delay::DelayNs for NoDelay {
         fn delay_ns(&mut self, _: u32) {}
     }
@@ -841,5 +905,202 @@ mod read_tests {
             }
             assert!(card.spi.0.is_empty(), "CMD12 cleanup was not consumed");
         }
+    }
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::read_tests::{NoDelay, ScriptSpi, Step};
+    use super::*;
+    use std::collections::VecDeque;
+
+    const ACCEPTED: u8 = 0xE5; // xxx0_0101: undefined high bits must be masked
+    const CRC_REJECTED: u8 = 0x0B; // xxx0_1011
+    const WRITE_REJECTED: u8 = 0x0D; // xxx0_1101
+
+    /// What happens to one block of a CMD25 stream.
+    #[derive(Clone, Copy)]
+    enum BlockOutcome {
+        /// The card returns this data response token.
+        Response(u8),
+        /// The SPI peripheral fails while the 512 data bytes go out.
+        PayloadFails,
+        /// The card stays busy before this block until the wait times out.
+        BusyTimeout,
+    }
+
+    /// How the cleanup after the data stream goes.
+    #[derive(Clone, Copy)]
+    enum Cleanup {
+        /// Stop token accepted; CMD13 answers R1 and the second status byte.
+        Status(u8, u8),
+        /// The SPI peripheral fails sending the Stop Tran token.
+        StopTokenFails,
+    }
+
+    fn command(steps: &mut VecDeque<Step>, command: u8, r1: u8) {
+        // card_command: wait not busy, frame, then poll R1.
+        steps.extend([
+            Step::Byte(0xFF),
+            Step::Command(command, false),
+            Step::Byte(r1),
+        ]);
+    }
+
+    fn block_fill(index: usize) -> u8 {
+        0x30 + index as u8
+    }
+
+    fn script(blocks: &[BlockOutcome], cleanup: Cleanup) -> VecDeque<Step> {
+        let mut steps = VecDeque::new();
+        command(&mut steps, CMD55, 0);
+        command(&mut steps, ACMD23, 0);
+        steps.push_back(Step::Byte(0xFF)); // not busy after ACMD23
+        command(&mut steps, CMD25, 0);
+        for (index, outcome) in blocks.iter().enumerate() {
+            match *outcome {
+                BlockOutcome::BusyTimeout => {
+                    let retries = Delay::DEFAULT_WRITE_RETRIES as usize;
+                    steps.extend((0..=retries).map(|_| Step::Byte(0x00)));
+                    break;
+                }
+                BlockOutcome::PayloadFails => {
+                    steps.extend([
+                        Step::Byte(0xFF), // not busy
+                        Step::Token(WRITE_MULTIPLE_TOKEN, false),
+                        Step::Payload(512, block_fill(index), true),
+                    ]);
+                    break;
+                }
+                BlockOutcome::Response(response) => {
+                    steps.extend([
+                        Step::Byte(0xFF), // not busy
+                        Step::Token(WRITE_MULTIPLE_TOKEN, false),
+                        Step::Payload(512, block_fill(index), false),
+                        Step::Payload(2, 0xFF, false), // CRC off: dummy CRC
+                        Step::Byte(response),
+                    ]);
+                    if response & DATA_RES_MASK != DATA_RES_ACCEPTED {
+                        break;
+                    }
+                }
+            }
+        }
+        steps.push_back(Step::Byte(0xFF)); // not busy before the stop token
+        match cleanup {
+            Cleanup::StopTokenFails => steps.push_back(Step::Token(STOP_TRAN_TOKEN, true)),
+            Cleanup::Status(r1, status) => {
+                steps.extend([
+                    Step::Token(STOP_TRAN_TOKEN, false),
+                    Step::Byte(0xFF), // N_BR: must not end the busy wait
+                ]);
+                // Programming outlasts the command timeout, so only the write
+                // timeout after the stop token can wait it out.
+                let busy = Delay::DEFAULT_COMMAND_RETRIES as usize + 1;
+                steps.extend((0..busy).map(|_| Step::Byte(0x00)));
+                steps.push_back(Step::Byte(0xFF)); // done
+                command(&mut steps, CMD13, r1);
+                steps.push_back(Step::Byte(status));
+            }
+        }
+        steps
+    }
+
+    fn run(steps: VecDeque<Step>, count: usize) -> (Result<(), Error>, VecDeque<Step>) {
+        let mut card = SdCardInner {
+            spi: ScriptSpi(steps),
+            delayer: NoDelay,
+            card_type: Some(CardType::SDHC),
+            options: AcquireOpts {
+                use_crc: false,
+                ..AcquireOpts::default()
+            },
+        };
+        let blocks: Vec<Block> = (0..count)
+            .map(|index| Block {
+                contents: [block_fill(index); Block::LEN],
+            })
+            .collect();
+        let result = card.write(&blocks, BlockIdx(123));
+        (result, card.spi.0)
+    }
+
+    #[test]
+    fn cmd25_success_stops_the_stream_and_checks_status() {
+        let ok = BlockOutcome::Response(ACCEPTED);
+        let (result, left) = run(script(&[ok, ok, ok], Cleanup::Status(0, 0)), 3);
+        assert!(result.is_ok(), "{result:?}");
+        assert!(left.is_empty(), "CMD25 script was not consumed");
+    }
+
+    #[test]
+    fn cmd25_always_stops_and_preserves_the_original_write_error() {
+        let ok = BlockOutcome::Response(ACCEPTED);
+        for (blocks, expected) in [
+            // Rejected on the first block (CRC) and on a later one (write error).
+            (
+                vec![BlockOutcome::Response(CRC_REJECTED)],
+                Error::WriteError,
+            ),
+            (
+                vec![ok, ok, BlockOutcome::Response(WRITE_REJECTED)],
+                Error::WriteError,
+            ),
+            // The SPI peripheral fails mid-block.
+            (vec![ok, BlockOutcome::PayloadFails], Error::Transport),
+            // The card never leaves busy between blocks.
+            (
+                vec![ok, BlockOutcome::BusyTimeout],
+                Error::TimeoutWaitNotBusy,
+            ),
+        ] {
+            // A clean status and a status that reports trouble too: the
+            // original error wins either way.
+            for cleanup in [Cleanup::Status(0, 0), Cleanup::Status(0, 0x04)] {
+                let (result, left) = run(script(&blocks, cleanup), 3);
+                assert_eq!(
+                    core::mem::discriminant(&result.unwrap_err()),
+                    core::mem::discriminant(&expected)
+                );
+                assert!(left.is_empty(), "Stop Tran cleanup was not consumed");
+            }
+        }
+    }
+
+    #[test]
+    fn cmd25_cleanup_failure_preserves_the_data_error_or_is_reported() {
+        let ok = BlockOutcome::Response(ACCEPTED);
+        // Data rejected, then the stop token cannot be sent: keep the data error.
+        let blocks = [ok, BlockOutcome::Response(WRITE_REJECTED)];
+        let (result, left) = run(script(&blocks, Cleanup::StopTokenFails), 3);
+        assert!(matches!(result, Err(Error::WriteError)), "{result:?}");
+        assert!(left.is_empty());
+        // Every block accepted, but stopping fails: report the stop failure.
+        let (result, left) = run(script(&[ok, ok], Cleanup::StopTokenFails), 2);
+        assert!(matches!(result, Err(Error::Transport)), "{result:?}");
+        assert!(left.is_empty());
+    }
+
+    #[test]
+    fn cmd25_reports_a_failed_program_from_the_final_status() {
+        let ok = BlockOutcome::Response(ACCEPTED);
+        // Card ECC failure in the R2 status byte, then an R1 error bit.
+        for cleanup in [Cleanup::Status(0, 0x10), Cleanup::Status(0x04, 0)] {
+            let (result, left) = run(script(&[ok, ok], cleanup), 2);
+            assert!(matches!(result, Err(Error::WriteError)), "{result:?}");
+            assert!(left.is_empty());
+        }
+    }
+
+    #[test]
+    fn rejected_cmd25_sends_no_data_and_needs_no_stop() {
+        let mut steps = VecDeque::new();
+        command(&mut steps, CMD55, 0);
+        command(&mut steps, ACMD23, 0);
+        steps.push_back(Step::Byte(0xFF));
+        command(&mut steps, CMD25, 0x20); // address error
+        let (result, left) = run(steps, 2);
+        assert!(matches!(result, Err(Error::WriteError)), "{result:?}");
+        assert!(left.is_empty());
     }
 }
