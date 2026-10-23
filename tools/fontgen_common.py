@@ -14,6 +14,15 @@ import sys
 import PIL
 from PIL import Image, ImageDraw, ImageFont, features
 
+# The table format lives in font_module, which needs no Pillow, so the
+# pack converter can use it too. Re-exported here for the generators.
+from font_module import (  # noqa: F401
+    KERNING_CODEPOINTS,
+    FontModule,
+    read_module_glyphs,
+    write_generated,
+)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -74,10 +83,6 @@ ADVANCE_SCALE = 16
 DEFAULT_THRESHOLD = 128
 MIN_KERNING_ADJUST_FP = 8
 MAX_KERNING_ENTRIES = 1024
-KERNING_CODEPOINTS = frozenset(
-    list(range(0x20, 0x7F))
-    + [0x2018, 0x2019, 0x201C, 0x201D, 0x2013, 0x2014, 0x2026]
-)
 
 
 def text_render_threshold() -> int:
@@ -541,19 +546,8 @@ def kerning_entries(font_path: Path, cps, px: int):
     return sorted(entries[:MAX_KERNING_ENTRIES])
 
 
-def write_generated(path: Path, out) -> None:
-    """Write a generated module ending in exactly one newline, as rustfmt leaves it."""
-    path.write_text("".join(out).rstrip("\n") + "\n")
-    print(f"wrote {path}")
-
-
-def write_kerning(out, name, entries, count_name=None):
-    count = count_name or f"{name}_KERNING_COUNT"
-    out.append(f"#[rustfmt::skip]\npub const {count}: usize = {len(entries)};\n")
-    out.append(f"#[rustfmt::skip]\npub static {name}_KERNING: [KerningEntry; {count}] = [\n")
-    for left, right, adjust_fp in entries:
-        out.append(
-            "    KerningEntry { "
-            f"left: 0x{left:04X}, right: 0x{right:04X}, adjust_fp: {adjust_fp} }},\n"
-        )
-    out.append("];\n\n")
+def missing_codepoints(path: Path, cps):
+    """Codepoints the face's cmap lacks; Pillow draws its .notdef box there."""
+    data, tables = font_tables(path)
+    cmap = parse_cmap(data, tables)
+    return {cp for cp in cps if cp not in cmap}

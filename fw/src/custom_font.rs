@@ -69,13 +69,39 @@ const EMPTY_METRIC_SLOT: MetricSlot = MetricSlot {
     records: [[0u8; FONT_PACK_METRIC_BYTES]; ASCII_METRIC_COUNT],
 };
 
+/// A glyph record from a custom pack: where its bits sit in the face's
+/// bitmap block, then its placement and advance. Built-in faces keep these
+/// in `display::font`; a pack keeps its own fixed 12-byte records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PackGlyph {
+    offset: usize,
+    len: usize,
+    width: u8,
+    height: u8,
+    x_offset: i8,
+    y_offset: i8,
+    advance_fp: u16,
+}
+
+impl PackGlyph {
+    fn metric(&self) -> GlyphMetric {
+        GlyphMetric {
+            width: self.width,
+            height: self.height,
+            x_offset: self.x_offset,
+            y_offset: self.y_offset,
+            advance_fp: self.advance_fp,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct NonAsciiMetricSlot {
     key: Option<(u64, u32, u16)>,
-    metric: GlyphMetric,
+    metric: PackGlyph,
 }
 
-const EMPTY_GLYPH_METRIC: GlyphMetric = GlyphMetric {
+const EMPTY_PACK_GLYPH: PackGlyph = PackGlyph {
     offset: 0,
     len: 0,
     width: 0,
@@ -87,7 +113,7 @@ const EMPTY_GLYPH_METRIC: GlyphMetric = GlyphMetric {
 
 const EMPTY_NON_ASCII_SLOT: NonAsciiMetricSlot = NonAsciiMetricSlot {
     key: None,
-    metric: EMPTY_GLYPH_METRIC,
+    metric: EMPTY_PACK_GLYPH,
 };
 
 impl MetricCache {
@@ -108,7 +134,7 @@ impl MetricCache {
 
     /// Serve a cached ASCII metric without touching the card. `None` means
     /// the caller must open the pack: non-ASCII char or unfilled face.
-    fn lookup(&self, identity: u64, face: FontPackFaceRecord, ch: char) -> Option<GlyphMetric> {
+    fn lookup(&self, identity: u64, face: FontPackFaceRecord, ch: char) -> Option<PackGlyph> {
         if Self::ascii_index(ch).is_none() {
             let codepoint = u16::try_from(ch as u32).unwrap_or(b'?' as u16);
             return self
@@ -140,7 +166,7 @@ impl MetricCache {
         identity: u64,
         face: FontPackFaceRecord,
         ch: char,
-    ) -> Option<GlyphMetric>
+    ) -> Option<PackGlyph>
     where
         D: embedded_sdmmc::BlockDevice,
         T: TimeSource,
@@ -345,9 +371,9 @@ pub(crate) fn for_each_metric<
             }
             continue;
         }
-        let metric = custom_face(source, size, weight, style)
+        let glyph = custom_face(source, size, weight, style)
             .and_then(|face| cache.fill_and_lookup(&file, identity, face, ch));
-        visit(style, metric);
+        visit(style, glyph.map(|glyph| glyph.metric()));
     }
 }
 
@@ -744,7 +770,7 @@ where
         Some(fixed_round(cursor_fp))
     }
 
-    fn metric_for_char(&mut self, face: FontPackFaceRecord, ch: char) -> Option<GlyphMetric> {
+    fn metric_for_char(&mut self, face: FontPackFaceRecord, ch: char) -> Option<PackGlyph> {
         let identity = self.source.custom_font_identity();
         if let Some(metric) = self.cache.lookup(identity, face, ch) {
             return Some(metric);
@@ -756,7 +782,7 @@ where
         &mut self,
         fb: &mut Framebuffer,
         face: FontPackFaceRecord,
-        metric: GlyphMetric,
+        metric: PackGlyph,
         x: i16,
         baseline_y: i16,
     ) -> Option<()> {
@@ -834,7 +860,7 @@ fn metric_for_char<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MA
     file: &File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     face: FontPackFaceRecord,
     ch: char,
-) -> Option<GlyphMetric>
+) -> Option<PackGlyph>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
@@ -851,7 +877,7 @@ fn metric<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES
     file: &File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     face: FontPackFaceRecord,
     codepoint: u16,
-) -> Option<GlyphMetric>
+) -> Option<PackGlyph>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
@@ -869,8 +895,8 @@ where
     Some(decode_metric(&bytes))
 }
 
-fn decode_metric(bytes: &[u8; FONT_PACK_METRIC_BYTES]) -> GlyphMetric {
-    GlyphMetric {
+fn decode_metric(bytes: &[u8; FONT_PACK_METRIC_BYTES]) -> PackGlyph {
+    PackGlyph {
         offset: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize,
         len: u16::from_le_bytes([bytes[4], bytes[5]]) as usize,
         width: bytes[6],

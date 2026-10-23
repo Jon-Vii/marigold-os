@@ -245,7 +245,7 @@ fn merge(out: &mut u8, bits: u8, mask: u8) {
 /// first, each row's first column in its top bit. Returns its columns,
 /// first column first, each with row 0 in its top bit.
 #[inline(always)]
-fn transpose8(mut high: u32, mut low: u32) -> [u8; 8] {
+pub(super) fn transpose8(mut high: u32, mut low: u32) -> [u8; 8] {
     let mut t = (high ^ (high >> 7)) & 0x00AA_00AA;
     high ^= t ^ (t << 7);
     t = (low ^ (low >> 7)) & 0x00AA_00AA;

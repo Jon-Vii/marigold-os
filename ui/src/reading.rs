@@ -1187,16 +1187,17 @@ impl InkCursor {
         } else {
             ch as u16
         };
-        let Some((metric, _)) = font.glyph(codepoint).or_else(|| font.glyph(b'?' as u16)) else {
-            self.advance_fp += 8 << 4;
-            self.right = self.right.max(fixed_ceil(self.advance_fp));
-            self.previous = Some(b'?' as u16);
-            return;
-        };
-        let drawn = if font.glyph(codepoint).is_some() {
-            codepoint
-        } else {
-            b'?' as u16
+        let (drawn, metric) = match font.metric(codepoint) {
+            Some(metric) => (codepoint, metric),
+            None => {
+                let Some(metric) = font.metric(b'?' as u16) else {
+                    self.advance_fp += 8 << 4;
+                    self.right = self.right.max(fixed_ceil(self.advance_fp));
+                    self.previous = Some(b'?' as u16);
+                    return;
+                };
+                (b'?' as u16, metric)
+            }
         };
         if let Some(left) = self.previous {
             self.advance_fp += font.kerning_adjust_fp(left, drawn) as i32;
@@ -1965,8 +1966,7 @@ mod tests {
             let mut tallest = 0;
             for style in STYLES {
                 let font = body_font(settings, style);
-                for (index, metric) in font.metrics.iter().enumerate() {
-                    let codepoint = font.codepoints[index];
+                for (codepoint, metric) in font.glyphs() {
                     // A glyph inks rows `baseline + y_offset` through
                     // `baseline + y_offset + height - 1`.
                     let first = i16::from(metric.y_offset);
@@ -2324,8 +2324,7 @@ mod tests {
                 );
                 for style in STYLES {
                     let font = body_font(settings, style);
-                    for (index, metric) in font.metrics.iter().enumerate() {
-                        let codepoint = font.codepoints[index];
+                    for (codepoint, metric) in font.glyphs() {
                         let first = i16::from(metric.y_offset);
                         let last = first + i16::from(metric.height) - 1;
                         assert!(
@@ -2665,9 +2664,9 @@ mod tests {
             } else {
                 ch as u16
             };
-            let (drawn, metric) = if let Some((metric, _)) = font.glyph(codepoint) {
+            let (drawn, metric) = if let Some(metric) = font.metric(codepoint) {
                 (codepoint, metric)
-            } else if let Some((metric, _)) = font.glyph(b'?' as u16) {
+            } else if let Some(metric) = font.metric(b'?' as u16) {
                 (b'?' as u16, metric)
             } else {
                 advance_fp += 8 << 4;

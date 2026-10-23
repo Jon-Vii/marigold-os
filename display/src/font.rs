@@ -1,4 +1,4 @@
-use crate::fb::Framebuffer;
+use crate::fb::{Framebuffer, GlyphPainter};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FontStyle {
@@ -34,10 +34,11 @@ pub fn style_from_marker_code(code: char) -> Option<FontStyle> {
     }
 }
 
+/// Where a glyph sits and how far it advances: its box is `width` x
+/// `height` pixels with its top-left corner `x_offset`, `y_offset` from the
+/// pen position on the baseline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GlyphMetric {
-    pub offset: usize,
-    pub len: usize,
     pub width: u8,
     pub height: u8,
     pub x_offset: i8,
@@ -46,38 +47,261 @@ pub struct GlyphMetric {
     pub advance_fp: u16,
 }
 
+/// A built-in glyph: its metric and the byte offset of its bitmap record in
+/// [`BitmapFont::bitmap`]. Identical glyphs share one record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct KerningEntry {
-    pub left: u16,
-    pub right: u16,
-    /// Kerning adjustment in 12.4 fixed-point pixels.
-    pub adjust_fp: i16,
+pub struct GlyphEntry {
+    pub bitmap: u16,
+    pub metric: GlyphMetric,
 }
 
+impl GlyphEntry {
+    /// The constructor generated tables use, to keep them short.
+    pub const fn new(
+        bitmap: u16,
+        width: u8,
+        height: u8,
+        x_offset: i8,
+        y_offset: i8,
+        advance_fp: u16,
+    ) -> Self {
+        Self {
+            bitmap,
+            metric: GlyphMetric {
+                width,
+                height,
+                x_offset,
+                y_offset,
+                advance_fp,
+            },
+        }
+    }
+}
+
+/// A run of consecutive codepoints a font covers, `first..=last`, whose
+/// glyph slots start at `slot`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CodepointRange {
+    pub first: u16,
+    pub last: u16,
+    pub slot: u16,
+}
+
+/// The codepoints kerning pairs can name, in kerning-index order: printable
+/// ASCII, then the dashes, curly quotes and ellipsis.
+/// `tools/fontgen_common.py` writes kerning in this order.
+pub const KERNING_CODEPOINTS: [u16; 102] = {
+    let mut out = [0u16; 102];
+    let mut i = 0;
+    while i < 95 {
+        out[i] = 0x20 + i as u16;
+        i += 1;
+    }
+    let punctuation = [0x2013, 0x2014, 0x2018, 0x2019, 0x201C, 0x201D, 0x2026];
+    let mut j = 0;
+    while j < punctuation.len() {
+        out[95 + j] = punctuation[j];
+        j += 1;
+    }
+    out
+};
+
+/// Entries in [`BitmapFont::kern_rows`]: one start per kerning codepoint
+/// plus the end of the last run.
+pub const KERN_ROWS: usize = KERNING_CODEPOINTS.len() + 1;
+
+#[inline]
+fn kerning_index(codepoint: u16) -> Option<usize> {
+    Some(match codepoint {
+        0x20..=0x7E => (codepoint - 0x20) as usize,
+        0x2013 => 95,
+        0x2014 => 96,
+        0x2018 => 97,
+        0x2019 => 98,
+        0x201C => 99,
+        0x201D => 100,
+        0x2026 => 101,
+        _ => return None,
+    })
+}
+
+/// A typeface at one size, rasterized to 1 bpp by the `tools/generate_*.py`
+/// scripts.
+///
+/// - `ranges` maps a codepoint to its glyph slot.
+/// - `present` has a bit per slot (least significant first in each word),
+///   set where the face has its own glyph. A clear bit means the face draws
+///   its missing-glyph box there, which is the last of `glyphs`, so those
+///   slots cost no entry. Empty when every slot is present.
+///   `present_rank[w]` counts the set bits before word `w`.
+/// - `glyphs` holds the present slots in order, then the missing-glyph box.
+/// - `bitmap` holds each glyph's rows, MSB first: per row a `0` bit repeats
+///   the row above (an empty row above the first), or a `1` bit is followed
+///   by `width` bits of the row. Records start on a byte.
+/// - `kern` holds the kerning pairs grouped by left codepoint, in
+///   [`KERNING_CODEPOINTS`] order, `kern_rows[i]..kern_rows[i + 1]` for left
+///   index `i`. Each pair is `right index << 9` plus the adjustment in 12.4
+///   fixed-point pixels as a 9-bit two's complement, sorted by right index.
 pub struct BitmapFont {
-    pub codepoints: &'static [u16],
     pub line_height: u8,
     pub baseline: u8,
-    pub metrics: &'static [GlyphMetric],
+    pub ranges: &'static [CodepointRange],
+    pub present: &'static [u32],
+    pub present_rank: &'static [u16],
+    pub glyphs: &'static [GlyphEntry],
     pub bitmap: &'static [u8],
-    pub kerning: &'static [KerningEntry],
+    pub kern_rows: &'static [u16; KERN_ROWS],
+    pub kern: &'static [u16],
 }
 
 impl BitmapFont {
-    pub fn glyph(&self, codepoint: u16) -> Option<(&GlyphMetric, &'static [u8])> {
-        let index = self.codepoints.binary_search(&codepoint).ok()?;
-        let metric = self.metrics.get(index)?;
-        Some((
-            metric,
-            &self.bitmap[metric.offset..metric.offset + metric.len],
-        ))
+    #[inline]
+    fn slot(&self, codepoint: u16) -> Option<usize> {
+        for range in self.ranges {
+            if codepoint < range.first {
+                return None;
+            }
+            if codepoint <= range.last {
+                return Some((range.slot + (codepoint - range.first)) as usize);
+            }
+        }
+        None
+    }
+
+    #[inline]
+    fn entry_at(&self, slot: usize) -> Option<&'static GlyphEntry> {
+        let glyphs: &'static [GlyphEntry] = self.glyphs;
+        if self.present.is_empty() {
+            return glyphs.get(slot);
+        }
+        let word = *self.present.get(slot / 32)?;
+        let bit = 1u32 << (slot % 32);
+        let index = if word & bit == 0 {
+            glyphs.len().checked_sub(1)?
+        } else {
+            self.present_rank[slot / 32] as usize + (word & (bit - 1)).count_ones() as usize
+        };
+        glyphs.get(index)
+    }
+
+    /// The glyph the face draws for `codepoint`, if it covers it.
+    #[inline]
+    pub fn entry(&self, codepoint: u16) -> Option<&'static GlyphEntry> {
+        self.entry_at(self.slot(codepoint)?)
+    }
+
+    /// The metric of the glyph the face draws for `codepoint`, if it covers
+    /// it.
+    #[inline]
+    pub fn metric(&self, codepoint: u16) -> Option<GlyphMetric> {
+        self.entry(codepoint).map(|entry| entry.metric)
+    }
+
+    /// Every covered codepoint and its metric, in codepoint order.
+    pub fn glyphs(&self) -> impl Iterator<Item = (u16, GlyphMetric)> + '_ {
+        self.ranges.iter().flat_map(move |range| {
+            (range.first..=range.last).filter_map(move |codepoint| {
+                let slot = (range.slot + (codepoint - range.first)) as usize;
+                Some((codepoint, self.entry_at(slot)?.metric))
+            })
+        })
     }
 
     pub fn kerning_adjust_fp(&self, left: u16, right: u16) -> i16 {
-        self.kerning
-            .binary_search_by(|entry| (entry.left, entry.right).cmp(&(left, right)))
-            .map(|index| self.kerning[index].adjust_fp)
-            .unwrap_or(0)
+        let (Some(left), Some(right)) = (kerning_index(left), kerning_index(right)) else {
+            return 0;
+        };
+        let start = self.kern_rows[left] as usize;
+        let end = self.kern_rows[left + 1] as usize;
+        let Some(pairs) = self.kern.get(start..end) else {
+            return 0;
+        };
+        let right = right as u16;
+        match pairs.binary_search_by(|pair| (pair >> 9).cmp(&right)) {
+            // Sign-extend the low 9 bits.
+            Ok(index) => ((pairs[index] << 7) as i16) >> 7,
+            Err(_) => 0,
+        }
+    }
+
+    /// Decode a glyph's rows top to bottom: `row(y, bits)` with the row's
+    /// pixels from bit 63 down. Glyphs are at most 64 pixels wide.
+    #[inline]
+    pub fn rows(&self, entry: &GlyphEntry, mut row: impl FnMut(u32, u64)) {
+        let (width, height) = (entry.metric.width as u32, entry.metric.height as u32);
+        if width == 0 || height == 0 || width > 64 {
+            return;
+        }
+        let mut bits = Bits::new(self.bitmap.get(entry.bitmap as usize..).unwrap_or(&[]));
+        let mut previous = 0u64;
+        // One call site for `row`, so it inlines into the glyph loop.
+        for y in 0..height {
+            bits.refill();
+            if bits.take(1) == 1 {
+                previous = if width <= 24 {
+                    ((bits.take(width) << (32 - width)) as u64) << 32
+                } else {
+                    bits.wide(width)
+                };
+            }
+            row(y, previous);
+        }
+    }
+}
+
+/// MSB-first reader over a glyph's bitmap record. Past the end of the
+/// table it reads zeros.
+struct Bits<'a> {
+    data: &'a [u8],
+    next: usize,
+    buffer: u32,
+    count: u32,
+}
+
+impl<'a> Bits<'a> {
+    #[inline]
+    fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            next: 0,
+            buffer: 0,
+            count: 0,
+        }
+    }
+
+    /// Buffer at least 25 bits.
+    #[inline]
+    fn refill(&mut self) {
+        while self.count <= 24 {
+            let byte = self.data.get(self.next).copied().unwrap_or(0);
+            self.next += 1;
+            self.buffer |= (byte as u32) << (24 - self.count);
+            self.count += 8;
+        }
+    }
+
+    /// The next `n` (1..=25) bits; `refill` first.
+    #[inline]
+    fn take(&mut self, n: u32) -> u32 {
+        let value = self.buffer >> (32 - n);
+        self.buffer <<= n;
+        self.count -= n;
+        value
+    }
+
+    /// A row 25..=64 pixels wide, MSB-first in a u64. Out of line: wide
+    /// glyphs are rare.
+    #[inline(never)]
+    fn wide(&mut self, width: u32) -> u64 {
+        let mut value = 0u64;
+        let mut left = width;
+        while left > 0 {
+            self.refill();
+            let n = left.min(16);
+            value = (value << n) | self.take(n) as u64;
+            left -= n;
+        }
+        value << (64 - width)
     }
 }
 
@@ -398,31 +622,33 @@ pub fn draw_text(
 ) -> i16 {
     let mut cursor_fp = (x as i32) << 4;
     let mut previous = None;
+    let fallback = font.entry(b'?' as u16);
     for ch in text.chars() {
         // Characters past the BMP have no glyphs; draw the same `?` that
         // `measure_text` counts, so centred and right-aligned text lines up.
         let codepoint = u16::try_from(ch as u32).unwrap_or(b'?' as u16);
-        let drawn = if font.glyph(codepoint).is_some() {
-            codepoint
-        } else {
-            b'?' as u16
+        let (drawn, entry) = match font.entry(codepoint) {
+            Some(entry) => (codepoint, Some(entry)),
+            None => (b'?' as u16, fallback),
         };
         if let Some(left) = previous {
             cursor_fp += font.kerning_adjust_fp(left, drawn) as i32;
         }
         let x = fixed_round(cursor_fp);
-        let (advance_fp, drawn) = draw_glyph(fb, font, codepoint, x, baseline_y, white);
-        cursor_fp += advance_fp as i32;
+        cursor_fp += match entry {
+            Some(entry) => {
+                draw_glyph(fb, font, entry, x, baseline_y, white);
+                entry.metric.advance_fp as i32
+            }
+            None => 8 << 4,
+        };
         previous = Some(drawn);
     }
     fixed_round(cursor_fp)
 }
 
 pub fn measure_text(font: &BitmapFont, text: &str) -> u16 {
-    let fallback = font
-        .glyph(b'?' as u16)
-        .map(|(m, _)| m.advance_fp)
-        .unwrap_or(8 << 4);
+    let fallback = font.metric(b'?' as u16);
     let mut advance_fp = 0i32;
     let mut previous = None;
     for ch in text.chars() {
@@ -431,12 +657,12 @@ pub fn measure_text(font: &BitmapFont, text: &str) -> u16 {
         } else {
             ch as u16
         };
-        let (advance, measured) = if let Some((metric, _)) = font.glyph(codepoint) {
+        let (advance, measured) = if let Some(metric) = font.metric(codepoint) {
             (metric.advance_fp, codepoint)
-        } else if let Some((metric, _)) = font.glyph(b'?' as u16) {
+        } else if let Some(metric) = fallback {
             (metric.advance_fp, b'?' as u16)
         } else {
-            (fallback, b'?' as u16)
+            (8 << 4, b'?' as u16)
         };
         if let Some(left) = previous {
             advance_fp += font.kerning_adjust_fp(left, measured) as i32;
@@ -447,48 +673,27 @@ pub fn measure_text(font: &BitmapFont, text: &str) -> u16 {
     fixed_ceil(advance_fp).max(0) as u16
 }
 
+/// Paint one glyph with its pen position at `x` on the baseline.
+#[inline]
 fn draw_glyph(
     fb: &mut Framebuffer,
     font: &BitmapFont,
-    codepoint: u16,
+    entry: &GlyphEntry,
     x: i16,
     baseline_y: i16,
     white: bool,
-) -> (u16, u16) {
-    let (drawn, metric, bitmap) = if let Some((metric, bitmap)) = font.glyph(codepoint) {
-        (codepoint, metric, bitmap)
-    } else if let Some((metric, bitmap)) = font.glyph(b'?' as u16) {
-        (b'?' as u16, metric, bitmap)
-    } else {
-        return (8 << 4, b'?' as u16);
-    };
-
-    let glyph_x = x + metric.x_offset as i16;
-    let glyph_y = baseline_y + metric.y_offset as i16;
-    let row_bytes = (metric.width as usize).div_ceil(8);
-    for y in 0..metric.height as usize {
-        for x_byte in 0..row_bytes {
-            let byte = bitmap[y * row_bytes + x_byte];
-            if byte == 0 {
-                continue;
-            }
-            for bit in 0..8 {
-                let px = x_byte * 8 + bit;
-                if px >= metric.width as usize {
-                    break;
-                }
-                if byte & (0x80 >> bit) != 0 {
-                    let draw_x = glyph_x + px as i16;
-                    let draw_y = glyph_y + y as i16;
-                    if draw_x >= 0 && draw_y >= 0 {
-                        fb.set_pixel(draw_x as usize, draw_y as usize, white);
-                    }
-                }
-            }
-        }
-    }
-
-    (metric.advance_fp, drawn)
+) {
+    let metric = entry.metric;
+    let mut painter = GlyphPainter::new(
+        fb,
+        x as i32 + metric.x_offset as i32,
+        baseline_y as i32 + metric.y_offset as i32,
+        metric.width as u32,
+        metric.height as u32,
+        white,
+    );
+    font.rows(entry, |row, bits| painter.row(row, bits));
+    painter.finish();
 }
 
 #[inline]
@@ -504,6 +709,7 @@ pub fn fixed_ceil(value_fp: i32) -> i16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fb::FbFrame;
 
     #[test]
     fn drawing_advances_exactly_as_far_as_measuring() {
@@ -519,6 +725,174 @@ mod tests {
                 (0..=1).contains(&(measured - end)),
                 "{text}: {measured} vs {end}"
             );
+        }
+    }
+
+    /// Every built-in face, for the table checks below.
+    fn all_fonts() -> std::vec::Vec<&'static BitmapFont> {
+        use crate::literata_extra_generated as extra;
+        let mut fonts = std::vec::Vec::new();
+        for size in [FontSize::Small, FontSize::Medium, FontSize::Large] {
+            for style in [
+                FontStyle::Regular,
+                FontStyle::Italic,
+                FontStyle::Bold,
+                FontStyle::BoldItalic,
+            ] {
+                fonts.push(literata_sized(size, style));
+                fonts.push(merriweather_sized(size, style));
+            }
+            fonts.push(semibold_sized(size, false));
+            fonts.push(semibold_sized(size, true));
+        }
+        fonts.extend([
+            &extra::LITERATA_SMALL_REGULAR,
+            &extra::LITERATA_SMALL_ITALIC,
+            &extra::LITERATA_SMALL_BOLD,
+            &extra::LITERATA_DISPLAY_REGULAR,
+        ]);
+        fonts
+    }
+
+    #[test]
+    fn tables_are_consistent() {
+        let fonts = all_fonts();
+        assert_eq!(fonts.len(), 34);
+        for font in fonts {
+            let slots: usize = font
+                .ranges
+                .iter()
+                .map(|r| (r.last - r.first) as usize + 1)
+                .sum();
+            assert_eq!(font.glyphs().count(), slots);
+            if !font.present.is_empty() {
+                assert_eq!(font.present.len(), slots.div_ceil(32));
+                let present: u32 = font.present.iter().map(|w| w.count_ones()).sum();
+                assert_eq!(present as usize + 1, font.glyphs.len());
+            }
+            for entry in font.glyphs {
+                let mut rows = 0;
+                font.rows(entry, |y, bits| {
+                    assert_eq!(y, rows);
+                    rows += 1;
+                    let width = entry.metric.width as u32;
+                    assert_eq!(bits.checked_shl(width).unwrap_or(0), 0);
+                });
+                let drawn = entry.metric.width > 0 && entry.metric.height > 0;
+                assert_eq!(rows, if drawn { entry.metric.height as u32 } else { 0 });
+            }
+            assert_eq!(font.kern_rows[0], 0);
+            assert_eq!(font.kern_rows[KERN_ROWS - 1] as usize, font.kern.len());
+            for run in font.kern_rows.windows(2) {
+                let pairs = &font.kern[run[0] as usize..run[1] as usize];
+                assert!(pairs.windows(2).all(|p| p[0] >> 9 < p[1] >> 9));
+            }
+        }
+    }
+
+    /// The glyph painted `set_pixel` by `set_pixel`, clipped the way the
+    /// glyph loop always clipped: nothing left of or above the frame, and
+    /// `set_pixel` drops anything past its far edges.
+    fn reference_glyph(
+        fb: &mut Framebuffer,
+        font: &BitmapFont,
+        entry: &GlyphEntry,
+        x: i32,
+        y: i32,
+        white: bool,
+    ) {
+        font.rows(entry, |row, bits| {
+            for column in 0..entry.metric.width as i32 {
+                if bits & (1u64 << (63 - column)) != 0 {
+                    let (px, py) = (x + column, y + row as i32);
+                    if px >= 0 && py >= 0 {
+                        fb.set_pixel(px as usize, py as usize, white);
+                    }
+                }
+            }
+        });
+    }
+
+    fn painted_glyph(
+        fb: &mut Framebuffer,
+        font: &BitmapFont,
+        entry: &GlyphEntry,
+        x: i32,
+        y: i32,
+        white: bool,
+    ) {
+        let metric = entry.metric;
+        let mut painter =
+            GlyphPainter::new(fb, x, y, metric.width as u32, metric.height as u32, white);
+        font.rows(entry, |row, bits| painter.row(row, bits));
+        painter.finish();
+    }
+
+    /// Places for a batch of glyphs: a grid inside the frame at every start
+    /// bit, then every edge and corner, half in and half out, and past each
+    /// far edge.
+    fn placements(frame_w: i32, frame_h: i32, w: i32, h: i32, index: usize) -> [(i32, i32); 10] {
+        let k = index as i32;
+        let along_x = (k * 37) % (frame_w - 64).max(1);
+        let along_y = (k * 23) % (frame_h - 64).max(1);
+        [
+            (
+                8 + (k * 61) % (frame_w - 80) + k % 8,
+                8 + (k * 29) % (frame_h - 80),
+            ),
+            (-w / 2, along_y),
+            (frame_w - w / 2, along_y),
+            (along_x, -h / 2),
+            (along_x, frame_h - h / 2),
+            (-w / 2, -h / 2),
+            (frame_w - w / 2, frame_h - h / 2),
+            (frame_w - w + 1, along_y),
+            (frame_w, along_y),
+            (along_x, frame_h),
+        ]
+    }
+
+    #[test]
+    fn painter_matches_set_pixel_for_every_glyph_in_every_frame() {
+        let frames = [
+            FbFrame::Native,
+            FbFrame::Landscape,
+            FbFrame::LandscapeFlipped,
+            FbFrame::Portrait,
+        ];
+        for (f, font) in all_fonts().into_iter().enumerate() {
+            for frame in frames {
+                // White ink on black for some faces, so both stores are held
+                // to the reference.
+                let white = f % 5 == 4;
+                let mut painted = Framebuffer::new();
+                let mut reference = Framebuffer::new();
+                for fb in [&mut painted, &mut reference] {
+                    fb.set_frame(frame);
+                    fb.clear(!white);
+                }
+                let (fw, fh) = (painted.frame_width() as i32, painted.frame_height() as i32);
+                let mut drawn = 0;
+                for (index, entry) in font.glyphs.iter().enumerate() {
+                    let (w, h) = (entry.metric.width as i32, entry.metric.height as i32);
+                    for (x, y) in placements(fw, fh, w, h, index) {
+                        painted_glyph(&mut painted, font, entry, x, y, white);
+                        reference_glyph(&mut reference, font, entry, x, y, white);
+                    }
+                    drawn += 1;
+                    // Compare in small batches, so overlapping ink can't
+                    // hide a wrong pixel for long.
+                    if drawn % 8 == 0 || index + 1 == font.glyphs.len() {
+                        assert!(
+                            painted.bytes()[..] == reference.bytes()[..],
+                            "font {f} {frame:?}: glyphs up to {index} differ"
+                        );
+                        for fb in [&mut painted, &mut reference] {
+                            fb.clear(!white);
+                        }
+                    }
+                }
+            }
         }
     }
 }
