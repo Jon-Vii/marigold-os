@@ -266,6 +266,8 @@ pub(crate) struct LineWindow<'a> {
     /// and what the word being placed joins to.
     joins: Option<(FontStyle, Option<u16>)>,
     piece_joins: Option<(FontStyle, Option<u16>)>,
+    /// The last word whose measure the builder kept, and that measure.
+    kept: Option<(usize, InkPiece)>,
     /// Justification spaces by style, once measured.
     spaces: [i16; 4],
 }
@@ -291,6 +293,7 @@ impl<'a> LineWindow<'a> {
             piece_at: (0, 0),
             joins: None,
             piece_joins: None,
+            kept: None,
             spaces: [0; 4],
         };
         // Whatever the scratch held is no cache.
@@ -330,6 +333,7 @@ impl<'a> LineWindow<'a> {
         self.piece_at = (0, 0);
         self.joins = None;
         self.piece_joins = None;
+        self.kept = None;
     }
 
     /// Starts keeping the words placed on an empty line in hand, of `role`
@@ -400,56 +404,41 @@ impl<'a> LineWindow<'a> {
         self.piece_joins
     }
 
-    /// The measure of the word being placed, `text` from its start, once
-    /// the builder measured it (a piece that moves to the next line is
-    /// placed again).
-    pub(crate) fn current_piece(&self, text: &str) -> Option<InkPiece> {
-        let word = self.current_word(text)?;
-        if !word.measured {
-            return None;
-        }
-        let mut piece = word.piece();
-        piece.last = word.last;
-        Some(piece)
+    /// The builder's measure of the word being placed, from its start, once
+    /// kept (a word that moves to the next line is placed again).
+    pub(crate) fn current_piece(&self) -> Option<InkPiece> {
+        let (index, piece) = self.kept?;
+        (self.piece_at == (index, 0)).then_some(piece)
     }
 
-    /// Keeps the builder's measure of the word being placed, `text` from
-    /// its start, with what joins it to the word before: `join_fp` when
-    /// the builder placed it after that word on its line, else measured.
-    pub(crate) fn keep_measure(
-        &mut self,
-        text: &str,
-        piece: &InkPiece,
-        join_fp: Option<i32>,
-        measure: &mut impl Measure,
-    ) {
-        let Some(mut word) = self.current_word(text) else {
-            return;
-        };
-        if word.measured {
-            return;
-        }
-        (word.advance_fp, word.ink_at_fp, word.ink) = piece.parts();
-        word.last = piece.last;
-        word.join_fp = match (join_fp, self.piece_joins) {
-            (Some(join_fp), _) => join_fp,
-            (None, Some(previous)) => measure.join(previous, word.space, word.style, piece.first),
-            (None, None) => 0,
-        };
-        let index = self.piece_at.0;
-        let packed = self.at(WORDS_AT + index * WORD_BYTES + 2, 2) as u16 | MEASURED;
-        self.write_word(index, &word, packed);
-        self.joins = Some((word.style, piece.last));
+    /// Whether the source has a space before the word being placed.
+    pub(crate) fn current_space(&self) -> bool {
+        let at = WORDS_AT + self.piece_at.0 * WORD_BYTES + 2;
+        self.piece_at.0 < self.words && self.buf[at + 1] & (SPACE >> 8) as u8 != 0
     }
 
-    /// The word being placed, when `text` is all of it.
-    fn current_word(&self, text: &str) -> Option<Word> {
+    /// Keeps the builder's measure of the word being placed, `len` bytes
+    /// from its start, with what joins it to the word before.
+    pub(crate) fn keep_measure(&mut self, len: usize, piece: &InkPiece, join_fp: i32) {
         let (index, offset) = self.piece_at;
         if !self.active || offset != 0 || index >= self.words {
-            return None;
+            return;
         }
-        let word = self.word(index);
-        (!word.image && self.text(&word) == text).then_some(word)
+        let at = WORDS_AT + index * WORD_BYTES;
+        let packed = u16::from_le_bytes([self.buf[at + 2], self.buf[at + 3]]);
+        if packed & (IMAGE | MEASURED) != 0 || usize::from(packed & LEN_MASK) != len {
+            return;
+        }
+        let (advance_fp, ink_at_fp, ink) = piece.parts();
+        let record = &mut self.buf[at..at + WORD_BYTES];
+        record[2..4].copy_from_slice(&(packed | MEASURED).to_le_bytes());
+        record[4..6].copy_from_slice(&(advance_fp.clamp(0, 0xffff) as u16).to_le_bytes());
+        record[6..8].copy_from_slice(&(join_fp as i16).to_le_bytes());
+        record[8..10].copy_from_slice(&(ink_at_fp.clamp(0, 0xffff) as u16).to_le_bytes());
+        record[10..12].copy_from_slice(&ink.to_le_bytes());
+        record[14..16].copy_from_slice(&piece.last.unwrap_or(u16::MAX).to_le_bytes());
+        self.kept = Some((index, *piece));
+        self.joins = Some((style_from_bits(packed), piece.last));
     }
 
     fn push(&mut self, text: &str, flags: u16, advance_fp: i32, extra: u16) -> bool {
@@ -463,25 +452,16 @@ impl<'a> LineWindow<'a> {
         let offset = self.text_len;
         self.buf[offset..offset + text.len()].copy_from_slice(text.as_bytes());
         self.text_len += text.len();
-        let image = flags & IMAGE != 0;
-        let word = Word {
-            offset,
-            len: text.len(),
-            style: FontStyle::Regular,
-            space: false,
-            may_hyphenate: false,
-            image,
-            looked_up: false,
-            dash: false,
-            measured: false,
-            last: None,
-            advance_fp,
-            ink_at_fp: 0,
-            ink: (advance_fp >> 4) as i16,
-            join_fp: 0,
-            extra,
-        };
-        self.write_word(self.words, &word, text.len() as u16 | flags);
+        // An image is measured as it comes: its width, inked to its end.
+        let at = WORDS_AT + self.words * WORD_BYTES;
+        let record = &mut self.buf[at..at + WORD_BYTES];
+        record[0..2].copy_from_slice(&(offset as u16).to_le_bytes());
+        record[2..4].copy_from_slice(&(text.len() as u16 | flags).to_le_bytes());
+        record[4..6].copy_from_slice(&(advance_fp as u16).to_le_bytes());
+        record[6..10].fill(0);
+        record[10..12].copy_from_slice(&((advance_fp >> 4) as u16).to_le_bytes());
+        record[12..14].copy_from_slice(&extra.to_le_bytes());
+        record[14..16].copy_from_slice(&u16::MAX.to_le_bytes());
         self.piece_at = (self.words, 0);
         self.words += 1;
         true
@@ -689,6 +669,7 @@ impl<'a> LineWindow<'a> {
             self.write_word(index - first, &word, packed);
         }
         self.words -= first;
+        self.kept = None;
         // The remaining words' breaks move to the front in slot order, which
         // only ever moves a slot down (a search may look up an earlier word
         // after a later one); each word learns its first slot again.

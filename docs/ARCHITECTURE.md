@@ -472,9 +472,9 @@ hyphenated. Justified gaps stretch around it as they do around a word.
 
 Greedy lines are kept unless one goes wrong. The builder also keeps the
 words of a justified paragraph's last few lines in `fw::line_window`, each
-measured once as it is placed (`ui::reading::InkPiece`, which the line's
-own measure is then built from), with a record of where each stored line
-starts. A line the page would leave ragged, or a third hyphenated line in a
+with its measure on its own (`ui::reading::InkPiece`), taken in the same
+pass that measures the line (`StyledInkCursor::push_word`), and a record of
+where each stored line starts. A line the page would leave ragged, or a third hyphenated line in a
 row, is repaired once two more lines follow it: the builder takes back the
 stored lines from three before it (`ReaderStore::truncate_lines`), and a
 total-fit search (Knuth and Plass's, without fitness classes) breaks their

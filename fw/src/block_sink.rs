@@ -456,15 +456,6 @@ impl LineInkCursor {
             Self::Custom(cursor) => cursor.push_piece(join_fp, piece, style),
         }
     }
-
-    /// The last glyph pushed, which kerns with the next (an SD font never
-    /// kerns).
-    fn previous(&self) -> Option<u16> {
-        match self {
-            Self::BuiltIn(cursor) => cursor.previous(),
-            Self::Custom(_) => None,
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -1508,10 +1499,19 @@ pub(crate) static HYPHEN_LOOKUP_MICROS: portable_atomic::AtomicU32 =
 
 /// Where the line repair's time goes, for the bench: lookups the break
 /// cache answered, repairs made, pieces the window measured, and candidate
-/// lines the search weighed (its time less its lookups and pieces).
+/// lines the search weighed (its time less its lookups and pieces). Apart
+/// from repairs: keeping words and lines in the window, and measuring the
+/// words it keeps (which the builder measures anyway).
 #[cfg(feature = "bench-serial")]
 pub(crate) mod repair_profile {
-    use portable_atomic::AtomicU32;
+    use portable_atomic::{AtomicU32, Ordering};
+    pub(crate) static KEEP_MICROS: AtomicU32 = AtomicU32::new(0);
+    pub(crate) static MEASURE_MICROS: AtomicU32 = AtomicU32::new(0);
+
+    pub(crate) fn add_keep(started: embassy_time::Instant) {
+        KEEP_MICROS.fetch_add(started.elapsed().as_micros() as u32, Ordering::Relaxed);
+    }
+
     pub(crate) static LOOKUP_HITS: AtomicU32 = AtomicU32::new(0);
     pub(crate) static REPAIRS: AtomicU32 = AtomicU32::new(0);
     pub(crate) static REPAIR_MICROS: AtomicU32 = AtomicU32::new(0);
@@ -1663,9 +1663,9 @@ where
 }
 
 /// Measures a justified word the window keeps, `text` from where it
-/// resumes, onto the line in hand as a piece with what joins it to the
-/// glyph before (none when `line_was_empty`): one measure serves the line
-/// and, for a whole word, the window's search.
+/// resumes, onto the line in hand after what joins it to the glyph before
+/// (none when `line_was_empty`): one measure serves the line and, for a
+/// whole word, the window's search.
 #[inline(never)]
 fn push_window_piece<
     D,
@@ -1683,28 +1683,45 @@ fn push_window_piece<
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    let mut measure =
-        SinkMeasure::new(sink.root, sink.library, sink.font_metrics, sink.hyphenation);
-    let kept = if line_was_empty {
-        sink.window.current_piece(text)
-    } else {
-        None
-    };
-    let piece = kept.unwrap_or_else(|| measure.piece(text, style, false));
-    let join = if line_was_empty {
-        None
-    } else {
-        let previous = (sink.line_style, sink.line_ink.previous());
-        debug_assert!(sink
-            .window
-            .piece_joins()
-            .is_none_or(|joins| joins.1.is_none() || joins == previous));
-        Some(measure.join(previous, space, style, piece.first))
-    };
-    sink.line_ink.push_piece(join.unwrap_or(0), &piece, style);
-    if kept.is_none() {
-        sink.window.keep_measure(text, &piece, join, &mut measure);
+    #[cfg(feature = "bench-serial")]
+    let _span = build_profile::Span::new(&repair_profile::MEASURE_MICROS);
+    if line_was_empty {
+        if let Some(piece) = sink.window.current_piece() {
+            // The whole word again, moved to a new line.
+            sink.line_ink.push_piece(0, &piece, style);
+            return;
+        }
     }
+    let restyle = (style != sink.line_style).then_some(style);
+    let (piece, join) = match &mut sink.line_ink {
+        LineInkCursor::BuiltIn(cursor) => cursor.push_word(space, restyle, text),
+        LineInkCursor::Custom(_) => {
+            let mut measure =
+                SinkMeasure::new(sink.root, sink.library, sink.font_metrics, sink.hyphenation);
+            let piece = measure.piece(text, style, false);
+            let previous = (sink.line_style, None);
+            let join = match line_was_empty {
+                true => 0,
+                false => measure.join(previous, space, style, piece.first),
+            };
+            sink.line_ink.push_piece(join, &piece, style);
+            (piece, join)
+        }
+    };
+    let join = match sink.window.piece_joins() {
+        // At a line's start the word joins the window's word before it.
+        Some(previous) if line_was_empty => {
+            let mut measure =
+                SinkMeasure::new(sink.root, sink.library, sink.font_metrics, sink.hyphenation);
+            measure.join(previous, sink.window.current_space(), style, piece.first)
+        }
+        _ => join,
+    };
+    #[cfg(feature = "bench-serial")]
+    let started = Instant::now();
+    sink.window.keep_measure(text.len(), &piece, join);
+    #[cfg(feature = "bench-serial")]
+    repair_profile::add_keep(started);
 }
 
 /// Puts an inline image on the line: one unbreakable unit of its fitted
@@ -2005,7 +2022,12 @@ fn window_word<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VO
     if !open_window(sink, placement) {
         return;
     }
-    if sink.window.push_word(word, style, space, may_hyphenate) {
+    #[cfg(feature = "bench-serial")]
+    let started = Instant::now();
+    let pushed = sink.window.push_word(word, style, space, may_hyphenate);
+    #[cfg(feature = "bench-serial")]
+    repair_profile::add_keep(started);
+    if pushed {
         return;
     }
     if sink.window.repair_pending() {
@@ -2089,13 +2111,21 @@ fn wrap_line<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLU
         push_line_in_hand(sink, false);
         return;
     }
+    #[cfg(feature = "bench-serial")]
+    let started = Instant::now();
     let bad = line_wants_repair(sink);
+    #[cfg(feature = "bench-serial")]
+    repair_profile::add_keep(started);
     let run_before = sink.hyphen_run;
     let unindented = sink.line_unindented;
     if push_line_in_hand(sink, false) {
+        #[cfg(feature = "bench-serial")]
+        let started = Instant::now();
         let block = sink.library.block_count() - 1;
         sink.window.note_line(block, run_before, bad, unindented);
         sink.window.trim();
+        #[cfg(feature = "bench-serial")]
+        repair_profile::add_keep(started);
     } else {
         sink.window.clear();
     }

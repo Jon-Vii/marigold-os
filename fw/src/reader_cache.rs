@@ -1930,7 +1930,7 @@ where
         use portable_atomic::Ordering;
         use repair_profile::*;
         esp_println::println!(
-            "bench: line_repair repairs={} repair_ms={} pieces={} piece_ms={} candidates={} relax_ms={} search_lookups={} search_lookup_ms={}",
+            "bench: line_repair repairs={} repair_ms={} pieces={} piece_ms={} candidates={} relax_ms={} search_lookups={} search_lookup_ms={} keep_ms={} kept_measure_ms={}",
             REPAIRS.swap(0, Ordering::Relaxed),
             REPAIR_MICROS.swap(0, Ordering::Relaxed) / 1000,
             PIECES.swap(0, Ordering::Relaxed),
@@ -1939,6 +1939,8 @@ where
             RELAX_MICROS.swap(0, Ordering::Relaxed) / 1000,
             SEARCH_LOOKUPS.swap(0, Ordering::Relaxed),
             SEARCH_LOOKUP_MICROS.swap(0, Ordering::Relaxed) / 1000,
+            KEEP_MICROS.swap(0, Ordering::Relaxed) / 1000,
+            MEASURE_MICROS.swap(0, Ordering::Relaxed) / 1000,
         );
     }
     #[cfg(feature = "bench-serial")]

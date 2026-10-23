@@ -1244,6 +1244,46 @@ impl InkCursor {
         self.previous
     }
 
+    /// [`InkCursor::push_char`], also measuring the glyph onto `piece` (a
+    /// word measured on its own) with the same lookups: within the word
+    /// the piece kerns against the same glyph the cursor does.
+    #[inline]
+    fn push_char_measuring(&mut self, font: &BitmapFont, ch: char, piece: &mut InkPiece) {
+        let codepoint = if ch as u32 > u16::MAX as u32 {
+            b'?' as u16
+        } else {
+            ch as u16
+        };
+        let (drawn, metric) = match font.metric(codepoint) {
+            Some(metric) => (codepoint, metric),
+            None => {
+                let Some(metric) = font.metric(b'?' as u16) else {
+                    self.advance_fp += 8 << 4;
+                    self.right = self.right.max(fixed_ceil(self.advance_fp));
+                    self.previous = Some(b'?' as u16);
+                    piece.push_fallback();
+                    return;
+                };
+                (b'?' as u16, metric)
+            }
+        };
+        if let Some(left) = self.previous {
+            let kerning = font.kerning_adjust_fp(left, drawn) as i32;
+            self.advance_fp += kerning;
+            if piece.last.is_some() {
+                piece.advance_fp += kerning;
+            }
+        }
+        let advance = fixed_round(self.advance_fp);
+        let glyph_right = advance + metric.x_offset as i16 + metric.width as i16;
+        self.right = self.right.max(glyph_right);
+        self.advance_fp += metric.advance_fp as i32;
+        self.previous = Some(drawn);
+        piece.push_metric(&metric);
+        piece.first.get_or_insert(drawn);
+        piece.last = Some(drawn);
+    }
+
     pub fn width(&self) -> i16 {
         self.right.max(fixed_ceil(self.advance_fp))
     }
@@ -1312,6 +1352,32 @@ impl StyledInkCursor {
     /// The last glyph pushed, which kerns with the next.
     pub fn previous(&self) -> Option<u16> {
         self.ink.previous()
+    }
+
+    /// Pushes a word as [`StyledInkCursor::push_str`] pushes a space (when
+    /// `space`), a style marker to `restyle` (when the word changes style),
+    /// and the word's text without its soft hyphens, measuring the same.
+    /// Returns the word measured on its own ([`InkPiece`]) and what joined
+    /// it to the glyph before.
+    pub fn push_word(
+        &mut self,
+        space: bool,
+        restyle: Option<FontStyle>,
+        text: &str,
+    ) -> (InkPiece, i32) {
+        let start = self.ink.advance_fp;
+        if space {
+            self.ink.push_char(self.font, ' ');
+        }
+        if let Some(style) = restyle {
+            self.ink.reset_pair();
+            self.font = body_font(self.settings, style);
+        }
+        let mut piece = InkPiece::default();
+        for ch in text.chars().filter(|ch| *ch != '\u{00AD}') {
+            self.ink.push_char_measuring(self.font, ch, &mut piece);
+        }
+        (piece, self.ink.advance_fp - start - piece.advance_fp)
     }
 
     pub fn width(&self) -> i16 {
@@ -2170,6 +2236,7 @@ mod tests {
         for settings in every_body_type() {
             let mut text = StyledInkCursor::new(settings, FontStyle::Regular);
             let mut pieces = StyledInkCursor::new(settings, FontStyle::Regular);
+            let mut words_cursor = StyledInkCursor::new(settings, FontStyle::Regular);
             let mut style = FontStyle::Regular;
             for (index, &(word, word_style, space)) in words.iter().enumerate() {
                 let mut run = String::new();
@@ -2199,6 +2266,20 @@ mod tests {
                     )
                 };
                 pieces.push_piece(join, &piece, word_style);
+                let mut both = words_cursor.clone();
+                let restyle = (word_style != style).then_some(word_style);
+                let (measured, joined) = words_cursor.push_word(space && index > 0, restyle, word);
+                assert_eq!(
+                    (measured, joined),
+                    (piece, join),
+                    "{settings:?} at {word:?}"
+                );
+                both.push_str(&run);
+                assert_eq!(
+                    words_cursor.width(),
+                    both.width(),
+                    "{settings:?} at {word:?}"
+                );
                 style = word_style;
                 assert_eq!(pieces.width(), text.width(), "{settings:?} at {word:?}");
                 assert_eq!(
