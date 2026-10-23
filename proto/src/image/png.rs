@@ -305,8 +305,8 @@ enum Pixels {
 /// pattern `floor(x * count / total)` gives, one span at a time and without
 /// dividing: each span is `total / count` pixels, or one more.
 #[derive(Clone, Copy, Debug)]
-struct Spans {
-    short: u32,
+pub(super) struct Spans {
+    pub(super) short: u32,
     extra: u32,
     count: u32,
     /// `x * count - span * total` at the next span's first pixel `x`: in
@@ -315,7 +315,7 @@ struct Spans {
 }
 
 impl Spans {
-    fn new(total: u32, count: u32) -> Self {
+    pub(super) fn new(total: u32, count: u32) -> Self {
         let count = count.max(1);
         Self {
             short: total / count,
@@ -327,7 +327,7 @@ impl Spans {
 
     /// Whether the next span is the longer one, advancing past it.
     #[inline(always)]
-    fn next_is_long(&mut self) -> bool {
+    pub(super) fn next_is_long(&mut self) -> bool {
         let long = self.error < self.extra;
         // Never underflows: a short span leaves `error >= extra`, and a
         // long one adds `count > extra` first.
@@ -336,7 +336,7 @@ impl Spans {
     }
 
     #[inline(always)]
-    fn next_len(&mut self) -> u32 {
+    pub(super) fn next_len(&mut self) -> u32 {
         self.short + u32::from(self.next_is_long())
     }
 }
@@ -1134,7 +1134,7 @@ fn over_white(value: u32, alpha: u32) -> u32 {
 /// `(2^32 - 1) / d`, for [`divide`]: `floor(2^32 / d)`, or one less when `d`
 /// is a power of two. Either way it is at least `2^32 / d - 1`, which is all
 /// `divide` needs.
-fn reciprocal(d: u32) -> u32 {
+pub(super) fn reciprocal(d: u32) -> u32 {
     u32::MAX / d.max(1)
 }
 
@@ -1144,7 +1144,7 @@ fn reciprocal(d: u32) -> u32 {
 /// is more than `n / d - 1`: the quotient or one less. One comparison fixes
 /// that.
 #[inline(always)]
-fn divide(n: u32, d: u32, inverse: u32) -> u32 {
+pub(super) fn divide(n: u32, d: u32, inverse: u32) -> u32 {
     let q = ((u64::from(n) * u64::from(inverse)) >> 32) as u32;
     q + u32::from(n - q * d >= d)
 }

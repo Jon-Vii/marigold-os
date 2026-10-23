@@ -156,9 +156,10 @@ answering, about 2 s per large image, rather than drawing a box that later
 changes into the picture. A press during that wait abandons it and is handled at
 once, so flipping past an image page is never held up.
 
-- Stored entries decode straight from ZIP reads. A deflated entry is inflated
+- Stored entries decode straight from ZIP reads. A deflated PNG is inflated
   to a spool file first and then decoded from it with the same inflater; one
-  43 KB `InflateState` cannot serve both layers at once. Spooling costs about
+  43 KB `InflateState` cannot serve both layers at once. (A deflated JPEG
+  needs no spool: see JPEG.) Spooling costs about
   3.6 s per MB of PNG (write plus read-back), so it is the slow path. A later
   optimization could lend the 48 KB previous-frame buffer as a second
   `InflateState` during a decode and re-render the previous frame afterwards,
@@ -206,7 +207,7 @@ image pages (and for the page after one). Do not add it speculatively.
    both panels and orientations (reusing #17's orientation-marker assets).
 3. **Decode pass, pack, draw, refresh** (`fw`): on-device bench on the X4
    (`page-turn`, `storage-cache`, decode timing, stack sizes).
-4. **JPEG baseline**.
+4. **JPEG baseline** (done; see JPEG).
 
 Each phase passes the full CI gate and gets an independent review.
 
@@ -345,7 +346,7 @@ a small symbol grows only by the bottom gap (0 to 5 rows by size and spacing;
 for wrapping and justification; the spaces around it in the source are kept as
 they are (a glued neighbour may still wrap away from it, as a styled run's
 does). Tokens never reach the hyphenator. An image that cannot be shown
-(unsupported, like JPEG for now, missing, or failing its probe) places its alt
+(unsupported, like a progressive JPEG, missing, or failing its probe) places its alt
 text inline in italics instead; an empty alt places nothing, and no alt places
 `[Image]`, as the block placeholder does. At draw time an inline image that is
 not decoded, or fails, draws an outline of its fitted size in its place.
@@ -392,3 +393,149 @@ existed only on development devices and simply rebuild. A book without images
 builds through the same code as before, byte for byte apart from the version
 stamp: the parser's old path, no tokens, no flagged records, and one branch per
 line.
+
+## JPEG
+
+Phase 4 (2026-10-22, branch `images/phase5-jpeg`). `proto::image::jpeg`
+decodes sequential Huffman JPEG with 8-bit samples (SOF0 baseline and
+SOF1 extended) with the PNG decoder's contract: fed in pieces of any
+size, rows to a `LumaSink` at exactly the fitted size, everything carved
+from borrowed scratch and initialized before use, no panic on any input.
+
+**What decodes.** Gray, or YCbCr with any sampling factors of 1 or 2
+(4:4:4, 4:2:2, 4:2:0, 4:4:0, and odd mixes, luma coarser than chroma
+included), in one interleaved scan or a scan per component in any order,
+with restart intervals. APPn and COM are skipped, so EXIF orientation is
+ignored. Progressive, arithmetic, lossless and hierarchical frames,
+12-bit samples, CMYK/YCCK, two components, factors of 3 or 4, and RGB
+(Adobe transform 0, or components named R, G, B without JFIF) probe as
+unsupported and keep their alt text. At most four Huffman tables are
+kept at once (all baseline files; extended allows eight).
+
+**Luma only.** Only Y is dequantized and inverse transformed. Cb and Cr
+are Huffman-decoded to stay in step with the stream and dropped, and a
+scan without Y is passed over to its next marker. JPEG's Y uses the
+BT.601 weights the PNG luma rounds to.
+
+**DCT scaling.** The decoder picks the smallest of 1/8, 1/4, 1/2 and 1 at
+which the image (each side rounded up, as libjpeg does) still covers the
+fitted size both ways. Reduced IDCTs (DC only, 2×2 from DC and the odd
+coefficients, 4×4 from all but the fourth) give each pixel the exact mean
+of the square of full-size pixels it stands for, in 13-bit fixed point
+with no division; the full size uses libjpeg's islow. The PNG decoder's
+division-free box filter then takes the scaled image to the exact size,
+across each MCU as it completes and down each row of MCUs. A 1600 × 1200
+photo fitted to 601 × 451 decodes at 1/2, a quarter of the IDCT and
+filter work; a 4,000-px photo at 1/4.
+
+**Scratch.** `4,227 + (4 + rows) · out_w` bytes, rows = the block side
+times luma's vertical factor (one for gray), at most 16. It does not
+depend on the source width: at the X4's 784 px the worst case is 19,907
+bytes (a 4:2:0 image just under twice the page width, decoded at full
+size), which fits the XHTML window beside the ditherer and a 1 KB inflate
+buffer; a 4,000-px 4:2:0 photo fitted to 784 needs 10,499. Huffman codes
+up to 8 bits resolve by one lookup, longer ones by a walk over the code
+lengths.
+
+**Bounds on hostile input.** Work is bounded per byte, not per image:
+every block takes at least two symbols and every symbol a bit, so a byte
+of scan data decodes at most four blocks, and about 64 KB can describe a
+4096 × 4096 gray image of flat blocks, which then takes as long as that
+image. Data that runs into a marker part way through an MCU finishes it
+on zero bits, as libjpeg does, and the next MCU fails, so a marker buys
+at most one made-up MCU; a restart interval with no data fails, so a
+scan of nothing but restart markers (two bytes an MCU otherwise) fails at
+its first. Restart markers must come in sequence where they are due,
+after nothing but fill; anything else is corrupt, without resync. An EOI
+with rows still to come fails at once, and at most 256 bytes in all may
+lie outside segments (junk, stray TEM and RST markers), so neither junk
+after an early EOI nor junk between segments is read to the end of the
+file. What that leaves is well-formed input that never reaches the last
+row (endless segments the decoder passes over, or a long scan without
+luma), read as far as the entry goes: a stored file's size, or a deflated
+entry's declared size, itself capped (below).
+
+**Probing.** The frame header can follow 64 KB of EXIF thumbnail.
+`ImageProber` reads a stored image a card block at a time and seeks past
+every segment it does not read; a deflated image is inflated and the
+skipped bytes dropped. At most 256 KB are read, or inflated (a chain of
+maximal APP1 segments deflates about 1,000 to 1, so a cap on compressed
+input alone would let one probe inflate a quarter of a GB), after which
+the image is failed. A PNG still stops at its first 33 bytes.
+
+**Decoding.** A stored JPEG streams from ZIP reads. A deflated one
+streams through the ZIP inflater straight into the decoder, a kilobyte of
+output at a time, with no spool: the JPEG decoder needs no inflater, so
+the one inflater serves only the ZIP layer. As for a spooled PNG, a
+deflated entry past 4 MB by its declared size is refused, and one that
+inflates to more than it declares is damage, so a small stream cannot
+inflate on until a press (which records nothing, and would start again).
+Packs, records, scheduling, cancellation and drawing are the PNG path's.
+
+**Index and caches.** `IMAGES.BIN` version 2 holds JPEGs (`.jpg`,
+`.jpeg`); a version 1 index is built again, deleting its packs, as any
+rebuild does. `CACHE_V2_VERSION` goes to 30. A v27 index keeps its
+one-time check, now counting JPEGs as well as PNGs, with one exception:
+nearly every book has a JPEG cover, so counting it would rebuild nearly
+every book once after the update. The check walks the whole central
+directory, and a book whose only image entry's file name contains
+`cover` (in any case) counts as having none: it is stamped 30 and keeps
+its sections. The trade-off, accepted: such a book's cover page keeps its
+v27 rendering (alt text, or nothing for an svg-wrapped cover) until it is
+laid out again for another reason, since its index says it has no images.
+A fresh build or relayout checks the ZIP again, counting the cover, and
+shows it. A cover and any other image, or one image not named as a cover,
+rebuild as before; v28 and v29 never shipped, and rebuild. svg-wrapped
+JPEG covers become image blocks.
+
+**Cost.** About 13 KB of `.text` on riscv32 for the decoder (its main
+loop with the IDCTs and filter inlined, 10.8 KB), 1.4 KB for the probe,
+1.3 KB of firmware glue; flash tables are the 64-byte zigzag only.
+Statics are unchanged on both panels and the X3's main-stack region stays
+30,984 bytes. The deepest image path under the display task is the
+deflated JPEG's (decode, inflate callback, decoder, pack write, card
+write) at 10,432 bytes against the PNG decode's 10,112 before; the
+deepest build path (18,944) and the task's overall deepest (19,520,
+the OTA check) are unchanged. Two existing frames moved: fat LTO no
+longer inlines the ditherer, now shared by two sinks, into PNG's row loop,
+whose frame went from 240 to 416 bytes (its path is 10,288), and the
+probe's from 288 to 368 for the prober it holds (its path is 13,936).
+
+**Tests.** Against zune-jpeg on jpeg-encoder files (every layout, sizes 1
+× 1 to 250 × 180, qualities 20 to 97, restart intervals), at full size
+within 2 levels per pixel and a quarter level mean. zune-jpeg 0.5.15
+decodes subsampled luma in a scan per component wrongly, so those files
+must decode exactly as their interleaved twins. A small in-test encoder
+writes the layouts jpeg-encoder cannot (odd sampling, separate scans in
+any order, SOF1 with 16-bit tables and table ids 2 and 3, Adobe and RGB
+markers, five tables) against a float-IDCT reference: within 1 level at
+full size, and at every scale within 2 per pixel of the reference
+averaged over the scale's squares and box-filtered the same way. Against
+the full-size reference box-filtered straight to the output, smooth
+photo-like images stay within 2 levels mean and 8 per pixel (measured
+1.9 and 7): where an output column's span does not line up with the
+scale's squares, a square that straddles two output pixels counts whole
+in one. Saturated black-on-white line art differs more from the
+reference, because the reduced IDCTs clamp the mean of a square rather
+than each pixel: ringing past 255 beside white paper and below 0 beside
+black ink cancels in the mean, but per-pixel clamping keeps the half it
+does not cut, so the reference is grayer at both ends. Measured on a test
+drawing (mean, worst): 2.8/7, 2.7/10 and 2.9/19 levels at 1/8, 1/4 and
+1/2 at quality 60; 0.9/3 to 1.1/7 at 85; within 2 at 95. Against the
+drawing itself the decoder is the closer of the two at every scale and
+quality (at 60 and 1/2, 1.8 mean against 3.4), which the test checks.
+Plus 1-byte and random feeding, dirty and reused scratch, a 20,000-file
+mutation loop and random segments, an EOI before or part way through the
+scan with megabytes of junk after it, junk and stray markers between
+segments, restart markers out of sequence, missing, or with data before
+them, a scan of only restart markers claiming a 16,384 × 4,096 image, a
+deflated APP1 chain that inflates 1,000 to 1, and firmware tests that
+probe past a 64 KB APP1 without reading it, decode stored and deflated
+JPEGs into the packs with no more card writes than stored, and fail
+deflated JPEGs that outgrow their declared size or end early unread.
+
+**To measure on the X4.** Decode time of Gutenberg's illustrated *Alice*
+(55 baseline JPEGs) and Rackham's colour plates, large and typical, stored
+and deflated, against the PNG figures above; probe time for a JPEG behind
+an EXIF block; and frames of svg-wrapped JPEG covers and the plates,
+checking the white point and dither on photographic content.

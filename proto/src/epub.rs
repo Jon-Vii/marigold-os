@@ -558,10 +558,15 @@ where
     }
 
     /// Reads the start of an entry found by its stored local-header offset
-    /// rather than by name, as an image probe does: up to `output.len()`
-    /// bytes, its whole length when shorter. `input` holds a deflated
-    /// entry's compressed bytes a read at a time, and no more than
-    /// `input_cap` of them are read in all.
+    /// rather than by name, as an image probe does, handing `visitor` its
+    /// bytes from the first until it has what it needs or the entry ends.
+    /// A stored entry is read a piece of `input` at a time, and what the
+    /// visitor would pass over unread ([`EntryVisitor::skippable`]) is not
+    /// read at all. A deflated one is inflated through `output`, its
+    /// compressed bytes a piece of `input` at a time, and what the visitor
+    /// passes over is inflated and dropped. Either way no more than `cap`
+    /// bytes of the entry are read, nor, from a deflated one, inflated: a
+    /// stream of a few KB can inflate to hundreds of MB.
     ///
     /// Only a failed read comes back as [`ZipError::Io`], which is worth
     /// retrying. Anything wrong with the archive itself is another error,
@@ -569,37 +574,71 @@ where
     /// archive's end (checked against its length, so it never reads as a
     /// failed read), or names another entry (`is_name` says, given the
     /// header's name, which must fit `input`), data past the end, an
-    /// unknown method, or a stream that does not inflate to `output.len()`
-    /// bytes within `input_cap`.
-    pub fn read_entry_start(
+    /// unknown method, or a stream that does not inflate, or that reaches
+    /// `cap` (read or inflated) before the visitor has what it needs. A
+    /// stored entry that reaches `cap` first just ends, and the visitor
+    /// judges what it has.
+    #[allow(clippy::too_many_arguments)]
+    pub fn visit_entry_start(
         &mut self,
         entry: OwnedZipEntry,
         is_name: &mut dyn FnMut(&[u8]) -> bool,
         input: &mut [u8],
         output: &mut [u8],
         inflate_scratch: &mut ZipInflateScratch,
-        input_cap: u32,
-    ) -> Result<usize, ZipError> {
+        cap: u32,
+        visitor: &mut dyn EntryVisitor,
+    ) -> Result<(), ZipError> {
         let payload = entry_payload_at(&mut self.reader, entry, input, is_name)?;
         match entry.compression_method {
             0 => {
-                let len = output
-                    .len()
-                    .min(entry.uncompressed_size as usize)
-                    .min(entry.compressed_size as usize);
-                read_exact_at(&mut self.reader, payload, &mut output[..len])?;
-                Ok(len)
+                let size = entry.uncompressed_size.min(entry.compressed_size);
+                let (mut at, mut read) = (0u32, 0u32);
+                while at < size && read < cap && !input.is_empty() {
+                    let len = (size - at).min(cap - read).min(input.len() as u32);
+                    let piece = &mut input[..len as usize];
+                    read_exact_at(&mut self.reader, payload + at, piece)?;
+                    at += len;
+                    read += len;
+                    if !visitor.take(piece) {
+                        return Ok(());
+                    }
+                    let skip = visitor.skippable().min(size - at);
+                    if skip > 0 {
+                        at += skip;
+                        visitor.skip(skip);
+                    }
+                }
+                Ok(())
             }
             8 => {
                 let reader = &mut self.reader;
-                inflate_chunks_prefix(
+                let mut stopped = false;
+                let mut inflated_len = 0u32;
+                let inflated = inflate_chunks_to_sink(
                     |fetched, buf| read_exact_at(reader, payload + fetched, buf),
-                    entry.compressed_size.min(input_cap),
+                    entry.compressed_size.min(cap),
                     input,
                     output,
                     inflate_scratch,
-                )
-                .map(|(len, _, _)| len)
+                    |chunk| {
+                        if !visitor.take(chunk) {
+                            stopped = true;
+                            return Err(ZipError::OutputTooSmall);
+                        }
+                        inflated_len = inflated_len.saturating_add(chunk.len() as u32);
+                        if inflated_len >= cap {
+                            // Inflated as far as a probe may go, still
+                            // wanting more: the visitor has failed.
+                            return Err(ZipError::OutputTooSmall);
+                        }
+                        Ok(())
+                    },
+                );
+                if stopped {
+                    return Ok(());
+                }
+                inflated.map(|_| ())
             }
             _ => Err(ZipError::UnsupportedCompression),
         }
@@ -959,19 +998,41 @@ pub trait EpubZipOps {
     }
 
     /// Reads the start of an entry by its stored offset; see
-    /// [`ZipStream::read_entry_start`]. A forward-only reader cannot go
+    /// [`ZipStream::visit_entry_start`]. A forward-only reader cannot go
     /// back, and finds nothing there.
-    fn read_entry_start(
+    #[allow(clippy::too_many_arguments)]
+    fn visit_entry_start(
         &mut self,
         entry: OwnedZipEntry,
         is_name: &mut dyn FnMut(&[u8]) -> bool,
         input: &mut [u8],
         output: &mut [u8],
         inflate_scratch: &mut ZipInflateScratch,
-        input_cap: u32,
-    ) -> Result<usize, ZipError> {
-        let _ = (entry, is_name, input, output, inflate_scratch, input_cap);
+        cap: u32,
+        visitor: &mut dyn EntryVisitor,
+    ) -> Result<(), ZipError> {
+        let _ = (entry, is_name, input, output, inflate_scratch, cap, visitor);
         Err(ZipError::EntryNotFound)
+    }
+}
+
+/// Takes an entry's bytes from its start, as
+/// [`ZipStream::visit_entry_start`] reads them.
+pub trait EntryVisitor {
+    /// Takes the entry's next bytes; false once it needs no more.
+    fn take(&mut self, bytes: &[u8]) -> bool;
+
+    /// How many of the bytes right after those taken it would pass over
+    /// unread. A reader that can seek does not read them, and says so with
+    /// [`EntryVisitor::skip`].
+    fn skippable(&self) -> u32 {
+        0
+    }
+
+    /// The reader passed over `n` bytes, at most what
+    /// [`EntryVisitor::skippable`] said.
+    fn skip(&mut self, n: u32) {
+        let _ = n;
     }
 }
 
@@ -1044,23 +1105,25 @@ where
         ZipStream::has_image_entries(self, buf)
     }
 
-    fn read_entry_start(
+    fn visit_entry_start(
         &mut self,
         entry: OwnedZipEntry,
         is_name: &mut dyn FnMut(&[u8]) -> bool,
         input: &mut [u8],
         output: &mut [u8],
         inflate_scratch: &mut ZipInflateScratch,
-        input_cap: u32,
-    ) -> Result<usize, ZipError> {
-        ZipStream::read_entry_start(
+        cap: u32,
+        visitor: &mut dyn EntryVisitor,
+    ) -> Result<(), ZipError> {
+        ZipStream::visit_entry_start(
             self,
             entry,
             is_name,
             input,
             output,
             inflate_scratch,
-            input_cap,
+            cap,
+            visitor,
         )
     }
 }
@@ -7364,10 +7427,13 @@ mod tests {
             .map(|index| std::format!("OEBPS/text/chapter-{index:03}.xhtml"))
             .collect();
         names.push("OEBPS/style.css".into());
-        names.push("OEBPS/images/cover.jpg".into());
+        // Not an image the index holds.
+        names.push("OEBPS/images/cover.svg".into());
         names.extend((0..images).map(|index| {
             if index == 0 {
                 std::format!("OEBPS/images/{}-plate.PNG", "long".repeat(20))
+            } else if index == 1 {
+                "OEBPS/images/photo.jpeg".into()
             } else {
                 std::format!("OEBPS/images/fig{index:03}.png")
             }
@@ -7653,21 +7719,26 @@ mod tests {
                 .find_entry(name, &mut [0u8; 46], &mut [0u8; 64])
                 .unwrap()
         };
-        let mut read =
+        let read =
             |stream: &mut ZipStream<'_, SliceReader<'_>>, entry: OwnedZipEntry, name: &str| {
                 let mut input = [0xa5u8; 512];
                 let mut output = [0xa5u8; 33];
                 let mut inflate = ZipInflateScratch::new();
+                let mut prefix = Prefix {
+                    bytes: StdVec::new(),
+                    want: 33,
+                };
                 stream
-                    .read_entry_start(
+                    .visit_entry_start(
                         entry,
                         &mut |found| found == name.as_bytes(),
                         &mut input,
                         &mut output,
                         &mut inflate,
                         4096,
+                        &mut prefix,
                     )
-                    .map(|len| output[..len].to_vec())
+                    .map(|()| prefix.bytes)
             };
         for name in ["a.png", "b.png"] {
             let found = entry(&mut stream, name);
@@ -7726,17 +7797,196 @@ mod tests {
         let mut input = [0u8; 512];
         let mut output = [0u8; 33];
         let mut inflate = ZipInflateScratch::new();
+        let mut prefix = Prefix {
+            bytes: StdVec::new(),
+            want: 33,
+        };
         assert_eq!(
-            failing.read_entry_start(
+            failing.visit_entry_start(
                 b,
                 &mut |_| true,
                 &mut input,
                 &mut output,
                 &mut inflate,
-                4096
+                4096,
+                &mut prefix,
             ),
             Err(ZipError::Io)
         );
+    }
+
+    /// Collects an entry's first `want` bytes.
+    struct Prefix {
+        bytes: StdVec<u8>,
+        want: usize,
+    }
+
+    impl EntryVisitor for Prefix {
+        fn take(&mut self, bytes: &[u8]) -> bool {
+            let n = (self.want - self.bytes.len()).min(bytes.len());
+            self.bytes.extend_from_slice(&bytes[..n]);
+            self.bytes.len() < self.want
+        }
+    }
+
+    /// Takes 4 bytes at every 1,000th offset and passes over the rest.
+    struct Sampler {
+        seen: StdVec<(u32, u8)>,
+        at: u32,
+        skip: u32,
+    }
+
+    impl EntryVisitor for Sampler {
+        fn take(&mut self, bytes: &[u8]) -> bool {
+            for &byte in bytes {
+                if self.skip > 0 {
+                    self.skip -= 1;
+                } else {
+                    self.seen.push((self.at, byte));
+                    if self.at % 1000 == 3 {
+                        self.skip = 996;
+                    }
+                }
+                self.at += 1;
+            }
+            self.seen.len() < 40
+        }
+
+        fn skippable(&self) -> u32 {
+            self.skip
+        }
+
+        fn skip(&mut self, n: u32) {
+            self.skip -= n;
+            self.at += n;
+        }
+    }
+
+    /// A reader that records where each read starts.
+    struct LoggingReader<'a> {
+        bytes: &'a [u8],
+        reads: &'a core::cell::RefCell<StdVec<u32>>,
+    }
+
+    impl ReadAt for LoggingReader<'_> {
+        type Error = ();
+
+        fn len(&mut self) -> Result<u32, Self::Error> {
+            Ok(self.bytes.len() as u32)
+        }
+
+        fn read_at(&mut self, offset: u32, out: &mut [u8]) -> Result<usize, Self::Error> {
+            self.reads.borrow_mut().push(offset);
+            SliceReader { bytes: self.bytes }.read_at(offset, out)
+        }
+    }
+
+    /// A JPEG of nothing but maximal APP1 segments deflates about 1,000
+    /// to 1: under a 256 KB cap on compressed bytes it would inflate to a
+    /// quarter of a GB. The cap holds for inflated bytes too, and the
+    /// probe fails there.
+    #[test]
+    fn a_deflated_probe_stops_at_the_cap_on_inflated_bytes() {
+        let mut bomb = std::vec![0xFF, 0xD8];
+        for _ in 0..64 {
+            bomb.extend_from_slice(&[0xFF, 0xE1, 0xFF, 0xFF]);
+            bomb.extend(std::iter::repeat_n(0u8, 65_533));
+        }
+        let deflated = miniz_oxide::deflate::compress_to_vec(&bomb, 9);
+        assert!(deflated.len() * 500 < bomb.len(), "{}", deflated.len());
+        let zip = zip_with_methods(&[("bomb.jpg", 8, &deflated, &bomb)]);
+        let mut tail = [0u8; 4096];
+        let mut stream = ZipStream::new(SliceReader { bytes: &zip }, &mut tail).unwrap();
+        let entry = stream
+            .find_entry("bomb.jpg", &mut [0u8; 46], &mut [0u8; 64])
+            .unwrap();
+        struct Counting(crate::image::index::ImageProber, usize);
+        impl EntryVisitor for Counting {
+            fn take(&mut self, bytes: &[u8]) -> bool {
+                self.1 += bytes.len();
+                self.0.take(bytes)
+            }
+        }
+        let mut prober = Counting(crate::image::index::ImageProber::new(), 0);
+        let cap = 256 * 1024;
+        let result = stream.visit_entry_start(
+            entry,
+            &mut |_| true,
+            &mut [0u8; 512],
+            &mut [0u8; 512],
+            &mut ZipInflateScratch::new(),
+            cap,
+            &mut prober,
+        );
+        assert_eq!(result, Err(ZipError::OutputTooSmall));
+        assert!(
+            (cap as usize..cap as usize + 512).contains(&prober.1),
+            "{}",
+            prober.1
+        );
+        assert_eq!(
+            prober.0.finish().status,
+            crate::image::index::ProbeStatus::Failed
+        );
+    }
+
+    #[test]
+    fn a_stored_entry_is_not_read_where_the_visitor_skips() {
+        let data: StdVec<u8> = (0..20_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let mut deflated = StdVec::new();
+        for piece in data.chunks(65_535) {
+            deflated.push(0);
+            deflated.extend_from_slice(&(piece.len() as u16).to_le_bytes());
+            deflated.extend_from_slice(&(!(piece.len() as u16)).to_le_bytes());
+            deflated.extend_from_slice(piece);
+        }
+        deflated.extend_from_slice(&[1, 0, 0, 0xff, 0xff]);
+        let zip = zip_with_methods(&[("s.bin", 0, &data, &data), ("d.bin", 8, &deflated, &data)]);
+        let expected: StdVec<(u32, u8)> = (0..10u32)
+            .flat_map(|k| (0..4).map(move |i| k * 1000 + i))
+            .map(|at| (at, data[at as usize]))
+            .collect();
+        for name in ["s.bin", "d.bin"] {
+            let reads = core::cell::RefCell::new(StdVec::new());
+            let mut tail = [0u8; 4096];
+            let mut stream = ZipStream::new(
+                LoggingReader {
+                    bytes: &zip,
+                    reads: &reads,
+                },
+                &mut tail,
+            )
+            .unwrap();
+            let entry = stream
+                .find_entry(name, &mut [0u8; 46], &mut [0u8; 64])
+                .unwrap();
+            reads.borrow_mut().clear();
+            let mut sampler = Sampler {
+                seen: StdVec::new(),
+                at: 0,
+                skip: 0,
+            };
+            stream
+                .visit_entry_start(
+                    entry,
+                    &mut |found| found == name.as_bytes(),
+                    &mut [0u8; 64],
+                    &mut [0u8; 100],
+                    &mut ZipInflateScratch::new(),
+                    1 << 20,
+                    &mut sampler,
+                )
+                .unwrap();
+            assert_eq!(sampler.seen, expected, "{name}");
+            let data_reads = reads.borrow().len();
+            if name == "s.bin" {
+                // The local header, its name, then one read per sample.
+                assert_eq!(data_reads, 2 + 10, "{:?}", reads.borrow());
+            } else {
+                // Deflated: everything up to the last sample is read.
+                assert!(data_reads > 100, "{data_reads}");
+            }
+        }
     }
 
     fn stored_zip(files: &[(&str, &[u8])]) -> StdVec<u8> {

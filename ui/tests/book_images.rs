@@ -13,6 +13,8 @@ mod book_images;
 mod custom_font;
 #[path = "support/fat.rs"]
 mod fat;
+#[path = "support/jpeg.rs"]
+mod jpeg;
 #[path = "../../fw/src/reader_cache_files.rs"]
 mod reader_cache_files;
 #[path = "../../fw/src/reader_layout.rs"]
@@ -64,24 +66,37 @@ const SMALL_PNG: &[u8] = include_bytes!("../../fixtures/images/orientation-small
 /// 640 × 900.
 const LARGE_PNG: &[u8] = include_bytes!("../../fixtures/images/orientation-test.png");
 
-/// A book with a chapter, a stylesheet, a JPEG (which the index does not
-/// hold), and PNGs of every kind a probe sorts: stored and deflated ones,
-/// a JPEG named as a PNG, damaged ones (a broken header, a local header
-/// naming another file, a stream that never starts), and one a chapter
-/// never names.
+/// The body of the APP1 the EXIF JPEGs carry before their frame header.
+const APP1_BYTES: usize = 65_000;
+
+/// A deflate stream of stored blocks holding `plain`, of any length.
+fn deflated(plain: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut pieces = plain.chunks(65_535).peekable();
+    while let Some(piece) = pieces.next() {
+        out.push(u8::from(pieces.peek().is_none()));
+        out.extend_from_slice(&(piece.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(!(piece.len() as u16)).to_le_bytes());
+        out.extend_from_slice(piece);
+    }
+    out
+}
+
+/// A book with a chapter, a stylesheet, and images of every kind a probe
+/// sorts: stored and deflated PNGs and JPEGs (two behind a 64 KB APP1), a
+/// progressive JPEG, the start of a JPEG named as a PNG, damaged ones (a
+/// broken header, a local header naming another file, a stream that never
+/// starts), and one a chapter never names.
 fn book() -> (Vec<u8>, Vec<(u32, u32)>) {
     let mut broken = SMALL_PNG[..20].to_vec();
     broken.extend_from_slice(&[0xff; 20]);
     let jpeg = [0xff, 0xd8, 0xff, 0xe0, 0, 16];
-    let deflated = |plain: &[u8]| {
-        let mut block = vec![0x01];
-        block.extend_from_slice(&(plain.len() as u16).to_le_bytes());
-        block.extend_from_slice(&(!(plain.len() as u16)).to_le_bytes());
-        block.extend_from_slice(plain);
-        block
-    };
-    // Empty stored blocks, never final: they inflate to nothing forever.
-    let endless: Vec<u8> = std::iter::repeat_n([0u8, 0, 0, 0xff, 0xff], 4000)
+    let photo = jpeg::photo(160, 120, false);
+    let exif = jpeg::with_app1(&photo, APP1_BYTES);
+    let progressive = jpeg::photo(64, 48, true);
+    // Empty stored blocks, never final: they inflate to nothing forever,
+    // past any cap a probe sets.
+    let endless: Vec<u8> = std::iter::repeat_n([0u8, 0, 0, 0xff, 0xff], 60_000)
         .flatten()
         .collect();
     let (mut bytes, spans) = zip_raw(&[
@@ -104,7 +119,12 @@ fn book() -> (Vec<u8>, Vec<(u32, u32)>) {
             deflated(LARGE_PNG),
             LARGE_PNG.len() as u32,
         ),
-        ("OEBPS/images/photo.jpg", 0, jpeg.to_vec(), 6),
+        (
+            "OEBPS/images/photo.jpg",
+            0,
+            photo.clone(),
+            photo.len() as u32,
+        ),
         ("OEBPS/images/fake.png", 0, jpeg.to_vec(), 6),
         ("OEBPS/images/broken.png", 8, deflated(&broken), 40),
         (
@@ -119,6 +139,19 @@ fn book() -> (Vec<u8>, Vec<(u32, u32)>) {
             0,
             SMALL_PNG.to_vec(),
             SMALL_PNG.len() as u32,
+        ),
+        ("OEBPS/images/exif.jpg", 0, exif.clone(), exif.len() as u32),
+        (
+            "OEBPS/images/zipped.jpeg",
+            8,
+            deflated(&exif),
+            exif.len() as u32,
+        ),
+        (
+            "OEBPS/images/progressive.jpg",
+            0,
+            progressive.clone(),
+            progressive.len() as u32,
         ),
     ]);
     // The local header names another file; the central directory does not.
@@ -341,20 +374,22 @@ fn a_first_pass_marks_images_the_probe_sorts_and_the_second_pass_shows() {
     ] {
         assert_eq!(place(&images, src, true), ImagePlacement::Missing, "{src}");
     }
-    // A JPEG waits for its decoder: its alt text, with no probe and no
-    // second pass.
-    let writes = disk.writes.get();
-    assert_eq!(
-        place(&images, "../images/photo.jpg", true),
-        ImagePlacement::Missing
-    );
-    assert_eq!(disk.writes.get(), writes);
-
-    // The first pass marks what it meets, once.
-    let names = ["small", "large", "fake", "broken", "renamed", "endless"];
+    // The first pass marks what it meets, once: PNGs and JPEGs alike.
+    let names = [
+        "small.png",
+        "large.png",
+        "fake.png",
+        "broken.png",
+        "renamed.png",
+        "endless.png",
+        "photo.jpg",
+        "exif.jpg",
+        "zipped.jpeg",
+        "progressive.jpg",
+    ];
     let mut slots = Vec::new();
     for name in names {
-        let src = format!("../images/{name}.png");
+        let src = format!("../images/{name}");
         let ImagePlacement::Unprobed { slot } = place(&images, &src, true) else {
             panic!("{src} is not probed yet");
         };
@@ -389,6 +424,8 @@ fn a_first_pass_marks_images_the_probe_sorts_and_the_second_pass_shows() {
     };
     // A read that fails stops the probing and records nothing for its
     // image, which is probed again next time.
+    // Every read a probe makes, from here on.
+    reads.borrow_mut().clear();
     let small = spans[2];
     fails.set(Some((small.0, small.0 + 1)));
     assert_eq!(
@@ -401,13 +438,12 @@ fn a_first_pass_marks_images_the_probe_sorts_and_the_second_pass_shows() {
     ));
     fails.set(None);
     // A press stops it after the image in hand.
-    reads.borrow_mut().clear();
     assert_eq!(
         probe(&mut zip, &mut scratch, true),
         Err(ProbeStop::Interrupted)
     );
     let probed = probe(&mut zip, &mut scratch, false).unwrap();
-    assert!((1..=5).contains(&probed), "{probed}");
+    assert!((1..names.len()).contains(&probed), "{probed}");
     assert_eq!(probe(&mut zip, &mut scratch, false), Ok(0), "all probed");
     let unused = spans[9];
     assert!(
@@ -425,7 +461,29 @@ fn a_first_pass_marks_images_the_probe_sorts_and_the_second_pass_shows() {
         .filter(|&&(offset, _)| offset >= endless.0 && offset < endless.1)
         .map(|&(_, len)| len)
         .sum();
-    assert!(endless_read <= 4096 + 512 + 64, "{endless_read} bytes");
+    let cap = book_images::PROBE_INPUT_CAP as usize;
+    assert!(
+        endless_read > cap / 2 && endless_read <= cap + 512 + 64,
+        "{endless_read} bytes"
+    );
+    // A stored JPEG's probe passes over the APP1 before its frame header
+    // without reading it: one read of its start, then on past the APP1.
+    let exif = spans[10];
+    let data = exif.0 + 30 + "OEBPS/images/exif.jpg".len() as u32;
+    let exif_reads: Vec<(u32, usize)> = reads
+        .borrow()
+        .iter()
+        .copied()
+        .filter(|&(offset, _)| offset >= data && offset < exif.1)
+        .collect();
+    let read: usize = exif_reads.iter().map(|&(_, len)| len).sum();
+    assert!(read <= 4 * 512, "{exif_reads:?}");
+    assert!(
+        exif_reads
+            .iter()
+            .all(|&(offset, _)| offset < data + 512 || offset >= data + 6 + APP1_BYTES as u32),
+        "{exif_reads:?}"
+    );
 
     // The second pass shows what the decoder takes, fitted to the page.
     assert_eq!(
@@ -448,11 +506,35 @@ fn a_first_pass_marks_images_the_probe_sorts_and_the_second_pass_shows() {
         },
         "a deflated image probes through the inflater"
     );
-    // A JPEG behind a PNG's name, and damaged images, keep their alt text,
-    // and are not probed again.
-    for name in ["fake", "broken", "renamed", "endless"] {
+    // JPEGs, stored, behind a large APP1, and deflated through it, show
+    // like PNGs.
+    for (name, slot) in [("photo.jpg", 6), ("exif.jpg", 7), ("zipped.jpeg", 8)] {
         assert_eq!(
-            place(&images, &format!("../images/{name}.png"), true),
+            place(&images, &format!("../images/{name}"), false),
+            ImagePlacement::Shown {
+                slot: slots[slot],
+                block: (160, 120),
+                inline: ui::reading::fits_inline(160, 120).then(|| ui::reading::fit_inline_image(
+                    PageBox::LANDSCAPE,
+                    160,
+                    120
+                )),
+                inline_marked: false,
+            },
+            "{name}"
+        );
+    }
+    // A progressive JPEG, the start of a JPEG behind a PNG's name, and
+    // damaged images keep their alt text, and are not probed again.
+    for name in [
+        "progressive.jpg",
+        "fake.png",
+        "broken.png",
+        "renamed.png",
+        "endless.png",
+    ] {
+        assert_eq!(
+            place(&images, &format!("../images/{name}"), true),
             ImagePlacement::Missing,
             "{name}"
         );

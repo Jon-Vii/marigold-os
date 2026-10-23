@@ -10,6 +10,7 @@
 pub mod dither;
 mod fit;
 pub mod index;
+pub mod jpeg;
 pub mod pack;
 pub mod path;
 pub mod png;

@@ -17,6 +17,8 @@ mod book_images;
 mod custom_font;
 #[path = "support/fat.rs"]
 mod fat;
+#[path = "support/jpeg.rs"]
+mod jpeg;
 #[path = "../../fw/src/reader_cache_files.rs"]
 mod reader_cache_files;
 #[path = "../../fw/src/reader_layout.rs"]
@@ -103,21 +105,35 @@ const INITIAL: &[u8] = include_bytes!("../../fixtures/images/inline-initial.png"
 /// 213 × 300.
 const PLATE: &[u8] = include_bytes!("../../fixtures/images/orientation-small.png");
 
-/// The images every test book holds, by name under `OEBPS/images/`. A JPEG
-/// is not in the index: it shows as its alt text.
-const IMAGES: [(&str, &[u8]); 4] = [
-    ("sym.png", SYMBOL),
-    ("t.png", INITIAL),
-    ("plate.png", PLATE),
-    ("photo.jpg", &[0xff, 0xd8, 0xff, 0xe0, 0, 16]),
-];
+/// The images every test book holds, by name under `OEBPS/images/`.
+/// `photo.jpg` is only a JPEG's first bytes: it fails its probe and shows
+/// as its alt text. The other JPEGs lay out as PNGs do.
+fn images() -> Vec<(&'static str, Vec<u8>)> {
+    vec![
+        ("sym.png", SYMBOL.to_vec()),
+        ("t.png", INITIAL.to_vec()),
+        ("plate.png", PLATE.to_vec()),
+        ("photo.jpg", vec![0xff, 0xd8, 0xff, 0xe0, 0, 16]),
+        ("cover.jpg", jpeg::photo(300, 400, false)),
+        ("tiny.jpg", jpeg::photo(17, 12, false)),
+        ("initial.jpg", jpeg::photo(75, 75, false)),
+    ]
+}
+
+/// Where `name` sits in [`images`].
+fn image_at(name: &str) -> usize {
+    images()
+        .iter()
+        .position(|(image, _)| *image == name)
+        .unwrap()
+}
 
 /// What a chapter laid out to: the store's blocks, and the image index's
 /// inline marks afterwards.
 struct Laid {
     store: Box<ReaderStore>,
-    /// Slot of each image in [`IMAGES`] order (None for the JPEG), and
-    /// whether its entry carries the inline mark.
+    /// Slot of each image in [`images`] order, and whether its entry
+    /// carries the inline mark.
     slots: Vec<Option<(u16, bool)>>,
 }
 
@@ -134,13 +150,11 @@ impl Laid {
     }
 
     fn slot(&self, name: &str) -> u16 {
-        let at = IMAGES.iter().position(|(image, _)| *image == name).unwrap();
-        self.slots[at].expect("in the index").0
+        self.slots[image_at(name)].expect("in the index").0
     }
 
     fn marked_inline(&self, name: &str) -> bool {
-        let at = IMAGES.iter().position(|(image, _)| *image == name).unwrap();
-        self.slots[at].expect("in the index").1
+        self.slots[image_at(name)].expect("in the index").1
     }
 }
 
@@ -150,12 +164,13 @@ fn wrap(body: &str) -> String {
 
 /// Lays `body` out as a spine is on the device: a first pass that marks
 /// the images no probe has read, their probes, and a second pass; a book
-/// whose ZIP holds the [`IMAGES`] gets an image index, and with `images`
+/// whose ZIP holds the [`images`] gets an image index, and with `images`
 /// false the sink is given none, as for a book without them.
 fn lay_out_with(body: &str, settings: TypeSettings, images: bool) -> Laid {
     let xhtml = wrap(body);
+    let book_images = self::images();
     let mut files: Vec<(String, bool, &[u8])> = vec![(CHAPTER.into(), false, xhtml.as_bytes())];
-    for (name, bytes) in IMAGES {
+    for (name, bytes) in &book_images {
         files.push((format!("OEBPS/images/{name}"), false, bytes));
     }
     let files: Vec<(&str, bool, &[u8])> = files
@@ -272,7 +287,7 @@ fn lay_out_with(body: &str, settings: TypeSettings, images: bool) -> Laid {
     }
     // The index's file is open once at a time.
     drop(index);
-    let slots = IMAGES
+    let slots = book_images
         .iter()
         .map(|(name, _)| {
             let mut path = [0u8; proto::epub::MAX_ENTRY_NAME_BYTES];
@@ -443,6 +458,53 @@ fn a_tall_image_inside_a_line_is_capped_and_marked_inline() {
     );
     // Its inline size is its own: it now decodes at that size.
     assert!(laid.marked_inline("t.png"));
+}
+
+/// A JPEG lays out as a PNG does: alone in its paragraph a block, inside
+/// a sentence in its line, capped and marked inline when taller than a
+/// line may hold. The `<image>` of an svg-wrapped cover becomes an image
+/// block, which before JPEGs were decoded left nothing at all.
+#[test]
+fn jpegs_lay_out_as_pngs_do_and_an_svg_wrapped_cover_is_an_image() {
+    let laid = lay_out(concat!(
+        r#"<div class="cover"><svg xmlns="http://www.w3.org/2000/svg" "#,
+        r#"xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 300 400">"#,
+        r#"<image width="300" height="400" xlink:href="../images/cover.jpg"/></svg></div>"#,
+        r#"<p>Complete the <img alt="PICT" src="../images/tiny.jpg"/> AEBG.</p>"#,
+        r#"<p>A large <img alt="T" src="../images/initial.jpg"/> initial.</p>"#,
+        r#"<p><img alt="A plate" src="../images/cover.jpg"/></p>"#,
+    ));
+    let blocks = laid.blocks();
+    assert_eq!(blocks.len(), 4, "{blocks:?}");
+    let cover = laid.slot("cover.jpg");
+    let (width, height) = fit_image(PageBox::LANDSCAPE, 300, 400);
+    let mut out = [0u8; proto::image::token::IMAGE_TOKEN_MAX_BYTES];
+    let (record, text) = &blocks[0];
+    assert!(record.is_image());
+    assert_eq!(record.image_height, height);
+    assert_eq!(
+        text.as_str(),
+        encode_image_token(cover, width, None, &mut out).unwrap()
+    );
+    let tiny = laid.slot("tiny.jpg");
+    assert_eq!(shown(&blocks[1].1), format!("Complete the [{tiny}] AEBG."));
+    assert_eq!(
+        inline_image_tokens(&blocks[1].1).collect::<Vec<_>>(),
+        [token(tiny, (17, 12))]
+    );
+    assert!(!laid.marked_inline("tiny.jpg"));
+    let initial = laid.slot("initial.jpg");
+    assert_eq!(
+        inline_image_tokens(&blocks[2].1).collect::<Vec<_>>(),
+        [token(initial, (64, 64))]
+    );
+    assert!(laid.marked_inline("initial.jpg"));
+    let (record, text) = &blocks[3];
+    assert!(record.is_image());
+    assert_eq!(
+        text.as_str(),
+        encode_image_token(cover, width, Some("A plate"), &mut out).unwrap()
+    );
 }
 
 #[test]

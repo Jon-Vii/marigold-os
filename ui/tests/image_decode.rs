@@ -12,6 +12,8 @@ mod book_images;
 mod fat;
 #[path = "../../fw/src/image_decode.rs"]
 mod image_decode;
+#[path = "support/jpeg.rs"]
+mod jpeg;
 #[path = "../../fw/src/page_images.rs"]
 mod page_images;
 #[path = "../../fw/src/reader_cache_files.rs"]
@@ -54,11 +56,13 @@ use display::font::TypeSettings;
 use embedded_sdmmc::{Directory, Mode, VolumeIdx, VolumeManager};
 use image_decode::{
     pending_size, reading_distance, window_pages, DecodeOutcome, IdleImageStep, IdleImageWork,
-    ImageScratch, ImageSession, Nearest, PageImage, PageImages, SPOOL_FILE, SPOOL_MAX_BYTES,
+    ImageScratch, ImageSession, Nearest, PageImage, PageImages, DEFLATED_MAX_BYTES,
+    JPEG_INFLATE_BYTES, SPOOL_FILE,
 };
 use proto::epub::{ZipInflateScratch, ZipStream};
 use proto::image::dither::Ditherer;
-use proto::image::index::{DecodeStatus, ImageEntry, ImagePlace, ProbeStatus};
+use proto::image::index::{DecodeStatus, ImageEntry, ImageFormat, ImagePlace, ProbeStatus};
+use proto::image::jpeg::JpegDecoder;
 use proto::image::pack::{pack_file, PackRecord, PACK_RECORD_HEADER_BYTES};
 use proto::image::png::PngDecoder;
 use reader_store::ReaderStore;
@@ -155,6 +159,25 @@ fn reference_rows(file: &[u8], width: u16, height: u16) -> Vec<u8> {
     let mut inflate = ZipInflateScratch::new();
     decoder.feed(inflate.inflater(), file, &mut sink).unwrap();
     decoder.finish(inflate.inflater(), &mut sink).unwrap();
+    rows
+}
+
+/// What the pack should hold for the JPEG `file` at `width × height`: the
+/// decoder and the ditherer run in RAM.
+fn reference_jpeg_rows(file: &[u8], width: u16, height: u16) -> Vec<u8> {
+    let mut scratch = vec![0x5au8; 64 * 1024];
+    let (cells, rest) = scratch.split_at_mut(Ditherer::scratch_bytes(width.into()));
+    let mut ditherer = Ditherer::new(cells, width.into()).unwrap();
+    let mut decoder = JpegDecoder::new(rest, width.into(), height.into()).unwrap();
+    let mut packed = vec![0u8; Ditherer::packed_len(width.into())];
+    let mut rows = Vec::new();
+    let mut sink = |_: u32, luma: &[u8]| {
+        ditherer.row(luma, &mut packed).unwrap();
+        rows.extend_from_slice(&packed);
+        Ok(())
+    };
+    decoder.feed(file, &mut sink).unwrap();
+    decoder.finish().unwrap();
     rows
 }
 
@@ -621,7 +644,7 @@ fn card_faults_are_retried_and_damaged_images_fail_for_their_orientation() {
             "huge.png".to_string(),
             8,
             deflate_stored(SMALL_PNG),
-            SPOOL_MAX_BYTES + 1,
+            DEFLATED_MAX_BYTES + 1,
         ),
         ("liar.png".to_string(), 8, deflate_stored(SMALL_PNG), 100),
     ]);
@@ -677,6 +700,245 @@ fn card_faults_are_retried_and_damaged_images_fail_for_their_orientation() {
         );
         assert_eq!(after.decode(true).status, DecodeStatus::NotDecoded);
         assert_eq!(decode(slot, &mut scratch), None);
+    }
+    assert!(!has_file(&dir, SPOOL_FILE));
+}
+
+/// JPEGs decode into the packs like PNGs, stored ones straight from the
+/// ZIP and deflated ones through its inflater straight into the decoder:
+/// no spool is written, so a deflated JPEG costs the card no more writes
+/// than a stored one. A photo larger than the page decodes at a reduced
+/// DCT scale; one behind a 64 KB APP1 passes over it.
+#[test]
+fn stored_and_deflated_jpegs_decode_into_the_pack_without_a_spool() {
+    let photo = jpeg::photo(640, 480, false);
+    let large = jpeg::with_app1(&jpeg::photo(1300, 975, false), 65_000);
+    let (bytes, spans) = book(&[
+        stored("photo.jpg", &photo),
+        deflated("photo.jpeg", &photo),
+        stored("large.jpg", &large),
+        deflated("large.jpeg", &large),
+    ]);
+    let disk = fat::Disk::new();
+    let manager: VolumeManager<_, _, 8, 8, 1> =
+        VolumeManager::new_with_limits(&disk, fat::Clock, 0);
+    let volume = manager.open_volume(VolumeIdx(0)).unwrap();
+    let root = volume.open_root_dir().unwrap();
+    reader_cache_files::ensure_v2_cache_dirs(&root, KEY).unwrap();
+    let dir = book_images::book_cache_dir(&root, KEY).unwrap();
+    let mut scratch = scratch();
+    let names = ["photo.jpg", "photo.jpeg", "large.jpg", "large.jpeg"];
+    let files: [&[u8]; 4] = [&photo, &photo, &large, &large];
+    let slots = lay_out(&dir, &bytes, &names.map(|name| (name, AT)), &mut scratch);
+    let reads = RefCell::new(Vec::new());
+    let fails = Cell::new(None);
+    for portrait in [false, true] {
+        let mut writes = Vec::new();
+        for (index, &slot) in slots.iter().enumerate() {
+            let before = entry(&dir, slot);
+            assert_eq!(before.format, ImageFormat::Jpeg);
+            let size = pending_size(&before, portrait).expect("still to decode");
+            if index >= 2 {
+                // Larger than the page: decoded at half size.
+                let info = proto::image::jpeg::probe(files[index]).unwrap();
+                assert_eq!(info.block_side(size.0.into(), size.1.into()), 4);
+            }
+            let page = PageImage {
+                slot,
+                drawn: Some(size),
+            };
+            let written = disk.writes.get();
+            reads.borrow_mut().clear();
+            assert_eq!(
+                decode_one(
+                    &dir,
+                    &bytes,
+                    &reads,
+                    &fails,
+                    page,
+                    portrait,
+                    &mut scratch,
+                    &|| false,
+                ),
+                Some(DecodeOutcome::Decoded),
+                "{} portrait={portrait}",
+                names[index]
+            );
+            writes.push(disk.writes.get() - written);
+            // Each byte of the entry is read at most once.
+            let span = spans[index + 1];
+            let read: usize = reads
+                .borrow()
+                .iter()
+                .filter(|&&(offset, _)| offset >= span.0 && offset < span.1)
+                .map(|&(_, len)| len)
+                .sum();
+            assert!(read <= (span.1 - span.0) as usize, "{}", names[index]);
+            let state = entry(&dir, slot).decode(portrait);
+            assert_eq!(state.status, DecodeStatus::Decoded);
+            let (record, rows) = pack_record(&dir, portrait, state.pack_offset);
+            assert!(record.matches(before.path_hash, size.0, size.1));
+            assert_eq!(
+                rows,
+                reference_jpeg_rows(files[index], size.0, size.1),
+                "{} portrait={portrait}",
+                names[index]
+            );
+            assert!(!has_file(&dir, SPOOL_FILE));
+        }
+        // A spool would write the whole image to the card first: about 60
+        // blocks for the small photo, 370 for the large. Without one the
+        // two decodes differ only by where the pack's clusters fall.
+        for pair in writes.chunks(2) {
+            assert!(pair[1] <= pair[0] + 16, "{writes:?} portrait={portrait}");
+        }
+    }
+}
+
+/// The window lends the decoder what the ditherer, the packed row and a
+/// deflated JPEG's inflate output leave, which covers the worst case at
+/// the widest page.
+#[test]
+fn the_window_holds_the_widest_jpeg_decode() {
+    let widest = PageBox::LANDSCAPE.right - PageBox::LANDSCAPE.left;
+    let width = widest as u32;
+    let worst = proto::image::jpeg::FIXED_SCRATCH + 20 * width as usize;
+    let used =
+        Ditherer::scratch_bytes(width) + Ditherer::packed_len(width) + JPEG_INFLATE_BYTES + worst;
+    assert!(used <= 24 * 1024, "{used}");
+}
+
+#[test]
+fn a_press_or_damage_stops_a_jpeg_decode() {
+    let photo = jpeg::photo(640, 480, false);
+    let mut damaged = photo.clone();
+    let at = damaged.len() / 2;
+    damaged[at..at + 64].fill(0xff);
+    let (bytes, _) = book(&[
+        deflated("photo.jpeg", &photo),
+        stored("damaged.jpg", &damaged),
+        stored("cut.jpg", &photo[..photo.len() / 2]),
+    ]);
+    let disk = fat::Disk::new();
+    let manager: VolumeManager<_, _, 8, 8, 1> =
+        VolumeManager::new_with_limits(&disk, fat::Clock, 0);
+    let volume = manager.open_volume(VolumeIdx(0)).unwrap();
+    let root = volume.open_root_dir().unwrap();
+    reader_cache_files::ensure_v2_cache_dirs(&root, KEY).unwrap();
+    let dir = book_images::book_cache_dir(&root, KEY).unwrap();
+    let mut scratch = scratch();
+    let names = ["photo.jpeg", "damaged.jpg", "cut.jpg"];
+    let slots = lay_out(&dir, &bytes, &names.map(|name| (name, AT)), &mut scratch);
+    let reads = RefCell::new(Vec::new());
+    let fails = Cell::new(None);
+    let decode = |slot, scratch: &mut Scratch, gives_way: &dyn Fn() -> bool| {
+        let page = PageImage { slot, drawn: None };
+        decode_one(
+            &dir, &bytes, &reads, &fails, page, false, scratch, gives_way,
+        )
+    };
+    // A press part way through the inflate: nothing recorded.
+    let asked = Cell::new(0);
+    let late_press = || {
+        asked.set(asked.get() + 1);
+        asked.get() > 40
+    };
+    let before = entry(&dir, slots[0]);
+    assert_eq!(
+        decode(slots[0], &mut scratch, &late_press),
+        Some(DecodeOutcome::Cancelled)
+    );
+    assert_eq!(entry(&dir, slots[0]), before);
+    assert_eq!(
+        decode(slots[0], &mut scratch, &|| false),
+        Some(DecodeOutcome::Decoded)
+    );
+    // Damaged and cut files fail for this orientation.
+    for &slot in &slots[1..] {
+        assert_eq!(
+            decode(slot, &mut scratch, &|| false),
+            Some(DecodeOutcome::Failed)
+        );
+        assert_eq!(entry(&dir, slot).decode(false).status, DecodeStatus::Failed);
+    }
+}
+
+/// A deflated JPEG is held to its declared size, at most
+/// `DEFLATED_MAX_BYTES`, as a spooled PNG is: a few KB of hostile stream
+/// cannot inflate on until a press. One that ends (EOI) with rows to come
+/// fails there, unread past it.
+#[test]
+fn a_deflated_jpeg_is_held_to_its_declared_size() {
+    let photo = jpeg::photo(320, 240, false);
+    // The photo's headers, EOI, then a megabyte of zeros.
+    let mut sos = 2;
+    while photo[sos + 1] != 0xDA {
+        sos += 2 + usize::from(u16::from_be_bytes([photo[sos + 2], photo[sos + 3]]));
+    }
+    let mut early = photo[..sos].to_vec();
+    early.extend_from_slice(&[0xFF, 0xD9]);
+    early.extend(std::iter::repeat_n(0u8, 1 << 20));
+    let (bytes, spans) = book(&[
+        deflated("good.jpeg", &photo),
+        (
+            "liar.jpeg".to_string(),
+            8,
+            deflate_stored(&photo),
+            photo.len() as u32 / 2,
+        ),
+        (
+            "huge.jpeg".to_string(),
+            8,
+            deflate_stored(&photo),
+            DEFLATED_MAX_BYTES + 1,
+        ),
+        deflated("early.jpeg", &early),
+    ]);
+    let disk = fat::Disk::new();
+    let manager: VolumeManager<_, _, 8, 8, 1> =
+        VolumeManager::new_with_limits(&disk, fat::Clock, 0);
+    let volume = manager.open_volume(VolumeIdx(0)).unwrap();
+    let root = volume.open_root_dir().unwrap();
+    reader_cache_files::ensure_v2_cache_dirs(&root, KEY).unwrap();
+    let dir = book_images::book_cache_dir(&root, KEY).unwrap();
+    let mut scratch = scratch();
+    let names = ["good.jpeg", "liar.jpeg", "huge.jpeg", "early.jpeg"];
+    let slots = lay_out(&dir, &bytes, &names.map(|name| (name, AT)), &mut scratch);
+    let reads = RefCell::new(Vec::new());
+    let fails = Cell::new(None);
+    for (index, &slot) in slots.iter().enumerate() {
+        reads.borrow_mut().clear();
+        let page = PageImage { slot, drawn: None };
+        let outcome = decode_one(
+            &dir,
+            &bytes,
+            &reads,
+            &fails,
+            page,
+            false,
+            &mut scratch,
+            &|| false,
+        );
+        let expected = if index == 0 {
+            DecodeOutcome::Decoded
+        } else {
+            DecodeOutcome::Failed
+        };
+        assert_eq!(outcome, Some(expected), "{}", names[index]);
+        let span = spans[index + 1];
+        let read: usize = reads
+            .borrow()
+            .iter()
+            .filter(|&&(offset, _)| offset >= span.0 && offset < span.1)
+            .map(|&(_, len)| len)
+            .sum();
+        match names[index] {
+            // Refused by its declared size: only its local header is read.
+            "huge.jpeg" => assert!(read <= 30 + 64, "{read}"),
+            // Failed at the EOI, a piece or two in.
+            "early.jpeg" => assert!(read <= 3 * 4096, "{read}"),
+            _ => {}
+        }
     }
     assert!(!has_file(&dir, SPOOL_FILE));
 }
@@ -1741,6 +2003,40 @@ fn rebuilding_the_index_deletes_the_packs_and_the_spool() {
     let found = entry(&dir, slots[0]);
     assert_eq!(found.decode(false).status, DecodeStatus::NotDecoded);
     assert_eq!(found.decode(true).status, DecodeStatus::NotDecoded);
+
+    // So is one from before JPEGs were indexed (version 1), packs and all.
+    lay_out(&dir, &bytes, &[("small.png", AT)], &mut scratch);
+    let page = PageImage {
+        slot: slots[0],
+        drawn: None,
+    };
+    assert_eq!(
+        decode_one(
+            &dir,
+            &bytes,
+            &reads,
+            &fails,
+            page,
+            false,
+            &mut scratch,
+            &|| false
+        ),
+        Some(DecodeOutcome::Decoded)
+    );
+    assert!(has_file(&dir, pack_file(false)));
+    assert!(!open(&mut zip, &mut scratch));
+    dir.open_file_in_dir(proto::image::index::IMAGE_INDEX_FILE, Mode::ReadWriteAppend)
+        .map(|file| {
+            file.seek_from_start(4).unwrap();
+            file.write(&1u16.to_le_bytes()).unwrap();
+        })
+        .unwrap();
+    assert!(open(&mut zip, &mut scratch));
+    assert!(!has_file(&dir, pack_file(false)));
+    assert_eq!(
+        entry(&dir, slots[0]).decode(false).status,
+        DecodeStatus::NotDecoded
+    );
 }
 
 #[test]

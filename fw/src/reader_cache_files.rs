@@ -967,18 +967,21 @@ where
 }
 
 /// Settles a book index loaded as `BookIndexLoadResult::BeforeImages`,
-/// once the book's ZIP has been checked for image entries (`None` when it
+/// once the book's ZIP has been checked for image entries beyond a lone
+/// cover (`book_images::book_has_images_beyond_a_cover`; `None` when it
 /// could not be read). This runs once per book: whatever it decides, the
 /// book's next index is written as the current version.
 ///
-/// - No images: the index is written again unchanged but for its version,
-///   through the usual generation-safe write, and is a hit; with the
-///   spacing changed, the reflow that follows writes it instead. Nothing
-///   is rebuilt.
-/// - Images: `page` is pinned in the old pagination and the index is
-///   dropped, so the book rebuilds into the other bank (the old index
-///   stays on the card until the new one commits) and its images replace
-///   the alt text it was laid out with.
+/// - No images, or only a cover: the index is written again unchanged but
+///   for its version, through the usual generation-safe write, and is a
+///   hit; with the spacing changed, the reflow that follows writes it
+///   instead. Nothing is rebuilt. The book's flag says it has no images,
+///   so its sessions open no image index; a cover keeps its v27 layout
+///   until a fresh build, which checks the ZIP again and shows it.
+/// - Other images (PNG or JPEG entries): `page` is pinned in the old
+///   pagination and the index is dropped, so the book rebuilds into the
+///   other bank (the old index stays on the card until the new one
+///   commits) and its images replace the alt text it was laid out with.
 /// - Unread: a complete book is read as it stands and checked again at its
 ///   next open; one that would be built on (a prefix, or a spacing reflow)
 ///   rebuilds instead, so nothing ever extends an unchecked index.

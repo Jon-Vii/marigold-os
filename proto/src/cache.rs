@@ -44,7 +44,16 @@ pub const CACHE_VERSION: u16 = 1;
 // development devices and are rebuilt. v27 is still accepted as before:
 // its records hold no image of either kind, and the firmware's one-time
 // check stamps a book without images as the current version.
-pub const CACHE_V2_VERSION: u16 = 29;
+//
+// Bumped 29 -> 30 when JPEGs became images (`proto::image::jpeg`): a book
+// laid out with a JPEG as its alt text must be laid out again to show it.
+// v28 and v29 never shipped, so they are rebuilt. v27 keeps its one-time
+// check, which now counts JPEGs as well as PNGs, except a lone image whose
+// file name says `cover`: nearly every book has a JPEG cover, so a v27 book
+// with only that is stamped 30, keeping its cover page's v27 layout until
+// a fresh build shows the cover. A v27 book with any other image rebuilds,
+// and one with none is stamped 30.
+pub const CACHE_V2_VERSION: u16 = 30;
 const CACHE_V2_COMPAT_VERSION: u16 = 27;
 pub const CACHE_ROOT_DIR: &str = "XTEINK";
 pub const CACHE_DIR: &str = "CACHE";
@@ -1387,11 +1396,15 @@ mod tests {
         let mut v26 = header_bytes;
         v26[4..6].copy_from_slice(&26u16.to_le_bytes());
         assert_eq!(decode_book_v2_header(&v26), Err(CacheError::BadVersion));
-        // v28 lived only on development devices, laid out without inline
-        // images: it rebuilds.
-        let mut v28 = header_bytes;
-        v28[4..6].copy_from_slice(&28u16.to_le_bytes());
-        assert_eq!(decode_book_v2_header(&v28), Err(CacheError::BadVersion));
+        // v28 and v29 lived only on development devices, laid out without
+        // inline images or without JPEGs: they rebuild.
+        for version in [28u16, 29] {
+            let mut old = header_bytes;
+            old[4..6].copy_from_slice(&version.to_le_bytes());
+            assert_eq!(decode_book_v2_header(&old), Err(CacheError::BadVersion));
+            assert!(!book_v2_predates_images(&old));
+        }
+        assert_eq!(CACHE_V2_VERSION, 30);
         assert!(!old.generated_toc);
         assert!(old.partial);
         assert_eq!(old.total_pages, header.total_pages);

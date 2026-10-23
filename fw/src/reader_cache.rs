@@ -1081,9 +1081,9 @@ where
     if let BookIndexLoadResult::BeforeImages { spacing_changed } = result {
         // Laid out before image blocks existed. The ZIP's central directory
         // says whether that matters: once per book, as whatever follows
-        // writes the index as the current version.
+        // writes the index as the current version. A lone cover does not.
         let checked = Instant::now();
-        let has_images = epub_has_images(root, epub, scratch);
+        let has_images = epub_has_images_beyond_a_cover(root, epub, scratch);
         esp_println::println!(
             "epub: v27 book index; images={:?} checked in {} ms",
             has_images,
@@ -1196,14 +1196,15 @@ where
     }
 }
 
-/// Whether the book's ZIP has image entries, from its central directory
-/// alone: the open reads the end record and the directory (or indexes it),
-/// and only a directory too big for that index is walked once more,
-/// through the idle compressed scratch. No image is read. None when the
-/// book cannot be opened; a directory damaged past the open counts as no
-/// images, as it does for a build.
+/// Whether the book's ZIP has image entries beyond a lone cover
+/// (`book_images::book_has_images_beyond_a_cover`), from its central
+/// directory alone: the open reads the end record and the directory (or
+/// indexes it), and the check walks it once more, from RAM when the open
+/// cached it and through the idle compressed scratch otherwise. No image
+/// is read. None when the book cannot be opened; a directory damaged past
+/// the open counts as no images, as it does for a build.
 #[inline(never)]
-fn epub_has_images<D, T, const ND: usize, const NF: usize, const NV: usize>(
+fn epub_has_images_beyond_a_cover<D, T, const ND: usize, const NF: usize, const NV: usize>(
     root: &Directory<'_, D, T, ND, NF, NV>,
     epub: EpubSource<'_>,
     scratch: &mut ReaderCacheScratch<'_>,
@@ -1228,7 +1229,7 @@ where
         read_bytes: 0,
     };
     let mut zip = ZipStream::new(reader, scratch.tail).ok()?;
-    Some(crate::book_images::book_has_images(
+    Some(crate::book_images::book_has_images_beyond_a_cover(
         &mut zip,
         scratch.compressed,
     ))

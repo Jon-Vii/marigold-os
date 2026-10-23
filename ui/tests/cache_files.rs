@@ -1738,74 +1738,108 @@ fn a_v27_index_is_checked_once_then_written_current_or_rebuilt() {
     );
 }
 
+/// The one-time check on a v27 index counts JPEGs as well as PNGs, except
+/// a lone image named as a cover: nearly every book has one, so a book
+/// whose only image is its cover is written as the current version and
+/// keeps its sections. A cover and any other image, or one image that is
+/// no cover, rebuild. A fresh build still counts the cover, so a relayout
+/// shows it.
 #[test]
-fn a_v27_book_whose_only_image_is_a_jpeg_cover_is_written_current_not_rebuilt() {
-    let disk = fat::Disk::new();
-    let manager: VolumeManager<_, _, 8, 8, 1> =
-        VolumeManager::new_with_limits(&disk, fat::Clock, 0);
-    let volume = manager.open_volume(VolumeIdx(0)).unwrap();
-    let root = volume.open_root_dir().unwrap();
-    let sections = [record(0, 0, 0, 4), record(1, 1, 4, 3)];
-    let mut store = ReaderStore::new();
-    assert_eq!(
-        reader_cache_files::prepare_book_replacement(&root, KEY),
-        Some(0)
-    );
-    assert!(write_index(&root, KEY, ID, 7, &sections, &store, false));
-    make_index_v27(&root);
-    store = ReaderStore::new();
-    assert_eq!(
-        reader_cache_files::load_v2_book_index(&root, KEY, ID, &mut store),
-        BookIndexLoadResult::BeforeImages {
-            spacing_changed: false
-        }
-    );
+fn a_v27_book_rebuilds_for_images_beyond_a_lone_cover() {
+    let cases: [(&[&str], bool); 5] = [
+        (&["OEBPS/images/cover.jpg"], false),
+        (&["OEBPS/images/Cover.PNG"], false),
+        (
+            &["OEBPS/images/cover.jpg", "OEBPS/images/plate01.jpg"],
+            true,
+        ),
+        (&["OEBPS/images/plate01.jpg"], true),
+        (&["OEBPS/images/cover.svg"], false),
+    ];
+    for (images, rebuild) in cases {
+        let disk = fat::Disk::new();
+        let manager: VolumeManager<_, _, 8, 8, 1> =
+            VolumeManager::new_with_limits(&disk, fat::Clock, 0);
+        let volume = manager.open_volume(VolumeIdx(0)).unwrap();
+        let root = volume.open_root_dir().unwrap();
+        let sections = [record(0, 0, 0, 4), record(1, 1, 4, 3)];
+        let mut store = ReaderStore::new();
+        assert_eq!(
+            reader_cache_files::prepare_book_replacement(&root, KEY),
+            Some(0)
+        );
+        assert!(write_index(&root, KEY, ID, 7, &sections, &store, false));
+        make_index_v27(&root);
+        store = ReaderStore::new();
+        assert_eq!(
+            reader_cache_files::load_v2_book_index(&root, KEY, ID, &mut store),
+            BookIndexLoadResult::BeforeImages {
+                spacing_changed: false
+            }
+        );
 
-    // The check the firmware makes on such an index: the ZIP's central
-    // directory, through the open.
-    let (bytes, _) = zip::zip(&[
-        ("OEBPS/cover.xhtml", false, b"<img src='cover.jpg'/>"),
-        ("OEBPS/cover.jpg", false, &[0xff, 0xd8, 0xff, 0xe0]),
-        ("OEBPS/ch01.xhtml", false, b"<p>Text</p>"),
-    ]);
-    let reads = std::cell::RefCell::new(Vec::new());
-    let fails = std::cell::Cell::new(None);
-    let mut tail = [0u8; 4096];
-    let mut zip = proto::epub::ZipStream::new(
-        zip::Archive {
-            bytes: &bytes,
-            reads: &reads,
-            fails: &fails,
-        },
-        &mut tail,
-    )
-    .unwrap();
-    let has_images = book_images::book_has_images(&mut zip, &mut [0u8; 512]);
-    assert!(!has_images, "a JPEG waits for its decoder");
-    assert_eq!(
-        reader_cache_files::settle_index_before_images(
+        // The check the firmware makes on such an index: the ZIP's central
+        // directory, through the open.
+        let mut files: Vec<(&str, bool, &[u8])> = vec![
+            ("OEBPS/cover.xhtml", false, b"<img src='images/cover.jpg'/>"),
+            ("OEBPS/ch01.xhtml", false, b"<p>Text</p>"),
+        ];
+        for name in images {
+            files.push((name, false, &[0xff, 0xd8, 0xff, 0xe0]));
+        }
+        let (bytes, _) = zip::zip(&files);
+        let reads = std::cell::RefCell::new(Vec::new());
+        let fails = std::cell::Cell::new(None);
+        let mut tail = [0u8; 4096];
+        let mut zip = proto::epub::ZipStream::new(
+            zip::Archive {
+                bytes: &bytes,
+                reads: &reads,
+                fails: &fails,
+            },
+            &mut tail,
+        )
+        .unwrap();
+        let beyond = book_images::book_has_images_beyond_a_cover(&mut zip, &mut [0u8; 512]);
+        assert_eq!(beyond, rebuild, "{images:?}");
+        // A fresh build of the same book counts every image, the cover too.
+        let svg_only = images == ["OEBPS/images/cover.svg"];
+        assert_eq!(
+            book_images::book_has_images(&mut zip, &mut [0u8; 512]),
+            !svg_only,
+            "{images:?}"
+        );
+        let settled = reader_cache_files::settle_index_before_images(
             &root,
             KEY,
             ID,
             &mut store,
-            Some(has_images),
+            Some(beyond),
             false,
             5,
             None,
-        ),
-        BookIndexLoadResult::Hit
-    );
-    store = ReaderStore::new();
-    assert_eq!(
-        reader_cache_files::load_v2_book_index(&root, KEY, ID, &mut store),
-        BookIndexLoadResult::Hit,
-        "written current, with its sections: nothing to rebuild"
-    );
-    assert_eq!(
-        store.book_sections.iter().collect::<Vec<_>>(),
-        sections.to_vec()
-    );
-    assert!(!store.book_has_images());
+        );
+        if rebuild {
+            // Pinned to the reader's place and rebuilt; the old index stays
+            // readable until the new one commits.
+            assert_eq!(settled, BookIndexLoadResult::Invalid, "{images:?}");
+            assert!(store.book_sections.is_empty());
+            assert!(store.anchors(ID, 5));
+            continue;
+        }
+        assert_eq!(settled, BookIndexLoadResult::Hit, "{images:?}");
+        store = ReaderStore::new();
+        assert_eq!(
+            reader_cache_files::load_v2_book_index(&root, KEY, ID, &mut store),
+            BookIndexLoadResult::Hit,
+            "written current, with its sections: nothing to rebuild"
+        );
+        assert_eq!(
+            store.book_sections.iter().collect::<Vec<_>>(),
+            sections.to_vec()
+        );
+        assert!(!store.book_has_images());
+    }
 }
 
 #[test]

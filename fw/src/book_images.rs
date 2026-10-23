@@ -20,28 +20,29 @@ use embedded_sdmmc::{Directory, File, Mode, TimeSource};
 use proto::cache::{CACHE_ROOT_DIR, CACHE_V2_DIR};
 use proto::epub::{EpubZipOps, OwnedZipEntry, ZipError, ZipInflateScratch};
 use proto::image::index::{
-    find_image, open_image_index, probe_image, read_image, scan_images, write_image_state,
-    BuildStep, DecodeState, DecodeStatus, ImageEntry, ImageIndexBuilder, ImageIndexHeader,
-    ImageIndexKey, ImagePlace, ImageProbe, IndexError, IndexIo, ProbeStatus, IMAGE_INDEX_FILE,
-    IMAGE_PROBE_BYTES,
+    find_image, is_cover_name, is_image_path, open_image_index, read_image, scan_images,
+    write_image_state, BuildStep, DecodeState, DecodeStatus, ImageEntry, ImageIndexBuilder,
+    ImageIndexHeader, ImageIndexKey, ImagePlace, ImageProbe, ImageProber, IndexError, IndexIo,
+    ProbeStatus, IMAGE_INDEX_FILE,
 };
 use proto::image::pack::{pack_file, PackRecord, SPOOL_FILE};
 use proto::image::path::{path_hash, resolve_image_path};
 use ui::reading::{fit_image, fit_inline_image, fits_inline, PageBox};
 
-/// Compressed bytes a deflated image's probe inflates from per read: its
-/// first bytes come out of the stream's first few dozen.
+/// Bytes a probe reads at a time: a stored image's, or a deflated one's
+/// compressed input.
 const PROBE_INPUT_BYTES: usize = 512;
-/// Most compressed bytes a probe reads before it calls the image damaged:
-/// a stream that has not given up its first bytes by then never will, and
-/// a request's probes must not read on until the session's budget runs
-/// out.
-const PROBE_INPUT_CAP: u32 = 4096;
-/// The part of the XHTML window a probe's bytes take; index entries are
-/// read into the rest.
-const PROBE_OUTPUT_BYTES: usize = 64;
-
-const _: () = assert!(IMAGE_PROBE_BYTES <= PROBE_OUTPUT_BYTES);
+/// Most bytes a probe reads, or inflates, before it calls the image
+/// damaged. A PNG's header is its first 33 bytes; a JPEG's frame header
+/// can follow large APPn segments (an EXIF thumbnail can be 64 KB), which
+/// a stored image seeks past but a deflated one inflates and drops. Either
+/// way a request's probes must not read on until the session's budget runs
+/// out, nor inflate a few KB into hundreds of MB between checks for a
+/// press.
+pub(crate) const PROBE_INPUT_CAP: u32 = 256 * 1024;
+/// The part of the XHTML window a deflated probe inflates into; index
+/// entries are read into the rest.
+const PROBE_OUTPUT_BYTES: usize = 512;
 
 /// What the index must match: the book, and the page boxes images are
 /// fitted to, so decodes for other boxes are never trusted.
@@ -148,6 +149,30 @@ pub(crate) fn book_has_images<Z: EpubZipOps>(zip: &mut Z, buf: &mut [u8]) -> boo
     zip.has_image_entries(buf).unwrap_or(false)
 }
 
+/// Whether a book laid out before sections held images (cache v27) must
+/// be laid out again to show them: it has image entries beyond a lone
+/// cover. Walks every entry of the central directory, through `buf`.
+///
+/// A book whose only image's file name says `cover` (`is_cover_name`)
+/// answers no, and its index is stamped current. Nearly every book has a
+/// JPEG cover, and rebuilding each once after the update would cost every
+/// library a rebuild of every book for one page; such a book's cover page
+/// keeps its v27 layout (alt text, or nothing for an svg-wrapped cover)
+/// until the book is laid out again for another reason, when a fresh
+/// build shows it (`book_has_images` still counts it). A directory that
+/// cannot be read through counts as no images, as for a build.
+pub(crate) fn book_has_images_beyond_a_cover<Z: EpubZipOps>(zip: &mut Z, buf: &mut [u8]) -> bool {
+    let (mut images, mut cover) = (0u32, false);
+    let walked = zip.for_each_entry(buf, &mut |entry| {
+        if is_image_path(entry.name) {
+            images += 1;
+            cover = is_cover_name(entry.name);
+        }
+        images < 2
+    });
+    walked.is_ok() && (images > 1 || (images == 1 && !cover))
+}
+
 impl<'v, D, T, const ND: usize, const NF: usize, const NV: usize> BookImages<'v, D, T, ND, NF, NV>
 where
     D: embedded_sdmmc::BlockDevice,
@@ -239,17 +264,21 @@ where
     /// Probes the images in `slots` that a chapter's first pass marked
     /// (wanted and not yet probed), and stores each result in its entry as
     /// one write. A probe reads the image's local header by its stored
-    /// offset, checks that it names the image, then reads its first
-    /// `IMAGE_PROBE_BYTES`; a deflated image is inflated only that far,
-    /// from at most `PROBE_INPUT_CAP` compressed bytes. An image whose
-    /// archive entry or header is damaged is marked failed and keeps its
-    /// alt text. A failed read records nothing and stops the probing, so
-    /// the image is probed again later.
+    /// offset, checks that it names the image, then reads on until it can
+    /// judge it (`ImageProber`): a PNG's first 33 bytes, or a JPEG's
+    /// segments up to its frame header. A stored image is read a block at
+    /// a time and seeks past segments the probe does not read; a deflated
+    /// one is inflated that far and the rest dropped. No more than
+    /// `PROBE_INPUT_CAP` bytes are read, or inflated, either way. An image
+    /// whose archive entry or header is damaged, or that has not said what
+    /// it is by the cap, is marked failed and keeps its alt text. A failed
+    /// read records nothing and stops the probing, so the image is probed
+    /// again later.
     ///
-    /// `window` (the XHTML window) holds the probe's bytes and runs of
-    /// index entries, `compressed` a deflated image's input, and `inflate`
-    /// its stream: all idle between a spine's passes. Asks `gives_way`
-    /// after each image. Returns how many it probed.
+    /// `window` (the XHTML window) holds a deflated probe's output and runs
+    /// of index entries, `compressed` the bytes read, and `inflate` the
+    /// stream: all idle between a spine's passes. Asks `gives_way` after
+    /// each image. Returns how many it probed.
     #[inline(never)]
     pub(crate) fn probe_marked<Z: EpubZipOps>(
         &self,
@@ -262,7 +291,7 @@ where
     ) -> Result<usize, ProbeStop> {
         let input_len = compressed.len().min(PROBE_INPUT_BYTES);
         let input = &mut compressed[..input_len];
-        let Some((bytes, entries)) = window.split_at_mut_checked(PROBE_OUTPUT_BYTES) else {
+        let Some((output, entries)) = window.split_at_mut_checked(PROBE_OUTPUT_BYTES) else {
             return Err(ProbeStop::Index);
         };
         let mut probed = 0;
@@ -284,21 +313,22 @@ where
                     uncompressed_size: entry.uncompressed_size,
                     local_header_offset: entry.local_header_offset,
                 };
-                let prefix = &mut bytes[..IMAGE_PROBE_BYTES];
                 let path_hash = entry.path_hash;
-                let read = zip.read_entry_start(
+                let mut prober = ImageProber::new();
+                let read = zip.visit_entry_start(
                     source,
                     &mut |name| {
                         core::str::from_utf8(name)
                             .is_ok_and(|name| proto::image::path::path_hash(name) == path_hash)
                     },
                     input,
-                    prefix,
+                    output,
                     inflate,
                     PROBE_INPUT_CAP,
+                    &mut prober,
                 );
                 entry.set_probe(match read {
-                    Ok(len) => probe_image(&prefix[..len]),
+                    Ok(()) => prober.finish(),
                     Err(ZipError::Io) => {
                         stop = Some(ProbeStop::Archive);
                         return Ok(false);

@@ -4,7 +4,7 @@
 //! Built once from the ZIP central directory, which a book open reads
 //! anyway, so building costs no extra card reads beyond walking that
 //! directory again when the book has more images than one pass can hold.
-//! It holds the images a decoder takes: PNGs, for now (see
+//! It holds the images a decoder takes: PNGs and JPEGs (see
 //! [`is_image_path`]).
 //! Everything else in an entry starts empty and is filled in place later:
 //! the image's format and size when it is first probed, a `wanted` mark
@@ -101,14 +101,17 @@
 //! The header is written last. A build that stops early leaves a zeroed
 //! header, which [`open_image_index`] rejects, so the index is rebuilt.
 
+use super::jpeg::{JpegError, JpegProbe};
 use super::path::path_hash;
 use super::png;
-use crate::epub::ZipEntry;
+use crate::epub::{EntryVisitor, ZipEntry};
 
 /// The file's name in a book's cache directory.
 pub const IMAGE_INDEX_FILE: &str = "IMAGES.BIN";
 pub const IMAGE_INDEX_MAGIC: [u8; 4] = *b"X4IM";
-pub const IMAGE_INDEX_VERSION: u16 = 1;
+/// 1 held PNGs only. 2 holds JPEGs too, so an index built before them is
+/// built again, which deletes its packs.
+pub const IMAGE_INDEX_VERSION: u16 = 2;
 pub const IMAGE_INDEX_HEADER_BYTES: usize = 64;
 pub const IMAGE_FANOUT_AT: u32 = 64;
 pub const IMAGE_FANOUT_BYTES: usize = 2 * (BUCKETS + 1);
@@ -207,8 +210,8 @@ pub enum ProbeStatus {
     Unprobed,
     /// A format and size the decoder takes.
     Supported,
-    /// A real image the decoder does not take (interlaced, too large, not
-    /// PNG): it shows as its alt text.
+    /// A real image the decoders do not take (an interlaced PNG, a
+    /// progressive JPEG, one too large, neither): it shows as its alt text.
     Unsupported,
     /// The header could not be read or makes no sense.
     Failed,
@@ -308,19 +311,156 @@ pub struct ImageProbe {
 /// Bytes [`probe_image`] needs to judge a PNG: the signature and IHDR.
 pub const IMAGE_PROBE_BYTES: usize = png::PROBE_BYTES;
 
-/// Judges an image from the first bytes of its file (up to
-/// [`IMAGE_PROBE_BYTES`]; fewer when the file is shorter).
+/// Judges an image from a prefix of its file: a PNG's first
+/// [`IMAGE_PROBE_BYTES`], or a JPEG's segments up to its frame header. A
+/// prefix that ends before what it needs judges as failed.
 pub fn probe_image(prefix: &[u8]) -> ImageProbe {
-    let unsupported = |format| ImageProbe {
-        format,
-        status: ProbeStatus::Unsupported,
-        width: 0,
-        height: 0,
-    };
-    // Baseline JPEG decoding is a later phase.
-    if prefix.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        return unsupported(ImageFormat::Jpeg);
+    let mut prober = ImageProber::new();
+    prober.take(prefix);
+    prober.finish()
+}
+
+/// Judges an image from its first bytes as they stream past: a PNG by its
+/// signature and IHDR, a JPEG by its segments up to the frame header,
+/// which may come after large APPn segments (an EXIF thumbnail can be 64
+/// KB). A reader that can seek need not read what
+/// [`EntryVisitor::skippable`] says the prober would pass over.
+#[derive(Clone, Debug)]
+pub struct ImageProber {
+    state: Prober,
+}
+
+#[derive(Clone, Debug)]
+enum Prober {
+    /// The first bytes, until they say which format.
+    Prefix([u8; IMAGE_PROBE_BYTES], u8),
+    Jpeg(JpegProbe),
+    Done(ImageProbe),
+}
+
+/// A JPEG starts with SOI and another marker.
+const JPEG_START: [u8; 3] = [0xFF, 0xD8, 0xFF];
+
+impl Default for ImageProber {
+    fn default() -> Self {
+        Self::new()
     }
+}
+
+impl ImageProber {
+    pub fn new() -> Self {
+        Self {
+            state: Prober::Prefix([0; IMAGE_PROBE_BYTES], 0),
+        }
+    }
+
+    /// The answer, once [`EntryVisitor::take`] has said it needs no more;
+    /// before that, what the bytes so far say about a file that ended
+    /// there.
+    pub fn finish(&self) -> ImageProbe {
+        match &self.state {
+            Prober::Done(probe) => *probe,
+            Prober::Prefix(bytes, len) => {
+                probe_png(bytes.get(..usize::from(*len)).unwrap_or_default())
+            }
+            Prober::Jpeg(_) => ImageProbe {
+                format: ImageFormat::Jpeg,
+                status: ProbeStatus::Failed,
+                ..ImageProbe::default()
+            },
+        }
+    }
+}
+
+impl EntryVisitor for ImageProber {
+    fn take(&mut self, mut bytes: &[u8]) -> bool {
+        if let Prober::Prefix(prefix, len) = &mut self.state {
+            let have = usize::from(*len);
+            let n = bytes.len().min(IMAGE_PROBE_BYTES - have);
+            if let (Some(room), Some(part)) = (prefix.get_mut(have..have + n), bytes.get(..n)) {
+                room.copy_from_slice(part);
+            }
+            *len += n as u8;
+            bytes = bytes.get(n..).unwrap_or_default();
+            let held = prefix.get(..usize::from(*len)).unwrap_or_default();
+            if held.starts_with(&JPEG_START) {
+                // A JPEG: its probe reads from the start.
+                let mut jpeg = JpegProbe::new();
+                let answer = jpeg.feed(held);
+                self.state = Prober::Jpeg(jpeg);
+                if let Some(answer) = answer {
+                    self.state = Prober::Done(jpeg_probe(answer));
+                    return false;
+                }
+            } else if held.len() >= JPEG_START.len() && !held.starts_with(&[0x89]) {
+                // Neither: every PNG starts with 0x89.
+                self.state = Prober::Done(ImageProbe {
+                    format: ImageFormat::Unknown,
+                    status: ProbeStatus::Unsupported,
+                    ..ImageProbe::default()
+                });
+                return false;
+            } else if held.len() == IMAGE_PROBE_BYTES {
+                self.state = Prober::Done(probe_png(held));
+                return false;
+            } else {
+                return true;
+            }
+        }
+        if let Prober::Jpeg(jpeg) = &mut self.state {
+            if let Some(answer) = jpeg.feed(bytes) {
+                self.state = Prober::Done(jpeg_probe(answer));
+                return false;
+            }
+            return true;
+        }
+        false
+    }
+
+    fn skippable(&self) -> u32 {
+        match &self.state {
+            Prober::Jpeg(jpeg) => jpeg.skippable(),
+            _ => 0,
+        }
+    }
+
+    fn skip(&mut self, n: u32) {
+        if let Prober::Jpeg(jpeg) = &mut self.state {
+            jpeg.skip(n);
+        }
+    }
+}
+
+fn jpeg_probe(answer: Result<super::jpeg::JpegInfo, JpegError>) -> ImageProbe {
+    let size = |side: u32| u16::try_from(side).unwrap_or(u16::MAX);
+    match answer {
+        Ok(info) => ImageProbe {
+            format: ImageFormat::Jpeg,
+            status: if info.is_supported() {
+                ProbeStatus::Supported
+            } else {
+                ProbeStatus::Unsupported
+            },
+            width: size(info.width),
+            height: size(info.height),
+        },
+        // Hierarchical: a real JPEG, with no size to say.
+        Err(JpegError::Unsupported) => ImageProbe {
+            format: ImageFormat::Jpeg,
+            status: ProbeStatus::Unsupported,
+            ..ImageProbe::default()
+        },
+        Err(_) => ImageProbe {
+            format: ImageFormat::Jpeg,
+            status: ProbeStatus::Failed,
+            ..ImageProbe::default()
+        },
+    }
+}
+
+/// Judges a PNG, or anything that is neither format, from its first bytes
+/// (up to [`IMAGE_PROBE_BYTES`]; fewer when the file is shorter).
+fn probe_png(prefix: &[u8]) -> ImageProbe {
     match png::probe(prefix) {
         Ok(info) => {
             let size = |side: u32| u16::try_from(side).unwrap_or(u16::MAX);
@@ -335,7 +475,12 @@ pub fn probe_image(prefix: &[u8]) -> ImageProbe {
                 height: size(info.height),
             }
         }
-        Err(png::PngError::NotPng) => unsupported(ImageFormat::Unknown),
+        Err(png::PngError::NotPng) => ImageProbe {
+            format: ImageFormat::Unknown,
+            status: ProbeStatus::Unsupported,
+            width: 0,
+            height: 0,
+        },
         // Cut short or a broken header. Past eight bytes the signature
         // matched, so it was meant to be a PNG.
         Err(_) => ImageProbe {
@@ -352,16 +497,23 @@ pub fn probe_image(prefix: &[u8]) -> ImageProbe {
 }
 
 /// Whether a ZIP entry name looks like an image the index should hold: a
-/// `.png`, in any case. A probe confirms it by the file's magic bytes.
+/// `.png`, `.jpg` or `.jpeg`, in any case. A probe confirms it by the
+/// file's magic bytes.
 ///
-/// JPEGs are left out until a decoder takes them. In the index they would
-/// cost every chapter that shows one a probe and a second layout pass, all
-/// to keep its alt text, and they would make nearly every book look
-/// illustrated, since most have a JPEG cover. Taking them in later bumps
-/// [`IMAGE_INDEX_VERSION`], so every index is built again with them, and
-/// the cache version, so books with JPEGs are laid out again to show them.
+/// Taking in a new format bumps [`IMAGE_INDEX_VERSION`], so every index is
+/// built again with it, and the cache version, so books holding it are
+/// laid out again to show it (see `proto::cache`).
 pub fn is_image_path(name: &str) -> bool {
     is_image_name(name.as_bytes())
+}
+
+/// Whether an image's file name (its last path component) says it is a
+/// cover: it contains `cover`, in any case.
+pub fn is_cover_name(name: &str) -> bool {
+    let file = name.rsplit('/').next().unwrap_or(name);
+    file.as_bytes()
+        .windows(5)
+        .any(|window| window.eq_ignore_ascii_case(b"cover"))
 }
 
 /// [`is_image_path`] on raw name bytes, which may be only a name's tail:
@@ -371,7 +523,10 @@ pub fn is_image_name(name: &[u8]) -> bool {
         return false;
     };
     let (stem, extension) = (&name[..dot], &name[dot + 1..]);
-    stem.last().is_some_and(|&byte| byte != b'/') && extension.eq_ignore_ascii_case(b"png")
+    stem.last().is_some_and(|&byte| byte != b'/')
+        && (extension.eq_ignore_ascii_case(b"png")
+            || extension.eq_ignore_ascii_case(b"jpg")
+            || extension.eq_ignore_ascii_case(b"jpeg"))
 }
 
 /// Reads and checks an index's header and fan-out. Any error means the
@@ -1302,9 +1457,12 @@ mod tests {
         let mut unfinished = good.bytes.clone();
         unfinished[..IMAGE_INDEX_HEADER_BYTES].fill(0);
         assert_eq!(open(&unfinished, &KEY), Err(IndexError::BadMagic));
-        let mut old = good.bytes.clone();
-        old[4] = 0;
-        assert_eq!(open(&old, &KEY), Err(IndexError::BadVersion));
+        for version in [0, 1] {
+            // Version 1 held PNGs only: built again, now with JPEGs.
+            let mut old = good.bytes.clone();
+            old[4] = version;
+            assert_eq!(open(&old, &KEY), Err(IndexError::BadVersion));
+        }
         // Any flipped header or fan-out byte fails the checksum or a check.
         for at in (6..IMAGE_FANOUT_AT as usize + IMAGE_FANOUT_BYTES).step_by(7) {
             let mut damaged = good.bytes.clone();
@@ -1456,36 +1614,109 @@ mod tests {
             (ProbeStatus::Unsupported, u16::MAX)
         );
         assert_eq!(probe_image(&png[..20]).status, ProbeStatus::Failed);
-        let jpeg = probe_image(&[0xFF, 0xD8, 0xFF, 0xE0, 0, 0x10]);
+        // A JPEG's frame header, after an APP0 it passes over.
+        let mut jpeg = std::vec![0xFF, 0xD8, 0xFF, 0xE0, 0, 16];
+        jpeg.extend_from_slice(b"JFIF\0\x01\x01\0\0\x01\0\x01\0\0");
+        jpeg.extend_from_slice(&[0xFF, 0xC0, 0, 17, 8, 0x02, 0x58, 0x03, 0x20, 3]);
+        jpeg.extend_from_slice(&[1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1]);
         assert_eq!(
-            (jpeg.format, jpeg.status),
-            (ImageFormat::Jpeg, ProbeStatus::Unsupported)
+            probe_image(&jpeg),
+            ImageProbe {
+                format: ImageFormat::Jpeg,
+                status: ProbeStatus::Supported,
+                width: 800,
+                height: 600,
+            }
         );
+        let mut progressive = jpeg.clone();
+        progressive[21] = 0xC2;
+        assert_eq!(
+            probe_image(&progressive),
+            ImageProbe {
+                status: ProbeStatus::Unsupported,
+                ..probe_image(&jpeg)
+            }
+        );
+        // Cut before the frame header, or broken: failed.
+        assert_eq!(
+            (
+                probe_image(&jpeg[..20]).format,
+                probe_image(&jpeg[..20]).status
+            ),
+            (ImageFormat::Jpeg, ProbeStatus::Failed)
+        );
+        let mut broken = jpeg.clone();
+        // A frame header too short for its components.
+        broken[23] = 9;
+        assert_eq!(probe_image(&broken).status, ProbeStatus::Failed);
         let gif = probe_image(b"GIF89a....");
         assert_eq!(
             (gif.format, gif.status),
             (ImageFormat::Unknown, ProbeStatus::Unsupported)
         );
+        // Three bytes say a file is neither.
+        let mut prober = ImageProber::new();
+        assert!(!prober.take(b"GIF"));
+        assert_eq!(prober.finish().status, ProbeStatus::Unsupported);
+        // Fed a byte at a time, the answers are the same.
+        for file in [&png[..], &jpeg, &progressive, &png[..20], &jpeg[..20]] {
+            let mut prober = ImageProber::new();
+            for &byte in file {
+                if !prober.take(&[byte]) {
+                    break;
+                }
+            }
+            assert_eq!(prober.finish(), probe_image(file));
+        }
+    }
+
+    #[test]
+    fn covers_are_named_so_in_their_file_names() {
+        for name in [
+            "OEBPS/images/cover.jpg",
+            "cover.jpeg",
+            "OEBPS/Images/9780141439518_Cover.JPG",
+            "img/front-COVER-image.png",
+        ] {
+            assert!(is_cover_name(name), "{name}");
+        }
+        for name in [
+            "OEBPS/cover/front.jpg",
+            "OEBPS/images/plate01.jpg",
+            "cove.jpg",
+            "",
+        ] {
+            assert!(!is_cover_name(name), "{name}");
+        }
     }
 
     #[test]
     fn image_names_are_picked_by_extension() {
-        for name in ["a.png", "OEBPS/Images/Cover.PNG", "x/y.Png"] {
+        for name in [
+            "a.png",
+            "OEBPS/Images/Cover.PNG",
+            "x/y.Png",
+            "cover.jpg",
+            "x/y.jpeg",
+            "OEBPS/Images/Plate.JPG",
+            "a.JpEg",
+        ] {
             assert!(is_image_path(name), "{name}");
         }
-        // JPEGs wait for their decoder.
         for name in [
             "a.gif",
             "a.svg",
             "png",
             ".png",
+            ".jpg",
+            "dir/.jpeg",
             "dir/.png",
             "a.png/",
+            "a.jpg/",
             "a.xhtml",
             "a.webp",
-            "cover.jpg",
-            "x/y.jpeg",
             "p.Jpe",
+            "a.jfif",
         ] {
             assert!(!is_image_path(name), "{name}");
         }

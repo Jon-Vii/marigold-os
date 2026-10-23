@@ -3,21 +3,25 @@
 //! reader first.
 //!
 //! A decode reads the image from the book's ZIP at the local-header offset
-//! its index entry keeps, runs it through the PNG decoder and the ditherer,
-//! and appends the 1 bpp rows to the orientation's pack behind a
-//! `PackRecord` header, through a write buffer. A stored image streams
-//! straight from the ZIP. A deflated one is first inflated to a spool file
-//! in the book's cache directory and decoded from that: the decoder's zlib
-//! stream needs the one inflater the ZIP read would need too. Only once the
-//! decoder's `finish` succeeds and the pack's new length is on the card is
-//! the index entry updated, in one write. A decode that stops part way
-//! leaves an orphan tail in the pack and nothing pointing at it.
+//! its index entry keeps, runs it through the decoder for its format (PNG
+//! or JPEG) and the ditherer, and appends the 1 bpp rows to the
+//! orientation's pack behind a `PackRecord` header, through a write
+//! buffer. A stored image streams straight from the ZIP. A deflated JPEG
+//! streams through the ZIP's inflater straight into the JPEG decoder,
+//! which needs no inflater of its own. A deflated PNG is first inflated to
+//! a spool file in the book's cache directory and decoded from that: the
+//! PNG decoder's zlib stream needs the one inflater the ZIP read would
+//! need too. Only once the decoder's `finish` succeeds and the pack's new
+//! length is on the card is the index entry updated, in one write. A
+//! decode that stops part way leaves an orphan tail in the pack and
+//! nothing pointing at it.
 //!
 //! What a decode records, by how it ends (the same classes as a probe's):
 //!
 //! - It succeeds: the entry gets the record's offset, decoded.
-//! - A content fault (a corrupt PNG, one the decoder does not take after
-//!   all, a damaged ZIP entry, a deflated image past [`SPOOL_MAX_BYTES`])
+//! - A content fault (a corrupt image, one the decoder does not take after
+//!   all, a damaged ZIP entry, a deflated image past [`DEFLATED_MAX_BYTES`]
+//!   or inflating to more than its entry says it holds)
 //!   marks that orientation failed for good: the image keeps its
 //!   placeholder. So does a pack that would pass `MAX_PACK_BYTES` with the
 //!   records images still use; one filled mostly by orphan tails is started
@@ -26,8 +30,9 @@
 //!   image is tried again later.
 //! - A press cancels it, also recording nothing. The sink asks between
 //!   output rows, the feed loop between pieces of [`FEED_BYTES`], which
-//!   bounds the decoder's work in between, and a spool between pieces of
-//!   compressed input.
+//!   bounds the decoder's work in between, and an inflate (to the spool or
+//!   into the JPEG decoder) between pieces of compressed input and of its
+//!   output.
 //!
 //! Every buffer comes from the EPUB scratch, idle whenever no spine is
 //! being laid out (see [`ImageScratch`]), so decoding adds no static RAM.
@@ -43,17 +48,28 @@ use proto::epub::{
     ZipInflateScratch,
 };
 use proto::image::dither::Ditherer;
-use proto::image::index::{DecodeState, DecodeStatus, ImageEntry, ImagePlace, ProbeStatus};
+use proto::image::index::{
+    DecodeState, DecodeStatus, ImageEntry, ImageFormat, ImagePlace, ProbeStatus,
+};
+use proto::image::jpeg::{JpegDecoder, JpegError};
 pub(crate) use proto::image::pack::SPOOL_FILE;
 use proto::image::pack::{pack_file, PackRecord, MAX_PACK_BYTES};
 use proto::image::png::{PngDecoder, PngError};
 use proto::image::{LumaSink, SinkError};
 use ui::reading::{fit_image, fit_inline_image, fits_inline, PageBox};
 
-/// Largest deflated image spooled, by its declared size: about 14 s of
-/// card writes and reads at the X4's measured rates. Larger ones are
-/// refused like an image past the decoder's pixel cap.
-pub(crate) const SPOOL_MAX_BYTES: u32 = 4 * 1024 * 1024;
+/// Largest deflated image decoded, by its declared size: for a PNG, about
+/// 14 s of card writes and reads to and from the spool at the X4's
+/// measured rates; for a JPEG, which streams, a bound on what a few KB of
+/// hostile stream can make the inflater produce. Larger ones are refused
+/// like an image past the decoder's pixel cap, and a stream that inflates
+/// past its declared size is damage.
+pub(crate) const DEFLATED_MAX_BYTES: u32 = 4 * 1024 * 1024;
+/// The part of the window a deflated JPEG inflates into on its way to the
+/// decoder. The rest of the window, after the ditherer's, holds the
+/// decoder's scratch, which at most needs `4,227 + 20 · out_w` bytes: at
+/// the X4's 784-pixel landscape width that leaves 402 bytes to spare.
+pub(crate) const JPEG_INFLATE_BYTES: usize = 1024;
 /// Bytes the decoder is fed between checks for a press. Deflate expands at
 /// most about 1,032 times, so one piece inflates at most about 1 MB: a few
 /// hundred milliseconds even for an image scaled down so far that output
@@ -72,16 +88,16 @@ pub(crate) struct ImageScratch<'a> {
     pub(crate) input: &'a mut [u8],
     /// The pack write buffer: the other half.
     pub(crate) stage: &'a mut [u8],
-    /// The XHTML window: the ditherer's error rows, the packed row, and the
-    /// PNG decoder's scratch, which takes the rest; before that, a deflated
-    /// image's inflate output on its way to the spool, or the index read
-    /// back a run of entries at a time.
+    /// The XHTML window: the ditherer's error rows, the packed row, a
+    /// deflated JPEG's inflate output, and the decoder's scratch, which
+    /// takes the rest; before that, a deflated PNG's inflate output on its
+    /// way to the spool, or the index read back a run of entries at a time.
     pub(crate) window: &'a mut [u8],
     /// The local header's name, checked against the index entry: the ZIP
     /// name scratch.
     pub(crate) name: &'a mut [u8],
-    /// The ZIP inflater: the spool's outer stream, then the PNG's zlib
-    /// stream.
+    /// The ZIP inflater: a deflated JPEG's stream, or the spool's outer
+    /// stream, then the PNG's zlib stream.
     pub(crate) inflate: &'a mut ZipInflateScratch,
 }
 
@@ -165,6 +181,14 @@ fn png_fault(error: PngError) -> Fault {
         PngError::Sink(SinkError::Io) => Fault::Io,
         // Including a scratch too small for the image's rows: a PNG the
         // decoder does not take after all.
+        _ => Fault::Content,
+    }
+}
+
+fn jpeg_fault(error: JpegError) -> Fault {
+    match error {
+        JpegError::Sink(SinkError::Cancelled) => Fault::Cancelled,
+        JpegError::Sink(SinkError::Io) => Fault::Io,
         _ => Fault::Content,
     }
 }
@@ -803,6 +827,10 @@ where
         })
         .map_err(zip_fault)?;
         match entry.method {
+            // Stored or deflated, a JPEG streams into its decoder.
+            _ if entry.format == ImageFormat::Jpeg => {
+                decode_jpeg(record, zip, payload, archive, pack, scratch, gives_way)?
+            }
             0 => decode_stream(
                 record,
                 entry.compressed_size,
@@ -876,7 +904,7 @@ where
 }
 
 /// Inflates a deflated image to the spool, through `scratch.input` and the
-/// window, capped at its declared size (and [`SPOOL_MAX_BYTES`]). Returns
+/// window, capped at its declared size (and [`DEFLATED_MAX_BYTES`]). Returns
 /// the spool, rewound, and its length.
 #[inline(never)]
 fn spool<'d, R, D, T, const ND: usize, const NF: usize, const NV: usize>(
@@ -893,7 +921,7 @@ where
     T: TimeSource,
 {
     let declared = zip.uncompressed_size;
-    if declared > SPOOL_MAX_BYTES {
+    if declared > DEFLATED_MAX_BYTES {
         return Err(Fault::Content);
     }
     let file = dir
@@ -1022,6 +1050,150 @@ where
     sink.out.flush().map_err(|_| Fault::Io)
 }
 
+/// Decodes a JPEG into `record`'s rows, appended to the pack after its
+/// header. A stored entry is read a piece of `scratch.input` at a time; a
+/// deflated one is inflated through the ZIP's inflater, a piece of
+/// compressed input at a time, into a piece of the window, and each output
+/// chunk goes straight to the decoder, which needs no inflater. Either way
+/// the decoder sees at most [`FEED_BYTES`] between checks for a press, and
+/// reading stops once its last row is out, or the decoder fails. A
+/// deflated entry is held to its declared size, at most
+/// [`DEFLATED_MAX_BYTES`], so a small hostile stream cannot inflate on
+/// until a press (which records nothing, so it would start again).
+#[inline(never)]
+fn decode_jpeg<R, D, T, const ND: usize, const NF: usize, const NV: usize>(
+    record: PackRecord,
+    zip: OwnedZipEntry,
+    payload: u32,
+    archive: &mut R,
+    pack: &File<'_, D, T, ND, NF, NV>,
+    scratch: &mut ImageScratch<'_>,
+    gives_way: &dyn Fn() -> bool,
+) -> Result<(), Fault>
+where
+    R: ReadAt,
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    let deflated = match zip.compression_method {
+        0 => false,
+        8 => true,
+        _ => return Err(Fault::Content),
+    };
+    // As for a spooled PNG: a deflated entry past the cap by its declared
+    // size is refused, and one that inflates to more than that is damage.
+    if deflated && zip.uncompressed_size > DEFLATED_MAX_BYTES {
+        return Err(Fault::Content);
+    }
+    let width = u32::from(record.width);
+    let (cells, rest) = scratch
+        .window
+        .split_at_mut_checked(Ditherer::scratch_bytes(width))
+        .ok_or(Fault::Content)?;
+    let (packed, rest) = rest
+        .split_at_mut_checked(usize::from(record.stride))
+        .ok_or(Fault::Content)?;
+    let inflated_len = if deflated { JPEG_INFLATE_BYTES } else { 0 };
+    let (inflated, decoder_scratch) = rest
+        .split_at_mut_checked(inflated_len)
+        .ok_or(Fault::Content)?;
+    let height = u32::from(record.height);
+    let mut sink = JpegPackSink {
+        sink: PackSink {
+            ditherer: Ditherer::new(cells, width).map_err(|_| Fault::Content)?,
+            packed,
+            out: Staged {
+                pack,
+                buf: &mut *scratch.stage,
+                len: 0,
+            },
+            gives_way,
+            rows: 0,
+        },
+        height,
+    };
+    let mut decoder = JpegDecoder::new(decoder_scratch, width, height).map_err(jpeg_fault)?;
+    sink.sink
+        .out
+        .push(&record.encode())
+        .map_err(|_| Fault::Io)?;
+    // Hands the decoder a chunk of the file, in pieces with a check for a
+    // press before each; true once it has its last row.
+    let mut feed = |bytes: &[u8]| -> Result<bool, Fault> {
+        for piece in bytes.chunks(FEED_BYTES) {
+            if gives_way() {
+                return Err(Fault::Cancelled);
+            }
+            decoder.feed(piece, &mut sink).map_err(jpeg_fault)?;
+            if decoder.is_complete() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    if deflated {
+        let declared = zip.uncompressed_size;
+        let mut inflated_len = 0u32;
+        // Why the inflate was stopped: a fault, or None once the decoder
+        // has its last row and the rest of the stream need not be read.
+        let stop: Cell<Option<Option<Fault>>> = Cell::new(None);
+        let inflate = inflate_to_sink(
+            &mut |at, buf| {
+                if gives_way() {
+                    stop.set(Some(Some(Fault::Cancelled)));
+                    return Err(ZipError::OutputTooSmall);
+                }
+                read_payload_at(archive, payload + at, buf)
+            },
+            zip.compressed_size,
+            scratch.input,
+            inflated,
+            scratch.inflate,
+            &mut |chunk| {
+                inflated_len = inflated_len.saturating_add(chunk.len() as u32);
+                let fed = if inflated_len > declared {
+                    Err(Fault::Content)
+                } else {
+                    feed(chunk)
+                };
+                match fed {
+                    Ok(false) => Ok(()),
+                    Ok(true) => {
+                        stop.set(Some(None));
+                        Err(ZipError::OutputTooSmall)
+                    }
+                    Err(fault) => {
+                        stop.set(Some(Some(fault)));
+                        Err(ZipError::OutputTooSmall)
+                    }
+                }
+            },
+        );
+        match stop.get() {
+            Some(Some(fault)) => return Err(fault),
+            Some(None) => {}
+            None => inflate.map_err(zip_fault)?,
+        }
+    } else {
+        let input = &mut *scratch.input;
+        let mut fed = 0u32;
+        while fed < zip.compressed_size {
+            let len = (zip.compressed_size - fed).min(input.len() as u32) as usize;
+            let piece = input.get_mut(..len).ok_or(Fault::Content)?;
+            read_payload_at(archive, payload + fed, piece).map_err(zip_fault)?;
+            fed += len as u32;
+            if feed(piece)? {
+                break;
+            }
+        }
+    }
+    decoder.finish().map_err(jpeg_fault)?;
+    if sink.sink.rows != height {
+        return Err(Fault::Content);
+    }
+    sink.sink.out.flush().map_err(|_| Fault::Io)
+}
+
 /// Pack writes gathered into whole runs of the write buffer.
 struct Staged<'a, 'f, D, T, const ND: usize, const NF: usize, const NV: usize>
 where
@@ -1075,13 +1247,13 @@ where
     rows: u32,
 }
 
-impl<D, T, const ND: usize, const NF: usize, const NV: usize> LumaSink
-    for PackSink<'_, '_, D, T, ND, NF, NV>
+impl<D, T, const ND: usize, const NF: usize, const NV: usize> PackSink<'_, '_, D, T, ND, NF, NV>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
-    fn row(&mut self, _y: u32, luma: &[u8]) -> Result<(), SinkError> {
+    #[inline(always)]
+    fn take_row(&mut self, luma: &[u8]) -> Result<(), SinkError> {
         if (self.gives_way)() {
             return Err(SinkError::Cancelled);
         }
@@ -1094,5 +1266,46 @@ where
         self.out.push(self.packed).map_err(|_| SinkError::Io)?;
         self.rows += 1;
         Ok(())
+    }
+}
+
+impl<D, T, const ND: usize, const NF: usize, const NV: usize> LumaSink
+    for PackSink<'_, '_, D, T, ND, NF, NV>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    fn row(&mut self, _y: u32, luma: &[u8]) -> Result<(), SinkError> {
+        self.take_row(luma)
+    }
+}
+
+/// The JPEG decoder's [`PackSink`], which also drops a row past the
+/// record's height (counted, so the decode then fails as content, as one
+/// with too few rows does). A sink of its own, so that each decoder's
+/// `row` has a single caller and LTO keeps inlining it into that decoder's
+/// row loop; one shared `row` went out of line and added a frame to the
+/// PNG path.
+struct JpegPackSink<'a, 'f, D, T, const ND: usize, const NF: usize, const NV: usize>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    sink: PackSink<'a, 'f, D, T, ND, NF, NV>,
+    height: u32,
+}
+
+impl<D, T, const ND: usize, const NF: usize, const NV: usize> LumaSink
+    for JpegPackSink<'_, '_, D, T, ND, NF, NV>
+where
+    D: embedded_sdmmc::BlockDevice,
+    T: TimeSource,
+{
+    fn row(&mut self, _y: u32, luma: &[u8]) -> Result<(), SinkError> {
+        if self.sink.rows >= self.height {
+            self.sink.rows += 1;
+            return Ok(());
+        }
+        self.sink.take_row(luma)
     }
 }

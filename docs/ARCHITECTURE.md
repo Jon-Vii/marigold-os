@@ -94,7 +94,7 @@ ui/        shared shell rendering plus ui::reading, the reader page-plan seam
            (page bounds, ink measurement, wrapping) used by fw and host tools
 proto/     bounded book/storage/text/cache models plus ZIP/EPUB/XHTML parser pieces,
            and book images (proto::image: the IMAGES.BIN index, image paths,
-           image tokens, streaming PNG decode, dithering)
+           image tokens, streaming PNG and JPEG decode, dithering)
 tools/emulator/ host-side development emulator and scenario runner
 tools/cargo.sh  rustup Cargo wrapper on the toolchain pinned in rust-toolchain.toml
 tools/bench/    serial bench harness for hardware timing, storage/cache,
@@ -405,8 +405,11 @@ and the host preview tool:
   `IMAGES.BIN` format (entries from the ZIP central directory, sorted by
   path hash, probed and decoded state filled in place), `token` is the
   text an image block stores and the 15-byte token (U+FFFC, slot, width,
-  height) a line carries for each image inside it, and `pack` is the record
-  a decoded image keeps in its orientation's pack. An image block is a
+  height) a line carries for each image inside it, `pack` is the record
+  a decoded image keeps in its orientation's pack, and `png` and `jpeg`
+  decode an image, fed in pieces of any size, to gray rows at the size
+  layout fitted (`jpeg` at a reduced DCT scale where that still covers
+  it, luma only). An image block is a
   `BlockRecord` whose `image_height` (the record's last two bytes, zero in
   caches before v28) is non-zero and under `BlockRecord::INLINE_IMAGES`
   (0x8000); a line holding images has that bit set and its tallest image's
@@ -582,8 +585,9 @@ orientation change mid-book and opening a book last read under other settings.
 Images get an index of their own. A build session whose ZIP has image
 entries opens the book's `IMAGES.BIN` before its first spine, building it
 from the central directory when there is no valid one (`fw::book_images`).
-The index holds PNGs; JPEGs, which most covers are, keep their alt text
-with no probe until a decoder takes them. A fresh build learns whether
+The index holds PNGs and JPEGs (by extension; the probe goes by magic
+bytes), and an index from before JPEGs (version 1) is built again. A
+fresh build learns whether
 there are any from the ZIP open's own pass over the central directory
 (only a directory of more than about 200 entries, too many for that pass's
 index, is walked once more), and records it in the book index, where every
@@ -593,13 +597,19 @@ images never touches the index. The compressed scratch and the XHTML
 window are idle then, and lend the build its buffers. No image is read:
 each is probed the first time a chapter's layout meets it. A spine that
 meets images no probe has read marks them wanted in the index and stops
-laying out at the first, probes them from their stored ZIP offsets (a
-stored image reads its first 33 bytes, a deflated one inflates that far
-through the idle inflater, from at most 4 KB), and is laid out again with
-their fitted sizes; an idle session's probes give way to a press between
-images. A probe whose local header is missing, lies past the archive's
-end, or names another file marks the image failed for good; a read that
-fails records nothing and fails the step, so the image is probed again.
+laying out at the first, probes them from their stored ZIP offsets, and
+is laid out again with their fitted sizes; an idle session's probes give
+way to a press between images. A probe reads until it can judge the
+image (`proto::image::index::ImageProber`): a PNG's first 33 bytes, or a
+JPEG's segments up to its frame header, which may follow 64 KB of EXIF.
+A stored image is read a card block at a time and seeks past every
+segment the probe does not read; a deflated one is inflated through the
+idle inflater and the skipped bytes dropped. Either way at most 256 KB
+are read or inflated, and an image that has not said what it is by then
+is failed. A
+probe whose local header is missing, lies past the archive's end, or
+names another file marks the image failed for good; a read that fails
+records nothing and fails the step, so the image is probed again.
 Nothing commits between the two passes, the first pass's sections leave
 the run's table before the second, and the second rewrites every section
 file the first wrote, so the discarded pass leaves nothing behind. Only
@@ -637,31 +647,36 @@ to, into an append-only pack in the book's cache directory (`IMGL.BIN`,
 which flipped landscape shares, and `IMGP.BIN`; `proto::image::pack`,
 `fw::image_decode`). A decode reads the image at the local-header offset
 its index entry keeps, after checking that the header names it, so no ZIP
-directory is opened. A stored image streams from the ZIP through the PNG
-decoder and the ditherer; a deflated one is first inflated to `SPOOL.TMP`
-beside the packs (refused past 4 MB by its declared size, as is a stream
-that outgrows it) and decoded from there, since the decoder's zlib stream
-needs the one inflater, and the spool is deleted after each image. Rows go
+directory is opened. A stored image streams from the ZIP through the
+decoder for its format and the ditherer. A deflated JPEG streams through
+the ZIP's inflater straight into the JPEG decoder, which needs no
+inflater. A deflated PNG is first inflated to `SPOOL.TMP` beside the
+packs and decoded from there, since the PNG decoder's zlib stream needs
+the one inflater, and the spool is deleted after each image. A deflated
+image of either kind past 4 MB by its declared size is refused, as is a
+stream that outgrows its declared size. Rows go
 to the pack behind a 16-byte record header through a write buffer, and
 only once the decode has finished and the pack's length is on the card
 does the index entry take the record's offset, in one write. A content
-fault (a corrupt PNG, one too wide for the window to hold its row, a
+fault (a corrupt image, a PNG too wide for the window to hold its row, a
 damaged entry) marks that orientation failed for good. A card fault or a
 spent read budget records nothing, and a press cancels the image in hand
-(the spool asks between pieces of input as well as between chunks of
-output); either leaves at most an orphan tail in the pack that nothing
-points at. A pack that would pass its 64 MB cap is mostly orphans when the
-records images use, with the next, fill at most half of it: every decode in
-that orientation is then forgotten in the index, the pack deleted, and a
-new one begun, so images decode again as they are needed. A pack its
-images' own records fill fails the next image instead. An index that is
-built again (damaged, or for another copy of the book) first deletes both
-packs and any spool, whose records nothing in it would point at. The decoder, the ditherer and the packed row take the
-XHTML window, ZIP reads and the write buffer split the compressed
-scratch, work lists take the container scratch, and the inflater serves
-both layers in turn. All of them are idle outside a build session, and
-image work always runs in an SD session of its own, so decoding adds no
-static RAM.
+(an inflate, to the spool or into the JPEG decoder, asks between pieces
+of input as well as between chunks of output); either leaves at most an
+orphan tail in the pack that nothing points at. A pack that would pass
+its 64 MB cap is mostly orphans when the records images use, with the
+next, fill at most half of it: every decode in that orientation is then
+forgotten in the index, the pack deleted, and a new one begun, so images
+decode again as they are needed. A pack its images' own records fill
+fails the next image instead. An index that is built again (damaged, for
+another copy of the book, or from before JPEGs) first deletes both packs
+and any spool, whose records nothing in it would point at. The decoder,
+the ditherer and the packed row take the XHTML window (with a deflated
+JPEG's inflate output), ZIP reads and the write buffer split the
+compressed scratch, work lists take the container scratch, and the
+inflater serves a deflated PNG's two layers in turn. All of them are idle
+outside a build session, and image work always runs in an SD session of
+its own, so decoding adds no static RAM.
 
 Images are decoded nearest the reader first. Layout records in each index
 entry where it first met the image, its spine and how many images that
@@ -700,11 +715,12 @@ settings decodes nothing again.
 
 Caches from before image blocks (v27) are still read. The first load of
 such a book's index reads its ZIP's central directory once: without PNGs
-(a JPEG cover alone does not count) the index is written again as the
-current version (v29), as it stands, and with them the book rebuilds,
-pinned to the reader's place, so its images replace the alt text it was
-laid out with. v28 caches, which only development builds wrote before
-images went inside lines, rebuild.
+or JPEGs beyond a lone image whose file name says `cover`, the index is
+written again as the current version (v30), as it stands, and the cover
+page keeps its v27 layout until a fresh build shows it; with any other
+image the book rebuilds, pinned to the reader's place, so its images
+replace the alt text it was laid out with. v28 and v29 caches, which only development builds wrote
+before images went inside lines and before JPEGs, rebuild.
 
 A reading page draws its images from the book's packs (`fw::page_images`).
 Pages draw from RAM outside any SD session, as before, unless the book has
@@ -756,7 +772,7 @@ snapshot or a completed scan has no EPUBs.
 /XTEINK/CACHE2/E<hash>/COVER.BIN
 /XTEINK/CACHE2/E<hash>/IMAGES.BIN     (books with images)
 /XTEINK/CACHE2/E<hash>/IMGL.BIN       (decoded images, landscape; IMGP.BIN portrait)
-/XTEINK/CACHE2/E<hash>/SPOOL.TMP      (a deflated image while it decodes)
+/XTEINK/CACHE2/E<hash>/SPOOL.TMP      (a deflated PNG while it decodes)
 /XTEINK/CACHE2/E<hash>/SECTIONS/S000.BIN
 /XTEINK/CACHE2/E<hash>/SECTIONS/S001.BIN
 /XTEINK/CACHE2/E<hash>/POSA.BIN       (per-book position, alternating with POSB.BIN)
