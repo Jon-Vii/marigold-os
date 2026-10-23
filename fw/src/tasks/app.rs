@@ -48,9 +48,10 @@ pub async fn run() {
     // book loads from SD ~1.5s later. Instead, kick the catalog + saved-position
     // restore now and leave the retained image (the sleep screen, on a deep-sleep
     // wake) up until it resolves; the first render is sent when Restored/Scanned
-    // lands (see first_render_kind), so wake is a single refresh straight onto the
-    // restored book. Now that sleep is terminal, wake is a full reboot — before
-    // that this cold-boot path never showed, the real book stayed resident.
+    // lands, or by an earlier button press (see first_render_kind), so wake is a
+    // single refresh straight onto the restored book. Now that sleep is
+    // terminal, wake is a full reboot. Before that, this cold-boot path never
+    // showed: the real book stayed resident.
     let mut boot_render_pending = true;
     if STORAGE_COMMANDS
         .try_send(StorageCommand::LoadCatalogCache)
@@ -278,7 +279,7 @@ pub async fn run() {
                 } else if rendering {
                     render_pending = true;
                 } else {
-                    send_render(RenderKind::Page, &state).await;
+                    send_render(first_render_kind(&mut boot_render_pending), &state).await;
                     rendering = true;
                     render_pending = false;
                 }
@@ -310,7 +311,7 @@ pub async fn run() {
                         STORAGE_COMMANDS.send(command).await;
                     }
                     if render_pending {
-                        send_render(RenderKind::Page, &state).await;
+                        send_render(first_render_kind(&mut boot_render_pending), &state).await;
                         rendering = true;
                         render_pending = false;
                     } else if suppress_input_until_open_settled && opening_book.is_none() {
@@ -345,7 +346,7 @@ pub async fn run() {
                 if rendering {
                     render_pending = true;
                 } else {
-                    send_render(RenderKind::Page, &state).await;
+                    send_render(first_render_kind(&mut boot_render_pending), &state).await;
                     rendering = true;
                     render_pending = false;
                 }
@@ -354,9 +355,13 @@ pub async fn run() {
     }
 }
 
-/// The first paint after boot uses `RenderKind::Boot` — a full refresh that
+/// The first paint after boot uses `RenderKind::Boot`, a full refresh that
 /// re-initialises the panel from its post-deep-sleep off state. Every paint
-/// after that is an ordinary page. Consumes the one-shot flag.
+/// after that is an ordinary page. Consumes the one-shot flag. Every render
+/// goes through here, not just the deferred Restored paint: a button pressed
+/// before the restore lands paints first, the Restored paint then waits behind
+/// it as an ordinary pending render, and while the flag stays set only
+/// Restored/Scanned may render, so a book open or reflow would never show.
 fn first_render_kind(boot_render_pending: &mut bool) -> RenderKind {
     if core::mem::take(boot_render_pending) {
         RenderKind::Boot
