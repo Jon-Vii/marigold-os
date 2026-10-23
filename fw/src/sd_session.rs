@@ -219,8 +219,9 @@ pub(crate) struct SdSpiDevice<'a, SPI, CS> {
 }
 
 /// Also sizes the shared bus's RX DMA buffer in main.rs: SD traffic is the
-/// only read path on SPI2 (the EPD is write-only), and every SD operation
-/// bounces through one of these chunks.
+/// only read path on SPI2 (the EPD is write-only), and the bus moves every
+/// SD transfer through its DMA buffers in pieces this size. Writes also
+/// bounce through one of these chunks on the way.
 /// X4 transfers a full sector per DMA operation. X3 retains the smaller
 /// buffer because its static stack region is close to the link-time floor.
 pub(crate) const SD_SPI_CHUNK_BYTES: usize = if cfg!(feature = "device-x3") { 64 } else { 512 };
@@ -301,20 +302,22 @@ impl<SPI, CS> SdSpiDevice<'_, SPI, CS>
 where
     SPI: BlockingSpiBus<u8>,
 {
+    // Every operation goes out as a full-duplex transfer_in_place, which the
+    // DMA bus copies through its own buffers in SD_SPI_CHUNK_BYTES pieces.
+    // Clocking straight from the caller's buffer spares each one-byte poll
+    // a block-sized fill, and each data block two copies.
+
     fn read_with_sd_clocks(&mut self, buffer: &mut [u8]) -> Result<(), SPI::Error> {
-        for chunk in buffer.chunks_mut(SD_SPI_CHUNK_BYTES) {
-            let mut bounce = AlignedSdChunk([0xFF; SD_SPI_CHUNK_BYTES]);
-            self.spi.transfer_in_place(&mut bounce.0[..chunk.len()])?;
-            chunk.copy_from_slice(&bounce.0[..chunk.len()]);
-        }
-        Ok(())
+        buffer.fill(0xFF);
+        self.spi.transfer_in_place(buffer)
     }
 
     fn write_chunked(&mut self, buffer: &[u8]) -> Result<(), SPI::Error> {
         for chunk in buffer.chunks(SD_SPI_CHUNK_BYTES) {
             let mut bounce = AlignedSdChunk([0xFF; SD_SPI_CHUNK_BYTES]);
-            bounce.0[..chunk.len()].copy_from_slice(chunk);
-            self.spi.transfer_in_place(&mut bounce.0[..chunk.len()])?;
+            let bounce = &mut bounce.0[..chunk.len()];
+            bounce.copy_from_slice(chunk);
+            self.spi.transfer_in_place(bounce)?;
         }
         Ok(())
     }
@@ -324,16 +327,8 @@ where
         let (read_common, read_tail) = read.split_at_mut(common);
         let (write_common, write_tail) = write.split_at(common);
 
-        for (read_chunk, write_chunk) in read_common
-            .chunks_mut(SD_SPI_CHUNK_BYTES)
-            .zip(write_common.chunks(SD_SPI_CHUNK_BYTES))
-        {
-            let mut bounce = AlignedSdChunk([0xFF; SD_SPI_CHUNK_BYTES]);
-            bounce.0[..write_chunk.len()].copy_from_slice(write_chunk);
-            self.spi
-                .transfer_in_place(&mut bounce.0[..write_chunk.len()])?;
-            read_chunk.copy_from_slice(&bounce.0[..read_chunk.len()]);
-        }
+        read_common.copy_from_slice(write_common);
+        self.spi.transfer_in_place(read_common)?;
         if !read_tail.is_empty() {
             self.read_with_sd_clocks(read_tail)?;
         }
@@ -344,13 +339,7 @@ where
     }
 
     fn transfer_in_place_chunked(&mut self, buffer: &mut [u8]) -> Result<(), SPI::Error> {
-        for chunk in buffer.chunks_mut(SD_SPI_CHUNK_BYTES) {
-            let mut bounce = AlignedSdChunk([0xFF; SD_SPI_CHUNK_BYTES]);
-            bounce.0[..chunk.len()].copy_from_slice(chunk);
-            self.spi.transfer_in_place(&mut bounce.0[..chunk.len()])?;
-            chunk.copy_from_slice(&bounce.0[..chunk.len()]);
-        }
-        Ok(())
+        self.spi.transfer_in_place(buffer)
     }
 }
 
