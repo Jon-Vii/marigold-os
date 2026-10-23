@@ -13,9 +13,9 @@ is chosen and the needed sizes are promoted into display/src.
 """
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
-from fontgen_common import ADVANCE_SCALE, THRESHOLD, ensure_fonts, write_generated
+from fontgen_common import ADVANCE_SCALE, THRESHOLD, ensure_fonts, load_font, write_generated
 
 ROOT = Path(__file__).resolve().parents[1]
 FONT_DIR = ROOT / "tools" / "fonts" / "literata"
@@ -104,7 +104,7 @@ def main():
 
     for size_name, px, line_height, baseline, styles in SETS:
         for style, filename in styles:
-            font = ImageFont.truetype(str(FONT_DIR / filename), px)
+            font = load_font(FONT_DIR / filename, px)
             metrics = []
             bitmap = []
             offset = 0

@@ -30,12 +30,11 @@ permits.
 """
 from pathlib import Path
 
-from PIL import ImageFont
-
 from fontgen_common import (
     codepoints_from_ranges,
     ensure_fonts,
     kerning_entries,
+    load_font,
     parse_generator_args,
     rasterize_glyph,
     threshold_for,
@@ -87,12 +86,6 @@ def codepoints():
     return codepoints_from_ranges(RANGES)
 
 
-def load_font(source, axes, px):
-    font = ImageFont.truetype(str(FONT_DIR / source), px)
-    font.set_variation_by_axes(axes)
-    return font
-
-
 def main(argv=None):
     parse_generator_args(__doc__, OUT, reading_face=True, argv=argv)
     ensure_fonts(FONT_DIR, SOURCES)
@@ -111,7 +104,7 @@ def main(argv=None):
 
     for px, line_height, baseline in SIZES:
         for style, source, axes in FONTS:
-            font = load_font(source, axes, px)
+            font = load_font(FONT_DIR / source, px, axes)
             metrics = []
             bitmap = []
             offset = 0

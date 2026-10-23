@@ -30,12 +30,11 @@ fontgen_common.py.
 """
 from pathlib import Path
 
-from PIL import ImageFont
-
 from fontgen_common import (
     codepoints_from_ranges,
     ensure_fonts,
     kerning_entries,
+    load_font,
     parse_generator_args,
     rasterize_glyph,
     threshold_for,
@@ -93,7 +92,7 @@ def main(argv=None):
 
     font_consts = []
     for style, filename in FONTS:
-        font = ImageFont.truetype(str(FONT_DIR / filename), PX)
+        font = load_font(FONT_DIR / filename, PX)
         metrics = []
         bitmap = []
         offset = 0

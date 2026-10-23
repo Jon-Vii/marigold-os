@@ -12,7 +12,7 @@ import struct
 import sys
 
 import PIL
-from PIL import Image, ImageDraw, features
+from PIL import Image, ImageDraw, ImageFont, features
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -149,6 +149,21 @@ def ensure_fonts(font_dir: Path, names) -> None:
                 f"  actual   sha256 {actual}"
             )
         partial.replace(path)
+
+
+def load_font(path: Path, px: int, axes=None):
+    """Open a face for rasterizing at `px`, always with Pillow's BASIC layout.
+
+    The checked-in tables carry BASIC's hinted, whole-pixel advances. Pillow
+    picks RAQM instead wherever libraqm and FriBiDi load (Pillow's Linux
+    wheels bundle raqm; FriBiDi comes from the system), and RAQM's unhinted
+    advances are fractional, so an unpinned run changed every advance.
+    `axes` instances a variable font (see `set_variation_by_axes`).
+    """
+    font = ImageFont.truetype(str(path), px, layout_engine=ImageFont.Layout.BASIC)
+    if axes is not None:
+        font.set_variation_by_axes(axes)
+    return font
 
 
 def check_rasterizer() -> None:
