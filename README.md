@@ -5,29 +5,27 @@ MarigoldOS is a lightweight, open-source firmware for the Xteink X4 and X3 e-rea
 [![Flashing](https://img.shields.io/badge/Flashing-2b2b2b?style=flat)](docs/FLASHING.md)
 [![Custom fonts](https://img.shields.io/badge/Custom_fonts-2b2b2b?style=flat)](docs/CUSTOM_FONTS.md)
 [![Architecture](https://img.shields.io/badge/Architecture-2b2b2b?style=flat)](docs/ARCHITECTURE.md)
+[![Development](https://img.shields.io/badge/Development-2b2b2b?style=flat)](docs/DEVELOPMENT.md)
 
 ![The MarigoldOS site showing the browser emulator home menu with Alice's Adventures in Wonderland selected](docs/home.png)
 
 If you'd like to explore the OS without flashing a device,
-[try the emulator](https://jon-vii.github.io/marigold-os/) in your browser — the
-firmware's app and rendering code compiled to WebAssembly, with a simulated
-e-ink display and a selection of public-domain books.
+[try the emulator](https://jon-vii.github.io/marigold-os/) in your browser. It
+runs the firmware's own app and rendering code, compiled to WebAssembly, on a
+simulated e-ink display with a few public-domain books.
 
 ## Features
 
 ### Reading
-- **EPUB 2 & 3** — native table of contents for each (EPUB 3 nav, NCX fallback)
-- **Reader typefaces** — Literata and Merriweather, plus an optional custom typeface slot from the SD card
-- **Whole-book pagination cache** — a book parses once and reopens in tens of milliseconds
-- **Fast page turns** — 473 ms end-to-end, within ~50 ms of the panel's rated floor
+- EPUB 2 and 3, with each book's own table of contents (EPUB 3 nav, or the NCX as a fallback)
+- PNG and JPEG images, dithered for the panel, including small ones set inside a line of text
+- Literata and Merriweather, plus a slot for your own typeface from the SD card
+- Books are paginated once and cached, so they reopen in tens of milliseconds
 
-### Library & sync
-- **Streamed catalog** — library size isn't bounded by RAM
-- **Local Wi-Fi shelf** — upload, list, and delete books from your browser
-- **Zero-config onboarding** — with no stored credentials, the reader raises an open hotspot with a captive portal and an on-screen QR code
-
-### Try it
-- **Browser emulator** — the real render code in WebAssembly, no device needed
+### Library and sync
+- The catalog streams from the card, so RAM doesn't limit how many books you can have
+- Upload, list and delete books from your browser over local Wi-Fi
+- With no saved network, the reader opens its own hotspot with a captive portal and shows a QR code to join it
 
 ## Development
 
@@ -48,20 +46,23 @@ tools/bench/bench.py channel-stress --host                       # host bench
 ```
 
 Only flashing needs the device on USB; the app logic, parsers, renderer, and
-emulator all build and test on a plain host. The stable toolchain is configured in
-`rust-toolchain.toml`.
+emulator all build and test on a plain host. `rust-toolchain.toml` pins the
+compiler version.
 
-Hardware-facing bench runs live in `tools/bench`. Use short `page-turn` and
+[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) has the full check CI runs and how to
+regenerate golden frames. Hardware bench runs live in
+[`tools/bench`](tools/bench/README.md). Use short `page-turn` and
 `sleep-sync` runs before trusting flashed builds after display, input, sleep,
 reader rendering, SD/cache, or progress-write changes; use longer soak/storage
 runs before risky merges or releases.
 
 ## Flashing
 
-`cargo run` flashes over USB for development. To install without a toolchain —
-from a built image, or onto a unit that shipped with USB flashing disabled —
-tagged releases publish the app/SD images and [docs/FLASHING.md](docs/FLASHING.md)
-covers the paths: web flasher, SD card, and the in-app update from the card.
+`cargo run` flashes over USB for development. To install without a toolchain,
+from a built image or onto a unit that shipped with USB flashing disabled, use
+the app and SD images published with each tagged release.
+[docs/FLASHING.md](docs/FLASHING.md) covers the three ways in: the web flasher,
+the SD card, and the in-app update from the card.
 
 ## Credits
 

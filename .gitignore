@@ -10,3 +10,6 @@ __pycache__/
 /tools/fonts/
 .venv-font/
 /web/x4_web_emulator.wasm
+
+# Local notes and issue tracker
+.scratch/

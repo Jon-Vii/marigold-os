@@ -1,7 +1,5 @@
-# Initial warning budgets for development bench summaries.
-# The CLI currently reports timings only; these values are the baseline for
-# turning reports into explicit pass/fail checks once several known-good X4/X3
-# runs have been captured.
+# Warning budgets for development bench summaries. `bench.py report --strict`
+# turns them into pass/fail checks.
 
 [page-turn]
 median_press_to_settled_ms = 550
