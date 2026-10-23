@@ -268,12 +268,12 @@ card, so several firmware images can coexist.
 `display::fb::Framebuffer` is the source of truth. White is bit `1`, black is
 bit `0`, row-major, `ROW_BYTES` per row (100 on the X4, 99 on the X3). Each
 framebuffer also carries its `FbFrame`, the drawing frame for how the device
-is held (see orientation below). Rules draw pixel by pixel. Built-in glyphs
-draw a row at a time through `fb::GlyphPainter`: a few masked byte stores per
-row in the landscape frames (mirrored through the bit-reversal table when
-flipped), and 8 × 8 bit transposes in portrait. A glyph that hangs off the
-frame falls back to `set_pixel`, clipped as before. Either way the painter
-leaves exactly what a `set_pixel` per ink pixel would.
+is held (see orientation below). Rules draw pixel by pixel. Glyphs, built-in
+or from a custom font pack, draw a row at a time through `fb::GlyphPainter`:
+a few masked byte stores per row in the landscape frames (mirrored through
+the bit-reversal table when flipped), and 8 × 8 bit transposes in portrait. A
+glyph that hangs off the frame falls back to `set_pixel`, clipped as before.
+Either way the painter leaves exactly what a `set_pixel` per ink pixel would.
 `Framebuffer::blit` draws a band of an image's 1 bpp rows, in the image pack
 layout, a byte at a time. In the landscape frames it shifts whole rows into
 place (bit-reversed through the panel transform's table when flipped), and in
