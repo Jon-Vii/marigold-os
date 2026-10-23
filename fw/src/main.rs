@@ -119,6 +119,7 @@ mod display_flush;
 mod firmware_files;
 mod image_decode;
 mod library_sd;
+mod line_window;
 mod ota_update;
 mod page_images;
 mod reader_cache;

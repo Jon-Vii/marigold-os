@@ -1033,8 +1033,10 @@ pub const READER_WRAP_SAFETY: i16 = 4;
 /// book's soft hyphens and compound dashes everywhere), which moves line
 /// breaks throughout. v24: a v23 build lost the space at the start of
 /// some styled runs and parser chunks; retire those lines. v25: the portrait
-/// page ends 8 rows higher, clear of the bezel.
-const READER_LAYOUT_VERSION: u16 = 25;
+/// page ends 8 rows higher, clear of the bezel. v26: a justified line left
+/// ragged, or a third hyphenated line in a row, has the lines around it
+/// broken again for the best fit, which moves line ends there.
+const READER_LAYOUT_VERSION: u16 = 26;
 
 /// Panel-geometry salt folded into the version bits: wrap points and page
 /// heights depend on the page box, so pagination cached on one panel must
@@ -1223,6 +1225,25 @@ impl InkCursor {
         self.previous = None;
     }
 
+    /// A word measured on its own, after what joins it to the glyph before
+    /// ([`InkPiece::join_fp`]): the same as pushing the join's space and the
+    /// word's glyphs one by one.
+    pub fn push_piece(&mut self, join_fp: i32, piece: &InkPiece) {
+        let end = self.advance_fp + join_fp + piece.advance_fp;
+        if piece.inked {
+            self.right = self.right.max(piece.right(end));
+        }
+        self.advance_fp = end;
+        if piece.last.is_some() {
+            self.previous = piece.last;
+        }
+    }
+
+    /// The last glyph pushed, which kerns with the next.
+    pub fn previous(&self) -> Option<u16> {
+        self.previous
+    }
+
     pub fn width(&self) -> i16 {
         self.right.max(fixed_ceil(self.advance_fp))
     }
@@ -1281,6 +1302,18 @@ impl StyledInkCursor {
         self.ink.push_object(width);
     }
 
+    /// A word in `style` measured on its own, after what joins it to the
+    /// glyph before, as [`InkCursor::push_piece`] takes it.
+    pub fn push_piece(&mut self, join_fp: i32, piece: &InkPiece, style: FontStyle) {
+        self.ink.push_piece(join_fp, piece);
+        self.font = body_font(self.settings, style);
+    }
+
+    /// The last glyph pushed, which kerns with the next.
+    pub fn previous(&self) -> Option<u16> {
+        self.ink.previous()
+    }
+
     pub fn width(&self) -> i16 {
         self.ink.width()
     }
@@ -1290,6 +1323,149 @@ pub fn styled_text_ink_width(text: &str, settings: TypeSettings, default_style: 
     let mut cursor = StyledInkCursor::new(settings, default_style);
     cursor.push_str(text);
     cursor.width()
+}
+
+/// A word (or part of one) measured on its own, as [`InkCursor`] measures
+/// it from a fresh start, for a line builder that weighs many candidate
+/// lines without measuring each one: its advance, and the glyph whose ink
+/// reaches farthest. A line of such pieces, each joined to the one before
+/// by [`InkPiece::join_fp`], measures exactly what [`StyledInkCursor`]
+/// measures for the stored line, because the farthest glyph is rounded
+/// where the line rounds it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InkPiece {
+    pub advance_fp: i32,
+    /// Where the farthest-reaching glyph starts, and its ink past that.
+    ink_at_fp: i32,
+    ink: i16,
+    inked: bool,
+    /// First and last glyphs drawn, which kern across a join.
+    pub first: Option<u16>,
+    pub last: Option<u16>,
+}
+
+impl InkPiece {
+    /// One glyph of a built-in face, kerned against the one before, as
+    /// [`InkCursor::push_char`] does.
+    pub fn push_char(&mut self, font: &BitmapFont, ch: char) {
+        let codepoint = if ch as u32 > u16::MAX as u32 {
+            b'?' as u16
+        } else {
+            ch as u16
+        };
+        let found = font
+            .metric(codepoint)
+            .map(|metric| (codepoint, metric))
+            .or_else(|| font.metric(b'?' as u16).map(|metric| (b'?' as u16, metric)));
+        let Some((drawn, metric)) = found else {
+            self.push_fallback();
+            return;
+        };
+        if let Some(left) = self.last {
+            self.advance_fp += font.kerning_adjust_fp(left, drawn) as i32;
+        }
+        self.push_metric(&metric);
+        self.first.get_or_insert(drawn);
+        self.last = Some(drawn);
+    }
+
+    /// One glyph that kerns with nothing (an SD font's), at its advance.
+    pub fn push_metric(&mut self, metric: &display::font::GlyphMetric) {
+        self.ink_from(metric.x_offset as i16 + metric.width as i16);
+        self.advance_fp += metric.advance_fp as i32;
+    }
+
+    /// A glyph no face has: an 8-pixel gap, inked to its end.
+    pub fn push_fallback(&mut self) {
+        self.ink_from(8);
+        self.advance_fp += 8 << 4;
+        self.first.get_or_insert(b'?' as u16);
+        self.last = Some(b'?' as u16);
+    }
+
+    /// A glyph starting at the current advance whose ink reaches `ink`
+    /// past it: the farthest so far, unless an earlier one reaches farther.
+    fn ink_from(&mut self, ink: i16) {
+        if !self.inked
+            || self.advance_fp + (i32::from(ink) << 4)
+                >= self.ink_at_fp + (i32::from(self.ink) << 4)
+        {
+            self.ink_at_fp = self.advance_fp;
+            self.ink = ink;
+            self.inked = true;
+        }
+    }
+
+    /// An inline image `width` columns wide, as
+    /// [`StyledInkCursor::push_object`] places one.
+    pub fn object(width: u16) -> Self {
+        Self {
+            advance_fp: i32::from(width) << 4,
+            ink_at_fp: 0,
+            ink: width as i16,
+            inked: true,
+            first: None,
+            last: None,
+        }
+    }
+
+    /// Its advance, where its farthest glyph starts, and that glyph's ink
+    /// past its start: all a line needs of it, for keeping in a record.
+    pub fn parts(&self) -> (i32, i32, i16) {
+        (self.advance_fp, self.ink_at_fp, self.ink)
+    }
+
+    /// A piece from [`InkPiece::parts`] (its glyphs, which only joins
+    /// read, are not kept).
+    pub fn from_parts(advance_fp: i32, ink_at_fp: i32, ink: i16) -> Self {
+        Self {
+            advance_fp,
+            ink_at_fp,
+            ink,
+            inked: true,
+            first: None,
+            last: None,
+        }
+    }
+
+    /// The piece's right ink edge when its advance ends at `end_fp` on a
+    /// line.
+    pub fn right(&self, end_fp: i32) -> i16 {
+        fixed_round(end_fp - self.advance_fp + self.ink_at_fp) + self.ink
+    }
+
+    /// What joins a piece to the one before it on a line, in a built-in
+    /// face: a space when the source has one (in the style before it,
+    /// kerned against the glyph before), and the kerning into the piece's
+    /// first glyph when no style marker resets the pair. `previous` is the
+    /// last glyph before (None after an image), in `previous_style`.
+    pub fn join_fp(
+        settings: TypeSettings,
+        previous_style: FontStyle,
+        previous: Option<u16>,
+        space: bool,
+        style: FontStyle,
+        first: Option<u16>,
+    ) -> i32 {
+        let font = body_font(settings, previous_style);
+        let mut join = 0;
+        let mut left = previous;
+        if space {
+            let mut gap = InkPiece {
+                last: left,
+                ..InkPiece::default()
+            };
+            gap.push_char(font, ' ');
+            join += gap.advance_fp;
+            left = gap.last;
+        }
+        if style == previous_style {
+            if let (Some(left), Some(right)) = (left, first) {
+                join += font.kerning_adjust_fp(left, right) as i32;
+            }
+        }
+        join
+    }
 }
 
 /// The style a stored line opens in: what its text up to the first
@@ -1893,6 +2069,144 @@ mod tests {
         }
         fn page_box(&self) -> PageBox {
             self.page_box
+        }
+    }
+
+    /// A line built from words measured alone and joined measures what the
+    /// stored line measures, whatever the face, the style runs, the
+    /// spacing (or none, as for punctuation after a styled word), and an
+    /// image inside it.
+    #[test]
+    fn ink_pieces_compose_to_the_measured_line() {
+        // (word, style, space before)
+        let words: &[(&str, FontStyle, bool)] = &[
+            ("\u{201c}Very", FontStyle::Regular, false),
+            ("well,\u{201d}", FontStyle::Regular, true),
+            ("said", FontStyle::Regular, true),
+            ("Alice", FontStyle::Italic, true),
+            ("\u{2019}s", FontStyle::Regular, false),
+            ("AVATAR", FontStyle::Bold, true),
+            ("To", FontStyle::Bold, true),
+            ("fly;", FontStyle::BoldItalic, true),
+            ("Wolf\u{2014}yes.", FontStyle::Regular, true),
+        ];
+        for settings in every_body_type() {
+            for skip in 0..words.len() {
+                let mut stored = String::new();
+                let mut stored_style = FontStyle::Regular;
+                let (mut total, mut right) = (0i32, 0i16);
+                let mut previous: Option<(FontStyle, Option<u16>)> = None;
+                for (index, &(word, style, space)) in words.iter().enumerate().skip(skip) {
+                    let image = index == 6;
+                    let space = space && !stored.is_empty();
+                    let mut piece = InkPiece::default();
+                    if image {
+                        piece = InkPiece::object(17);
+                    } else {
+                        for ch in word.chars() {
+                            piece.push_char(body_font(settings, style), ch);
+                        }
+                    }
+                    if let Some((previous_style, last)) = previous {
+                        let (style, first) = if image {
+                            (previous_style, None)
+                        } else {
+                            (style, piece.first)
+                        };
+                        total +=
+                            InkPiece::join_fp(settings, previous_style, last, space, style, first);
+                    }
+                    total += piece.advance_fp;
+                    right = right.max(piece.right(total));
+                    if space {
+                        stored.push(' ');
+                    }
+                    if image {
+                        previous = previous
+                            .map(|(style, _)| (style, None))
+                            .or(Some((FontStyle::Regular, None)));
+                        stored.push_str("\u{fffc}");
+                        continue;
+                    }
+                    if style != stored_style {
+                        stored.push(STYLE_MARKER);
+                        stored.push(style_marker_code(style));
+                        stored_style = style;
+                    }
+                    stored.push_str(word);
+                    previous = Some((style, piece.last));
+                }
+                let mut cursor = StyledInkCursor::new(settings, FontStyle::Regular);
+                for (index, run) in stored.split('\u{fffc}').enumerate() {
+                    if index > 0 {
+                        cursor.push_object(17);
+                    }
+                    cursor.push_str(run);
+                }
+                let composed = right.max(fixed_ceil(total));
+                assert_eq!(
+                    composed,
+                    cursor.width(),
+                    "{settings:?} from word {skip}: {stored:?}"
+                );
+            }
+        }
+    }
+
+    /// A line's cursor fed whole measured words keeps the width and the
+    /// kerning glyph it keeps when fed their text.
+    #[test]
+    fn a_cursor_takes_pieces_as_it_takes_text() {
+        let words: &[(&str, FontStyle, bool)] = &[
+            ("AVAST,", FontStyle::Regular, false),
+            ("\u{201c}Very", FontStyle::Regular, true),
+            ("well,\u{201d}", FontStyle::Italic, true),
+            ("To", FontStyle::Italic, true),
+            ("\u{2019}s", FontStyle::Regular, false),
+            ("fly;", FontStyle::BoldItalic, true),
+            ("Wolf\u{2014}yes.", FontStyle::Bold, true),
+            ("Yet", FontStyle::Bold, true),
+        ];
+        for settings in every_body_type() {
+            let mut text = StyledInkCursor::new(settings, FontStyle::Regular);
+            let mut pieces = StyledInkCursor::new(settings, FontStyle::Regular);
+            let mut style = FontStyle::Regular;
+            for (index, &(word, word_style, space)) in words.iter().enumerate() {
+                let mut run = String::new();
+                if space && index > 0 {
+                    run.push(' ');
+                }
+                if word_style != style {
+                    run.push(STYLE_MARKER);
+                    run.push(style_marker_code(word_style));
+                }
+                run.push_str(word);
+                text.push_str(&run);
+                let mut piece = InkPiece::default();
+                for ch in word.chars() {
+                    piece.push_char(body_font(settings, word_style), ch);
+                }
+                let join = if index == 0 {
+                    0
+                } else {
+                    InkPiece::join_fp(
+                        settings,
+                        style,
+                        pieces.previous(),
+                        space,
+                        word_style,
+                        piece.first,
+                    )
+                };
+                pieces.push_piece(join, &piece, word_style);
+                style = word_style;
+                assert_eq!(pieces.width(), text.width(), "{settings:?} at {word:?}");
+                assert_eq!(
+                    pieces.previous(),
+                    text.previous(),
+                    "{settings:?} at {word:?}"
+                );
+            }
         }
     }
 

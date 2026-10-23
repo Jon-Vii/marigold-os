@@ -1,9 +1,9 @@
 #[cfg(feature = "bench-serial")]
 use crate::block_sink::build_profile;
 pub(crate) use crate::block_sink::Preparation;
-use crate::block_sink::{LibraryBlockSink, LineInkCursor, LowerAscii, PendingImages, SpineRun};
 #[cfg(feature = "bench-serial")]
-use crate::block_sink::{HYPHEN_LOOKUPS, HYPHEN_LOOKUP_MICROS};
+use crate::block_sink::{repair_profile, HYPHEN_LOOKUPS, HYPHEN_LOOKUP_MICROS};
+use crate::block_sink::{LibraryBlockSink, LineInkCursor, LowerAscii, PendingImages, SpineRun};
 use crate::book_images::{BookImages, ProbeStop};
 use crate::display_flush::Epd;
 use crate::image_decode::{DecodeOutcome, ImageScratch, ImageSession, PageImages, SessionStats};
@@ -1920,10 +1920,27 @@ where
     );
     #[cfg(feature = "bench-serial")]
     esp_println::println!(
-        "bench: hyphenation lookups={} lookup_ms={}",
+        "bench: hyphenation lookups={} lookup_ms={} hits={}",
         HYPHEN_LOOKUPS.swap(0, portable_atomic::Ordering::Relaxed),
         HYPHEN_LOOKUP_MICROS.swap(0, portable_atomic::Ordering::Relaxed) / 1000,
+        repair_profile::LOOKUP_HITS.swap(0, portable_atomic::Ordering::Relaxed),
     );
+    #[cfg(feature = "bench-serial")]
+    {
+        use portable_atomic::Ordering;
+        use repair_profile::*;
+        esp_println::println!(
+            "bench: line_repair repairs={} repair_ms={} pieces={} piece_ms={} candidates={} relax_ms={} search_lookups={} search_lookup_ms={}",
+            REPAIRS.swap(0, Ordering::Relaxed),
+            REPAIR_MICROS.swap(0, Ordering::Relaxed) / 1000,
+            PIECES.swap(0, Ordering::Relaxed),
+            PIECE_MICROS.swap(0, Ordering::Relaxed) / 1000,
+            CANDIDATES.swap(0, Ordering::Relaxed),
+            RELAX_MICROS.swap(0, Ordering::Relaxed) / 1000,
+            SEARCH_LOOKUPS.swap(0, Ordering::Relaxed),
+            SEARCH_LOOKUP_MICROS.swap(0, Ordering::Relaxed) / 1000,
+        );
+    }
     #[cfg(feature = "bench-serial")]
     esp_println::println!(
         "bench: build_profile spine_reads_ms={} feeds_ms={} paragraphs_ms={} lines_ms={} pages_ms={} commits_ms={} sd_read_ms={} sd_write_ms={} section_write_reads={}",
@@ -2216,6 +2233,12 @@ where
     );
     let visible_page_capacity = library.page_capacity().max(1);
     reader_cache_files::with_v2_sections_dir(root, cache_key.as_str(), |sections_dir| {
+        // The XHTML window only stages inflated chunks for the parser (the
+        // inflater keeps its own history), so its tail is idle while the
+        // spine streams: the line builder keeps its window of words there.
+        let (xhtml_window, line_window) = scratch
+            .xhtml
+            .split_at_mut(READER_XHTML_SCRATCH - crate::line_window::LINE_WINDOW_BYTES);
         let type_settings = library.type_settings();
         let mut sink = LibraryBlockSink {
             library: &mut *library,
@@ -2260,6 +2283,7 @@ where
             paragraph_has_text: false,
             line_image_height: 0,
             line_unindented: false,
+            window: crate::line_window::LineWindow::new(line_window),
         };
         // Stream the whole member through the resumable block parser in
         // bounded windows: spine XHTML of any size decodes completely, with
@@ -2274,7 +2298,7 @@ where
         let read_result = zip.read_entry_to_sink(
             xhtml_entry,
             &mut *scratch.compressed,
-            &mut *scratch.xhtml,
+            xhtml_window,
             &mut *scratch.zip_inflate,
             &mut |chunk| {
                 #[cfg(feature = "bench-serial")]
