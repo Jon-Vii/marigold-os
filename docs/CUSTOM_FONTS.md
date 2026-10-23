@@ -1,17 +1,17 @@
 # Custom fonts
 
-MarigoldOS supports one optional custom reader typeface. Users do not copy a raw
-TTF or OTF file to the device; the font first has to be converted into
-MarigoldOS' bounded `CUSTOM.FNT` format.
+MarigoldOS supports one optional custom reader typeface. You can't copy a raw
+TTF or OTF file to the device. The font has to be converted into MarigoldOS'
+bounded `CUSTOM.FNT` format first.
 
-When a valid custom font pack is installed, Settings shows it as another
-Typeface choice using the display name stored in the pack. If no valid pack is
-installed, Settings stays unchanged.
+Once a valid custom font pack is installed, Settings lists it as another
+Typeface choice, under the display name stored in the pack. Without a valid
+pack, Settings looks the same as before.
 
 ## Install a custom font
 
-1. Pick the font files you want to use. A regular TTF/OTF face is required.
-   Italic, bold, and bold italic faces are optional.
+1. Pick the font files you want to use. You need a regular TTF/OTF face;
+   italic, bold, and bold italic faces are optional.
 2. Build `CUSTOM.FNT` from a checkout of this repo:
 
    ```sh
@@ -34,9 +34,9 @@ installed, Settings stays unchanged.
    ```
 
    The converter runs through [uv](https://docs.astral.sh/uv/). The script
-   declares its own pinned Pillow, so `uv run --script` fetches it on first use;
-   no virtualenv or `pip install` is needed. On macOS and Linux you can also
-   run `tools/build_font_pack.py` directly.
+   declares its own pinned Pillow, which `uv run --script` fetches the first
+   time you run it, so you don't need a virtualenv or `pip install`. On macOS
+   and Linux you can also run `tools/build_font_pack.py` directly.
 3. Copy the generated file to the SD card:
 
    ```text
@@ -47,24 +47,25 @@ installed, Settings stays unchanged.
 4. Eject the SD card, insert it into the reader, and reboot.
 5. Open Settings and choose the custom typeface by name.
 
-Replacing `CUSTOM.FNT` with a different font can make books rebuild their page
-cache the next time they are opened. That is expected: font metrics affect line
-breaks and page counts.
+If you replace `CUSTOM.FNT` with a different font, books may rebuild their
+page cache the next time you open them. Font metrics affect line breaks and
+page counts, so this is expected.
 
 ## Current limits
 
 - There is one custom slot: `/XTEINK/FONTS/CUSTOM.FNT`.
 - Raw `.ttf` and `.otf` files on the SD card are ignored.
 - Missing styles fall back to the closest supplied face while building the pack.
-- Keep font licensing in mind. Only install fonts you have the right to use.
-- The website does not build or upload custom fonts yet; the local converter is
-  the current user path.
+- Only install fonts you have the right to use.
+- The website doesn't build or upload custom fonts yet. For now, use the local
+  converter.
 
 ## Developer compile-in path
 
-Firmware developers can also compile the same custom pack into a firmware build.
-This is useful for experiments, demos, or hardware batches that should ship with
-a specific custom typeface without relying on an SD card file.
+Firmware developers can also compile the same custom pack into a firmware
+build. That's useful for experiments, demos, or hardware batches that should
+ship with a specific custom typeface without depending on a file on the SD
+card.
 
 ```sh
 uv run --script tools/build_font_pack.py build \
@@ -82,7 +83,7 @@ uv run --script tools/font_pack_to_rust.py \
 tools/cargo.sh build --release --features builtin-custom-font
 ```
 
-`display/src/custom_generated.rs` is a tracked placeholder in normal builds so
-workspace tooling can resolve the optional module. Replace it with the generated
-file before enabling `builtin-custom-font`. When enabled, the compiled-in custom
-font takes precedence over the SD card `CUSTOM.FNT`.
+In normal builds `display/src/custom_generated.rs` is a tracked placeholder,
+there so workspace tooling can resolve the optional module. Replace it with the
+generated file before you enable `builtin-custom-font`. With the feature on, the
+compiled-in custom font takes precedence over `CUSTOM.FNT` on the SD card.

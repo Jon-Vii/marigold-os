@@ -96,7 +96,7 @@
   /* White shell: four blank keys on the short side, each sitting level
      with the legend row the firmware draws for it; Power alone at the far
      right of the top long edge. Keys carry no printed labels, as on the
-     hardware - the screen's rail names them in context. */
+     hardware; the screen's rail names them in context. */
   /* A 5.9 mm slab in Mist Gray: thin, even bezel, credit-card corners,
      and the page rocker + power as slivers on the bottom edge itself,
      protruding from the silhouette the way they do on the hardware. */
@@ -120,7 +120,7 @@
       margin 420ms cubic-bezier(.2,.8,.2,1);
   }
   .device.buttons-up { transform: rotate(180deg); }
-  /* The portrait hold: a quarter turn counter-clockwise at full size —
+  /* The portrait hold: a quarter turn counter-clockwise at full size:
      the panel keeps its landscape resolution. Transforms leave layout
      alone, so syncDeviceOrientation adds compensating margins that push
      the sections below out of the taller visual box. */
@@ -429,12 +429,12 @@
   <div class="body">
     <div class="sidekeys">
       <div class="slot s1"><div class="rocker">
-        <button id="k-back" title="Upper half - the screen names it" aria-label="Top rocker, upper half"></button>
-        <button id="k-ok" title="Lower half - the screen names it" aria-label="Top rocker, lower half"></button>
+        <button id="k-back" title="Upper half: the screen shows what it does" aria-label="Top rocker, upper half"></button>
+        <button id="k-ok" title="Lower half: the screen shows what it does" aria-label="Top rocker, lower half"></button>
       </div></div>
       <div class="slot s2"><div class="rocker">
-        <button id="k-prev" title="Upper half - the screen names it" aria-label="Bottom rocker, upper half"></button>
-        <button id="k-next" title="Lower half - the screen names it" aria-label="Bottom rocker, lower half"></button>
+        <button id="k-prev" title="Upper half: the screen shows what it does" aria-label="Bottom rocker, upper half"></button>
+        <button id="k-next" title="Lower half: the screen shows what it does" aria-label="Bottom rocker, lower half"></button>
       </div></div>
     </div>
     <div class="screen">
@@ -447,7 +447,7 @@
     <button id="p-next" title="Page forward" aria-label="Page forward"></button>
   </div>
   <div class="edgetab powertab">
-    <button id="k-power" title="Power - sleep and wake" aria-label="Power"></button>
+    <button id="k-power" title="Power: sleep and wake" aria-label="Power"></button>
   </div>
   <span class="led" id="led" aria-hidden="true"></span>
 </div>
@@ -539,7 +539,7 @@
     const dpr = window.devicePixelRatio || 1;
     // Layout width, not getBoundingClientRect(): the portrait hold rotates
     // and scales the device chrome with a CSS transform, and the rect of a
-    // transformed canvas is its visual box — sizing the backing store from
+    // transformed canvas is its visual box, so sizing the backing store from
     // that undersamples the panel (fuzzy) at the wrong aspect. clientWidth
     // ignores transforms; the browser then resamples the full-resolution
     // canvas through the transform at device-pixel quality.

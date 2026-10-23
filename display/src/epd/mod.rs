@@ -14,8 +14,7 @@ use crate::{fb::Framebuffer, BAND_BYTES, BAND_ROWS, HEIGHT, ROW_BYTES};
 /// desktop emulator simulates.
 pub mod ssd1677;
 
-/// Xteink X3: 792x528 panel, UC8253 controller. Skeleton only — see
-/// docs/plans/2026-07-06-x3-support-plan.md, Phase 2.
+/// Xteink X3: 792x528 panel, UC8253 controller.
 #[cfg(feature = "device-x3")]
 pub mod uc8253;
 

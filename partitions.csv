@@ -3,7 +3,7 @@
 # This mirrors the partition table a stock/locked X4 already has in flash, so
 # our app boots under the *stock* second-stage bootloader (which just boots
 # whatever `otadata` selects) and so both OTA slots exist for in-app updates
-# and a recovery hatch. Our app image goes in ota_0 at 0x10000 — the same
+# and a recovery hatch. Our app image goes in ota_0 at 0x10000, the same
 # offset the web flasher and `esptool write_flash 0x10000` target.
 #
 # Name,   Type, SubType,  Offset,   Size, Flags

@@ -1,7 +1,7 @@
 //! Emits `ram-layout.x`, the linker fragment that pins the previous-frame
 //! framebuffer to the top of `dram2_seg` and hands every byte below it to
 //! the main stack. See `src/sync_mem.rs` for the ownership story and
-//! `docs/plans/2026-07-06-x3-support-plan.md` for the stack budget.
+//! `docs/DEVELOPMENT.md` for the stack budget.
 
 use std::env;
 use std::fs;
