@@ -110,6 +110,25 @@ for a decode (`image wait`), and page turns that only checked (`image check`).
 To time page turns over pages whose images are already decoded, leave the book
 idle on its first page until its `image_session` lines stop.
 
+### Staged page telemetry
+
+On the X4 the next reading page is drawn and written to the panel's BW RAM
+while the reader reads (see "Staging the next page" in
+[`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md)). Each `bench: render`
+line says whether its page was staged (`staged=true stage=hit`) or why not
+(`stage=none`, `other_page`, `store_changed`). A staged page's `layout_ms` is
+only the check that it still holds, and its `flush_ms` has no BW write.
+`bench: stage` reports each staging: `step=bw` with the draw, one store
+fingerprint (`digest_us`) and the BW write when it got that far, `step=render`
+when a press stopped the draw, and `step=check` when the page couldn't be
+staged. Bench-serial builds draw every staged page again once it is shown and
+log `bench: stage_check match=...`.
+
+`report` counts staged pages, splits page-turn times into staged and drawn
+turns, and treats any `stage_check` that didn't match as a warning, which
+`--strict` turns into a failure. `check_forward_turns.py` prints the same split
+and fails on a mismatch.
+
 ## Automated button sequences
 
 Development firmware built with `--features bench-serial` accepts USB serial
