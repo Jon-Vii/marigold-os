@@ -114,10 +114,10 @@ pub(crate) mod sd_stats {
 }
 
 /// The FAT layer hands a run of whole sectors within a cluster to one read
-/// call, which the X4 sends as a single multi-block read (CMD18). No X3 has
-/// run CMD18 yet, so the X3 still reads such a run one CMD17 per sector,
-/// exactly as it did before batching.
-const SINGLE_BLOCK_READS: bool = cfg!(feature = "device-x3");
+/// or write call, which the X4 sends as a single multi-block command (CMD18
+/// or CMD25). No X3 has run either yet, so the X3 still moves such a run one
+/// CMD17 or CMD24 per sector, exactly as it did before batching.
+const SINGLE_BLOCK_IO: bool = cfg!(feature = "device-x3");
 
 /// Counts physical block transactions on their way to the SD card, so bench
 /// telemetry can report exact CMD17/CMD18/CMD24-level traffic per workload.
@@ -127,12 +127,12 @@ impl<B: BlockDevice> BlockDevice for CountingDevice<B> {
     type Error = B::Error;
 
     fn read(&self, blocks: &mut [Block], start_block_idx: BlockIdx) -> Result<(), Self::Error> {
-        let commands = if SINGLE_BLOCK_READS { blocks.len() } else { 1 };
+        let commands = if SINGLE_BLOCK_IO { blocks.len() } else { 1 };
         sd_stats::bump(&sd_stats::READ_CALLS, commands as u32);
         sd_stats::bump(&sd_stats::READ_BLOCKS, blocks.len() as u32);
         #[cfg(feature = "bench-serial")]
         let started = embassy_time::Instant::now();
-        let result = if SINGLE_BLOCK_READS {
+        let result = if SINGLE_BLOCK_IO {
             blocks
                 .iter_mut()
                 .zip(start_block_idx.0..)
@@ -159,11 +159,21 @@ impl<B: BlockDevice> BlockDevice for CountingDevice<B> {
     }
 
     fn write(&self, blocks: &[Block], start_block_idx: BlockIdx) -> Result<(), Self::Error> {
-        sd_stats::bump(&sd_stats::WRITE_CALLS, 1);
+        let commands = if SINGLE_BLOCK_IO { blocks.len() } else { 1 };
+        sd_stats::bump(&sd_stats::WRITE_CALLS, commands as u32);
         sd_stats::bump(&sd_stats::WRITE_BLOCKS, blocks.len() as u32);
         #[cfg(feature = "bench-serial")]
         let started = embassy_time::Instant::now();
-        let result = self.0.write(blocks, start_block_idx);
+        let result = if SINGLE_BLOCK_IO {
+            blocks
+                .iter()
+                .zip(start_block_idx.0..)
+                .try_for_each(|(block, idx)| {
+                    self.0.write(core::slice::from_ref(block), BlockIdx(idx))
+                })
+        } else {
+            self.0.write(blocks, start_block_idx)
+        };
         #[cfg(feature = "bench-serial")]
         {
             sd_stats::bump(

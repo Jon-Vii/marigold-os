@@ -94,13 +94,26 @@ data. The SD spec's data-response section asks for CMD12 after a rejected
 block; the driver follows Linux `mmc_spi` and FatFs, which send Stop Tran
 instead. Scripted SPI tests cover a clean stream, a block rejected first and
 later, an SPI failure mid-block, a busy timeout, failed cleanup, a failed final
-status, and a rejected CMD25. The sequence has not yet run on hardware.
+status, and a rejected CMD25. On hardware it has run on one X4 with one card,
+where no write failed, so the cleanup paths have only run against the script.
 
-The write feature is an experiment until matched hardware measurements justify
-enabling it. Host transaction counts are not hardware throughput claims. Keep
-feature-off builds as the baseline and verify both X4/X3 stack links, writes
-(section text, image packs, browser uploads), and sleep/wake before enabling it
-in release builds.
+Since October 2026 the firmware turns the write feature on as well (and `ui`,
+as for reads). On an X4 bench build, with reads already batched, it made spacing
+reflows of a 764-page book about 9% faster, a deflated PNG's spool to the card
+about 22% faster and browser uploads 23% faster (270 to 333 KB/s), with
+section files, image packs and uploaded books reading back identically. Only
+the X4 sends CMD25: no X3 has run it, so `fw::sd_session::CountingDevice`
+splits each batch into single-sector writes there.
+
+Two limits of a batched write, neither reachable from the firmware's current
+writers, which create, truncate or append and rewrite in place only within one
+sector. First, the driver sends ACMD23 (pre-erase) before CMD25, and the SD
+spec leaves pre-erased blocks undefined when a stream stops early, so a batch
+that fails while overwriting existing data may also lose the old contents of
+the rest of its range; a retry rewrites the whole range. Second, an SPI failure
+in the middle of a block's payload leaves the card still waiting for data, so
+the Stop Tran cleanup is taken as block data: the card rejects that block on
+its CRC, and the next session's cold re-acquire brings it back in step.
 
 ## Verification
 

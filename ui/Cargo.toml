@@ -15,4 +15,4 @@ jpeg-encoder = "0.6.1"
 # The same FAT code as the firmware (fw/Cargo.toml). The test disk's
 # one-sector clusters never form a multi-block batch; vendor/embedded-sdmmc's
 # own tests cover batching.
-embedded-sdmmc = { git = "https://github.com/Jon-Vii/embedded-sdmmc-rs.git", rev = "329b3a53a55fb527f62a7813557b420817e831d8", default-features = false, features = ["contiguous-file-read"] }
+embedded-sdmmc = { git = "https://github.com/Jon-Vii/embedded-sdmmc-rs.git", rev = "329b3a53a55fb527f62a7813557b420817e831d8", default-features = false, features = ["contiguous-file-read", "contiguous-file-write"] }

@@ -37,9 +37,10 @@ embedded-hal       = "1.0.0"
 # Marigold fork based exactly on the proven #210 revision, adding allocation-
 # free VFAT long-name creation/deletion. Do not update to newer upstream SD
 # driver rewrites: they fail cold card init on the X4 (July 4 2026).
-# contiguous-file-read hands whole sectors of a cluster to the card as one
-# multi-block read (CMD18); see vendor/embedded-sdmmc/MARIGOLD-PATCH.md.
-embedded-sdmmc     = { git = "https://github.com/Jon-Vii/embedded-sdmmc-rs.git", rev = "329b3a53a55fb527f62a7813557b420817e831d8", default-features = false, features = ["contiguous-file-read"] }
+# contiguous-file-read and -write hand whole sectors of a cluster to the card
+# as one multi-block read (CMD18) or write (CMD25); see
+# vendor/embedded-sdmmc/MARIGOLD-PATCH.md.
+embedded-sdmmc     = { git = "https://github.com/Jon-Vii/embedded-sdmmc-rs.git", rev = "329b3a53a55fb527f62a7813557b420817e831d8", default-features = false, features = ["contiguous-file-read", "contiguous-file-write"] }
 nb                = "1.1.0"
 portable-atomic   = { version = "1.10.0", features = ["unsafe-assume-single-core"] }
 static_cell       = "2.1.0"
