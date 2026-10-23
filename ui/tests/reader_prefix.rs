@@ -433,10 +433,12 @@ fn justification_stops_short_of_gaping_word_spaces() {
     use ui::reading::{justify_extra, READER_WRAP_SAFETY};
     let space = 6;
     let right = 400 + READER_WRAP_SAFETY;
-    // 30 px over six gaps (5 each, under 1.5 spaces) stretches.
+    // 30 px over six gaps (5 each, under two spaces) stretches, and so does
+    // 36 px over three (12 each, two spaces exactly).
     assert_eq!(justify_extra(0, 370, right, 6, space), Some(30));
-    // The same 30 px over three gaps (10 each) would gape: natural spacing.
-    assert_eq!(justify_extra(0, 370, right, 3, space), None);
+    assert_eq!(justify_extra(0, 364, right, 3, space), Some(36));
+    // 40 px over three gaps (over 13 each) would gape: natural spacing.
+    assert_eq!(justify_extra(0, 360, right, 3, space), None);
     // Lines under two thirds of the measure never stretch.
     assert_eq!(justify_extra(0, 250, right, 40, space), None);
 }

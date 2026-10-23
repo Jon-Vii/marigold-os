@@ -1491,9 +1491,9 @@ pub fn word_space_width(settings: TypeSettings, style: FontStyle) -> i16 {
 /// Extra width to spread across a justified line's inter-word gaps, or
 /// `None` when it should keep natural spacing: no gaps, nothing to add, a
 /// line so short (under two thirds of the measure) that stretching it
-/// would open rivers, or one whose gaps would each grow by more than one
-/// and a half spaces -- typically a line cut short by a word that could
-/// not be broken.
+/// would open rivers, or one whose gaps would each grow by more than two
+/// spaces -- typically a line cut short by a word that could not be
+/// broken.
 pub fn justify_extra(
     x: i16,
     natural_width: i16,
@@ -1506,7 +1506,7 @@ pub fn justify_extra(
     if gaps == 0
         || extra <= 0
         || extra * 3 > target - x
-        || i32::from(extra) * 2 > gaps as i32 * i32::from(space) * 3
+        || i32::from(extra) > gaps as i32 * i32::from(space) * 2
     {
         return None;
     }
@@ -2504,13 +2504,13 @@ mod tests {
 
     #[test]
     fn lines_holding_images_justify_whenever_two_thirds_full() {
-        // A measure of 780 with nine four-pixel gaps: a text line takes 54
-        // to spare at most (one and a half spaces a gap); a line holding
-        // images takes anything up to a third of the measure.
+        // A measure of 780 with nine four-pixel gaps: a text line takes 72
+        // to spare at most (two spaces a gap); a line holding images takes
+        // anything up to a third of the measure.
         let (x, right) = (8, 792);
         let measure = right - READER_WRAP_SAFETY - x;
-        assert_eq!(justify_extra(x, measure - 54, right, 9, 4), Some(54));
-        assert_eq!(justify_extra(x, measure - 71, right, 9, 4), None);
+        assert_eq!(justify_extra(x, measure - 72, right, 9, 4), Some(72));
+        assert_eq!(justify_extra(x, measure - 73, right, 9, 4), None);
         assert_eq!(justify_inline_extra(x, measure - 71, right, 9), Some(71));
         assert_eq!(justify_inline_extra(x, measure - 260, right, 4), Some(260));
         assert_eq!(justify_inline_extra(x, measure - 261, right, 4), None);

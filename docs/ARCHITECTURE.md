@@ -465,8 +465,7 @@ Venice: 18.9 s without, 24.6 s with), and idle-time preparation (see the reader
 cache) keeps most of it off the open. A paragraph's last word is never split,
 and a word wider than a whole line breaks wherever it can. At draw time,
 `justify_extra` leaves a line at natural spacing rather than open gaps past
-one and a half spaces, and does the same for lines under two thirds of the
-measure. Soft hyphens survive normalisation as break hints and are stripped
+two spaces, and does the same for lines under two thirds of the measure. Soft hyphens survive normalisation as break hints and are stripped
 from stored lines. An image inside a line is one unit of its fitted width,
 measured as an object (`StyledInkCursor::push_object`) and never split or
 hyphenated. Justified gaps stretch around it as they do around a word.
