@@ -352,12 +352,19 @@ pub fn section_v2_cache_size(header: SectionV2Header) -> usize {
         + header.text_bytes as usize
 }
 
-pub fn book_v2_cache_size(header: BookV2Header) -> usize {
+/// Where the book title starts in a book index: after the header, the
+/// prefix's section records, the seed's section records, the TOC records and
+/// the TOC text.
+pub fn book_v2_title_offset(header: BookV2Header) -> usize {
     BOOK_V2_HEADER_BYTES
         + (header.section_count as usize + header.seed_section_count as usize)
             * BOOK_V2_SECTION_RECORD_BYTES
         + header.toc_count as usize * TOC_RECORD_BYTES
         + header.toc_text_bytes as usize
+}
+
+pub fn book_v2_cache_size(header: BookV2Header) -> usize {
+    book_v2_title_offset(header)
         + header.title_text_bytes as usize
         + header.author_text_bytes as usize
 }
@@ -1417,6 +1424,13 @@ mod tests {
                 + 128
                 + 20
                 + 18
+        );
+        assert_eq!(
+            book_v2_title_offset(header),
+            BOOK_V2_HEADER_BYTES
+                + BOOK_V2_SECTION_RECORD_BYTES * (2 + 3)
+                + TOC_RECORD_BYTES * 4
+                + 128
         );
 
         header_bytes[4] = CACHE_VERSION as u8;
