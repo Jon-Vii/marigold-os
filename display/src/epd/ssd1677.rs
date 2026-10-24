@@ -8,11 +8,16 @@ pub const CMD_DATA_ENTRY_MODE: u8 = 0x11;
 pub const CMD_SW_RESET: u8 = 0x12;
 pub const CMD_TEMP_SENSOR: u8 = 0x18;
 pub const CMD_WRITE_TEMPERATURE: u8 = 0x1A;
+pub const CMD_READ_TEMPERATURE: u8 = 0x1B;
 pub const CMD_MASTER_ACTIVATION: u8 = 0x20;
 pub const CMD_DISPLAY_UPDATE_CTRL1: u8 = 0x21;
 pub const CMD_DISPLAY_UPDATE_CTRL2: u8 = 0x22;
 pub const CMD_WRITE_RAM_BW: u8 = 0x24;
 pub const CMD_WRITE_RAM_RED: u8 = 0x26;
+pub const CMD_WRITE_LUT: u8 = 0x32;
+pub const CMD_GATE_VOLTAGE: u8 = 0x03;
+pub const CMD_SOURCE_VOLTAGE: u8 = 0x04;
+pub const CMD_WRITE_VCOM: u8 = 0x2C;
 pub const CMD_BORDER_WAVEFORM: u8 = 0x3C;
 pub const CMD_SET_RAM_X_RANGE: u8 = 0x44;
 pub const CMD_SET_RAM_Y_RANGE: u8 = 0x45;
@@ -158,4 +163,102 @@ pub const fn is_byte_aligned(rect: Rect) -> bool {
 
 pub fn fill_transformed_band(fb: &Framebuffer, band_y: usize, out: &mut [u8; BAND_BYTES]) -> usize {
     fill_transformed_band_impl::<MIRROR_X, MIRROR_Y, REVERSE_BITS>(fb, band_y, out)
+}
+
+/// The panel's own page-turn waveform: the OTP waveform setting the
+/// SSD1677 loads for display mode 2, read back from an X4's controller
+/// with the undocumented command 0x33 (the register's read, between 0x32
+/// Write LUT and 0x34 CRC). The same set loads at every temperature: one
+/// group of phases 3, 16, 1 and 1 frames at 50 Hz (frame-rate code 2).
+/// The four pixel classes are (RED << 1) | BW, with RED the previous
+/// frame: black to black gets 3 frames toward black, black to white and
+/// white to black 20 frames each, white to white 1 frame toward white,
+/// and the last frame drives nothing.
+pub const FAST_LUT: [u8; 105] = [
+    0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+    0xA8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x54, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x03, 0x10, 0x01, 0x01, 0x00, //
+    0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x00, 0x00, 0x00, 0x00, 0x00, //
+    0x00, 0x00, 0x00, 0x00, 0x01, //
+    0x22, 0x22, 0x22, 0x22, 0x22,
+];
+
+/// The same OTP set's gate voltage (VGH), source voltages (VSH1, VSH2,
+/// VSL) and VCOM, which a waveform written through 0x32 must set itself.
+pub const FAST_GATE_VOLTAGE: u8 = 0x17;
+pub const FAST_SOURCE_VOLTAGES: [u8; 3] = [0x41, 0xA8, 0x32];
+pub const FAST_VCOM: u8 = 0x10;
+
+/// Where [`FAST_LUT`] keeps the length of its main phase (group 0,
+/// phase B), and that length.
+const FAST_MAIN_PHASE: usize = 51;
+pub const FAST_MAIN_FRAMES: u8 = 16;
+
+/// Main-phase frames for a quick page turn at a panel temperature read at
+/// boot, or `None` for the OTP waveform. The OTP gives the page turn the
+/// same 20 frames of drive at every temperature, while its full refresh
+/// takes 176 frames above 20 C, 232 above 15 C and 331 above 10 C: the ink
+/// moves that much faster when warm. Above 20 C a blind comparison on an
+/// X4 at 22.5 C could not tell an 8-frame main phase from the factory's
+/// 16, so 10 frames keep a margin there; above 15 C the main phase grows
+/// with the full refresh's ratio and keeps the same margin; colder panels,
+/// and an unknown temperature, keep the factory waveform.
+pub const fn quick_turn_frames(temp_c: Option<i8>) -> Option<u8> {
+    match temp_c {
+        Some(t) if t > 20 => Some(10),
+        Some(t) if t > 15 => Some(13),
+        _ => None,
+    }
+}
+
+/// [`FAST_LUT`] with its main phase cut to `main_frames`. Black to white
+/// and white to black shorten together, so their drives stay equal and
+/// opposite, and every other byte is the panel's own.
+pub const fn quick_turn_lut(main_frames: u8) -> [u8; 105] {
+    let mut lut = FAST_LUT;
+    lut[FAST_MAIN_PHASE] = main_frames;
+    lut
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_full_length_quick_turn_is_the_otp_waveform() {
+        assert_eq!(quick_turn_lut(FAST_MAIN_FRAMES), FAST_LUT);
+    }
+
+    #[test]
+    fn a_quick_turn_changes_only_the_main_phase() {
+        let lut = quick_turn_lut(10);
+        for (index, (&quick, &otp)) in lut.iter().zip(FAST_LUT.iter()).enumerate() {
+            if index == FAST_MAIN_PHASE {
+                assert_eq!((quick, otp), (10, FAST_MAIN_FRAMES));
+            } else {
+                assert_eq!(quick, otp, "byte {index}");
+            }
+        }
+    }
+
+    #[test]
+    fn cold_or_unknown_panels_keep_the_otp_waveform() {
+        assert_eq!(quick_turn_frames(None), None);
+        assert_eq!(quick_turn_frames(Some(-5)), None);
+        assert_eq!(quick_turn_frames(Some(15)), None);
+        assert_eq!(quick_turn_frames(Some(16)), Some(13));
+        assert_eq!(quick_turn_frames(Some(20)), Some(13));
+        assert_eq!(quick_turn_frames(Some(21)), Some(10));
+        assert_eq!(quick_turn_frames(Some(40)), Some(10));
+    }
 }

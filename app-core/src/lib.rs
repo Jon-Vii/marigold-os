@@ -329,11 +329,57 @@ impl RenderRequest {
             alignment: self.alignment,
         }
     }
+
+    /// The request fields a reading page from the card is drawn from, or
+    /// `None` for any other render (see [`ReadingPageKey`]).
+    pub fn reading_page_key(&self) -> Option<ReadingPageKey> {
+        (self.view == AppView::Reading && ReaderSource::from_book_id(self.book_id).is_sd()).then(
+            || ReadingPageKey {
+                book_id: self.book_id,
+                page: self.page,
+                orientation: self.orientation,
+                type_settings: self.type_settings(),
+            },
+        )
+    }
+}
+
+/// Every field of a [`RenderRequest`] that the firmware's reading page for
+/// a card book reads (`fw::views::draw_sd_reader_page` and the helpers it
+/// calls): the book, to find it in the store; the page; the orientation,
+/// which picks the drawing frame and which side the page counter sits on;
+/// and the type settings, which must match the store's layout before the
+/// page is drawn at all. Everything else on the page comes from the reader
+/// store. The other request fields are never read there: `kind`,
+/// `refresh_policy` and `dirty` only steer the refresh, `chapter`,
+/// `selection`, `page_count`, `front_buttons`, the battery and library
+/// counts, the firmware and sync fields and the Wi-Fi name belong to other
+/// views, and `last_button` and the raw ADC values feed a debug overlay
+/// that is compiled out. Those per-press fields differ between two
+/// requests for the same page, so the display task compares this key, not
+/// whole requests, when it decides that a page it drew ahead of a press is
+/// the page the press asks for. A field the reading page starts to read
+/// belongs here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadingPageKey {
+    pub book_id: u32,
+    pub page: u32,
+    pub orientation: DisplayOrientation,
+    pub type_settings: TypeSettings,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DisplayCommand {
     Render(RenderRequest),
+    /// The render a Next press is expected to send while reading, offered
+    /// once the page on screen has settled and nothing else is in flight,
+    /// so the display task can draw it and load it into the panel ahead of
+    /// the press (X4 only). `presses` is the firmware's button-press count
+    /// when the app predicted it: any later press makes it stale.
+    StageNext {
+        request: RenderRequest,
+        presses: u32,
+    },
     Sleep,
 }
 
@@ -954,24 +1000,7 @@ impl ReaderState {
                 next.read_request_pending = false;
             }
             (AppView::Reading, Some(Button::Next | Button::PageNext)) => {
-                if ReaderSource::from_book_id(self.book_id).is_sd() {
-                    if self.pending_page.is_some() {
-                        // Coalesce repeated turns while the same page is loading.
-                    } else if self.page.saturating_add(1) < self.sd_page_count {
-                        next.page = self.page.saturating_add(1);
-                    } else if !self.sd_complete {
-                        next.pending_page = Some(self.page.saturating_add(1));
-                    } else {
-                        next.page = self.sd_page_count.saturating_sub(1);
-                    }
-                    next.chapter = next.sd_chapter_for_page(next.page);
-                    next.selection = next.chapter;
-                } else {
-                    next.chapter =
-                        wrap_next(self.chapter, (ctx.builtin_chapter_count as u16).max(1));
-                    next.selection = next.chapter;
-                    next.page = 0;
-                }
+                next = next.turn_forward(ctx);
             }
             (AppView::Reading, Some(Button::Previous | Button::PagePrevious)) => {
                 next.pending_page = None;
@@ -1459,6 +1488,48 @@ impl ReaderState {
             wifi_ssid_len: self.wifi_ssid_len,
             dirty: self.dirty,
         }
+    }
+
+    /// What Next does while reading. A card book turns to the following
+    /// page, or waits for preparation at the end of the prefix, or stays on
+    /// the last page; the built-in book steps to its next chapter.
+    fn turn_forward(mut self, ctx: ReducerContext) -> Self {
+        if ReaderSource::from_book_id(self.book_id).is_sd() {
+            if self.pending_page.is_some() {
+                // Coalesce repeated turns while the same page is loading.
+            } else if self.page.saturating_add(1) < self.sd_page_count {
+                self.page = self.page.saturating_add(1);
+            } else if !self.sd_complete {
+                self.pending_page = Some(self.page.saturating_add(1));
+            } else {
+                self.page = self.sd_page_count.saturating_sub(1);
+            }
+            self.chapter = self.sd_chapter_for_page(self.page);
+        } else {
+            self.chapter = wrap_next(self.chapter, (ctx.builtin_chapter_count as u16).max(1));
+            self.page = 0;
+        }
+        self.selection = self.chapter;
+        self
+    }
+
+    /// The render a Next press would lead to from here: the following page
+    /// of the card book being read, which the firmware renders once storage
+    /// has confirmed it. Compare it with that render by
+    /// [`RenderRequest::reading_page_key`]; the per-press fields differ.
+    /// `None` outside Reading, for the built-in book, while a turn already
+    /// waits for its page, on the last page, and at the end of a prefix
+    /// still being prepared, where Next waits rather than turns.
+    pub fn next_page_request(self, ctx: ReducerContext) -> Option<RenderRequest> {
+        if self.view != AppView::Reading
+            || !ReaderSource::from_book_id(self.book_id).is_sd()
+            || self.pending_page.is_some()
+        {
+            return None;
+        }
+        let next = self.turn_forward(ctx);
+        (next.pending_page.is_none() && next.page > self.page)
+            .then(|| next.render_request(RenderKind::Page))
     }
 
     pub fn persisted(self) -> PersistedAppState {
@@ -3142,5 +3213,169 @@ mod tests {
         };
         assert_eq!(target_pages, u16::MAX);
         assert_eq!(StorageCommand::RefreshCatalog.retry_at_page(1), None);
+    }
+
+    /// Page 4 of a ten-page card book whose chapters start on pages 0, 3
+    /// and 5, so the next page opens a chapter.
+    fn reading_card_book() -> ReaderState {
+        let mut state = card_book_state();
+        state.view = AppView::Reading;
+        state.page = 4;
+        state.sd_page_count = 10;
+        state.sd_complete = true;
+        state.sd_chapter_count = 3;
+        state.sd_chapter_pages[1] = 3;
+        state.sd_chapter_pages[2] = 5;
+        state.chapter = 1;
+        state.selection = 1;
+        state.battery_mv = 3_950;
+        state.battery_percent = 64;
+        state
+    }
+
+    #[test]
+    fn next_page_prediction_matches_the_render_a_next_press_leads_to() {
+        let raw_buttons = [
+            Button::Back,
+            Button::Confirm,
+            Button::Previous,
+            Button::Next,
+            Button::PagePrevious,
+            Button::PageNext,
+        ];
+        for orientation in [
+            DisplayOrientation::LandscapeButtonsBottom,
+            DisplayOrientation::LandscapeButtonsTop,
+            DisplayOrientation::PortraitButtonsLeft,
+            DisplayOrientation::PortraitButtonsRight,
+        ] {
+            for front_buttons in [FrontButtons::PagesRight, FrontButtons::PagesLeft] {
+                for complete in [true, false] {
+                    let mut state = reading_card_book();
+                    state.orientation = orientation;
+                    state.front_buttons = front_buttons;
+                    state.sd_complete = complete;
+                    state.font_size = FontSize::Large;
+                    state.alignment = Alignment::Left;
+                    let predicted = state.next_page_request(CTX).expect("page 5 follows");
+                    assert_eq!(predicted.page, 5);
+                    let mut forward_keys = 0;
+                    for button in raw_buttons {
+                        let pressed = state.apply_input(
+                            CTX,
+                            InputEvent::Sample {
+                                button: Some(button),
+                                aux_raw: 1_234,
+                                nav_raw: 56,
+                                page_raw: 78,
+                                battery_mv: 3_870,
+                                battery_percent: 41,
+                            },
+                        );
+                        if pressed.view != AppView::Reading || pressed.page != 5 {
+                            continue;
+                        }
+                        forward_keys += 1;
+                        // The firmware asks storage for the page and renders
+                        // the state its answer leaves.
+                        let answered = pressed.apply_library_event(
+                            CTX,
+                            LibraryEvent::PrefixLoaded {
+                                request_id: 1,
+                                book_id: state.book_id,
+                                pages: 10,
+                                chapters: 3,
+                                current_chapter: 2,
+                                chapter_pages: state.sd_chapter_pages,
+                                complete,
+                                page: Some(5),
+                            },
+                        );
+                        let rendered = answered.render_request(RenderKind::Page);
+                        assert!(rendered.reading_page_key().is_some());
+                        assert_eq!(
+                            rendered.reading_page_key(),
+                            predicted.reading_page_key(),
+                            "{orientation:?} {front_buttons:?} {button:?}"
+                        );
+                        // The press's own sample rides in the request, which
+                        // is why staging compares keys and not requests.
+                        assert_ne!(rendered, predicted);
+                    }
+                    assert_eq!(forward_keys, 2, "{orientation:?} {front_buttons:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_next_page_is_predicted_past_the_end_or_outside_reading() {
+        let mut last = reading_card_book();
+        last.page = 9;
+        assert_eq!(last.next_page_request(CTX), None);
+        assert_eq!(press(last, Button::Next).page, 9);
+
+        let mut prefix_end = last;
+        prefix_end.sd_complete = false;
+        assert_eq!(prefix_end.next_page_request(CTX), None);
+        assert_eq!(press(prefix_end, Button::Next).pending_page, Some(10));
+
+        let mut waiting = reading_card_book();
+        waiting.pending_page = Some(5);
+        assert_eq!(waiting.next_page_request(CTX), None);
+
+        for view in [
+            AppView::Home,
+            AppView::Library,
+            AppView::Chapters,
+            AppView::Wireless,
+            AppView::Settings,
+            AppView::FirmwareUpdate,
+        ] {
+            let mut elsewhere = reading_card_book();
+            elsewhere.view = view;
+            assert_eq!(elsewhere.next_page_request(CTX), None, "{view:?}");
+            let request = elsewhere.render_request(RenderKind::Page);
+            assert_eq!(request.reading_page_key(), None);
+        }
+
+        let mut built_in = reading_card_book();
+        built_in.book_id = 1;
+        assert_eq!(built_in.next_page_request(CTX), None);
+        assert_eq!(
+            built_in.render_request(RenderKind::Page).reading_page_key(),
+            None
+        );
+    }
+
+    #[test]
+    fn reading_page_key_tracks_what_the_page_draws_from() {
+        let request = reading_card_book().render_request(RenderKind::Page);
+        let key = request.reading_page_key().unwrap();
+        let mut pressed = request;
+        pressed.kind = RenderKind::Battery;
+        pressed.chapter = 2;
+        pressed.selection = 2;
+        pressed.page_count = 0;
+        pressed.last_button = Some(Button::PageNext);
+        pressed.aux_raw = 1;
+        pressed.nav_raw = 2;
+        pressed.page_raw = 3;
+        pressed.battery_mv = 3_700;
+        pressed.battery_percent = 12;
+        pressed.refresh_policy = RefreshPolicy::FullEveryTen;
+        pressed.front_buttons = FrontButtons::PagesLeft;
+        assert_eq!(pressed.reading_page_key(), Some(key));
+        let mut other_page = request;
+        other_page.page = 5;
+        let mut flipped = request;
+        flipped.orientation = DisplayOrientation::LandscapeButtonsTop;
+        let mut heavier = request;
+        heavier.font_weight = FontWeight::Heavy;
+        let mut other_book = request;
+        other_book.book_id += 1;
+        for changed in [other_page, flipped, heavier, other_book] {
+            assert_ne!(changed.reading_page_key(), Some(key));
+        }
     }
 }

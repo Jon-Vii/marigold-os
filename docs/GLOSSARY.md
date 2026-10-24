@@ -57,3 +57,9 @@ The session's storage-admission rules (which storage commands may run before and
 The display-policy decision that maps render history, view/book context, selection changes, library changes, sleep/wake state, and refresh policy to a panel refresh mode (`RefreshMode`). The X4 (SSD1677) and X3 (UC8253) drivers each carry out that mode in their own way.
 
 Firmware and the emulator share this decision (full, fast-clean, or fast). Panel command streaming, framebuffer transforms, and adapter-specific panel state stay outside the refresh plan.
+
+### Staged page
+
+On the X4, the next reading page drawn into the framebuffer and written to BW RAM while the reader is still on the page before, so that a Next press only has to start the waveform. The app task offers the render a Next press would send (`DisplayCommand::StageNext`), and the display task stages it when the page is resident and drawn from RAM.
+
+A staged page stands in for a render only when the render's `ReadingPageKey` and the reader store's fingerprint both match what they were when it was staged. Any press after the offer abandons staging.

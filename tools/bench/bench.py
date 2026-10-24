@@ -439,6 +439,9 @@ def summarize_paths(
 
     renders = [event for event in events if event.get("event") == "render"]
     reading_renders = [event for event in renders if event.get("view") == "Reading"]
+    staged_renders = [event for event in reading_renders if event.get("staged") is True]
+    drawn_renders = [event for event in reading_renders if event.get("staged") is not True]
+    stages = [event for event in events if event.get("event") == "stage"]
     refreshes = [event for event in events if event.get("event") == "refresh"]
     sleeps = [event for event in events if event.get("event") == "sleep"]
     warnings = [event for event in events if event.get("event") == "warning"]
@@ -450,8 +453,21 @@ def summarize_paths(
     print(f"storage:       {len(storage)}")
     print(f"sleeps:        {len(sleeps)}")
     print(f"warnings:      {len(warnings)}")
-    print_duration("reading layout", values(reading_renders, "layout_ms"))
+    print_duration("reading layout", values(drawn_renders, "layout_ms"))
     print_duration("page turn", page_turn_durations(events))
+    if any("staged" in event for event in reading_renders):
+        # A staged page was drawn while the reader read the one before, so
+        # its layout_ms is only the check that it still holds.
+        print(f"staged pages:  {len(staged_renders)} of {len(reading_renders)} reading renders")
+        print_duration("staged check", values(staged_renders, "layout_ms"))
+        print_duration("turn, staged", page_turn_durations(events, staged=True))
+        print_duration("turn, drawn", page_turn_durations(events, staged=False))
+    written = [event for event in stages if event.get("step") == "bw" and event.get("ok") is True]
+    print_duration("stage render", values(written, "render_ms"))
+    print_duration("stage BW", values(written, "bw_ms"))
+    if stages:
+        given_way = [event for event in stages if event.get("ok") is False and event.get("step") in {"render", "bw"}]
+        print(f"stages:        {len(written)} written, {len(given_way)} gave way to a press or command")
     print_duration("render flush", values(renders, "flush_ms"))
     print_duration("prestage", values(renders, "prestage_ms"))
     print_duration("refresh busy", values(refreshes, "busy_ms"))
@@ -505,8 +521,17 @@ def summarize_paths(
         print("warning lines:")
         for event in warnings[:10]:
             print(f"  {event.get('line', event)}")
+    checks = [event for event in events if event.get("event") == "stage_check" and event.get("done") is True]
+    if checks:
+        matched = sum(1 for event in checks if event.get("match") is True)
+        print(f"stage checks:  {matched} of {len(checks)} staged pages matched a fresh render")
     budget_warnings = evaluate_budgets(events, load_budgets(budgets_path))
     suite_warnings = evaluate_suite_signals(events) if validate_suites else []
+    stage_warnings = evaluate_stage_checks(events)
+    if stage_warnings:
+        print("stage warnings:")
+        for warning in stage_warnings:
+            print(f"  {warning}")
     if budget_warnings:
         print("budget warnings:")
         for warning in budget_warnings:
@@ -515,7 +540,24 @@ def summarize_paths(
         print("suite warnings:")
         for warning in suite_warnings:
             print(f"  {warning}")
-    return budget_warnings + suite_warnings
+    return stage_warnings + budget_warnings + suite_warnings
+
+
+def evaluate_stage_checks(events: list[dict[str, Any]]) -> list[str]:
+    """A staged page that differs from a fresh render of the same request
+    (`bench: stage_check match=false`) put a wrong frame on the panel. That
+    is a correctness failure, never a budget."""
+    mismatches = [
+        event
+        for event in events
+        if event.get("event") == "stage_check"
+        and event.get("done") is True
+        and event.get("match") is not True
+    ]
+    if not mismatches:
+        return []
+    pages = ", ".join(str(event.get("page")) for event in mismatches[:10])
+    return [f"stage_check: {len(mismatches)} staged page(s) differed from a fresh render (pages {pages})"]
 
 
 def image_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
@@ -580,7 +622,12 @@ def print_duration(label: str, data: list[int]) -> None:
     print(f"{label:14} median={median:.0f}ms p95={p95:.0f}ms min={min(data)}ms max={max(data)}ms")
 
 
-def page_turn_durations(events: list[dict[str, Any]]) -> list[int]:
+def page_turn_durations(
+    events: list[dict[str, Any]], staged: bool | None = None
+) -> list[int]:
+    """Input-to-settled times for page turns. `staged` keeps only the turns
+    whose page was (True) or was not (False) staged ahead of the press;
+    pairing always runs over every turn."""
     pending_inputs: list[int] = []
     durations: list[int] = []
     for event in sorted(events, key=event_sort_key):
@@ -592,7 +639,8 @@ def page_turn_durations(events: list[dict[str, Any]]) -> list[int]:
             t_ms = event.get("t_ms")
             if isinstance(t_ms, int) and pending_inputs:
                 input_t = pending_inputs.pop(0)
-                if t_ms >= input_t:
+                was_staged = event.get("staged") is True
+                if t_ms >= input_t and (staged is None or staged == was_staged):
                     durations.append(t_ms - input_t)
     return durations
 
@@ -642,7 +690,11 @@ def evaluate_budgets(events: list[dict[str, Any]], budgets: dict[str, Any]) -> l
             page_turn.get("median_press_to_settled_ms"),
         )
         reading_layout = values(
-            [event for event in render_events if event.get("view") == "Reading"],
+            [
+                event
+                for event in render_events
+                if event.get("view") == "Reading" and event.get("staged") is not True
+            ],
             "layout_ms",
         )
         warn_if_above(
@@ -847,6 +899,8 @@ class ChannelStressModel:
         assert all(sync_loaned_admits(command) for command in admitted)
         self.checks.append("sync session admits only progress, credentials, and upload after loan")
 
+        self.checks.extend(NextPageModel().run())
+
     def input_page_turn(self) -> None:
         self.state_page += 1
         if self.rendering:
@@ -879,6 +933,136 @@ class ChannelStressModel:
     def sleep(self) -> None:
         self.rendering = False
         self.render_pending = False
+
+
+class NextPageModel:
+    """Host model of drawing the next page ahead of the press: the app's
+    offer (`NextPageOffer` in fw/src/tasks/app.rs) and the display task's
+    stage (fw/src/next_page.rs). `store` stands in for the reader store's
+    fingerprint."""
+
+    def __init__(self) -> None:
+        self.page = 4
+        self.page_count = 10
+        self.shown: int | None = None
+        self.rendering = False
+        self.offered: int | None = None
+        self.presses = 0
+        self.store = 0
+        self.offer: tuple[int, int] | None = None
+        self.staged: tuple[int, int] | None = None
+        self.recheck = False
+        self.after_idle = False
+
+    def run(self) -> list[str]:
+        checks = []
+        self.send_render()
+        self.app_offer()
+        assert self.offer is None
+        self.settled()
+        assert self.offer == (5, 0)
+        self.stage()
+        assert self.staged == (5, 0)
+        self.press_next()
+        assert self.send_render() == "hit"
+        checks.append("a settled page offers the next; the press's render uses the staged frame")
+
+        self.settled()
+        assert self.offer == (6, 1)
+        self.press_next()
+        self.stage()
+        assert self.staged is None and self.offer is None
+        assert self.send_render() == "none"
+        checks.append("a press counted after the offer abandons staging")
+
+        self.settled()
+        self.stage()
+        self.page -= 1  # Previous: another page than the one staged
+        assert self.send_render() == "other_page"
+        self.settled()
+        self.stage()
+        self.store += 1  # e.g. a catalog load touched the store
+        self.page += 1
+        assert self.send_render() == "store_changed"
+        checks.append("the staged frame stands in only for its page over an unchanged store")
+
+        self.settled()
+        self.stage()
+        self.idle_step()
+        assert not self.due(idle_pending=True)
+        assert self.due(idle_pending=False)
+        self.stage()
+        self.page += 1
+        assert self.send_render() == "hit"
+        checks.append("idle preparation defers staging again until it has finished")
+
+        self.page = self.page_count - 1
+        self.send_render()
+        self.settled()
+        assert self.offer is None
+        checks.append("nothing is staged past the last page")
+        return checks
+
+    # The app task.
+    def send_render(self) -> str:
+        self.rendering = True
+        self.shown = self.page
+        self.offered = None
+        return self.display_render(self.page)
+
+    def settled(self) -> None:
+        self.rendering = False
+        self.app_offer()
+
+    def app_offer(self) -> None:
+        if self.rendering or self.shown != self.page or self.page + 1 >= self.page_count:
+            return
+        if self.offered == self.page + 1:
+            return
+        self.offered = self.page + 1
+        self.offer = (self.page + 1, self.presses)
+        self.after_idle = False
+
+    def press_next(self) -> None:
+        self.presses += 1
+        self.page += 1
+
+    # The display task.
+    def due(self, idle_pending: bool = False) -> bool:
+        if self.offer is None:
+            return False
+        stale = self.recheck or self.staged is None or self.staged[0] != self.offer[0]
+        return stale and not (self.after_idle and idle_pending)
+
+    def stage(self) -> None:
+        if self.offer is None:
+            return
+        page, presses = self.offer
+        if presses != self.presses:
+            self.offer = None
+            return
+        if self.recheck and self.staged == (page, self.store):
+            self.recheck = False
+            return
+        self.recheck = False
+        self.staged = (page, self.store)
+
+    def idle_step(self) -> None:
+        self.store += 1
+        self.recheck = True
+        self.after_idle = True
+
+    def display_render(self, page: int) -> str:
+        self.offer = None
+        self.recheck = False
+        staged, self.staged = self.staged, None
+        if staged is None:
+            return "none"
+        if staged[0] != page:
+            return "other_page"
+        if staged[1] != self.store:
+            return "store_changed"
+        return "hit"
 
 
 def sync_loaned_admits(command: str) -> bool:

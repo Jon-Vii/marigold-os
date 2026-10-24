@@ -37,7 +37,7 @@ flowchart TD
 
     buttons -->|"raw samples"| input_task
     input_task -->|"InputEvent"| app_task
-    app_task -->|"DisplayCommand::Render / Sleep"| display_task
+    app_task -->|"DisplayCommand::Render / StageNext"| display_task
     app_task -->|"StorageCommand"| display_task
     display_task -->|"DisplayEvent::Settled / Asleep<br/>LibraryEvent"| app_task
     app_task -->|"PowerEvent::Activity"| power_task
@@ -110,12 +110,17 @@ tools/bench/    serial bench harness for hardware timing, storage/cache,
 app_task
   owns ReaderState
   InputEvent -> DisplayCommand::Render
+  settled reading page -> DisplayCommand::StageNext, the render a Next press
+  would send (X4)
   views (AppView): Home, Library, Reading, Chapters, Wireless, Settings,
   FirmwareUpdate
 
 board_io/display task
   owns EpdBus, SD CS, ReaderStore, and Framebuffer
-  DisplayCommand::Render -> pure framebuffer render from the current ReaderStore snapshot
+  DisplayCommand::Render -> pure framebuffer render from the current ReaderStore snapshot,
+  or straight to the refresh when that frame is already staged
+  DisplayCommand::StageNext -> next reading page drawn into the framebuffer
+  and BW RAM while the reader reads (X4)
   StorageCommand::* -> serialized SD/FAT/catalog/cache work on the shared SPI bus
   DisplayCommand::Sleep -> sleep screen full refresh -> panel deep sleep -> PowerEvent::DisplayAsleep
   sends DisplayEvent::Settled to app_task when render completes
@@ -216,7 +221,10 @@ Input/render backpressure is coalesced on purpose. The app keeps at most one
 display render in flight. While the display is refreshing, new button events
 still update `ReaderState`, but they set a single pending-render flag instead
 of queuing stale framebuffer renders. When `DisplayEvent::Settled` arrives,
-the app renders the latest state once.
+the app renders the latest state once. Once a reading page has settled with
+nothing in flight, the app also offers the display task the render a Next
+press would send, so the page can be staged before the press (see "Staging
+the next page").
 
 Storage is explicit too. Files/Home/Reading transitions enqueue
 `StorageCommand`s, and render commands never scan FAT, open EPUBs, build
@@ -285,7 +293,29 @@ On the X4, the SSD1677 path writes the current framebuffer to BW RAM
 RED RAM (`0x26`) and runs the multi-flash full waveform (~3.5 s), the only mode
 that reliably clears unknown pixels. Normal page turns use a second, retained
 framebuffer as the RED RAM previous-frame source, then trigger the SSD1677
-fast waveform (~421 ms).
+fast waveform (~421 ms). A turn to a staged page (below) starts the waveform
+without drawing or writing anything first.
+
+That fast waveform is the panel's own display-mode-2 set from OTP, and OTP
+has only one: the same 21 frames at 50 Hz at every temperature (3 frames, a
+16-frame main phase, 1 and 1). The full refresh's OTP sets, by contrast, run
+176 frames above 20 C, 232 above 15 C and 331 above 10 C, because the ink
+moves faster when warm. The controller's datasheet has no way to read a LUT
+back, but the SSD1677 answers an undocumented `0x33` with its LUT register,
+which is how the page-turn set was copied into `display::epd::FAST_LUT`. A
+warm panel turns pages from that copy with a shorter main phase instead
+(`quick_turn_frames`): 10 frames above 20 C (300 ms) and 13 above 15 C
+(360 ms). Colder panels, or a temperature that could not be read, keep the
+OTP waveform. The copy changes only the main phase, so black to white and
+white to black stay equal and opposite, and the voltages and the other two
+pixel classes are the panel's own. In a blind comparison on an X4 at
+22.5 C, main phases from 8 to 16 frames looked the same.
+
+The temperature comes from the controller's own sensor, read once at boot
+(`fw::panel_temp`) before the display SPI bus is built: the controller
+answers reads on its data line, which the board wires to MOSI, so the read
+releases that pin and clocks the reply in by hand. Deep sleep ends in a
+reboot, so every wake reads it again.
 
 `RefreshMode::FastClean` sits between those two: a clean with one flicker. On
 the SSD1677 it runs the display-mode-1 waveform with the temperature register
@@ -352,6 +382,66 @@ X4 (SSD1677) addressing follows the behavior of the OpenX4 community SDK:
 - BUSY is active high.
 - X window is pixel-addressed, `0..799`.
 - Y gate scan is reversed, so the full Y window is `479..0`.
+
+### Staging the next page
+
+On the X4 a page turn used to draw the page (about 40 ms) and stream it into
+BW RAM (16 ms) after the press, before the waveform could start. Now the next
+page is usually there before the press. Once a reading page settles and RED
+RAM holds it again, the app task runs the reducer on a copy of its state to
+predict the render a Next press would send
+(`ReaderState::next_page_request`), and offers it as
+`DisplayCommand::StageNext` with the button-press count it predicted at. It
+offers nothing outside Reading, on the last page, at the end of a prefix
+still being prepared, while a render, open, or turn is in flight, or while
+input waits to be handled.
+
+The display task (`fw::next_page`) stages the page when it belongs to the
+loaded book, is resident in the store in the layout the request names, and
+draws from RAM: no images on it and not the custom face from the card, both
+of which draw inside an SD session. It draws the page into the framebuffer,
+the frame on screen staying in the previous-frame buffer and RED RAM, and
+writes it to BW RAM. When the press's render arrives for the same frame, the
+task skips the draw and the BW write and starts the refresh
+(`display_flush::flush_staged`). Full and FastClean refreshes write RED RAM
+from the framebuffer as always, and it holds the staged page, so every mode
+works.
+
+"The same frame" is a key with two halves. `app_core::ReadingPageKey` holds
+the request fields a reading page reads: the book, the page, the
+orientation, and the type settings. Whole requests never match, since each
+also carries the press's own sample (button, raw ADC values, battery) and
+fields only other views or the refresh planner read. The other half is
+`ReaderStore::fingerprint`, a 64-bit digest of every field of the reader
+store, derived through `Hash` so that a new field is covered once it
+compiles. It is taken when the page is staged and again when the render
+arrives, after that render's own window loads. Any store change in between,
+from idle preparation, an image decode, a catalog or chapter load, a
+relayout, or another book, makes the staged page a miss, and the render
+draws as before. Nothing has to remember to invalidate it. A change confined
+to one word of the store always changes the digest; wider changes collide
+with odds near 2^-64. The framebuffer and BW RAM are otherwise written only
+by renders, the loading plate, and the sleep screen, and each of them drops
+the staged page.
+
+Staging doesn't hold up a press. It starts only when no command is queued,
+and gives way to any press counted since the prediction: the draw checks
+before each line and the BW write before each band, so a press is handled
+within a line's draw, one band's transfer, or one store fingerprint of when
+it would have been otherwise. The input task runs at interrupt priority, so
+the count moves even while the draw holds the thread executor. Idle
+preparation changes the store, so after each idle step the staged page is
+checked against it and dropped if the store moved. A press during
+preparation then finds nothing staged and pays nothing for the check. The
+page is drawn again once preparation has nothing left to do, not after
+every step. Sleep drops it, and a sync session stages nothing.
+
+A turn to a staged page logs `staged=true stage=hit` in its `bench: render`
+line; `layout_ms` is then only the check and `flush_ms` holds no BW write. A
+miss says why (`none`, `other_page`, `store_changed`). Staging logs
+`bench: stage`, with what the draw, one fingerprint (`digest_us`), and the
+BW write took. Bench-serial builds draw every staged page again once it is
+shown and log `bench: stage_check match=...`. The X3 stages nothing.
 
 ## Data-oriented design
 
@@ -1078,6 +1168,7 @@ interfaces:
 
 ```text
 fw::display_flush       panel-plan execution, RAM streaming, BUSY waits, and sleep
+fw::next_page           the next reading page, staged ahead of the press (X4)
 fw::library_sd          FAT scan, SD chip-select handling, and file discovery
 fw::sd_session          SD session open/close and the upload write pump
 fw::reader_cache        EPUB-to-cache loading into bounded proto::cache records
@@ -1113,12 +1204,12 @@ is still read). There is no flash copy.
 
 | | |
 |---|---|
-| Page turn | 473 ms end-to-end; 421 ms of that is the panel's rated fast waveform |
+| Page turn | about 350 ms end-to-end above 20 C (300 ms of it the waveform); 473 ms on the OTP waveform below 15 C |
 | Wake from sleep | one flicker, ~1.5 s |
 | Cold-boot full refresh | 3.5 s |
 | Reopen a cached book | tens of milliseconds |
 | RAM | 400 KB SRAM, no PSRAM |
-| Main stack | linked region about 44.7 KB on X4 (36.1 KB on X3); the link fails below 27 KB (`fw/build.rs`) |
+| Main stack | linked region about 44.5 KB on X4 (36.0 KB on X3); the link fails below 27 KB (`fw/build.rs`) |
 | Framebuffers | two (current + previous frame), 48 KB each on X4, 1 bit per pixel |
 
 ## Bring-up checklist
