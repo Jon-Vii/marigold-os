@@ -17,13 +17,26 @@ type BoardAdcDriver = Adc<'static, BoardAdc, esp_hal::Blocking>;
 pub type BatteryGauge =
     hal_ext::bq27220::Bq27220<esp_hal::i2c::master::I2c<'static, esp_hal::Async>>;
 
-// 15 ms polling puts press-to-event latency at 30-45 ms (two debounce
-// ticks) instead of the 80-120 ms a 40 ms poll cost; the tick-based
-// constants below are scaled to keep their wall-clock behavior.
+// 15 ms polling; the tick-based constants below are scaled to keep their
+// wall-clock behavior.
 const POLL_MS: u64 = 15;
 const CALIBRATION_ONLY: bool = false;
 const RAW_LOG_ENABLED: bool = false;
 const DEBOUNCE_TICKS: u8 = 2;
+// On the X4 a ladder press lands on its final reading within a millisecond
+// and does not bounce (1 ms traces, October 2026), so a press is confirmed
+// by a second reading 2 ms after the first rather than a whole poll later:
+// 0-17 ms from press to event instead of 15-30. Releases do chatter: the
+// front-right button read between 6 and 455 for up to 24 ms before going
+// idle, always in its own band or in none. So a release waits for three
+// idle polls (30-45 ms), and chatter can't end a press and start another.
+// The X3's ladders have not been traced and keep two polls each way.
+#[cfg(not(feature = "device-x3"))]
+const FAST_PRESS: bool = true;
+#[cfg(feature = "device-x3")]
+const FAST_PRESS: bool = false;
+const PRESS_CONFIRM_MS: u64 = 2;
+const RELEASE_TICKS: u8 = if FAST_PRESS { 3 } else { DEBOUNCE_TICKS };
 // ~480 ms between held-button repeats, matching the fast-refresh settle
 // cadence so one repeat advances one displayed page.
 const REPEAT_COOLDOWN_TICKS: u8 = 32;
@@ -194,7 +207,14 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
         }
         last_power = power_pressed;
 
-        let nav = nav_stable.update(classify(sample.nav, NAV));
+        let nav_reading = classify(sample.nav, NAV);
+        let nav = if nav_stable.starts_press(nav_reading) {
+            Timer::after_millis(PRESS_CONFIRM_MS).await;
+            let again = classify(read_adc(&mut adc, &mut pins.nav_pin).await, NAV);
+            nav_stable.confirm(nav_reading, again)
+        } else {
+            nav_stable.update(nav_reading)
+        };
         if let Some(nav) = nav {
             let StableEvent::Changed(hardware) = nav;
             let button = map_hardware(hardware);
@@ -202,7 +222,14 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
             log_input(Some(button), sample);
         }
 
-        let page = page_stable.update(classify(sample.page, PAGE));
+        let page_reading = classify(sample.page, PAGE);
+        let page = if page_stable.starts_press(page_reading) {
+            Timer::after_millis(PRESS_CONFIRM_MS).await;
+            let again = classify(read_adc(&mut adc, &mut pins.page_pin).await, PAGE);
+            page_stable.confirm(page_reading, again)
+        } else {
+            page_stable.update(page_reading)
+        };
         if let Some(page) = page {
             let StableEvent::Changed(hardware) = page;
             let button = map_hardware(hardware);
@@ -330,6 +357,29 @@ impl StableButton {
         }
     }
 
+    /// Whether `next`, read with no button down, starts a press that one
+    /// more reading can confirm straight away.
+    fn starts_press(&self, next: Option<HardwareButton>) -> bool {
+        FAST_PRESS && self.current.is_none() && next.is_some()
+    }
+
+    /// The poll's reading `first` and the reading taken just after it: a
+    /// press when they agree, otherwise the later one as an ordinary poll.
+    fn confirm(
+        &mut self,
+        first: Option<HardwareButton>,
+        again: Option<HardwareButton>,
+    ) -> Option<StableEvent> {
+        let (Some(button), true) = (first, again == first) else {
+            return self.update(again);
+        };
+        self.cooldown = REPEAT_COOLDOWN_TICKS;
+        self.candidate = Some(button);
+        self.current = Some(button);
+        self.ticks = DEBOUNCE_TICKS;
+        Some(StableEvent::Changed(button))
+    }
+
     fn update(&mut self, next: Option<HardwareButton>) -> Option<StableEvent> {
         self.cooldown = self.cooldown.saturating_sub(1);
         if next == self.candidate {
@@ -339,7 +389,12 @@ impl StableButton {
             self.ticks = 1;
         }
 
-        if self.ticks < DEBOUNCE_TICKS {
+        let needed = if self.candidate.is_none() {
+            RELEASE_TICKS
+        } else {
+            DEBOUNCE_TICKS
+        };
+        if self.ticks < needed {
             return None;
         }
 
