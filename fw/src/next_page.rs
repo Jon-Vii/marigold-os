@@ -1,5 +1,9 @@
 //! The next page, drawn and loaded into the panel ahead of the press that
-//! asks for it (X4 only).
+//! asks for it.
+//!
+//! "BW RAM" below is the panel's new-frame plane: BW RAM on the X4's
+//! SSD1677, DTM2 on the X3's UC8253 (`display_flush::stage_frame`), and
+//! RED RAM the previous-frame plane (DTM1 there).
 //!
 //! A page turn used to render the page (about 40 ms) and stream it into
 //! BW RAM (16 ms) between the press and the start of the 421 ms waveform.

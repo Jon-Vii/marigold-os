@@ -120,7 +120,6 @@ mod firmware_files;
 mod image_decode;
 mod library_sd;
 mod line_window;
-#[cfg(not(feature = "device-x3"))]
 mod next_page;
 mod ota_update;
 mod page_images;

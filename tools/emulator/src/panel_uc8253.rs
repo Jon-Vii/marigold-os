@@ -3,7 +3,9 @@
 //! Refresh sequencing comes from `display::epd::uc8253::flush_plan`, the
 //! same allocation-free plan executed by the firmware backend. This module
 //! only models controller state: command lengths, complete RAM-plane writes,
-//! DTM1 data-stop ordering, LUT/CDI readiness, power, refresh, and sleep.
+//! DTM1 data-stop ordering, LUT/CDI readiness, power, refresh, and sleep. A
+//! refresh needs a complete DTM2 write since the last one, whether the
+//! turn wrote it or staging did ahead of time (`stage_frame`).
 
 use crate::panel_common::{
     cmd_history_entry, expect_len, ram_history_entry, HISTORY_DEEP_SLEEP, HISTORY_RESET,
@@ -15,7 +17,7 @@ use display::epd::{
     CMD_LUT_BW, CMD_LUT_VCOM, CMD_LUT_WB, CMD_LUT_WW, CMD_LV_SELECTION, CMD_PANEL_SETTING,
     CMD_PLL_CONTROL, CMD_POWER_OFF, CMD_POWER_OFF_SEQ, CMD_POWER_ON, CMD_POWER_SETTING,
     CMD_RESOLUTION, CMD_VCOM_DATA_INTERVAL, CMD_VCOM_DC, DEEP_SLEEP_CHECK, INIT_SEQUENCE, LUT_LEN,
-    PRESTAGE_STEPS,
+    PRESTAGE_STEPS, STAGE_NEW_STEPS,
 };
 use display::fb::Framebuffer;
 use display::{BAND_BYTES, BAND_ROWS, FB_BYTES, HEIGHT, ROW_BYTES, WIDTH};
@@ -39,6 +41,8 @@ pub struct PanelModel {
     last_refresh: Option<RefreshMode>,
     ram_write: Option<RamWriteState>,
     plane_complete: [bool; 2],
+    /// A complete DTM2 write has landed since the last refresh.
+    new_since_refresh: bool,
     old_needs_stop: bool,
     commands: Vec<(u8, usize)>,
     history: Vec<String>,
@@ -58,6 +62,7 @@ impl PanelModel {
             last_refresh: None,
             ram_write: None,
             plane_complete: [false; 2],
+            new_since_refresh: false,
             old_needs_stop: false,
             commands: Vec::new(),
             history: Vec::new(),
@@ -132,10 +137,14 @@ impl PanelModel {
                 if !self.plane_complete[plane_index(RamPlane::New)] {
                     return Err("DRF before a complete DTM2 write".into());
                 }
+                if !self.new_since_refresh {
+                    return Err("DRF without a DTM2 write since the last refresh".into());
+                }
                 if self.cdi.is_none() || !self.lut_written.iter().all(|written| *written) {
                     return Err("DRF before a complete LUT bank and CDI".into());
                 }
                 self.displayed.copy_from_slice(&self.new_ram);
+                self.new_since_refresh = false;
             }
             CMD_DEEP_SLEEP => {
                 if data != [DEEP_SLEEP_CHECK] {
@@ -160,15 +169,48 @@ impl PanelModel {
         requested_mode: RefreshMode,
         previous_staged: bool,
     ) -> Result<RefreshMode, String> {
+        self.flush_with(current, previous, requested_mode, previous_staged, false)
+    }
+
+    /// A flush onto a frame [`Self::stage_frame`] wrote to DTM2.
+    pub fn flush_staged(
+        &mut self,
+        current: &Framebuffer,
+        previous: &Framebuffer,
+        requested_mode: RefreshMode,
+        previous_staged: bool,
+    ) -> Result<RefreshMode, String> {
+        self.flush_with(current, previous, requested_mode, previous_staged, true)
+    }
+
+    /// Write the next frame to DTM2 ahead of its refresh.
+    pub fn stage_frame(&mut self, fb: &Framebuffer) -> Result<(), String> {
+        self.execute_steps(fb, fb, STAGE_NEW_STEPS)
+    }
+
+    fn flush_with(
+        &mut self,
+        current: &Framebuffer,
+        previous: &Framebuffer,
+        requested_mode: RefreshMode,
+        previous_staged: bool,
+        new_staged: bool,
+    ) -> Result<RefreshMode, String> {
         if !self.initialized {
             return Err("flush before init sequence".into());
         }
-        let plan = flush_plan(requested_mode, self.powered, previous_staged);
+        let plan = flush_plan(requested_mode, self.powered, previous_staged, new_staged);
         if plan.effective_mode == RefreshMode::Fast
             && previous_staged
             && !transformed_matches(&self.old_ram, previous)
         {
             return Err("prestaged DTM1 does not match the previous framebuffer".into());
+        }
+        if plan.effective_mode == RefreshMode::Fast
+            && new_staged
+            && !transformed_matches(&self.new_ram, current)
+        {
+            return Err("staged DTM2 does not match the current framebuffer".into());
         }
         self.execute_steps(current, previous, plan.steps)?;
         self.last_refresh = Some(plan.effective_mode);
@@ -318,6 +360,8 @@ impl PanelModel {
         self.plane_complete[plane_index(state.plane)] = true;
         if state.plane == RamPlane::Old {
             self.old_needs_stop = true;
+        } else {
+            self.new_since_refresh = true;
         }
         let command = match state.plane {
             RamPlane::Old => CMD_DTM1,
@@ -336,6 +380,7 @@ impl PanelModel {
         self.cdi = None;
         self.ram_write = None;
         self.plane_complete = [false; 2];
+        self.new_since_refresh = false;
         self.old_needs_stop = false;
         self.history.push(HISTORY_RESET.into());
     }
@@ -498,6 +543,111 @@ mod tests {
             .flush(&current, &claimed_previous, RefreshMode::Fast, true)
             .unwrap_err()
             .contains("prestaged DTM1"));
+    }
+
+    /// A panel showing `first` after a Full refresh, with DTM1 prestaged.
+    fn showing(first: &Framebuffer) -> PanelModel {
+        let mut panel = PanelModel::new();
+        panel.init_sequence().unwrap();
+        panel
+            .flush(first, &Framebuffer::new(), RefreshMode::Full, false)
+            .unwrap();
+        panel.prestage_previous(first).unwrap();
+        panel
+    }
+
+    #[test]
+    fn a_staged_page_refreshes_with_no_plane_writes_after_an_idle_wait() {
+        let first = frame(3, 5);
+        let next = frame(400, 300);
+        let mut panel = showing(&first);
+        panel.stage_frame(&next).unwrap();
+        assert!(transformed_matches(&panel.new_ram, &next));
+        assert!(transformed_matches(&panel.displayed, &first));
+        // The reader reads: nothing reaches the panel for a while.
+        panel.history.push("idle 20000ms".into());
+        let start = panel.commands.len();
+        let effective = panel
+            .flush_staged(&next, &first, RefreshMode::Fast, true)
+            .unwrap();
+        assert_eq!(effective, RefreshMode::Fast);
+        assert!(transformed_matches(&panel.displayed, &next));
+        assert!(transformed_matches(&panel.old_ram, &first));
+        assert!(!panel.commands[start..]
+            .iter()
+            .any(|(cmd, _)| *cmd == CMD_DTM1 || *cmd == CMD_DTM2));
+        assert_eq!(
+            panel.commands[start..]
+                .iter()
+                .filter(|(cmd, _)| *cmd == CMD_DISPLAY_REFRESH)
+                .count(),
+            1
+        );
+        // The turn after it prestages and runs as before.
+        panel.prestage_previous(&next).unwrap();
+        let third = frame(10, 500);
+        panel.flush(&third, &next, RefreshMode::Fast, true).unwrap();
+        assert!(transformed_matches(&panel.displayed, &third));
+    }
+
+    #[test]
+    fn a_dropped_stage_is_rewritten_by_the_normal_flush() {
+        let first = frame(3, 5);
+        let staged = frame(400, 300);
+        let instead = frame(50, 60);
+        let mut panel = showing(&first);
+        panel.stage_frame(&staged).unwrap();
+        // The store changed, or another page was asked for: the render
+        // draws afresh and the flush writes DTM2 itself.
+        let start = panel.commands.len();
+        panel
+            .flush(&instead, &first, RefreshMode::Fast, true)
+            .unwrap();
+        assert!(panel.commands[start..].contains(&(CMD_DTM2, FB_BYTES)));
+        assert!(transformed_matches(&panel.displayed, &instead));
+    }
+
+    #[test]
+    fn a_staged_page_under_other_modes_and_without_prestage_still_shows() {
+        let first = frame(3, 5);
+        let next = frame(400, 300);
+        // FastClean writes DTM2 itself.
+        let mut panel = showing(&first);
+        panel.stage_frame(&next).unwrap();
+        panel
+            .flush_staged(&next, &first, RefreshMode::FastClean, true)
+            .unwrap();
+        assert!(transformed_matches(&panel.displayed, &next));
+        // Without a prestaged DTM1, the staged turn writes DTM1 only.
+        let mut panel = showing(&first);
+        panel.stage_frame(&next).unwrap();
+        let start = panel.commands.len();
+        panel
+            .flush_staged(&next, &first, RefreshMode::Fast, false)
+            .unwrap();
+        assert!(panel.commands[start..].contains(&(CMD_DTM1, FB_BYTES)));
+        assert!(!panel.commands[start..]
+            .iter()
+            .any(|(cmd, _)| *cmd == CMD_DTM2));
+        assert!(transformed_matches(&panel.displayed, &next));
+    }
+
+    #[test]
+    fn a_staged_refresh_without_a_stage_is_rejected() {
+        let first = frame(3, 5);
+        let next = frame(400, 300);
+        let mut panel = showing(&first);
+        assert!(panel
+            .flush_staged(&next, &first, RefreshMode::Fast, true)
+            .unwrap_err()
+            .contains("staged DTM2"));
+        // Even a DTM2 that happens to match must have been written since
+        // the last refresh.
+        let mut panel = showing(&first);
+        assert!(panel
+            .flush_staged(&first, &first, RefreshMode::Fast, true)
+            .unwrap_err()
+            .contains("since the last refresh"));
     }
 
     #[test]

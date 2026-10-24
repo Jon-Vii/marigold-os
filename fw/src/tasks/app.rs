@@ -64,7 +64,6 @@ pub async fn run() {
     loop {
         // Every event has been handled: if the reader is on a settled page
         // with nothing in flight, let the display task draw the next one.
-        #[cfg(not(feature = "device-x3"))]
         next_page.offer(
             &state,
             ctx,
@@ -568,31 +567,24 @@ async fn send_render(kind: RenderKind, state: &ReaderState, next_page: &mut Next
 
 /// The app's half of drawing the next page ahead of the press (see
 /// `crate::next_page`): which reading page the last render showed, and
-/// which page was offered since. X4 only; on the X3 it does nothing.
+/// which page was offered since.
 struct NextPageOffer {
-    #[cfg(not(feature = "device-x3"))]
     shown: Option<app_core::ReadingPageKey>,
-    #[cfg(not(feature = "device-x3"))]
     offered: Option<app_core::ReadingPageKey>,
 }
 
 impl NextPageOffer {
     const fn new() -> Self {
         Self {
-            #[cfg(not(feature = "device-x3"))]
             shown: None,
-            #[cfg(not(feature = "device-x3"))]
             offered: None,
         }
     }
 
     /// `request` is going out; the display task drops anything it staged.
     fn rendered(&mut self, request: RenderRequest) -> RenderRequest {
-        #[cfg(not(feature = "device-x3"))]
-        {
-            self.shown = request.reading_page_key();
-            self.offered = None;
-        }
+        self.shown = request.reading_page_key();
+        self.offered = None;
         request
     }
 
@@ -600,7 +592,6 @@ impl NextPageOffer {
     /// page: only while `quiet` (no render in flight or pending, no open,
     /// jump, or queued storage request) and while the reader's page is the
     /// page the last render showed, so no turn is on its way.
-    #[cfg(not(feature = "device-x3"))]
     fn offer(&mut self, state: &ReaderState, ctx: ReducerContext, quiet: bool) {
         if !quiet
             || self.shown.is_none()
