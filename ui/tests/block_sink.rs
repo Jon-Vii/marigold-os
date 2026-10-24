@@ -19,6 +19,8 @@ mod custom_font;
 mod fat;
 #[path = "support/jpeg.rs"]
 mod jpeg;
+#[path = "../../fw/src/line_window.rs"]
+mod line_window;
 #[path = "../../fw/src/reader_cache_files.rs"]
 mod reader_cache_files;
 #[path = "../../fw/src/reader_layout.rs"]
@@ -209,6 +211,8 @@ fn lay_out_with(body: &str, settings: TypeSettings, images: bool) -> Laid {
     let mut metrics = custom_font::MetricCache::new();
     // Dirty, as the container scratch's tail is on the device.
     let mut pending = vec![0xa5u8; 3800];
+    // Dirty, as the XHTML window's tail is on the device.
+    let mut line_buf = vec![0xa5u8; line_window::LINE_WINDOW_BYTES];
     let mut path = [0xa5u8; proto::epub::MAX_ENTRY_NAME_BYTES];
     let (mut partial, mut micros) = (false, 0u64);
     for first_pass in [true, false] {
@@ -253,6 +257,7 @@ fn lay_out_with(body: &str, settings: TypeSettings, images: bool) -> Laid {
             paragraph_has_text: false,
             line_image_height: 0,
             line_unindented: false,
+            window: line_window::LineWindow::new(&mut line_buf),
         };
         let mut tokenizer = StreamingXmlTokenizer::new();
         let mut parser = XhtmlBlockStreamParser::new(false);
@@ -1019,4 +1024,75 @@ fn a_drop_cap_s_first_line_fills_the_measure() {
     };
     let laid = lay_out_with(body, left, true);
     assert!(line_ink_right(&laid, 0) < right - 40);
+}
+
+/// A long paragraph with styled runs, soft hyphens and a dash, whose
+/// ragged lines the line builder takes back and breaks again: every word
+/// is kept in order, once, and every line fits the measure.
+#[test]
+fn a_long_justified_paragraph_keeps_its_words_through_repairs() {
+    let words = [
+        "the",
+        "quick",
+        "brown",
+        "fox",
+        "jumps",
+        "over",
+        "lazy",
+        "dogs",
+        "while",
+        "extra\u{ad}ordinary",
+        "circum\u{ad}stances",
+        "accumulate",
+        "slowly",
+        "and",
+        "a",
+        "notwithstanding",
+        "remarkably",
+        "short",
+        "words",
+        "abound\u{2014}as",
+        "do",
+        "<i>styled</i>",
+        "<b>runs</b>",
+    ];
+    let source: Vec<&str> = (0..1200usize)
+        .map(|index| words[(index * 7 + index / 3) % words.len()])
+        .collect();
+    let laid = lay_out(&format!("<p>{}</p>", source.join(" ")));
+    let settings = TypeSettings::DEFAULT;
+    assert_lines_fit(&laid, settings);
+    let blocks = laid.blocks();
+    let plain = |text: &str| {
+        let mut out = String::new();
+        let mut chars = text.chars();
+        while let Some(ch) = chars.next() {
+            match ch {
+                STYLE_MARKER => {
+                    chars.next();
+                }
+                ' ' | '\u{ad}' => {}
+                ch => out.push(ch),
+            }
+        }
+        out
+    };
+    let stored: String = blocks
+        .iter()
+        .map(|(_, text)| {
+            let line = plain(text);
+            // The source has no hyphens: a line ending in one broke a word.
+            line.strip_suffix('-').map(str::to_string).unwrap_or(line)
+        })
+        .collect();
+    let expected: String = source
+        .iter()
+        .map(|word| {
+            let word = ["<i>", "</i>", "<b>", "</b>"]
+                .iter()
+                .fold(word.to_string(), |word, tag| word.replace(tag, ""));
+            plain(&word)
+        })
+        .collect();
+    assert_eq!(stored, expected);
 }

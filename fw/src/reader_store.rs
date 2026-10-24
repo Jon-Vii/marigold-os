@@ -1046,6 +1046,23 @@ impl ReaderStore {
         self.cover_ready = true;
     }
 
+    /// Drops block `first` and every block after it, and the pages that
+    /// start among them, so the line builder can store those lines again
+    /// (it breaks a few justified lines anew). The page index is then
+    /// stale from the last page left.
+    pub(crate) fn truncate_lines(&mut self, first: usize) {
+        if first >= self.block_count {
+            return;
+        }
+        self.text_len = self.blocks[first].text_offset as usize;
+        self.block_count = first;
+        while self.page_count > 0
+            && usize::from(self.pages[self.page_count - 1].first_block) >= first
+        {
+            self.page_count -= 1;
+        }
+    }
+
     pub(crate) fn clear_lines(&mut self) {
         self.text_len = 0;
         self.block_count = 0;

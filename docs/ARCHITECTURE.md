@@ -560,6 +560,28 @@ from stored lines. An image inside a line is one unit of its fitted width,
 measured as an object (`StyledInkCursor::push_object`) and never split or
 hyphenated. Justified gaps stretch around it as they do around a word.
 
+Greedy lines are kept unless one goes wrong. The builder also keeps the
+words of a justified paragraph's last few lines in `fw::line_window`, each
+with its measure on its own (`ui::reading::InkPiece`), taken in the same
+pass that measures the line (`StyledInkCursor::push_word`), and a record of
+where each stored line starts. A line the page would leave ragged, or a third hyphenated line in a
+row, is repaired once two more lines follow it: the builder takes back the
+stored lines from three before it (`ReaderStore::truncate_lines`), and a
+total-fit search (Knuth and Plass's, without fitness classes) breaks their
+words again with the line in hand, which stays in hand for the words to
+come. The search judges each line as the page will set it
+(`justify_extra`): TeX's badness of 100 r³ for gaps stretched r
+half-spaces, and for a line left ragged a premium over any justified one
+that grows with its shortfall and triples under two thirds of the measure.
+Hyphens cost a little, a hyphen after another a lot. A word is looked up
+only where it straddles the end of a line that would be loose without it,
+and lookups, the builder's and the search's, share a cache of break
+positions that lasts the spine. Lines the search stored are not taken back
+again but for the last. On eight Project Gutenberg books, lines left ragged
+fall from 6.9 to 4.2 in a thousand at the default type (portrait 102 to
+72), with about 32 repairs per thousand lines (portrait 156). The window
+(9 KB) is the idle tail of the XHTML window while a spine streams.
+
 All of this applies to text the book sets justified, which is the body
 default. The Alignment setting's Left choice turns that text left-aligned
 before the line builder sees it (`ui::reading::effective_align`). The text then
