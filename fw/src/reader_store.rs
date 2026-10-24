@@ -464,17 +464,13 @@ impl ImageNote {
 
 /// The FNV-1a offset basis and 64-bit prime, used word-wise by
 /// [`StoreHasher`].
-#[cfg(not(feature = "device-x3"))]
 const STORE_HASH_SEED: u64 = 0xcbf2_9ce4_8422_2325;
-#[cfg(not(feature = "device-x3"))]
 const STORE_HASH_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 /// The [`ReaderStore::fingerprint`] hasher: FNV-1a over 32-bit words, with
 /// a rotate so the high half of the state feeds back into the low half.
-#[cfg(not(feature = "device-x3"))]
 struct StoreHasher(u64);
 
-#[cfg(not(feature = "device-x3"))]
 impl StoreHasher {
     fn mix(&mut self, word: u32) {
         self.0 = (self.0 ^ u64::from(word))
@@ -483,7 +479,6 @@ impl StoreHasher {
     }
 }
 
-#[cfg(not(feature = "device-x3"))]
 impl core::hash::Hasher for StoreHasher {
     fn write(&mut self, bytes: &[u8]) {
         let mut words = bytes.chunks_exact(4);
@@ -748,7 +743,6 @@ impl ReaderStore {
     /// whose streams differ in a single word always digest differently;
     /// wider differences collide with odds near 2^-64. About 50 KB, around
     /// a millisecond or two on the C3.
-    #[cfg(not(feature = "device-x3"))]
     pub(crate) fn fingerprint(&self) -> u64 {
         let mut hasher = StoreHasher(STORE_HASH_SEED);
         core::hash::Hash::hash(self, &mut hasher);

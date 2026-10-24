@@ -71,7 +71,7 @@ previous-frame buffer must match the display crate's framebuffer size, and the
 main stack region must be at least 27 KB (`27 * 1024` bytes).
 
 The X3 build has less margin above that floor than the X4. As of late October
-2026 the linked stack was 36,048 bytes on X3 and 44,472 on X4, because both X3
+2026 the linked stack was 35,880 bytes on X3 and 44,456 on X4, because both X3
 framebuffers are larger. Re-check the EPUB-open path with `-Zemit-stack-sizes`
 before making it any deeper.
 

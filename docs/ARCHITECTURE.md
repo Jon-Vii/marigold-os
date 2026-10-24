@@ -111,7 +111,7 @@ app_task
   owns ReaderState
   InputEvent -> DisplayCommand::Render
   settled reading page -> DisplayCommand::StageNext, the render a Next press
-  would send (X4)
+  would send
   views (AppView): Home, Library, Reading, Chapters, Wireless, Settings,
   FirmwareUpdate
 
@@ -120,7 +120,7 @@ board_io/display task
   DisplayCommand::Render -> pure framebuffer render from the current ReaderStore snapshot,
   or straight to the refresh when that frame is already staged
   DisplayCommand::StageNext -> next reading page drawn into the framebuffer
-  and BW RAM while the reader reads (X4)
+  and the panel's new-frame plane while the reader reads
   StorageCommand::* -> serialized SD/FAT/catalog/cache work on the shared SPI bus
   DisplayCommand::Sleep -> sleep screen full refresh -> panel deep sleep -> PowerEvent::DisplayAsleep
   sends DisplayEvent::Settled to app_task when render completes
@@ -385,10 +385,11 @@ X4 (SSD1677) addressing follows the behavior of the OpenX4 community SDK:
 
 ### Staging the next page
 
-On the X4 a page turn used to draw the page (about 40 ms) and stream it into
-BW RAM (16 ms) after the press, before the waveform could start. Now the next
-page is usually there before the press. Once a reading page settles and RED
-RAM holds it again, the app task runs the reducer on a copy of its state to
+A page turn used to draw the page (about 40 ms) and stream it into the
+panel's new-frame plane (BW RAM on the X4, 16 ms there; DTM2 on the X3)
+after the press, before the waveform could start. Now the next page is
+usually there before the press. Once a reading page settles and the
+previous-frame plane (RED RAM on the X4, DTM1 on the X3) holds it again, the app task runs the reducer on a copy of its state to
 predict the render a Next press would send
 (`ReaderState::next_page_request`), and offers it as
 `DisplayCommand::StageNext` with the button-press count it predicted at. It
@@ -400,12 +401,20 @@ The display task (`fw::next_page`) stages the page when it belongs to the
 loaded book, is resident in the store in the layout the request names, and
 draws from RAM: no images on it and not the custom face from the card, both
 of which draw inside an SD session. It draws the page into the framebuffer,
-the frame on screen staying in the previous-frame buffer and RED RAM, and
-writes it to BW RAM. When the press's render arrives for the same frame, the
-task skips the draw and the BW write and starts the refresh
-(`display_flush::flush_staged`). Full and FastClean refreshes write RED RAM
-from the framebuffer as always, and it holds the staged page, so every mode
-works.
+the frame on screen staying in the previous-frame buffer and plane, and
+writes it to the new-frame plane (`display_flush::stage_frame`). When the
+press's render arrives for the same frame, the task skips the draw and the
+plane write and starts the refresh (`display_flush::flush_staged`). Full
+and FastClean refreshes write their planes from the framebuffer as always,
+and it holds the staged page, so every mode works. On the X4 that is RED
+RAM. On the X3 the UC8253 step plan picks the refresh
+(`display::epd::uc8253::flush_plan`): a staged Fast turn is only the bank
+load and the refresh, or also the DTM1 write when DTM1 wasn't prestaged,
+while FastClean, Full, and an unpowered Fast promoted to FastClean write
+DTM2 themselves. Staging DTM2 ends with DATA_STOP, as the init sequence's
+DTM2 fill does, since idle time and SD traffic come before the refresh. The
+emulator's UC8253 model runs the same plans and refuses a refresh with no
+DTM2 write since the last one.
 
 "The same frame" is a key with two halves. `app_core::ReadingPageKey` holds
 the request fields a reading page reads: the book, the page, the
@@ -420,13 +429,13 @@ from idle preparation, an image decode, a catalog or chapter load, a
 relayout, or another book, makes the staged page a miss, and the render
 draws as before. Nothing has to remember to invalidate it. A change confined
 to one word of the store always changes the digest; wider changes collide
-with odds near 2^-64. The framebuffer and BW RAM are otherwise written only
-by renders, the loading plate, and the sleep screen, and each of them drops
-the staged page.
+with odds near 2^-64. The framebuffer and the new-frame plane are otherwise
+written only by renders, the loading plate, and the sleep screen, and each
+of them drops the staged page.
 
 Staging doesn't hold up a press. It starts only when no command is queued,
 and gives way to any press counted since the prediction: the draw checks
-before each line and the BW write before each band, so a press is handled
+before each line and the plane write before each band, so a press is handled
 within a line's draw, one band's transfer, or one store fingerprint of when
 it would have been otherwise. The input task runs at interrupt priority, so
 the count moves even while the draw holds the thread executor. Idle
@@ -437,11 +446,12 @@ page is drawn again once preparation has nothing left to do, not after
 every step. Sleep drops it, and a sync session stages nothing.
 
 A turn to a staged page logs `staged=true stage=hit` in its `bench: render`
-line; `layout_ms` is then only the check and `flush_ms` holds no BW write. A
-miss says why (`none`, `other_page`, `store_changed`). Staging logs
+line; `layout_ms` is then only the check and `flush_ms` holds no plane
+write. A miss says why (`none`, `other_page`, `store_changed`). Staging logs
 `bench: stage`, with what the draw, one fingerprint (`digest_us`), and the
-BW write took. Bench-serial builds draw every staged page again once it is
-shown and log `bench: stage_check match=...`. The X3 stages nothing.
+plane write took (`bw_ms`). Bench-serial builds draw every staged page again
+once it is shown and log `bench: stage_check match=...`. Both panels stage;
+the X3's path has run only against the emulator's model so far.
 
 ## Data-oriented design
 
@@ -1168,7 +1178,7 @@ interfaces:
 
 ```text
 fw::display_flush       panel-plan execution, RAM streaming, BUSY waits, and sleep
-fw::next_page           the next reading page, staged ahead of the press (X4)
+fw::next_page           the next reading page, staged ahead of the press
 fw::library_sd          FAT scan, SD chip-select handling, and file discovery
 fw::sd_session          SD session open/close and the upload write pump
 fw::reader_cache        EPUB-to-cache loading into bounded proto::cache records
@@ -1209,7 +1219,7 @@ is still read). There is no flash copy.
 | Cold-boot full refresh | 3.5 s |
 | Reopen a cached book | tens of milliseconds |
 | RAM | 400 KB SRAM, no PSRAM |
-| Main stack | linked region about 44.5 KB on X4 (36.0 KB on X3); the link fails below 27 KB (`fw/build.rs`) |
+| Main stack | linked region about 44.5 KB on X4 (35.9 KB on X3); the link fails below 27 KB (`fw/build.rs`) |
 | Framebuffers | two (current + previous frame), 48 KB each on X4, 1 bit per pixel |
 
 ## Bring-up checklist

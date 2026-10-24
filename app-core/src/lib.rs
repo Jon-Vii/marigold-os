@@ -374,7 +374,7 @@ pub enum DisplayCommand {
     /// The render a Next press is expected to send while reading, offered
     /// once the page on screen has settled and nothing else is in flight,
     /// so the display task can draw it and load it into the panel ahead of
-    /// the press (X4 only). `presses` is the firmware's button-press count
+    /// the press. `presses` is the firmware's button-press count
     /// when the app predicted it: any later press makes it stale.
     StageNext {
         request: RenderRequest,

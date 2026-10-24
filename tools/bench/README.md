@@ -112,7 +112,7 @@ idle on its first page until its `image_session` lines stop.
 
 ### Staged page telemetry
 
-On the X4 the next reading page is drawn and written to the panel's BW RAM
+The next reading page is drawn and written to the panel's new-frame plane
 while the reader reads (see "Staging the next page" in
 [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md)). Each `bench: render`
 line says whether its page was staged (`staged=true stage=hit`) or why not

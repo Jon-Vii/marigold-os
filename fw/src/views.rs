@@ -76,7 +76,6 @@ pub(crate) fn render_sd_reading_while(
 /// draws inside an SD session and is left to its own render, as is any
 /// page while the input debug overlay (which draws per-press fields) is
 /// compiled in.
-#[cfg(not(feature = "device-x3"))]
 pub(crate) fn page_can_be_staged(request: RenderRequest, sd_library: &ReaderStore) -> bool {
     let Some(index) = ReaderSource::from_book_id(request.book_id).sd_index() else {
         return false;

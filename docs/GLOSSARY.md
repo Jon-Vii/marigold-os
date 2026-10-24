@@ -60,6 +60,6 @@ Firmware and the emulator share this decision (full, fast-clean, or fast). Panel
 
 ### Staged page
 
-On the X4, the next reading page drawn into the framebuffer and written to BW RAM while the reader is still on the page before, so that a Next press only has to start the waveform. The app task offers the render a Next press would send (`DisplayCommand::StageNext`), and the display task stages it when the page is resident and drawn from RAM.
+The next reading page drawn into the framebuffer and written to the panel's new-frame plane (BW RAM on the X4, DTM2 on the X3) while the reader is still on the page before, so that a Next press only has to start the waveform. The app task offers the render a Next press would send (`DisplayCommand::StageNext`), and the display task stages it when the page is resident and drawn from RAM.
 
 A staged page stands in for a render only when the render's `ReadingPageKey` and the reader store's fingerprint both match what they were when it was staged. Any press after the offer abandons staging.

@@ -7,7 +7,10 @@
 //! with the absolute half bank. As on the X4, `prestage_previous` stages
 //! the just-shown frame into the old plane (DTM1) off the page-turn
 //! critical path, so the next `Fast` finds its diff base already loaded —
-//! `flush`'s `prev_staged` says whether that happened.
+//! `flush`'s `prev_staged` says whether that happened. `stage_frame`
+//! writes the next page into the new plane (DTM2) while the reader reads
+//! (`crate::next_page`), and `flush_staged` then refreshes without
+//! streaming it again.
 //!
 //! UNVERIFIED on hardware (plan Phase 6): the two-phase BUSY timing, panel
 //! orientation, and whether the ported waveforms hold at the chosen SPI
@@ -19,7 +22,7 @@ use display::epd::uc8253::{
     bank_for, flush_plan, sleep_plan, FlushStep, FrameSource, LutBank, RamPlane, SleepStep,
     CDI_INTERVAL, CMD_DATA_STOP, CMD_DEEP_SLEEP, CMD_DISPLAY_REFRESH, CMD_DTM1, CMD_DTM2,
     CMD_LUT_BB, CMD_LUT_BW, CMD_LUT_VCOM, CMD_LUT_WB, CMD_LUT_WW, CMD_POWER_OFF, CMD_POWER_ON,
-    CMD_VCOM_DATA_INTERVAL, DEEP_SLEEP_CHECK, INIT_SEQUENCE, PRESTAGE_STEPS,
+    CMD_VCOM_DATA_INTERVAL, DEEP_SLEEP_CHECK, INIT_SEQUENCE, PRESTAGE_STEPS, STAGE_NEW_STEPS,
 };
 use display::epd::{RefreshMode, SpiOp};
 use display::fb::Framebuffer;
@@ -73,13 +76,83 @@ pub(crate) async fn flush(
     prev_staged: bool,
     _quick_allowed: bool,
 ) -> Result<(), PanelError> {
-    let plan = flush_plan(mode, SCREEN_POWERED.load(Ordering::Relaxed), prev_staged);
-    esp_println::println!(
-        "display: x3 flush requested={:?} effective={:?}",
-        plan.requested_mode,
-        plan.effective_mode
+    flush_with(epd, fb, prev_fb, tx_band, mode, prev_staged, false).await
+}
+
+/// [`flush`] for a frame [`stage_frame`] already wrote to the new plane:
+/// a Fast turn only loads its bank (and the old plane, if it wasn't
+/// prestaged) before the refresh. Full and FastClean, and an unpowered
+/// Fast promoted to FastClean, write their planes as always. The X3 has no
+/// quick waveform, so `quick_allowed` changes nothing here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn flush_staged(
+    epd: &mut Epd,
+    fb: &Framebuffer,
+    prev_fb: &Framebuffer,
+    tx_band: &mut [u8; BAND_BYTES],
+    _screen_on: bool,
+    mode: RefreshMode,
+    prev_staged: bool,
+    _quick_allowed: bool,
+) -> Result<(), PanelError> {
+    flush_with(epd, fb, prev_fb, tx_band, mode, prev_staged, true).await
+}
+
+async fn flush_with(
+    epd: &mut Epd,
+    fb: &Framebuffer,
+    prev_fb: &Framebuffer,
+    tx_band: &mut [u8; BAND_BYTES],
+    mode: RefreshMode,
+    prev_staged: bool,
+    new_staged: bool,
+) -> Result<(), PanelError> {
+    let plan = flush_plan(
+        mode,
+        SCREEN_POWERED.load(Ordering::Relaxed),
+        prev_staged,
+        new_staged,
     );
-    execute_steps(epd, fb, prev_fb, tx_band, plan.effective_mode, plan.steps).await
+    esp_println::println!(
+        "display: x3 flush requested={:?} effective={:?} new_staged={}",
+        plan.requested_mode,
+        plan.effective_mode,
+        new_staged
+    );
+    execute_steps(
+        epd,
+        fb,
+        prev_fb,
+        tx_band,
+        plan.effective_mode,
+        plan.steps,
+        &mut || true,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Write `fb` into the new plane (DTM2) ahead of the refresh that will
+/// show it ([`STAGE_NEW_STEPS`]), asking `go_on` before each band.
+/// Ok(false) when it said no: the plane is then part written, which no
+/// flush relies on, since every plan but a staged Fast writes it in full.
+/// The transfer still ends with its DATA_STOP.
+pub(crate) async fn stage_frame(
+    epd: &mut Epd,
+    fb: &Framebuffer,
+    tx_band: &mut [u8; BAND_BYTES],
+    mut go_on: impl FnMut() -> bool,
+) -> Result<bool, PanelError> {
+    execute_steps(
+        epd,
+        fb,
+        fb,
+        tx_band,
+        RefreshMode::Fast,
+        STAGE_NEW_STEPS,
+        &mut go_on,
+    )
+    .await
 }
 
 /// Stage the just-shown frame into DTM1 ("old" RAM) so the next fast turn's
@@ -90,7 +163,17 @@ pub(crate) async fn prestage_previous(
     fb: &Framebuffer,
     tx_band: &mut [u8; BAND_BYTES],
 ) -> Result<(), PanelError> {
-    execute_steps(epd, fb, fb, tx_band, RefreshMode::Fast, PRESTAGE_STEPS).await
+    execute_steps(
+        epd,
+        fb,
+        fb,
+        tx_band,
+        RefreshMode::Fast,
+        PRESTAGE_STEPS,
+        &mut || true,
+    )
+    .await
+    .map(|_| ())
 }
 
 pub(crate) async fn sleep_panel(epd: &mut Epd) -> Result<(), PanelError> {
@@ -115,6 +198,9 @@ pub(crate) async fn sleep_panel(epd: &mut Epd) -> Result<(), PanelError> {
     Ok(())
 }
 
+/// Run `steps`, asking `go_on` before each band of a framebuffer write.
+/// Ok(false) when it said no: the steps after the stopped write are
+/// skipped, all but DATA_STOP, so the transfer still ends cleanly.
 async fn execute_steps(
     epd: &mut Epd,
     fb: &Framebuffer,
@@ -122,8 +208,13 @@ async fn execute_steps(
     tx_band: &mut [u8; BAND_BYTES],
     mode: RefreshMode,
     steps: &[FlushStep],
-) -> Result<(), PanelError> {
+    go_on: &mut dyn FnMut() -> bool,
+) -> Result<bool, PanelError> {
+    let mut finished = true;
     for step in steps {
+        if !finished && *step != FlushStep::DataStop {
+            continue;
+        }
         match *step {
             FlushStep::LoadBank(mode) => {
                 let (bank, cdi) = bank_for(mode);
@@ -134,11 +225,16 @@ async fn execute_steps(
                     RamPlane::Old => CMD_DTM1,
                     RamPlane::New => CMD_DTM2,
                 };
-                match source {
-                    FrameSource::White => fill_plane(epd, command, 0xFF).await?,
-                    FrameSource::Current => send_plane(epd, command, fb, tx_band).await?,
-                    FrameSource::Previous => send_plane(epd, command, prev_fb, tx_band).await?,
-                }
+                finished = match source {
+                    FrameSource::White => {
+                        fill_plane(epd, command, 0xFF).await?;
+                        true
+                    }
+                    FrameSource::Current => send_plane(epd, command, fb, tx_band, go_on).await?,
+                    FrameSource::Previous => {
+                        send_plane(epd, command, prev_fb, tx_band, go_on).await?
+                    }
+                };
             }
             FlushStep::DataStop => epd.command(CMD_DATA_STOP, &[]).await?,
             FlushStep::PowerOn => power_on(epd).await?,
@@ -146,7 +242,7 @@ async fn execute_steps(
             FlushStep::DelayMs(ms) => Timer::after_millis(u64::from(ms)).await,
         }
     }
-    Ok(())
+    Ok(finished)
 }
 
 async fn power_on(epd: &mut Epd) -> Result<(), PanelError> {
@@ -216,17 +312,23 @@ async fn load_bank(epd: &mut Epd, cdi0: u8, bank: &LutBank) -> Result<(), PanelE
 /// Deliberately does NOT send DATA_STOP: the hardware-proven reference
 /// never puts one between a DTM2 write and the refresh that displays it —
 /// only after DTM1 syncs and white fills. Callers add it where the
-/// reference does.
+/// reference does. Asks `go_on` before each band; Ok(false) when it said
+/// no and the write stopped part way.
 async fn send_plane(
     epd: &mut Epd,
     ram_cmd: u8,
     fb: &Framebuffer,
     tx_band: &mut [u8; BAND_BYTES],
-) -> Result<(), PanelError> {
+    go_on: &mut dyn FnMut() -> bool,
+) -> Result<bool, PanelError> {
     epd.begin_ram_write(ram_cmd).await?;
     let mut y = 0;
-    let mut result = Ok(());
+    let mut result = Ok(true);
     while y < HEIGHT {
+        if !go_on() {
+            result = Ok(false);
+            break;
+        }
         let len = fill_transformed_band(fb, y, tx_band);
         if let Err(err) = epd.ram_chunk(&tx_band[..len]).await {
             result = Err(err);
