@@ -12,7 +12,16 @@ import struct
 import sys
 
 import PIL
-from PIL import Image, ImageDraw, features
+from PIL import Image, ImageDraw, ImageFont, features
+
+# The table format lives in font_module, which needs no Pillow, so the
+# pack converter can use it too. Re-exported here for the generators.
+from font_module import (  # noqa: F401
+    KERNING_CODEPOINTS,
+    FontModule,
+    read_module_glyphs,
+    write_generated,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -74,10 +83,6 @@ ADVANCE_SCALE = 16
 DEFAULT_THRESHOLD = 128
 MIN_KERNING_ADJUST_FP = 8
 MAX_KERNING_ENTRIES = 1024
-KERNING_CODEPOINTS = frozenset(
-    list(range(0x20, 0x7F))
-    + [0x2018, 0x2019, 0x201C, 0x201D, 0x2013, 0x2014, 0x2026]
-)
 
 
 def text_render_threshold() -> int:
@@ -149,6 +154,21 @@ def ensure_fonts(font_dir: Path, names) -> None:
                 f"  actual   sha256 {actual}"
             )
         partial.replace(path)
+
+
+def load_font(path: Path, px: int, axes=None):
+    """Open a face for rasterizing at `px`, always with Pillow's BASIC layout.
+
+    The checked-in tables carry BASIC's hinted, whole-pixel advances. Pillow
+    picks RAQM instead wherever libraqm and FriBiDi load (Pillow's Linux
+    wheels bundle raqm; FriBiDi comes from the system), and RAQM's unhinted
+    advances are fractional, so an unpinned run changed every advance.
+    `axes` instances a variable font (see `set_variation_by_axes`).
+    """
+    font = ImageFont.truetype(str(path), px, layout_engine=ImageFont.Layout.BASIC)
+    if axes is not None:
+        font.set_variation_by_axes(axes)
+    return font
 
 
 def check_rasterizer() -> None:
@@ -526,19 +546,8 @@ def kerning_entries(font_path: Path, cps, px: int):
     return sorted(entries[:MAX_KERNING_ENTRIES])
 
 
-def write_generated(path: Path, out) -> None:
-    """Write a generated module ending in exactly one newline, as rustfmt leaves it."""
-    path.write_text("".join(out).rstrip("\n") + "\n")
-    print(f"wrote {path}")
-
-
-def write_kerning(out, name, entries, count_name=None):
-    count = count_name or f"{name}_KERNING_COUNT"
-    out.append(f"#[rustfmt::skip]\npub const {count}: usize = {len(entries)};\n")
-    out.append(f"#[rustfmt::skip]\npub static {name}_KERNING: [KerningEntry; {count}] = [\n")
-    for left, right, adjust_fp in entries:
-        out.append(
-            "    KerningEntry { "
-            f"left: 0x{left:04X}, right: 0x{right:04X}, adjust_fp: {adjust_fp} }},\n"
-        )
-    out.append("];\n\n")
+def missing_codepoints(path: Path, cps):
+    """Codepoints the face's cmap lacks; Pillow draws its .notdef box there."""
+    data, tables = font_tables(path)
+    cmap = parse_cmap(data, tables)
+    return {cp for cp in cps if cp not in cmap}

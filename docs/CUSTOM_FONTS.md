@@ -87,3 +87,8 @@ In normal builds `display/src/custom_generated.rs` is a tracked placeholder,
 there so workspace tooling can resolve the optional module. Replace it with the
 generated file before you enable `builtin-custom-font`. With the feature on, the
 compiled-in custom font takes precedence over `CUSTOM.FNT` on the SD card.
+
+`font_pack_to_rust.py` writes the pack into the same compact tables as the
+built-in faces (see `display::font::BitmapFont`). A pack doesn't record which
+slots are the face's missing-glyph box, so every slot keeps its own entry;
+identical glyph bitmaps are still stored once.

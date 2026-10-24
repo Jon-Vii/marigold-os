@@ -6,7 +6,7 @@
 pub(crate) mod bench;
 
 use crate::reader_store::ReaderStore;
-use display::fb::Framebuffer;
+use display::fb::{Framebuffer, GlyphPainter};
 use display::font::{
     fixed_ceil, fixed_round, FontSize, FontStyle, FontWeight, GlyphMetric, STYLE_MARKER,
 };
@@ -69,13 +69,39 @@ const EMPTY_METRIC_SLOT: MetricSlot = MetricSlot {
     records: [[0u8; FONT_PACK_METRIC_BYTES]; ASCII_METRIC_COUNT],
 };
 
+/// A glyph record from a custom pack: where its bits sit in the face's
+/// bitmap block, then its placement and advance. Built-in faces keep these
+/// in `display::font`; a pack keeps its own fixed 12-byte records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PackGlyph {
+    offset: usize,
+    len: usize,
+    width: u8,
+    height: u8,
+    x_offset: i8,
+    y_offset: i8,
+    advance_fp: u16,
+}
+
+impl PackGlyph {
+    fn metric(&self) -> GlyphMetric {
+        GlyphMetric {
+            width: self.width,
+            height: self.height,
+            x_offset: self.x_offset,
+            y_offset: self.y_offset,
+            advance_fp: self.advance_fp,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct NonAsciiMetricSlot {
     key: Option<(u64, u32, u16)>,
-    metric: GlyphMetric,
+    metric: PackGlyph,
 }
 
-const EMPTY_GLYPH_METRIC: GlyphMetric = GlyphMetric {
+const EMPTY_PACK_GLYPH: PackGlyph = PackGlyph {
     offset: 0,
     len: 0,
     width: 0,
@@ -87,7 +113,7 @@ const EMPTY_GLYPH_METRIC: GlyphMetric = GlyphMetric {
 
 const EMPTY_NON_ASCII_SLOT: NonAsciiMetricSlot = NonAsciiMetricSlot {
     key: None,
-    metric: EMPTY_GLYPH_METRIC,
+    metric: EMPTY_PACK_GLYPH,
 };
 
 impl MetricCache {
@@ -108,7 +134,7 @@ impl MetricCache {
 
     /// Serve a cached ASCII metric without touching the card. `None` means
     /// the caller must open the pack: non-ASCII char or unfilled face.
-    fn lookup(&self, identity: u64, face: FontPackFaceRecord, ch: char) -> Option<GlyphMetric> {
+    fn lookup(&self, identity: u64, face: FontPackFaceRecord, ch: char) -> Option<PackGlyph> {
         if Self::ascii_index(ch).is_none() {
             let codepoint = u16::try_from(ch as u32).unwrap_or(b'?' as u16);
             return self
@@ -140,7 +166,7 @@ impl MetricCache {
         identity: u64,
         face: FontPackFaceRecord,
         ch: char,
-    ) -> Option<GlyphMetric>
+    ) -> Option<PackGlyph>
     where
         D: embedded_sdmmc::BlockDevice,
         T: TimeSource,
@@ -345,9 +371,9 @@ pub(crate) fn for_each_metric<
             }
             continue;
         }
-        let metric = custom_face(source, size, weight, style)
+        let glyph = custom_face(source, size, weight, style)
             .and_then(|face| cache.fill_and_lookup(&file, identity, face, ch));
-        visit(style, metric);
+        visit(style, glyph.map(|glyph| glyph.metric()));
     }
 }
 
@@ -744,7 +770,7 @@ where
         Some(fixed_round(cursor_fp))
     }
 
-    fn metric_for_char(&mut self, face: FontPackFaceRecord, ch: char) -> Option<GlyphMetric> {
+    fn metric_for_char(&mut self, face: FontPackFaceRecord, ch: char) -> Option<PackGlyph> {
         let identity = self.source.custom_font_identity();
         if let Some(metric) = self.cache.lookup(identity, face, ch) {
             return Some(metric);
@@ -756,7 +782,7 @@ where
         &mut self,
         fb: &mut Framebuffer,
         face: FontPackFaceRecord,
-        metric: GlyphMetric,
+        metric: PackGlyph,
         x: i16,
         baseline_y: i16,
     ) -> Option<()> {
@@ -781,29 +807,56 @@ where
                 read_full(file, bytes)
             },
         )?;
-        for y in 0..metric.height as usize {
-            let row = &bitmap[y * row_bytes..(y + 1) * row_bytes];
-            for (x_byte, &byte) in row.iter().enumerate() {
-                if byte == 0 {
-                    continue;
-                }
-                for bit in 0..8 {
-                    let px = x_byte * 8 + bit;
-                    if px >= metric.width as usize {
-                        break;
-                    }
-                    if byte & (0x80 >> bit) != 0 {
-                        let draw_x = glyph_x + px as i16;
-                        let draw_y = glyph_y + y as i16;
-                        if draw_x >= 0 && draw_y >= 0 {
-                            fb.set_pixel(draw_x as usize, draw_y as usize, false);
-                        }
-                    }
-                }
-            }
-        }
+        paint_pack_glyph(
+            fb,
+            bitmap,
+            row_bytes,
+            metric.width as usize,
+            metric.height as usize,
+            glyph_x as i32,
+            glyph_y as i32,
+        );
         Some(())
     }
+}
+
+/// Paint a pack glyph black with its top-left pixel at frame (`x`, `y`):
+/// `bitmap` holds `height` rows of `row_bytes` bytes, MSB first, and bits
+/// past `width` are ignored. The painter takes rows of up to 56 columns
+/// whole, so wider glyphs go in column strips.
+fn paint_pack_glyph(
+    fb: &mut Framebuffer,
+    bitmap: &[u8],
+    row_bytes: usize,
+    width: usize,
+    height: usize,
+    x: i32,
+    y: i32,
+) {
+    let mut first = 0;
+    while first < width {
+        let count = (width - first).min(56);
+        let mut painter =
+            GlyphPainter::new(fb, x + first as i32, y, count as u32, height as u32, false);
+        for row in 0..height {
+            let bytes = &bitmap[row * row_bytes..(row + 1) * row_bytes];
+            painter.row(row as u32, pack_row_bits(bytes, first, count));
+        }
+        painter.finish();
+        first += count;
+    }
+}
+
+/// Columns `first..first + count` (`count` 1..=56) of a 1 bpp row, MSB
+/// first in a `u64`.
+fn pack_row_bits(row: &[u8], first: usize, count: usize) -> u64 {
+    let shift = first % 8;
+    let mut word = 0u64;
+    for k in 0..(shift + count).div_ceil(8) {
+        let byte = row.get(first / 8 + k).copied().unwrap_or(0);
+        word |= (byte as u64) << (56 - 8 * k);
+    }
+    (word << shift) & (u64::MAX << (64 - count))
 }
 
 fn custom_face(
@@ -834,7 +887,7 @@ fn metric_for_char<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MA
     file: &File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     face: FontPackFaceRecord,
     ch: char,
-) -> Option<GlyphMetric>
+) -> Option<PackGlyph>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
@@ -851,7 +904,7 @@ fn metric<D, T, const MAX_DIRS: usize, const MAX_FILES: usize, const MAX_VOLUMES
     file: &File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     face: FontPackFaceRecord,
     codepoint: u16,
-) -> Option<GlyphMetric>
+) -> Option<PackGlyph>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
@@ -869,8 +922,8 @@ where
     Some(decode_metric(&bytes))
 }
 
-fn decode_metric(bytes: &[u8; FONT_PACK_METRIC_BYTES]) -> GlyphMetric {
-    GlyphMetric {
+fn decode_metric(bytes: &[u8; FONT_PACK_METRIC_BYTES]) -> PackGlyph {
+    PackGlyph {
         offset: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize,
         len: u16::from_le_bytes([bytes[4], bytes[5]]) as usize,
         width: bytes[6],
@@ -954,4 +1007,79 @@ struct InlineLine<'a> {
     size: FontSize,
     weight: FontWeight,
     baseline_y: i16,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use display::fb::FbFrame;
+
+    /// The per-bit loop the painter replaced: `set_pixel` per ink pixel,
+    /// nothing left of or above the frame.
+    fn reference(
+        fb: &mut Framebuffer,
+        bitmap: &[u8],
+        row_bytes: usize,
+        width: usize,
+        x: i32,
+        y: i32,
+    ) {
+        for (row, bytes) in bitmap.chunks(row_bytes).enumerate() {
+            for column in 0..width {
+                if bytes[column / 8] & (0x80 >> (column % 8)) != 0 {
+                    let (px, py) = (x + column as i32, y + row as i32);
+                    if px >= 0 && py >= 0 {
+                        fb.set_pixel(px as usize, py as usize, false);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pack_glyphs_paint_like_the_per_bit_loop_in_every_frame() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for frame in [
+            FbFrame::Native,
+            FbFrame::Landscape,
+            FbFrame::LandscapeFlipped,
+            FbFrame::Portrait,
+        ] {
+            let mut painted = Framebuffer::new();
+            let mut expected = Framebuffer::new();
+            painted.set_frame(frame);
+            expected.set_frame(frame);
+            let (fw, fh) = (painted.frame_width() as i32, painted.frame_height() as i32);
+            for width in [1usize, 7, 8, 9, 24, 31, 33, 56, 57, 64, 100, 255] {
+                let row_bytes = width.div_ceil(8);
+                let height = 1 + (next() % 40) as usize;
+                // Random ink, with the padding bits set too: they must not
+                // draw.
+                let bitmap: std::vec::Vec<u8> =
+                    (0..row_bytes * height).map(|_| next() as u8).collect();
+                for (x, y) in [
+                    (37, 41),
+                    ((next() % 300) as i32, (next() % 300) as i32),
+                    (-(width as i32) / 2, 50),
+                    (fw - width as i32 / 2, 60),
+                    (30, -(height as i32) / 2),
+                    (40, fh - height as i32 / 2),
+                    (fw + 3, fh + 3),
+                ] {
+                    paint_pack_glyph(&mut painted, &bitmap, row_bytes, width, height, x, y);
+                    reference(&mut expected, &bitmap, row_bytes, width, x, y);
+                    assert!(
+                        painted.bytes()[..] == expected.bytes()[..],
+                        "{frame:?} width {width} at ({x}, {y})"
+                    );
+                }
+            }
+        }
+    }
 }

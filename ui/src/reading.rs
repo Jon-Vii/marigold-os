@@ -1207,16 +1207,17 @@ impl InkCursor {
         } else {
             ch as u16
         };
-        let Some((metric, _)) = font.glyph(codepoint).or_else(|| font.glyph(b'?' as u16)) else {
-            self.advance_fp += 8 << 4;
-            self.right = self.right.max(fixed_ceil(self.advance_fp));
-            self.previous = Some(b'?' as u16);
-            return;
-        };
-        let drawn = if font.glyph(codepoint).is_some() {
-            codepoint
-        } else {
-            b'?' as u16
+        let (drawn, metric) = match font.metric(codepoint) {
+            Some(metric) => (codepoint, metric),
+            None => {
+                let Some(metric) = font.metric(b'?' as u16) else {
+                    self.advance_fp += 8 << 4;
+                    self.right = self.right.max(fixed_ceil(self.advance_fp));
+                    self.previous = Some(b'?' as u16);
+                    return;
+                };
+                (b'?' as u16, metric)
+            }
         };
         if let Some(left) = self.previous {
             self.advance_fp += font.kerning_adjust_fp(left, drawn) as i32;
@@ -1510,9 +1511,9 @@ pub fn word_space_width(settings: TypeSettings, style: FontStyle) -> i16 {
 /// Extra width to spread across a justified line's inter-word gaps, or
 /// `None` when it should keep natural spacing: no gaps, nothing to add, a
 /// line so short (under two thirds of the measure) that stretching it
-/// would open rivers, or one whose gaps would each grow by more than one
-/// and a half spaces -- typically a line cut short by a word that could
-/// not be broken.
+/// would open rivers, or one whose gaps would each grow by more than two
+/// spaces -- typically a line cut short by a word that could not be
+/// broken.
 pub fn justify_extra(
     x: i16,
     natural_width: i16,
@@ -1525,7 +1526,7 @@ pub fn justify_extra(
     if gaps == 0
         || extra <= 0
         || extra * 3 > target - x
-        || i32::from(extra) * 2 > gaps as i32 * i32::from(space) * 3
+        || i32::from(extra) > gaps as i32 * i32::from(space) * 2
     {
         return None;
     }
@@ -1985,8 +1986,7 @@ mod tests {
             let mut tallest = 0;
             for style in STYLES {
                 let font = body_font(settings, style);
-                for (index, metric) in font.metrics.iter().enumerate() {
-                    let codepoint = font.codepoints[index];
+                for (codepoint, metric) in font.glyphs() {
                     // A glyph inks rows `baseline + y_offset` through
                     // `baseline + y_offset + height - 1`.
                     let first = i16::from(metric.y_offset);
@@ -2344,8 +2344,7 @@ mod tests {
                 );
                 for style in STYLES {
                     let font = body_font(settings, style);
-                    for (index, metric) in font.metrics.iter().enumerate() {
-                        let codepoint = font.codepoints[index];
+                    for (codepoint, metric) in font.glyphs() {
                         let first = i16::from(metric.y_offset);
                         let last = first + i16::from(metric.height) - 1;
                         assert!(
@@ -2525,13 +2524,13 @@ mod tests {
 
     #[test]
     fn lines_holding_images_justify_whenever_two_thirds_full() {
-        // A measure of 780 with nine four-pixel gaps: a text line takes 54
-        // to spare at most (one and a half spaces a gap); a line holding
-        // images takes anything up to a third of the measure.
+        // A measure of 780 with nine four-pixel gaps: a text line takes 72
+        // to spare at most (two spaces a gap); a line holding images takes
+        // anything up to a third of the measure.
         let (x, right) = (8, 792);
         let measure = right - READER_WRAP_SAFETY - x;
-        assert_eq!(justify_extra(x, measure - 54, right, 9, 4), Some(54));
-        assert_eq!(justify_extra(x, measure - 71, right, 9, 4), None);
+        assert_eq!(justify_extra(x, measure - 72, right, 9, 4), Some(72));
+        assert_eq!(justify_extra(x, measure - 73, right, 9, 4), None);
         assert_eq!(justify_inline_extra(x, measure - 71, right, 9), Some(71));
         assert_eq!(justify_inline_extra(x, measure - 260, right, 4), Some(260));
         assert_eq!(justify_inline_extra(x, measure - 261, right, 4), None);
@@ -2685,9 +2684,9 @@ mod tests {
             } else {
                 ch as u16
             };
-            let (drawn, metric) = if let Some((metric, _)) = font.glyph(codepoint) {
+            let (drawn, metric) = if let Some(metric) = font.metric(codepoint) {
                 (codepoint, metric)
-            } else if let Some((metric, _)) = font.glyph(b'?' as u16) {
+            } else if let Some(metric) = font.metric(b'?' as u16) {
                 (b'?' as u16, metric)
             } else {
                 advance_fp += 8 << 4;

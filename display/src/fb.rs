@@ -1,7 +1,9 @@
 use crate::{FB_BYTES, HEIGHT, ROW_BYTES, WIDTH};
 
 mod blit;
+mod glyph;
 pub use blit::ImageRows;
+pub use glyph::GlyphPainter;
 
 /// The upright drawing frame for one render: which way the device is held.
 /// `set_pixel`/`pixel` take coordinates in this frame — x rightward, y

@@ -276,7 +276,12 @@ card, so several firmware images can coexist.
 `display::fb::Framebuffer` is the source of truth. White is bit `1`, black is
 bit `0`, row-major, `ROW_BYTES` per row (100 on the X4, 99 on the X3). Each
 framebuffer also carries its `FbFrame`, the drawing frame for how the device
-is held (see orientation below). Glyphs and rules draw pixel by pixel.
+is held (see orientation below). Rules draw pixel by pixel. Glyphs, built-in
+or from a custom font pack, draw a row at a time through `fb::GlyphPainter`:
+a few masked byte stores per row in the landscape frames (mirrored through
+the bit-reversal table when flipped), and 8 × 8 bit transposes in portrait. A
+glyph that hangs off the frame falls back to `set_pixel`, clipped as before.
+Either way the painter leaves exactly what a `set_pixel` per ink pixel would.
 `Framebuffer::blit` draws a band of an image's 1 bpp rows, in the image pack
 layout, a byte at a time. In the landscape frames it shifts whole rows into
 place (bit-reversed through the panel transform's table when flipped), and in
@@ -290,6 +295,27 @@ that reliably clears unknown pixels. Normal page turns use a second, retained
 framebuffer as the RED RAM previous-frame source, then trigger the SSD1677
 fast waveform (~421 ms). A turn to a staged page (below) starts the waveform
 without drawing or writing anything first.
+
+That fast waveform is the panel's own display-mode-2 set from OTP, and OTP
+has only one: the same 21 frames at 50 Hz at every temperature (3 frames, a
+16-frame main phase, 1 and 1). The full refresh's OTP sets, by contrast, run
+176 frames above 20 C, 232 above 15 C and 331 above 10 C, because the ink
+moves faster when warm. The controller's datasheet has no way to read a LUT
+back, but the SSD1677 answers an undocumented `0x33` with its LUT register,
+which is how the page-turn set was copied into `display::epd::FAST_LUT`. A
+warm panel turns pages from that copy with a shorter main phase instead
+(`quick_turn_frames`): 10 frames above 20 C (300 ms) and 13 above 15 C
+(360 ms). Colder panels, or a temperature that could not be read, keep the
+OTP waveform. The copy changes only the main phase, so black to white and
+white to black stay equal and opposite, and the voltages and the other two
+pixel classes are the panel's own. In a blind comparison on an X4 at
+22.5 C, main phases from 8 to 16 frames looked the same.
+
+The temperature comes from the controller's own sensor, read once at boot
+(`fw::panel_temp`) before the display SPI bus is built: the controller
+answers reads on its data line, which the board wires to MOSI, so the read
+releases that pin and clocks the reply in by hand. Deep sleep ends in a
+reboot, so every wake reads it again.
 
 `RefreshMode::FastClean` sits between those two: a clean with one flicker. On
 the SSD1677 it runs the display-mode-1 waveform with the temperature register
@@ -529,8 +555,7 @@ Venice: 18.9 s without, 24.6 s with), and idle-time preparation (see the reader
 cache) keeps most of it off the open. A paragraph's last word is never split,
 and a word wider than a whole line breaks wherever it can. At draw time,
 `justify_extra` leaves a line at natural spacing rather than open gaps past
-one and a half spaces, and does the same for lines under two thirds of the
-measure. Soft hyphens survive normalisation as break hints and are stripped
+two spaces, and does the same for lines under two thirds of the measure. Soft hyphens survive normalisation as break hints and are stripped
 from stored lines. An image inside a line is one unit of its fitted width,
 measured as an object (`StyledInkCursor::push_object`) and never split or
 hyphenated. Justified gaps stretch around it as they do around a word.
@@ -941,6 +966,18 @@ Latin, Latin-1, Latin Extended-A/B and Additional, Greek, Cyrillic, general
 punctuation, currency and letterlike symbols, arrows, and geometric shapes.
 Firmware doesn't rasterize TTFs on-device.
 
+The generated modules hold `display::font::BitmapFont` tables, laid out for
+flash rather than for the generator. Codepoint ranges map a codepoint to its
+glyph slot. A presence bitmap marks the slots a face lacks, which all draw
+its missing-glyph box and share one entry (about 40% of the reading faces'
+slots). Glyph entries are 8 bytes. Each distinct glyph bitmap is stored once,
+with a row that repeats the row above folded into one bit. Kerning pairs are
+grouped by left glyph at 2 bytes each. `tools/fontgen_common.py` pins Pillow's
+BASIC layout, whose hinted whole-pixel advances the tables carry, and
+`tools/generate_merriweather.py` carries U+2116 over from the checked-in table,
+because a FreeType that can load HarfBuzz autohints that one glyph
+differently.
+
 ## Development emulator
 
 `tools/emulator` is a host-side parity tool for fast development loops. It has
@@ -1145,7 +1182,7 @@ is still read). There is no flash copy.
 
 | | |
 |---|---|
-| Page turn | 473 ms end-to-end; 421 ms of that is the panel's rated fast waveform |
+| Page turn | about 350 ms end-to-end above 20 C (300 ms of it the waveform); 473 ms on the OTP waveform below 15 C |
 | Wake from sleep | one flicker, ~1.5 s |
 | Cold-boot full refresh | 3.5 s |
 | Reopen a cached book | tens of milliseconds |

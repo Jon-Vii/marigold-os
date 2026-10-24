@@ -111,7 +111,7 @@ fn custom_face_on_card(request: RenderRequest, sd_library: &ReaderStore) -> bool
 
 /// A reading page that will draw image blocks, whose rows are in the
 /// book's packs. A book without images stops at the first check.
-fn reader_page_has_images(request: RenderRequest, sd_library: &ReaderStore) -> bool {
+pub(crate) fn reader_page_has_images(request: RenderRequest, sd_library: &ReaderStore) -> bool {
     sd_library.book_has_images()
         && request.view == AppView::Reading
         && ReaderSource::from_book_id(request.book_id).is_sd()

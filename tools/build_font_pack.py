@@ -176,15 +176,14 @@ def codepoints_from_ranges(ranges: list[tuple[int, int]]) -> list[int]:
 
 def build_face(source: SourceFace, size_px: int, line_height: int, baseline: int, cps: list[int]) -> BuiltFace:
     try:
-        from PIL import ImageFont
-        from fontgen_common import kerning_entries, rasterize_glyph
+        from fontgen_common import kerning_entries, load_font, rasterize_glyph
     except ModuleNotFoundError as exc:
         raise RuntimeError(
             "Pillow is required. Run `uv run --script tools/build_font_pack.py`, which "
             "installs the pinned Pillow from the script header."
         ) from exc
 
-    font = ImageFont.truetype(str(source.path), size_px)
+    font = load_font(source.path, size_px)
     metric_records = bytearray()
     bitmap = bytearray()
     for code in cps:
