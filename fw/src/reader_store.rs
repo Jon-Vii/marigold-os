@@ -98,7 +98,7 @@ pub(crate) const EMPTY_TOC_RECORD: TocRecord = TocRecord {
 /// to its spine item and how far through that spine's pages it sat. The
 /// rebuild resolves the pin against the new pagination, and the reader
 /// keeps their place in the text rather than their page number.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct PageAnchor {
     /// `(source_hash, source_size)` of the book.
     pub(crate) source: (u32, u32),
@@ -164,7 +164,7 @@ fn spine_extent<const N: usize>(sections: &SectionTable<N>, spine: u16) -> Optio
 /// each starts where the one before it ends (a book index is only accepted
 /// that way), so ids and start pages are derived rather than stored. Walking
 /// it in order yields full records; there are at most `MAX_BOOK_SECTIONS`.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Hash)]
 pub(crate) struct SectionTable<const N: usize = MAX_BOOK_SECTIONS> {
     base: u16,
     start_page: u32,
@@ -175,7 +175,7 @@ pub(crate) struct SectionTable<const N: usize = MAX_BOOK_SECTIONS> {
 
 /// A section's spine and page count; the top bit of `pages` marks a
 /// partial section.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Hash)]
 struct SectionEntry {
     spine: u16,
     pages: u16,
@@ -336,7 +336,7 @@ impl<const N: usize> SectionTable<N> {
 /// provisional page saved or requested meanwhile still finds its place.
 /// One per generation of the book's cache: a new run would renumber the
 /// pages of the old.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Hash)]
 pub(crate) struct SeedRun {
     /// The run's first spine; None when this generation has none.
     pub(crate) first_spine: Option<u16>,
@@ -369,7 +369,7 @@ impl SeedRun {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum LibraryScanStatus {
     NotScanned,
     Scanning,
@@ -378,7 +378,7 @@ pub(crate) enum LibraryScanStatus {
     Error,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum BookLoadStatus {
     Empty,
     Loading,
@@ -386,6 +386,7 @@ pub(crate) enum BookLoadStatus {
     Error,
 }
 
+#[derive(Hash)]
 pub(crate) struct LibraryBookEntry {
     pub(crate) display_name: String<64>,
     pub(crate) display_label: String<64>,
@@ -408,6 +409,7 @@ impl LibraryBookEntry {
     }
 }
 
+#[derive(Hash)]
 pub(crate) struct FirmwareFileEntry {
     pub(crate) display_name: String<64>,
     pub(crate) open_name: String<16>,
@@ -445,7 +447,7 @@ pub(crate) struct TocItem<'a> {
 /// so the note holds until the book, its layout, or its index changes; a
 /// book that grows keeps its pages' note but may have new images. It sits
 /// in the store's padding.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ImageNote {
     from: u16,
     to: u16,
@@ -460,6 +462,77 @@ impl ImageNote {
     };
 }
 
+/// The FNV-1a offset basis and 64-bit prime, used word-wise by
+/// [`StoreHasher`].
+#[cfg(not(feature = "device-x3"))]
+const STORE_HASH_SEED: u64 = 0xcbf2_9ce4_8422_2325;
+#[cfg(not(feature = "device-x3"))]
+const STORE_HASH_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// The [`ReaderStore::fingerprint`] hasher: FNV-1a over 32-bit words, with
+/// a rotate so the high half of the state feeds back into the low half.
+#[cfg(not(feature = "device-x3"))]
+struct StoreHasher(u64);
+
+#[cfg(not(feature = "device-x3"))]
+impl StoreHasher {
+    fn mix(&mut self, word: u32) {
+        self.0 = (self.0 ^ u64::from(word))
+            .wrapping_mul(STORE_HASH_PRIME)
+            .rotate_left(29);
+    }
+}
+
+#[cfg(not(feature = "device-x3"))]
+impl core::hash::Hasher for StoreHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        let mut words = bytes.chunks_exact(4);
+        for word in &mut words {
+            self.mix(u32::from_le_bytes([word[0], word[1], word[2], word[3]]));
+        }
+        let tail = words.remainder();
+        if !tail.is_empty() {
+            let mut word = [0u8; 4];
+            word[..tail.len()].copy_from_slice(tail);
+            // The length keeps a short tail of zeros apart from none.
+            self.mix(u32::from_le_bytes(word) ^ ((tail.len() as u32) << 24));
+        }
+    }
+
+    fn write_u8(&mut self, value: u8) {
+        self.mix(u32::from(value));
+    }
+
+    fn write_u16(&mut self, value: u16) {
+        self.mix(u32::from(value));
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.mix(value);
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.mix(value as u32);
+        self.mix((value >> 32) as u32);
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        // One word on the C3; enum discriminants and lengths come this way.
+        self.mix(value as u32);
+        if usize::BITS > u32::BITS {
+            self.mix((value as u64 >> 32) as u32);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// Hashing it whole is what lets the display task trust a page it drew
+/// ahead of a press (see [`ReaderStore::fingerprint`]); every field must be
+/// `Hash`, so a new one is covered as soon as it compiles.
+#[derive(Hash)]
 pub(crate) struct ReaderStore {
     pub(crate) status: LibraryScanStatus,
     /// Full book count across CATALOG.BIN (the source of truth), independent of
@@ -659,6 +732,27 @@ impl ReaderStore {
             custom_font_faces: [proto::font_pack::FontPackFaceRecord::EMPTY; MAX_CUSTOM_FONT_FACES],
             custom_font_face_count: 0,
         }
+    }
+
+    /// A 64-bit digest of every byte of state the store holds: the catalog
+    /// window and active entry, the loaded book's index, seed run, TOC and
+    /// chapter map, the resident section's page and block records and text,
+    /// the layout, the custom font pack, and the rest. Everything a reading
+    /// page draws from the store is in here, and so is a good deal it never
+    /// reads, so equal digests say the store has not changed in any way
+    /// that could move a pixel, and unequal ones only cost a fresh render.
+    ///
+    /// Each 32-bit word (or smaller value) of the derived `Hash` stream
+    /// steps the state through `(state ^ word) * odd`, then a rotate. For a
+    /// given word that step is a bijection of the state, so two stores
+    /// whose streams differ in a single word always digest differently;
+    /// wider differences collide with odds near 2^-64. About 50 KB, around
+    /// a millisecond or two on the C3.
+    #[cfg(not(feature = "device-x3"))]
+    pub(crate) fn fingerprint(&self) -> u64 {
+        let mut hasher = StoreHasher(STORE_HASH_SEED);
+        core::hash::Hash::hash(self, &mut hasher);
+        core::hash::Hasher::finish(&hasher)
     }
 
     pub(crate) fn clear_firmware_files(&mut self) {

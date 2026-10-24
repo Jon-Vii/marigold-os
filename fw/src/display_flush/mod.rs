@@ -6,7 +6,9 @@
 //! task never sees command bytes or RAM-plane names. Both controllers keep
 //! a previous-frame plane for differential fast refreshes (SSD1677: RED
 //! RAM; UC8253: DTM1), which is what `prestage_previous` and `flush`'s
-//! `prev_staged` speak to.
+//! `prev_staged` speak to. The SSD1677 backend also writes a page into BW
+//! RAM ahead of need (`stage_frame`) and refreshes onto it without
+//! streaming it again (`flush_staged`), for `crate::next_page`.
 
 use esp_hal::gpio::{Input, Output};
 use esp_hal::spi::master::SpiDmaBus;
@@ -18,7 +20,9 @@ mod ssd1677;
 mod uc8253;
 
 #[cfg(not(feature = "device-x3"))]
-pub(crate) use ssd1677::{flush, init_panel, prestage_previous, sleep_panel};
+pub(crate) use ssd1677::{
+    flush, flush_staged, init_panel, prestage_previous, sleep_panel, stage_frame,
+};
 #[cfg(feature = "device-x3")]
 pub(crate) use uc8253::{flush, init_panel, prestage_previous, sleep_panel};
 

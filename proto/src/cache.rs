@@ -124,7 +124,7 @@ pub struct SpineRecord {
     pub byte_size: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TocRecord {
     pub title_offset: u32,
     pub title_len: u16,
@@ -223,7 +223,7 @@ pub struct PageCacheHeader {
     pub partial: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PageRecord {
     pub first_block: u16,
     pub block_count: u16,
@@ -248,7 +248,7 @@ pub struct WordRecord {
     pub style: FontStyle,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BlockRecord {
     pub text_offset: u32,
     pub text_len: u16,

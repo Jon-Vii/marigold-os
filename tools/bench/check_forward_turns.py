@@ -17,6 +17,10 @@ def main():
     inputs = [r for r in rows if r.get("event") == "input" and r.get("button") == "Next"]
     renders = [r for r in rows if r.get("event") == "render" and r.get("view") == "Reading"]
     builds = [r for r in rows if r.get("event") == "storage_build"]
+    differed = [
+        r for r in rows
+        if r.get("event") == "stage_check" and r.get("done") is True and r.get("match") is not True
+    ]
     pages = [r["page"] for r in renders]
     expected = list(range(args.first_page, args.first_page + args.turns))
     errors = []
@@ -26,14 +30,24 @@ def main():
         errors.append(f"expected exactly one render per forward page; got {pages}")
     if builds:
         errors.append(f"{len(builds)} EPUB preparation steps occurred during reading")
+    if differed:
+        errors.append(f"{len(differed)} staged pages differed from a fresh render: {[r.get('page') for r in differed]}")
     latencies = []
     if not errors:
         latencies = [frame["t_ms"] - button["t_ms"] for button, frame in zip(inputs, renders)]
         if min(latencies) < 0 or max(latencies) > args.max_latency_ms:
             errors.append(f"turn latency outside 0..{args.max_latency_ms} ms: {latencies}")
-    print(f"Next inputs={len(inputs)} reading renders={len(renders)} EPUB builds={len(builds)}")
+    staged = [r.get("staged") is True for r in renders]
+    print(
+        f"Next inputs={len(inputs)} reading renders={len(renders)} "
+        f"staged={sum(staged)} EPUB builds={len(builds)}"
+    )
     if latencies:
         print(f"input-to-settled median={statistics.median(latencies):g} ms max={max(latencies)} ms")
+        for label, keep in (("staged", True), ("drawn", False)):
+            subset = [ms for ms, was in zip(latencies, staged) if was == keep]
+            if subset:
+                print(f"  {label}: {len(subset)} turns, median={statistics.median(subset):g} ms max={max(subset)} ms")
     if errors:
         raise SystemExit("\n".join(errors))
 

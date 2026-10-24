@@ -55,7 +55,7 @@ pub struct FontPackHeader {
     pub data_offset: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FontPackFaceRecord {
     pub size_px: u8,
     pub style: u8,

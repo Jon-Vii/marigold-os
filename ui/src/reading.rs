@@ -614,11 +614,30 @@ pub fn draw_reading_page_body(
     fb: &mut Framebuffer,
     source: &impl ReadingBlocks,
     page: PageRecord,
-    mut draw_image: impl FnMut(&mut Framebuffer, &ReaderImage<'_>),
+    draw_image: impl FnMut(&mut Framebuffer, &ReaderImage<'_>),
 ) {
+    draw_reading_page_body_while(fb, source, page, draw_image, || true);
+}
+
+/// [`draw_reading_page_body`], asking `go_on` before each block (one line,
+/// in the firmware's section caches) and stopping, the page half drawn, as
+/// soon as it says no. False when it stopped. Lets a page drawn ahead of
+/// need give way to a button press within a line's draw.
+pub fn draw_reading_page_body_while(
+    fb: &mut Framebuffer,
+    source: &impl ReadingBlocks,
+    page: PageRecord,
+    mut draw_image: impl FnMut(&mut Framebuffer, &ReaderImage<'_>),
+    mut go_on: impl FnMut() -> bool,
+) -> bool {
     let settings = source.type_settings();
     let page_box = source.page_box();
+    let mut finished = true;
     for_each_drawable_block(source, page, |block| {
+        if !go_on() {
+            finished = false;
+            return false;
+        }
         if let Some(image) = block.image {
             draw_image(fb, &image);
             return true;
@@ -709,6 +728,7 @@ pub fn draw_reading_page_body(
         };
         true
     });
+    finished
 }
 
 /// What placing a line's inline images needs: the column, which no image

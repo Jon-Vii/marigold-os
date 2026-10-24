@@ -652,7 +652,9 @@ where
             Either::Second(Either::Second(DisplayCommand::Sleep)) => {
                 return UploadSessionExit::Sleep
             }
-            Either::Second(Either::Second(DisplayCommand::Render(_))) => continue,
+            Either::Second(Either::Second(
+                DisplayCommand::Render(_) | DisplayCommand::StageNext { .. },
+            )) => continue,
         };
         let ok = if begin.delete {
             let removed = if begin.in_books {
@@ -887,7 +889,9 @@ async fn next_upload_chunk() -> Result<UploadChunk, UploadSessionExit> {
             Either::Second(Either::Second(DisplayCommand::Sleep)) => {
                 return Err(UploadSessionExit::Sleep)
             }
-            Either::Second(Either::Second(DisplayCommand::Render(_))) => {}
+            Either::Second(Either::Second(
+                DisplayCommand::Render(_) | DisplayCommand::StageNext { .. },
+            )) => {}
         }
     }
 }
@@ -918,7 +922,9 @@ async fn refuse_uploads_until_exit() -> UploadSessionExit {
             Either::Second(Either::Second(DisplayCommand::Sleep)) => {
                 return UploadSessionExit::Sleep
             }
-            Either::Second(Either::Second(DisplayCommand::Render(_))) => {}
+            Either::Second(Either::Second(
+                DisplayCommand::Render(_) | DisplayCommand::StageNext { .. },
+            )) => {}
         }
     }
 }
