@@ -28,6 +28,7 @@ pub(crate) async fn init_panel(epd: &mut Epd) -> Result<(), PanelError> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn flush(
     epd: &mut Epd,
     fb: &Framebuffer,
@@ -36,6 +37,7 @@ pub(crate) async fn flush(
     screen_on: bool,
     mode: RefreshMode,
     prev_staged: bool,
+    quick_allowed: bool,
 ) -> Result<(), PanelError> {
     let bw_start = Instant::now();
     write_ram(epd, CMD_WRITE_RAM_BW, fb, tx_band).await?;
@@ -73,8 +75,10 @@ pub(crate) async fn flush(
     }
     // A page turn on a warm panel runs the panel's own waveform from a copy
     // with a shorter main phase, written over whatever LUT the last update
-    // loaded. The update sequence then leaves out the OTP load (0x10).
-    let quick_frames = if mode == RefreshMode::Fast {
+    // loaded. The update sequence then leaves out the OTP load (0x10). The
+    // caller withholds it from turns into or out of a page with images,
+    // whose dithered dots need the full drive to leave no residue.
+    let quick_frames = if mode == RefreshMode::Fast && quick_allowed {
         quick_turn_frames(crate::panel_temp::celsius())
     } else {
         None

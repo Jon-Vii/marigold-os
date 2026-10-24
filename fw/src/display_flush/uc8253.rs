@@ -62,6 +62,7 @@ pub(crate) async fn init_panel(epd: &mut Epd) -> Result<(), PanelError> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn flush(
     epd: &mut Epd,
     fb: &Framebuffer,
@@ -70,6 +71,7 @@ pub(crate) async fn flush(
     _screen_on: bool,
     mode: RefreshMode,
     prev_staged: bool,
+    _quick_allowed: bool,
 ) -> Result<(), PanelError> {
     let plan = flush_plan(mode, SCREEN_POWERED.load(Ordering::Relaxed), prev_staged);
     esp_println::println!(
