@@ -121,6 +121,8 @@ mod image_decode;
 mod library_sd;
 mod ota_update;
 mod page_images;
+#[cfg(not(feature = "device-x3"))]
+mod panel_temp;
 mod reader_cache;
 mod reader_cache_files;
 mod reader_layout;
@@ -277,12 +279,25 @@ fn main() -> ! {
     // transforms, and EPUB inflate are all CPU-bound, so run at full speed
     // and rely on race-to-idle for power.
     let config = esp_hal::Config::default().with_cpu_clock(esp_hal::clock::CpuClock::_160MHz);
-    let peripherals = esp_hal::init(config);
+    #[cfg_attr(feature = "device-x3", allow(unused_mut))]
+    let mut peripherals = esp_hal::init(config);
     esp_println::println!("xteink-x4-os: boot");
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let sw_ints = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start(timg0.timer0, sw_ints.software_interrupt0);
+
+    // Before the display SPI bus takes these pins: the read needs the data
+    // line as an input.
+    #[cfg(not(feature = "device-x3"))]
+    panel_temp::read_at_boot(
+        peripherals.GPIO8.reborrow(),
+        peripherals.GPIO10.reborrow(),
+        peripherals.GPIO21.reborrow(),
+        peripherals.GPIO4.reborrow(),
+        peripherals.GPIO5.reborrow(),
+        peripherals.GPIO6.reborrow(),
+    );
 
     let epd_cs = Output::new(peripherals.GPIO21, Level::High, OutputConfig::default());
     let epd_dc = Output::new(peripherals.GPIO4, Level::High, OutputConfig::default());

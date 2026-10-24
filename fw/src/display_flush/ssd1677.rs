@@ -7,6 +7,10 @@ use display::epd::{
     CMD_WRITE_RAM_BW, CMD_WRITE_RAM_RED, CMD_WRITE_TEMPERATURE, FAST_CLEAN_TEMPERATURE,
     INIT_SEQUENCE, UPDATE_SEQUENCE_LOAD_TEMP,
 };
+use display::epd::{
+    quick_turn_frames, quick_turn_lut, CMD_GATE_VOLTAGE, CMD_SOURCE_VOLTAGE, CMD_WRITE_LUT,
+    CMD_WRITE_VCOM, FAST_GATE_VOLTAGE, FAST_SOURCE_VOLTAGES, FAST_VCOM,
+};
 use display::fb::Framebuffer;
 use display::{Rect, BAND_BYTES, BAND_ROWS, HEIGHT};
 use embassy_time::Instant;
@@ -24,6 +28,7 @@ pub(crate) async fn init_panel(epd: &mut Epd) -> Result<(), PanelError> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn flush(
     epd: &mut Epd,
     fb: &Framebuffer,
@@ -32,6 +37,7 @@ pub(crate) async fn flush(
     screen_on: bool,
     mode: RefreshMode,
     prev_staged: bool,
+    quick_allowed: bool,
 ) -> Result<(), PanelError> {
     let bw_start = Instant::now();
     write_ram(epd, CMD_WRITE_RAM_BW, fb, tx_band).await?;
@@ -67,23 +73,39 @@ pub(crate) async fn flush(
         epd.command(CMD_WRITE_TEMPERATURE, &FAST_CLEAN_TEMPERATURE)
             .await?;
     }
+    // A page turn on a warm panel runs the panel's own waveform from a copy
+    // with a shorter main phase, written over whatever LUT the last update
+    // loaded. The update sequence then leaves out the OTP load (0x10). The
+    // caller withholds it from turns into or out of a page with images,
+    // whose dithered dots need the full drive to leave no residue.
+    let quick_frames = if mode == RefreshMode::Fast && quick_allowed {
+        quick_turn_frames(crate::panel_temp::celsius())
+    } else {
+        None
+    };
+    let mut sequence = update_control_2(mode, screen_on, false);
+    if let Some(frames) = quick_frames {
+        epd.command(CMD_WRITE_LUT, &quick_turn_lut(frames)).await?;
+        epd.command(CMD_GATE_VOLTAGE, &[FAST_GATE_VOLTAGE]).await?;
+        epd.command(CMD_SOURCE_VOLTAGE, &FAST_SOURCE_VOLTAGES)
+            .await?;
+        epd.command(CMD_WRITE_VCOM, &[FAST_VCOM]).await?;
+        sequence &= !0x10;
+    }
     epd.command(CMD_DISPLAY_UPDATE_CTRL1, &update_control_1(mode))
         .await?;
-    epd.command(
-        CMD_DISPLAY_UPDATE_CTRL2,
-        &[update_control_2(mode, screen_on, false)],
-    )
-    .await?;
+    epd.command(CMD_DISPLAY_UPDATE_CTRL2, &[sequence]).await?;
     epd.command(CMD_MASTER_ACTIVATION, &[]).await?;
     let start = Instant::now();
     epd.wait_ready().await?;
     let elapsed = start.elapsed();
     esp_println::println!("display: refresh busy {} ms", elapsed.as_millis());
     esp_println::println!(
-        "bench: refresh mode={:?} busy_ms={} screen_on={}",
+        "bench: refresh mode={:?} busy_ms={} screen_on={} quick_frames={}",
         mode,
         elapsed.as_millis(),
         screen_on,
+        quick_frames.unwrap_or(0),
     );
     if mode == RefreshMode::FastClean {
         // Re-load the real sensor temperature so the next Fast partial

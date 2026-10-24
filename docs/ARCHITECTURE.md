@@ -287,6 +287,27 @@ that reliably clears unknown pixels. Normal page turns use a second, retained
 framebuffer as the RED RAM previous-frame source, then trigger the SSD1677
 fast waveform (~421 ms).
 
+That fast waveform is the panel's own display-mode-2 set from OTP, and OTP
+has only one: the same 21 frames at 50 Hz at every temperature (3 frames, a
+16-frame main phase, 1 and 1). The full refresh's OTP sets, by contrast, run
+176 frames above 20 C, 232 above 15 C and 331 above 10 C, because the ink
+moves faster when warm. The controller's datasheet has no way to read a LUT
+back, but the SSD1677 answers an undocumented `0x33` with its LUT register,
+which is how the page-turn set was copied into `display::epd::FAST_LUT`. A
+warm panel turns pages from that copy with a shorter main phase instead
+(`quick_turn_frames`): 10 frames above 20 C (300 ms) and 13 above 15 C
+(360 ms). Colder panels, or a temperature that could not be read, keep the
+OTP waveform. The copy changes only the main phase, so black to white and
+white to black stay equal and opposite, and the voltages and the other two
+pixel classes are the panel's own. In a blind comparison on an X4 at
+22.5 C, main phases from 8 to 16 frames looked the same.
+
+The temperature comes from the controller's own sensor, read once at boot
+(`fw::panel_temp`) before the display SPI bus is built: the controller
+answers reads on its data line, which the board wires to MOSI, so the read
+releases that pin and clocks the reply in by hand. Deep sleep ends in a
+reboot, so every wake reads it again.
+
 `RefreshMode::FastClean` sits between those two: a clean with one flicker. On
 the SSD1677 it runs the display-mode-1 waveform with the temperature register
 overridden to 90 C, which selects the hotter (shorter) OTP LUT. That cleans up
@@ -1091,7 +1112,7 @@ is still read). There is no flash copy.
 
 | | |
 |---|---|
-| Page turn | 473 ms end-to-end; 421 ms of that is the panel's rated fast waveform |
+| Page turn | about 350 ms end-to-end above 20 C (300 ms of it the waveform); 473 ms on the OTP waveform below 15 C |
 | Wake from sleep | one flicker, ~1.5 s |
 | Cold-boot full refresh | 3.5 s |
 | Reopen a cached book | tens of milliseconds |

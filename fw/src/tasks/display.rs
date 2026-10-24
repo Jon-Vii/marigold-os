@@ -159,6 +159,9 @@ pub async fn run(
     // A loading plate can have the same request as its eventual page. Keep
     // this bit separate so a RAM reply only skips a proven body-page redraw.
     let mut last_reader_render_ready = false;
+    // Whether the page on the panel holds images: a quick page turn out of
+    // it would leave their dots' residue behind.
+    let mut shown_has_images = false;
     let mut idle = IdlePreparation::new();
     loop {
         let idle_at = idle
@@ -302,6 +305,7 @@ pub async fn run(
                     );
                 }
                 let flush_start = Instant::now();
+                let has_images = crate::views::reader_page_has_images(request, sd_library);
                 if display_flush::flush(
                     &mut epd,
                     fb,
@@ -310,10 +314,12 @@ pub async fn run(
                     refresh_planner.screen_on(),
                     mode,
                     prev_prestaged,
+                    !(has_images || shown_has_images),
                 )
                 .await
                 .is_ok()
                 {
+                    shown_has_images = has_images;
                     let flush_ms = flush_start.elapsed().as_millis();
                     refresh_planner.record_render(request, mode);
                     last_reader_render_ready = request.view == AppView::Reading
@@ -422,6 +428,7 @@ pub async fn run(
                     refresh_planner.screen_on(),
                     RefreshMode::Full,
                     prev_prestaged,
+                    false,
                 )
                 .await
                 .is_ok()
@@ -510,6 +517,8 @@ pub async fn run(
                     ) {
                         crate::views::render(fb, loading_request, sd_library);
                         let mode = refresh_planner.mode_for(loading_request);
+                        let quick_allowed = !shown_has_images;
+                        shown_has_images = false;
                         if display_flush::flush(
                             &mut epd,
                             fb,
@@ -518,6 +527,7 @@ pub async fn run(
                             refresh_planner.screen_on(),
                             mode,
                             prev_prestaged,
+                            quick_allowed,
                         )
                         .await
                         .is_ok()
