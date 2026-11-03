@@ -36,7 +36,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.release_tag || github.sha }}
       # No toolchain argument: rustup reads rust-toolchain.toml from the
@@ -109,7 +109,7 @@ jobs:
               path.write_text(json.dumps(manifest, indent=2) + "\n")
           PY
           tools/verify_web_flasher.sh _site
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: _site
 
@@ -121,4 +121,4 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

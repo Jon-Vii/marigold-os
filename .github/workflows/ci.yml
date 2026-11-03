@@ -1,9 +1,13 @@
 name: CI
 
 on:
+  # Prose-only changes skip CI. release.yml still runs the full gate through
+  # workflow_call, which ignores these filters.
   pull_request:
+    paths-ignore: ["docs/**", "README.md", "LICENSE"]
   push:
     branches: [main]
+    paths-ignore: ["docs/**", "README.md", "LICENSE"]
   # release.yml runs this gate against the tagged commit before publishing.
   workflow_call:
     inputs:
@@ -25,11 +29,11 @@ env:
 
 jobs:
   host:
-    name: Host tests, goldens, formatting
+    name: Host crate tests
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
 
@@ -42,12 +46,37 @@ jobs:
           rustc --version
           echo "HOST_TARGET=$(rustc -vV | sed -n 's/^host: //p')" >> "$GITHUB_ENV"
 
+      - uses: Swatinem/rust-cache@v2
+
+      # .cargo/config.toml defaults to the firmware target, so every host
+      # command names the target explicitly.
+      - name: Host crate tests
+        run: cargo test -p app-core -p proto -p ui -p display --target "$HOST_TARGET"
+
+      - name: UI tests at X3 geometry
+        run: cargo test -p ui --target "$HOST_TARGET" --features display/device-x3
+
+  emulator:
+    name: Formatting, emulators, goldens
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup set profile minimal
+          rustup toolchain install
+          rustc --version
+          echo "HOST_TARGET=$(rustc -vV | sed -n 's/^host: //p')" >> "$GITHUB_ENV"
+
       # The emulator and web emulator are separate workspaces with their own
       # lockfiles and target directories.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
-            . -> target
             tools/emulator -> target
             tools/web-emulator -> target
 
@@ -57,14 +86,6 @@ jobs:
           cargo fmt --manifest-path tools/emulator/Cargo.toml --all --check
           cargo fmt --manifest-path tools/web-emulator/Cargo.toml --all --check
           cargo fmt --manifest-path tools/preview/Cargo.toml --all --check
-
-      # .cargo/config.toml defaults to the firmware target, so every host
-      # command names the target explicitly.
-      - name: Host crate tests
-        run: cargo test -p app-core -p proto -p ui -p display --target "$HOST_TARGET"
-
-      - name: UI tests at X3 geometry
-        run: cargo test -p ui --target "$HOST_TARGET" --features display/device-x3
 
       - name: Emulator tests (X4)
         run: cargo test --manifest-path tools/emulator/Cargo.toml --target "$HOST_TARGET" --no-default-features
@@ -89,18 +110,30 @@ jobs:
 
       - name: Upload golden frame diffs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: golden-diff
           path: target/golden-diff/
           if-no-files-found: ignore
 
+  # One job per device: the fat-LTO links dominate and run in parallel.
   firmware:
-    name: Firmware clippy and build
+    name: Firmware clippy and build (${{ matrix.device }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Workspace-wide clippy runs once, with the X4 default features.
+          - device: X4
+            features: ""
+            clippy_scope: --workspace
+          - device: X3
+            features: --features device-x3
+            clippy_scope: -p fw
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
 
@@ -111,18 +144,14 @@ jobs:
           rustc --version
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.device }}
 
       # Default target is riscv32imc-unknown-none-elf (.cargo/config.toml).
-      - name: Clippy (workspace, X4)
-        run: cargo clippy --workspace --release -- -D warnings
-
-      - name: Clippy (firmware, X3)
-        run: cargo clippy -p fw --release --features device-x3 -- -D warnings
+      - name: Clippy
+        run: cargo clippy ${{ matrix.clippy_scope }} --release ${{ matrix.features }} -- -D warnings
 
       # Linking runs the stack-floor and framebuffer-size assertions that
       # fw/build.rs emits into ram-layout.x.
-      - name: Build firmware (X4)
-        run: cargo build -p fw --release
-
-      - name: Build firmware (X3)
-        run: cargo build -p fw --release --features device-x3
+      - name: Build firmware
+        run: cargo build -p fw --release ${{ matrix.features }}
