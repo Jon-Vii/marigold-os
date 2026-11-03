@@ -25,7 +25,7 @@ jobs:
       tag: ${{ steps.check.outputs.tag }}
       sha: ${{ steps.check.outputs.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -65,7 +65,7 @@ jobs:
       # tools/verify_release_images.py.
       MARIGOLD_VERSION: ${{ needs.preflight.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.preflight.outputs.sha }}
 
@@ -76,13 +76,18 @@ jobs:
           rustup toolchain install
           rustc --version
 
-      # Same espflash as the maintainer's local tools/build-release.sh, so CI
-      # and local images are packaged identically. The repo's cargo config
-      # defaults to the firmware target, hence the explicit host target.
+      # Same espflash version as the maintainer's local tools/build-release.sh,
+      # so CI and local images are packaged identically. The upstream release
+      # binary saves building it from source; the digest pins the exact asset.
       - name: Install espflash 4.4.0
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ESPFLASH_SHA256: ac2031bd1f04c9107d9ba0e977535daa885a9f533f937dc369debd77f83665cd
         run: |
-          CARGO_BUILD_TARGET="$(rustc -vV | sed -n 's/^host: //p')" \
-            cargo install espflash@4.4.0 --locked
+          gh release download v4.4.0 --repo esp-rs/espflash \
+            --pattern espflash-x86_64-unknown-linux-gnu.zip --dir "$RUNNER_TEMP"
+          echo "$ESPFLASH_SHA256  $RUNNER_TEMP/espflash-x86_64-unknown-linux-gnu.zip" | sha256sum --check
+          unzip -q "$RUNNER_TEMP/espflash-x86_64-unknown-linux-gnu.zip" -d "$HOME/.cargo/bin"
           espflash --version
 
       - name: Build X4 release images
