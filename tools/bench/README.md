@@ -181,3 +181,26 @@ python3 tools/bench/fb_dump.py --port /dev/cu.usbmodem101 --keys n --frame lands
 A capture shows exactly what reached the panel's buffer (image placement,
 dithering, clipping) without anyone looking at the device. It can't show panel
 effects such as ghosting.
+
+## Light sleep and battery runs
+
+`bench-serial` builds print `bench: light_sleep` every 30 s (time asleep and
+sleep count since boot) and a `bench: ls_press` line per button, timing the
+wake, the poll, the app and the waveform. They also keep breadcrumbs: recent
+button, USB and render events, plus a panic's stack words, in RTC memory, with
+a 25 s RTC watchdog that turns a hang into a reset. The next boot prints the
+previous run's breadcrumbs once a host is attached, and appends them to flash
+(`espflash read-flash 0xff1000 0xf000`; `espflash erase-region 0xff1000
+0xf000` clears them).
+
+`--features bench-unplug` runs light sleep off and on in turns away from a
+host, pressing side Down every 30 s at the pin, and logs the battery voltage
+once a minute. Plain `bench-unplug` only turns the USB pull-up off, so on a
+port that powers the reader the battery figures mean nothing; with
+`bench-unplug-real` the run starts once the cable is really out and does
+three 40-minute phases (off, on, off). The log goes to flash at 0xff0000. A
+boot that finds it prints it every minute while a host is attached instead
+of starting over, and the host can read it with `espflash read-flash 0xff0000
+0x1000`. Erase that sector (`espflash erase-region 0xff0000 0x1000`) before
+the next run. Compare voltage slopes within phases: the step at a phase
+change is the load changing, not charge used.

@@ -8,6 +8,13 @@ default-run = "fw"
 # Development bench only: USB button injection and 2s timer wake after sleep.
 # Never enabled by the release-image workflow.
 bench-serial = []
+# Development bench only: with bench-serial, fakes four minutes off USB (D+
+# pull-up off) and presses side Down by driving its ladder pin low, then
+# reconnects. Exercises light sleep while unplugged without a person.
+bench-unplug = ["bench-serial"]
+# With bench-unplug: wait for the cable to really come out instead of
+# faking it, then alternate light sleep off/on/off on battery.
+bench-unplug-real = ["bench-unplug"]
 # Temporary on-device validation of the flash + otadata path without an SD card:
 # on first boot, copy the running image into the inactive slot and switch
 # otadata to it. Never enabled in a release build. See fw::ota_update.
@@ -34,6 +41,7 @@ esp-hal           = { version = "1.1.1", features = ["esp32c3", "unstable"] }
 esp-rtos          = { version = "0.3.0", features = ["esp32c3", "embassy", "esp-radio", "esp-alloc"] }
 embedded-hal-async = "1.0.0"
 embedded-hal       = "1.0.0"
+critical-section   = "1.2.0"
 # Marigold fork based exactly on the proven #210 revision, adding allocation-
 # free VFAT long-name creation/deletion. Do not update to newer upstream SD
 # driver rewrites: they fail cold card init on the X4 (July 4 2026).

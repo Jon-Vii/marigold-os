@@ -18,7 +18,7 @@ flowchart TD
     input_task["input_task<br/>debounce + classify buttons"]
     app_task["app_task<br/>owns ReaderState reducer shell"]
     display_task["board I/O + display task<br/>single owner of EPD bus, SD CS,<br/>ReaderStore, framebuffer"]
-    power_task["power_task<br/>idle timer + deep sleep"]
+    power_task["power_task<br/>idle timer + deep sleep<br/>(light sleep: fw::light_sleep idle hook)"]
     wifi_task["wifi_task<br/>wireless session + browser shelf"]
 
     app_core["app-core<br/>Copy message contracts<br/>ReaderState reducer<br/>RefreshPlanner"]
@@ -132,6 +132,7 @@ input_task
 power_task
   observes activity and display-settled events
   asks display_task to sleep the panel, then enters ESP32-C3 deep sleep
+  (light sleep between turns is the esp-rtos idle hook, not this task)
 
 wifi_task
   parked until SyncCommand::Start arrives from the Wireless screen
@@ -212,10 +213,33 @@ under host tests; the wifi task only owns sockets.
 
 Embassy handles cooperative waits. ADC retry delays, button polling, SPI DMA
 transfers, BUSY waits, and sleep windows all yield instead of spinning. The
-real battery saving comes after the display settles: the power task asks the
-display task to draw a visible sleep screen and power down the panel, then
-moves the ESP32-C3 into deep sleep. The power button requests this same sleep
-path rather than being treated as ordinary navigation input.
+power task's idle timeout and the power button lead to the deepest sleep: the
+power task asks the display task to draw a visible sleep screen and power down
+the panel, then moves the ESP32-C3 into deep sleep. The power button requests
+this sleep path rather than being treated as ordinary navigation input.
+
+Between page turns the chip light-sleeps (`fw::light_sleep`). esp-rtos runs an
+idle hook whenever no thread is ready; ours sleeps until the next timer is due
+instead of waiting with `wfi` at 160 MHz. Resting on a page, the chip is
+asleep about 97% of the time, which by the datasheet's figures is about 1 mA
+instead of about 20. On an X4 turning a page every 30 s off USB, the battery
+voltage fell 3 to 7 times slower with light sleep on than in the phases with it
+off before and after. RAM, registers and pad states survive; the
+clocks stop. A task with hardware work in flight holds the chip awake: the
+display task everywhere except its wait for the next command, the input task
+while it samples, a Wi-Fi session from start to reset, and the X3 gauge during
+an I2C read. Light sleep also stops the systimer behind `Instant::now()` and
+the TIMG0 alarm esp-rtos wakes on, so each sleep runs to that alarm's
+deadline, moves the systimer forward by the time the RTC clock counted, and
+fires the alarm at once; every embassy timer keeps wall-clock time.
+
+The Power button and Next on either ladder pull their lines to 0 V and end a
+sleep the moment they are pressed. The other ladder buttons sit too high to
+read as a digital low and are found by the input poll: every 15 ms for 10 s
+after a press, then every 40 ms. USB D+ is a wake source too: a computer's bus
+reset holds it low, and the chip stays awake for three seconds to enumerate.
+While a host keeps sending start-of-frame packets the chip does not sleep at
+all, so flashing and the serial console work as before.
 
 Input/render backpressure is coalesced on purpose. The app keeps at most one
 display render in flight. While the display is refreshing, new button events

@@ -69,6 +69,8 @@ pub async fn run(spawner: Spawner, wifi: WIFI<'static>) {
             SyncCommand::Exit => {}
         }
     }
+    // The radio needs the chip awake; the session ends in a reset.
+    crate::light_sleep::hold(crate::light_sleep::Hold::Wifi);
 
     // The loan request runs through the storage queue so it serializes
     // behind any in-flight SD work, then the memory comes back to us.

@@ -194,7 +194,10 @@ pub async fn run(
                 Either::Second(()) => pending_reader.take().map(Either::Second),
             }
         } else if let Some(due) = wake {
-            match select(
+            // Nothing is in flight on the bus or the panel; the chip may
+            // sleep until the next command or the deadline.
+            crate::light_sleep::release(crate::light_sleep::Hold::Display);
+            let incoming = match select(
                 select(DISPLAY_COMMANDS.receive(), STORAGE_COMMANDS.receive()),
                 embassy_time::Timer::at(due),
             )
@@ -202,9 +205,14 @@ pub async fn run(
             {
                 Either::First(command) => Some(command),
                 Either::Second(()) => None,
-            }
+            };
+            crate::light_sleep::hold(crate::light_sleep::Hold::Display);
+            incoming
         } else {
-            Some(select(DISPLAY_COMMANDS.receive(), STORAGE_COMMANDS.receive()).await)
+            crate::light_sleep::release(crate::light_sleep::Hold::Display);
+            let incoming = select(DISPLAY_COMMANDS.receive(), STORAGE_COMMANDS.receive()).await;
+            crate::light_sleep::hold(crate::light_sleep::Hold::Display);
+            Some(incoming)
         };
         let Some(incoming) = incoming else {
             let now = Instant::now();
@@ -260,6 +268,8 @@ pub async fn run(
         idle.rearm(IDLE_PREPARATION_DELAY);
         match incoming {
             Either::First(DisplayCommand::Render(request)) => {
+                #[cfg(feature = "bench-serial")]
+                crate::light_sleep::trace::command(request.view);
                 if pending_reader.is_some_and(|command| !pending_reader_matches(command, request)) {
                     pending_reader = None;
                 }

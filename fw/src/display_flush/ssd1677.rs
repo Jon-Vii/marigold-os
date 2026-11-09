@@ -166,9 +166,13 @@ async fn refresh(
         .await?;
     epd.command(CMD_DISPLAY_UPDATE_CTRL2, &[sequence]).await?;
     epd.command(CMD_MASTER_ACTIVATION, &[]).await?;
+    #[cfg(feature = "bench-serial")]
+    crate::light_sleep::trace::activate();
     let start = Instant::now();
     epd.wait_ready().await?;
     let elapsed = start.elapsed();
+    #[cfg(feature = "bench-serial")]
+    crate::light_sleep::trace::refresh(elapsed.as_millis());
     esp_println::println!("display: refresh busy {} ms", elapsed.as_millis());
     esp_println::println!(
         "bench: refresh mode={:?} busy_ms={} screen_on={} quick_frames={}",
