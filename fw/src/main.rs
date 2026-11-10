@@ -64,21 +64,17 @@ const fn descriptor_version(version: &str) -> [u8; 32] {
 
 /// What follows a panic, after esp-backtrace has printed the trace. A device
 /// in someone's hand must not sit halted with the CPU running and no
-/// watchdog until the battery is flat, so release builds give the trace two
-/// seconds to drain over USB and then reboot into the reader. Bench builds
-/// halt instead, keeping the evidence on the console.
+/// watchdog until the battery is flat, so it gives the trace two seconds to
+/// drain over USB and then reboots into the reader. Bench builds also keep
+/// the panic's stack words in RTC memory (see `crumbs`), since a device off
+/// USB prints its trace to nobody.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 extern "Rust" fn custom_halt() -> ! {
     #[cfg(feature = "bench-serial")]
-    loop {
-        core::hint::spin_loop();
-    }
-    #[cfg(not(feature = "bench-serial"))]
-    {
-        esp_hal::delay::Delay::new().delay_millis(2_000);
-        esp_hal::system::software_reset()
-    }
+    crumbs::panicked();
+    esp_hal::delay::Delay::new().delay_millis(2_000);
+    esp_hal::system::software_reset()
 }
 
 // The only allocator user is the Wi-Fi sync session; reader paths stay
@@ -114,11 +110,14 @@ use tasks::input::InputPins;
 mod block_sink;
 mod book_images;
 pub mod catalog;
+#[cfg(feature = "bench-serial")]
+mod crumbs;
 mod custom_font;
 mod display_flush;
 mod firmware_files;
 mod image_decode;
 mod library_sd;
+mod light_sleep;
 mod line_window;
 mod next_page;
 mod ota_update;
@@ -284,10 +283,19 @@ fn main() -> ! {
     #[cfg_attr(feature = "device-x3", allow(unused_mut))]
     let mut peripherals = esp_hal::init(config);
     esp_println::println!("xteink-x4-os: boot");
+    #[cfg(feature = "bench-serial")]
+    {
+        crumbs::boot();
+        crumbs::start_watchdog();
+    }
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let sw_ints = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
-    esp_rtos::start(timg0.timer0, sw_ints.software_interrupt0);
+    esp_rtos::start_with_idle_hook(
+        timg0.timer0,
+        sw_ints.software_interrupt0,
+        light_sleep::idle_hook,
+    );
 
     // Before the display SPI bus takes these pins: the read needs the data
     // line as an input.
@@ -425,6 +433,12 @@ fn main() -> ! {
         spawner.spawn(tasks::display::run(epd_bus, sd_cs, epub_scratch).unwrap());
         esp_println::println!("main: spawn power");
         spawner.spawn(tasks::power::run(peripherals.LPWR).unwrap());
+        #[cfg(feature = "bench-serial")]
+        spawner.spawn(tasks::power::report_light_sleep().unwrap());
+        #[cfg(feature = "bench-serial")]
+        spawner.spawn(crumbs::heartbeat().unwrap());
+        #[cfg(feature = "bench-unplug")]
+        spawner.spawn(tasks::bench_unplug::run().unwrap());
         esp_println::println!("main: spawn app");
         spawner.spawn(tasks::app::run().unwrap());
         esp_println::println!("main: spawn wifi");

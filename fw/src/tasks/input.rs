@@ -1,4 +1,6 @@
+use crate::light_sleep::{self, Hold};
 use crate::{Button, InputEvent, INPUT_EVENTS};
+use embassy_futures::select::select;
 use embassy_time::{Instant, Timer};
 use esp_hal::analog::adc::{Adc, AdcCalCurve, AdcCalScheme, AdcPin};
 use esp_hal::gpio::Input;
@@ -20,6 +22,14 @@ pub type BatteryGauge =
 // 15 ms polling; the tick-based constants below are scaled to keep their
 // wall-clock behavior.
 const POLL_MS: u64 = 15;
+// Once no button has been down for ACTIVE_MS the poll slows to
+// IDLE_POLL_MS, and the chip light-sleeps between polls (see
+// crate::light_sleep). Next on either ladder and the Power button wake the
+// chip the moment they go low, so only the buttons that sit higher on the
+// ladders wait for a slow poll. A press brings back 15 ms polling before
+// any tick-counted debounce or repeat starts.
+const ACTIVE_MS: u64 = 10_000;
+const IDLE_POLL_MS: u64 = 40;
 const CALIBRATION_ONLY: bool = false;
 const RAW_LOG_ENABLED: bool = false;
 const DEBOUNCE_TICKS: u8 = 2;
@@ -160,11 +170,31 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
     let mut raw_log_ticks = 0u8;
     let mut reported_percent: Option<u8> = None;
     let mut battery_seeded = false;
+    let mut last_active = Instant::now();
 
     loop {
-        Timer::after_millis(POLL_MS).await;
+        let poll_ms =
+            if light_sleep::sleep_switched_off() || last_active.elapsed().as_millis() < ACTIVE_MS {
+                POLL_MS
+            } else {
+                IDLE_POLL_MS
+            };
+        // Sampling runs the ADC, so the chip may only sleep while this
+        // task waits for its next poll.
+        light_sleep::BUTTON_WAKE.reset();
+        light_sleep::release(Hold::Input);
+        select(
+            Timer::after_millis(poll_ms),
+            light_sleep::BUTTON_WAKE.wait(),
+        )
+        .await;
+        light_sleep::hold(Hold::Input);
+        #[cfg(feature = "bench-serial")]
+        crate::crumbs::feed();
 
         let (battery_mv, raw_percent, aux) = read_power(&mut adc, &mut pins).await;
+        #[cfg(feature = "bench-unplug")]
+        crate::tasks::bench_unplug::battery_sample(battery_mv);
         let sample = RawSample {
             aux,
             nav: read_adc(&mut adc, &mut pins.nav_pin).await,
@@ -185,6 +215,13 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
 
         if CALIBRATION_ONLY {
             continue;
+        }
+
+        if pins.power.is_low()
+            || classify(sample.nav, NAV).is_some()
+            || classify(sample.page, PAGE).is_some()
+        {
+            last_active = Instant::now();
         }
 
         let percent = stable_percent(&mut reported_percent, raw_percent);
@@ -265,7 +302,10 @@ async fn read_power(_adc: &mut BoardAdcDriver, _pins: &mut InputPins) -> (u16, u
 pub async fn battery_run(mut gauge: BatteryGauge) {
     let mut failures = 0u32;
     loop {
-        match gauge.read().await {
+        light_sleep::hold(Hold::Battery);
+        let reading = gauge.read().await;
+        light_sleep::release(Hold::Battery);
+        match reading {
             Ok((mv, percent)) => {
                 if failures > 0 {
                     esp_println::println!("battery: gauge recovered after {} failures", failures);
@@ -299,8 +339,10 @@ fn stable_percent(reported: &mut Option<u8>, raw: u8) -> u8 {
 }
 
 fn emit(button: Option<Button>, sample: RawSample, battery_mv: u16, battery_percent: u8) {
-    if button.is_some() {
+    if let Some(_button) = button {
         crate::note_button_press();
+        #[cfg(feature = "bench-serial")]
+        light_sleep::trace::press(_button, false);
     }
     let event = InputEvent::Sample {
         button,

@@ -261,7 +261,11 @@ async fn power_on(epd: &mut Epd) -> Result<(), PanelError> {
 async fn display_refresh(epd: &mut Epd, mode: RefreshMode) -> Result<(), PanelError> {
     let start = Instant::now();
     epd.command(CMD_DISPLAY_REFRESH, &[]).await?;
+    #[cfg(feature = "bench-serial")]
+    crate::light_sleep::trace::activate();
     let (low, ms) = epd.wait_two_phase().await?;
+    #[cfg(feature = "bench-serial")]
+    crate::light_sleep::trace::refresh(ms);
     esp_println::println!(
         "display: x3 DRF busy_low={} {}ms level_high={:?}",
         low,

@@ -56,17 +56,44 @@ pub async fn run(usb: USB_DEVICE<'static>) {
     // Use only RX. esp-println retains its existing USB TX logging path.
     let mut serial = UsbSerialJtag::new(usb);
     esp_println::println!("bench: serial_ready commands=onpbsf timer_wake_ms=2000");
+    // A host tty opened with echo still on (a fresh ttyACM after the device
+    // re-enumerates, before the host sets raw mode) sends the device's own
+    // log lines back, and their letters include command keys. Real commands
+    // come one byte at a time, so a batch holding any byte that is not a
+    // command is an echo: drop it whole and ignore input for a while after.
+    let mut quarantine_until = Instant::now();
     loop {
         // Bound interrupt-executor work even if the host floods USB input.
-        for _ in 0..8 {
-            let command = match serial.read_byte() {
-                Ok(command) => command,
+        let mut batch = [0u8; 8];
+        let mut len = 0;
+        while len < batch.len() {
+            match serial.read_byte() {
+                Ok(byte) => {
+                    batch[len] = byte;
+                    len += 1;
+                }
                 Err(nb::Error::WouldBlock) => break,
                 Err(nb::Error::Other(_)) => {
                     esp_println::println!("bench: serial_error operation=read");
                     break;
                 }
-            };
+            }
+        }
+        let batch = &batch[..len];
+        let echo = batch.iter().any(|&byte| {
+            !byte.is_ascii_whitespace() && byte != b'f' && command_button(byte).is_none()
+        });
+        if echo {
+            quarantine_until = Instant::now() + embassy_time::Duration::from_millis(500);
+        }
+        if echo || Instant::now() < quarantine_until {
+            if len > 0 {
+                esp_println::println!("bench: serial_echo_dropped bytes={}", len);
+            }
+            Timer::after_millis(10).await;
+            continue;
+        }
+        for &command in batch {
             if command.is_ascii_whitespace() {
                 continue;
             }
@@ -83,6 +110,7 @@ pub async fn run(usb: USB_DEVICE<'static>) {
                 "queue_full"
             } else {
                 crate::note_button_press();
+                crate::light_sleep::trace::press(button, true);
                 // InputEvent::button uses the host-test battery sample (77%).
                 // Identify injected input explicitly in timing/battery traces.
                 esp_println::println!(
@@ -100,6 +128,13 @@ pub async fn run(usb: USB_DEVICE<'static>) {
                 Instant::now().as_millis()
             );
         }
-        Timer::after_millis(10).await;
+        // Unplugged, nothing can arrive; poll slowly so these wakes don't
+        // swamp a light-sleep measurement.
+        let idle_ms = if crate::light_sleep::usb_host_seen() {
+            10
+        } else {
+            250
+        };
+        Timer::after_millis(idle_ms).await;
     }
 }

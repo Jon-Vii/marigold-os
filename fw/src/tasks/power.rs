@@ -83,6 +83,7 @@ async fn enter_sleep(rtc: &mut Rtc<'_>) {
                     let gpio = RtcioWakeupSource::new(&mut pins);
                     let timer = TimerWakeupSource::new(core::time::Duration::from_secs(2));
                     esp_println::println!("bench: serial_sleep timer_wake_ms=2000 gpio=3");
+                    crate::crumbs::stop_watchdog();
                     rtc.sleep_deep(&[&gpio, &timer]);
                 }
                 #[cfg(not(feature = "bench-serial"))]
@@ -104,4 +105,23 @@ async fn enter_sleep(rtc: &mut Rtc<'_>) {
 #[allow(unsafe_code)]
 fn steal_wake_button() -> GPIO3<'static> {
     unsafe { GPIO3::steal() }
+}
+
+/// Bench builds only: logs how much of the uptime went to light sleep, and
+/// the presses made since the last report.
+#[cfg(feature = "bench-serial")]
+#[embassy_executor::task]
+pub async fn report_light_sleep() {
+    loop {
+        Timer::after_secs(30).await;
+        let (slept_us, sleeps) = crate::light_sleep::stats();
+        esp_println::println!(
+            "bench: light_sleep slept_ms={} sleeps={} uptime_ms={}",
+            slept_us / 1000,
+            sleeps,
+            Instant::now().as_millis(),
+        );
+        crate::light_sleep::trace::print_pending();
+        crate::crumbs::print_previous();
+    }
 }
