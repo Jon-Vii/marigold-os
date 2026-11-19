@@ -15,7 +15,15 @@ const POST_OPEN_CONFIRM_BLOCK_MS: u64 = 700;
 pub async fn run() {
     esp_println::println!("app: started");
     let ctx = reducer_context();
-    let mut state = ReaderState::boot();
+    // A wake from a sleep that began on a reading page goes back to that
+    // page: the restored position opens the book as Home's continue key
+    // would, and the first paint is the page.
+    let wake_into_reading = crate::wake_mark::at_boot().is_some_and(|screen| screen.reading);
+    let mut state = if wake_into_reading {
+        ReaderState::boot_into_reading()
+    } else {
+        ReaderState::boot()
+    };
     // Compile-time dev credentials name the network immediately; the
     // display task's boot probe of /XTEINK/WIFI.BIN arrives later and
     // overrides, matching the wifi task's stored-beats-built-in order.
@@ -53,6 +61,11 @@ pub async fn run() {
     // terminal, wake is a full reboot. Before that, this cold-boot path never
     // showed: the real book stayed resident.
     let mut boot_render_pending = true;
+    // The wake's open is in flight; its page is the first paint.
+    let mut resuming = false;
+    // The sleep screen is up and the power task is in standby or on its way
+    // to deep sleep. The Power button wakes the reader where it was.
+    let mut asleep = false;
     let mut next_page = NextPageOffer::new();
     if STORAGE_COMMANDS
         .try_send(StorageCommand::LoadCatalogCache)
@@ -69,6 +82,7 @@ pub async fn run() {
             ctx,
             !rendering
                 && !render_pending
+                && !asleep
                 && pending_storage.is_none()
                 && opening_book.is_none()
                 && !suppress_input_until_open_settled
@@ -97,13 +111,29 @@ pub async fn run() {
                     opening_book = None;
                 }
             }
-            let should_render = if boot_render_pending {
+            let should_render = if boot_render_pending && !resuming {
                 library_event_allows_first_render(&event)
             } else {
                 library_event_affects_view(&state, &event)
             };
+            let previous = state;
             let previous_persisted = state.persisted();
             state = state.apply_library_event(ctx, event);
+            // Only a wake into reading enters Reading from a library event:
+            // open the book, and paint once its page is loaded.
+            let mut awaiting_reader_data = false;
+            if previous.view != AppView::Reading && state.view == AppView::Reading {
+                if let Some(command) = storage_command_for_transition(&previous, &state) {
+                    awaiting_reader_data = dispatch_storage(
+                        command,
+                        &mut pending_storage,
+                        &mut opening_book,
+                        &mut suppress_input_until_open_settled,
+                        &mut unresolved_position,
+                    );
+                    resuming = awaiting_reader_data;
+                }
+            }
             let resolved_position = resolve_open_position(&event, &state, &mut unresolved_position);
             if matches!(
                 event,
@@ -116,9 +146,10 @@ pub async fn run() {
                     &mut pending_progress,
                 );
             }
-            if !should_render {
+            if !should_render || awaiting_reader_data {
                 continue;
             }
+            resuming = false;
             if rendering {
                 render_pending = true;
             } else {
@@ -153,11 +184,29 @@ pub async fn run() {
                         ..
                     }
                 ) {
+                    if core::mem::take(&mut asleep) {
+                        // Standby: the chip never went down, so the reader
+                        // state is whole. Activity ends the power task's
+                        // standby, and the view the reader left is painted
+                        // over the sleep screen.
+                        esp_println::println!("app: wake requested");
+                        state = state.apply_input(ctx, event);
+                        let _ = POWER_EVENTS.send(PowerEvent::Activity).await;
+                        send_render(
+                            first_render_kind(&mut boot_render_pending),
+                            &state,
+                            &mut next_page,
+                        )
+                        .await;
+                        rendering = true;
+                        render_pending = false;
+                        continue;
+                    }
                     // Hand off to the power task, which drives the display to its
-                    // sleep image and then deep-sleeps the SoC with the Power
-                    // button armed as the wake source. Waking is a fresh boot
-                    // (deep sleep is terminal), so there is no in-app "asleep"
-                    // state to toggle back out of here.
+                    // sleep image, rests in standby, and then deep-sleeps the
+                    // SoC with the Power button armed as the wake source.
+                    // Waking from deep sleep is a fresh boot; a wake from
+                    // standby comes back through the branch above.
                     esp_println::println!("app: sleep requested");
                     next_reader_request_id();
                     state.pending_page = None;
@@ -195,6 +244,7 @@ pub async fn run() {
                 }
 
                 let _ = POWER_EVENTS.try_send(PowerEvent::Activity);
+                asleep = false;
                 let previous = state;
                 let previous_persisted = state.persisted();
                 state = state.apply_input(ctx, event);
@@ -235,34 +285,13 @@ pub async fn run() {
                 // still needs a render's Settled event to drain pending_storage.
                 let mut awaiting_reader_data = false;
                 if let Some(command) = storage_command {
-                    if let Some(book_id) = provisional_position_book_id(command) {
-                        unresolved_position = Some(book_id);
-                    }
-                    if should_send_storage_immediately(command) {
-                        log_storage_command("send", command);
-                        if let Some(book_id) = open_book_id(command) {
-                            opening_book = Some(book_id);
-                            suppress_input_until_open_settled = true;
-                        }
-                        if STORAGE_COMMANDS.try_send(command).is_err() {
-                            log_storage_command("queue", command);
-                            pending_storage = Some(command);
-                        } else if matches!(
-                            command,
-                            StorageCommand::OpenBook { .. }
-                                | StorageCommand::LoadChapters { .. }
-                                | StorageCommand::ExtendSection { .. }
-                        ) {
-                            awaiting_reader_data = true;
-                        }
-                    } else {
-                        log_storage_command("queue", command);
-                        if let Some(book_id) = open_book_id(command) {
-                            opening_book = Some(book_id);
-                            suppress_input_until_open_settled = true;
-                        }
-                        pending_storage = Some(command);
-                    }
+                    awaiting_reader_data = dispatch_storage(
+                        command,
+                        &mut pending_storage,
+                        &mut opening_book,
+                        &mut suppress_input_until_open_settled,
+                        &mut unresolved_position,
+                    );
                 }
                 if previous_persisted != next_persisted
                     && unresolved_position != Some(state.book_id)
@@ -351,6 +380,7 @@ pub async fn run() {
                 }
                 DisplayEvent::Asleep => {
                     esp_println::println!("app: display asleep");
+                    asleep = true;
                     rendering = false;
                     render_pending = false;
                     opening_book = None;
@@ -386,6 +416,42 @@ pub async fn run() {
             }
         }
     }
+}
+
+/// Hand a reader command to the display task, or park it for the next
+/// Settled when it must wait or the queue is full. True when the command
+/// went out and its completion event will bring the render.
+fn dispatch_storage(
+    command: StorageCommand,
+    pending_storage: &mut Option<StorageCommand>,
+    opening_book: &mut Option<u32>,
+    suppress_input_until_open_settled: &mut bool,
+    unresolved_position: &mut Option<u32>,
+) -> bool {
+    if let Some(book_id) = provisional_position_book_id(command) {
+        *unresolved_position = Some(book_id);
+    }
+    let send_now = should_send_storage_immediately(command);
+    log_storage_command(if send_now { "send" } else { "queue" }, command);
+    if let Some(book_id) = open_book_id(command) {
+        *opening_book = Some(book_id);
+        *suppress_input_until_open_settled = true;
+    }
+    if !send_now {
+        *pending_storage = Some(command);
+        return false;
+    }
+    if STORAGE_COMMANDS.try_send(command).is_err() {
+        log_storage_command("queue", command);
+        *pending_storage = Some(command);
+        return false;
+    }
+    matches!(
+        command,
+        StorageCommand::OpenBook { .. }
+            | StorageCommand::LoadChapters { .. }
+            | StorageCommand::ExtendSection { .. }
+    )
 }
 
 /// The first paint after boot uses `RenderKind::Boot`, a full refresh that

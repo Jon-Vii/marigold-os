@@ -30,6 +30,11 @@ const POLL_MS: u64 = 15;
 // any tick-counted debounce or repeat starts.
 const ACTIVE_MS: u64 = 10_000;
 const IDLE_POLL_MS: u64 = 40;
+// In standby (the sleep screen is up, deep sleep has not begun) only the
+// Power button is listened to. Pressing it ends the chip's light sleep at
+// once, so while the chip is sleeping between polls they can be far apart.
+// A chip kept awake (by a USB host) polls at the idle rate instead.
+const STANDBY_POLL_MS: u64 = 2_000;
 const CALIBRATION_ONLY: bool = false;
 const RAW_LOG_ENABLED: bool = false;
 const DEBOUNCE_TICKS: u8 = 2;
@@ -171,14 +176,28 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
     let mut reported_percent: Option<u8> = None;
     let mut battery_seeded = false;
     let mut last_active = Instant::now();
+    let mut was_standby = false;
+    let mut standby_sleeps = 0;
 
     loop {
-        let poll_ms =
-            if light_sleep::sleep_switched_off() || last_active.elapsed().as_millis() < ACTIVE_MS {
+        let standby = light_sleep::standby();
+        let poll_ms = if standby {
+            let (_, sleeps) = light_sleep::stats();
+            let slept_since_last_poll = core::mem::replace(&mut standby_sleeps, sleeps) != sleeps;
+            // A press being debounced keeps the fast poll.
+            if power_ticks > 0 || pins.power.is_low() {
                 POLL_MS
+            } else if slept_since_last_poll {
+                STANDBY_POLL_MS
             } else {
                 IDLE_POLL_MS
-            };
+            }
+        } else if light_sleep::sleep_switched_off() || last_active.elapsed().as_millis() < ACTIVE_MS
+        {
+            POLL_MS
+        } else {
+            IDLE_POLL_MS
+        };
         // Sampling runs the ADC, so the chip may only sleep while this
         // task waits for its next poll.
         light_sleep::BUTTON_WAKE.reset();
@@ -191,6 +210,35 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
         light_sleep::hold(Hold::Input);
         #[cfg(feature = "bench-serial")]
         crate::crumbs::feed();
+
+        if standby {
+            // The ladders are not read: nothing but Power wakes the reader,
+            // and the ADC stays off. A press of Power is reported with a
+            // fresh battery reading, since the wake paints it.
+            was_standby = true;
+            let power_pressed = debounce_active_low(pins.power.is_low(), &mut power_ticks);
+            if power_pressed && !last_power {
+                let (battery_mv, raw_percent, aux) = read_power(&mut adc, &mut pins).await;
+                let sample = RawSample {
+                    aux,
+                    nav: read_adc(&mut adc, &mut pins.nav_pin).await,
+                    page: read_adc(&mut adc, &mut pins.page_pin).await,
+                };
+                reported_percent = None;
+                let percent = stable_percent(&mut reported_percent, raw_percent);
+                emit(Some(Button::Power), sample, battery_mv, percent);
+                log_input(Some(Button::Power), sample);
+            }
+            last_power = power_pressed;
+            continue;
+        }
+        if core::mem::take(&mut was_standby) {
+            // Back from standby: a ladder button held through the wake is
+            // not a press, and the buttons get the fast poll again.
+            nav_stable = StableButton::new();
+            page_stable = StableButton::new();
+            last_active = Instant::now();
+        }
 
         let (battery_mv, raw_percent, aux) = read_power(&mut adc, &mut pins).await;
         #[cfg(feature = "bench-unplug")]

@@ -11,6 +11,45 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 /// so this only fires if that task is stuck; deep sleep then still happens
 /// instead of leaving the device awake until the battery dies.
 const SLEEP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long a sleep rests in standby before deep sleep. In standby the
+/// sleep screen is up and the panel is powered down, as in deep sleep, but
+/// the chip only light-sleeps with the Power button as its one wake source,
+/// so a reader who picks the device up again finds it where they left it
+/// after one page turn's refresh instead of a reboot. Light sleep draws
+/// more than deep sleep (on the order of a milliamp against microamps), so
+/// the window is bounded: an hour of it costs a fraction of a percent of
+/// the battery, and a reader put down for the night still spends the night
+/// in deep sleep.
+#[cfg(not(feature = "bench-serial"))]
+const STANDBY: Duration = Duration::from_secs(3600);
+/// Past this long since boot a sleep skips standby, so the wake is a boot.
+/// The panel's temperature is read at boot and sets the length of a page
+/// turn; waking from standby time after time would let one reading stand
+/// for a whole day of carrying the reader between rooms and weather.
+const STANDBY_UPTIME_LIMIT: Duration = Duration::from_secs(3 * 3600);
+/// Bench builds go straight to deep sleep, which their timer wake makes
+/// unattended, unless `MARIGOLD_STANDBY_SECS` gave a window at build time.
+#[cfg(feature = "bench-serial")]
+const STANDBY: Duration = Duration::from_secs(parse_secs(option_env!("MARIGOLD_STANDBY_SECS")));
+
+#[cfg(feature = "bench-serial")]
+const fn parse_secs(text: Option<&str>) -> u64 {
+    let Some(text) = text else {
+        return 0;
+    };
+    let bytes = text.as_bytes();
+    let mut secs = 0u64;
+    let mut index = 0;
+    while index < bytes.len() {
+        assert!(
+            bytes[index].is_ascii_digit(),
+            "MARIGOLD_STANDBY_SECS must be a whole number of seconds"
+        );
+        secs = secs * 10 + (bytes[index] - b'0') as u64;
+        index += 1;
+    }
+    secs
+}
 
 #[embassy_executor::task]
 pub async fn run(lpwr: LPWR<'static>) {
@@ -44,57 +83,82 @@ pub async fn run(lpwr: LPWR<'static>) {
 }
 
 /// Renders the sleep screen, lets the display flush in-flight work and any
-/// pending reading progress, then powers the SoC down into deep sleep with the
-/// Power button as the wake source.
+/// pending reading progress, rests in standby, then powers the SoC down
+/// into deep sleep with the Power button as the wake source.
 ///
-/// Deep sleep is terminal — the chip reboots on wake — so this only returns if
-/// a button press arrives during the display handshake and aborts the
-/// transition. Waiting for `DisplayAsleep` lets the display write pending
-/// progress and paint its sleep image first; it answers even when either of
-/// those fails.
+/// Deep sleep is terminal — the chip reboots on wake — so this only returns
+/// if a button press arrives first: during the display handshake, which
+/// aborts the transition, or in standby, which the Power button ends.
+/// Waiting for `DisplayAsleep` lets the display write pending progress and
+/// paint its sleep image first; it answers even when either of those fails.
 async fn enter_sleep(rtc: &mut Rtc<'_>) {
     esp_println::println!("power: display sleep");
     DISPLAY_COMMANDS.send(DisplayCommand::Sleep).await;
-    let deadline = Instant::now() + SLEEP_HANDSHAKE_TIMEOUT;
+    let mut deadline = Instant::now() + SLEEP_HANDSHAKE_TIMEOUT;
+    let mut standing_by = false;
 
     loop {
         let event = match select(POWER_EVENTS.receive(), Timer::at(deadline)).await {
             Either::First(event) => event,
+            Either::Second(()) if standing_by => {
+                esp_println::println!("power: standby over");
+                deep_sleep(rtc)
+            }
             Either::Second(()) => {
                 esp_println::println!("power: display did not answer sleep; sleeping anyway");
                 // Whatever the panel shows now, it isn't a finished sleep
                 // screen; wake must not trust an older mark.
-                crate::wake_mark::set(false);
-                PowerEvent::DisplayAsleep
+                crate::wake_mark::set(None);
+                deep_sleep(rtc)
             }
         };
         match event {
             PowerEvent::DisplayAsleep => {
-                esp_println::println!("power: deep sleep");
-                let mut button = steal_wake_button();
-                #[cfg(feature = "bench-serial")]
+                if STANDBY.as_ticks() == 0
+                    || !crate::light_sleep::standby_allowed()
+                    || Instant::now().as_ticks() > STANDBY_UPTIME_LIMIT.as_ticks()
                 {
-                    use esp_hal::gpio::RtcPinWithResistors;
-                    use esp_hal::rtc_cntl::sleep::{
-                        RtcioWakeupSource, TimerWakeupSource, WakeupLevel,
-                    };
-                    let mut pins: [(&mut dyn RtcPinWithResistors, WakeupLevel); 1] =
-                        [(&mut button, WakeupLevel::Low)];
-                    let gpio = RtcioWakeupSource::new(&mut pins);
-                    let timer = TimerWakeupSource::new(core::time::Duration::from_secs(2));
-                    esp_println::println!("bench: serial_sleep timer_wake_ms=2000 gpio=3");
-                    crate::crumbs::stop_watchdog();
-                    rtc.sleep_deep(&[&gpio, &timer]);
+                    deep_sleep(rtc);
                 }
-                #[cfg(not(feature = "bench-serial"))]
-                hal_ext::rtc::enter_deep_sleep_button(rtc, &mut button);
+                esp_println::println!("bench: standby secs={}", STANDBY.as_secs());
+                crate::light_sleep::set_standby(true);
+                standing_by = true;
+                deadline = Instant::now() + STANDBY;
             }
-            PowerEvent::Activity => return,
+            PowerEvent::Activity => {
+                if standing_by {
+                    esp_println::println!(
+                        "bench: standby woken t_ms={}",
+                        Instant::now().as_millis()
+                    );
+                }
+                crate::light_sleep::set_standby(false);
+                return;
+            }
             // Outcomes of renders still in flight when sleep was requested;
             // they say nothing about the sleep transition itself.
             PowerEvent::DisplaySettled | PowerEvent::DisplayFailed | PowerEvent::SleepNow => {}
         }
     }
+}
+
+fn deep_sleep(rtc: &mut Rtc<'_>) -> ! {
+    esp_println::println!("power: deep sleep");
+    let mut button = steal_wake_button();
+    #[cfg(feature = "bench-serial")]
+    {
+        use esp_hal::gpio::RtcPinWithResistors;
+        use esp_hal::rtc_cntl::sleep::{RtcioWakeupSource, TimerWakeupSource, WakeupLevel};
+        let mut pins: [(&mut dyn RtcPinWithResistors, WakeupLevel); 1] =
+            [(&mut button, WakeupLevel::Low)];
+        let gpio = RtcioWakeupSource::new(&mut pins);
+        let timer = TimerWakeupSource::new(core::time::Duration::from_secs(2));
+        esp_println::println!("bench: serial_sleep timer_wake_ms=2000 gpio=3");
+        crate::crumbs::stop_watchdog();
+        rtc.sleep_deep(&[&gpio, &timer])
+    }
+    #[cfg(not(feature = "bench-serial"))]
+    hal_ext::rtc::enter_deep_sleep_button(rtc, &mut button)
 }
 
 /// Re-materialises the Power button (GPIO3) as a deep-sleep wake source.

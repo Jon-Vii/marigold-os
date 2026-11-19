@@ -57,6 +57,25 @@ pub fn release(holder: Hold) {
     HOLDS.fetch_and(!(holder as u8), Ordering::SeqCst);
 }
 
+/// Standby: the sleep screen is up and the panel is powered down, but the
+/// chip has not yet gone on to deep sleep (see `tasks::power`). Only the
+/// Power button is listened to, as in deep sleep.
+static STANDBY: portable_atomic::AtomicBool = portable_atomic::AtomicBool::new(false);
+
+pub fn set_standby(on: bool) {
+    STANDBY.store(on, Ordering::SeqCst);
+}
+
+pub fn standby() -> bool {
+    STANDBY.load(Ordering::SeqCst)
+}
+
+/// Whether a sleep may rest in standby before deep sleep. A Wi-Fi session
+/// holds the chip awake until its reset, so it goes straight down.
+pub fn standby_allowed() -> bool {
+    HOLDS.load(Ordering::SeqCst) & Hold::Wifi as u8 == 0
+}
+
 /// Raised after a sleep that a button ended, so the input task samples at
 /// once instead of at its next poll.
 pub static BUTTON_WAKE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
@@ -66,7 +85,6 @@ static SLEPT_US: AtomicU64 = AtomicU64::new(0);
 static SLEEPS: AtomicU32 = AtomicU32::new(0);
 
 /// `(microseconds slept, sleeps)` since boot.
-#[cfg_attr(not(feature = "bench-serial"), allow(dead_code))]
 pub fn stats() -> (u64, u32) {
     (
         SLEPT_US.load(Ordering::Relaxed),
@@ -96,6 +114,10 @@ const MAX_SLEEP_US: u64 = 60_000_000;
 const BUTTON_PINS: [usize; 3] = [1, 2, 3];
 const USB_DP_PIN: usize = 19;
 const WAKE_PINS: [usize; 4] = [1, 2, 3, USB_DP_PIN];
+/// In standby a ladder button must not wake the chip, or hold it awake
+/// while something in a bag leans on it.
+const POWER_PIN: [usize; 1] = [3];
+const STANDBY_WAKE_PINS: [usize; 2] = [3, USB_DP_PIN];
 /// How long a D+ wake keeps the chip up for the host to enumerate it; once
 /// it does, its start-of-frame traffic keeps the chip awake.
 const USB_ENUMERATION_US: u64 = 3_000_000;
@@ -186,9 +208,22 @@ pub fn sleep_switched_off() -> bool {
 fn active_wake_pins() -> &'static [usize] {
     #[cfg(feature = "bench-unplug")]
     if FAKE_UNPLUGGED.load(Ordering::Relaxed) {
-        return &BUTTON_PINS;
+        return wake_buttons();
     }
-    &WAKE_PINS
+    if standby() {
+        &STANDBY_WAKE_PINS
+    } else {
+        &WAKE_PINS
+    }
+}
+
+/// The buttons among the wake pins.
+fn wake_buttons() -> &'static [usize] {
+    if standby() {
+        &POWER_PIN
+    } else {
+        &BUTTON_PINS
+    }
 }
 
 /// Whether a USB host is attached, for bench code outside the idle hook.
@@ -238,7 +273,7 @@ fn sleep_once(rtc: &mut Rtc<'_>) -> bool {
     let rtc_after = rtc_now_us(rtc);
     let ticks_after = SystemTimer::unit_value(Unit::Unit0);
 
-    let button = pins_low(&BUTTON_PINS);
+    let button = pins_low(wake_buttons());
     let usb_bus = active_wake_pins().contains(&USB_DP_PIN)
         && (GPIO::regs().status().read().bits() & (1 << USB_DP_PIN) != 0
             || pins_low(&[USB_DP_PIN]));
