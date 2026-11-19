@@ -52,6 +52,10 @@ struct Expect {
     firmware_status: Option<String>,
     last_button: Option<String>,
     last_refresh: Option<String>,
+    /// The X3's last refresh where its panel runs another mode than the
+    /// planner asked for.
+    #[cfg_attr(not(feature = "device-x3"), allow(dead_code))]
+    last_refresh_x3: Option<String>,
     panel_sleeping: Option<bool>,
     history_contains: Option<String>,
     pending_storage: Option<String>,
@@ -196,7 +200,15 @@ impl Scenario {
                 ));
             }
         }
-        if let Some(last_refresh) = &self.expect.last_refresh {
+        #[cfg(feature = "device-x3")]
+        let last_refresh = self
+            .expect
+            .last_refresh_x3
+            .as_ref()
+            .or(self.expect.last_refresh.as_ref());
+        #[cfg(not(feature = "device-x3"))]
+        let last_refresh = self.expect.last_refresh.as_ref();
+        if let Some(last_refresh) = last_refresh {
             let expected = parse_refresh_mode(last_refresh)?;
             if emu.panel().last_refresh() != Some(expected) {
                 return Err(format!(

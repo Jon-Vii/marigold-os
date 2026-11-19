@@ -141,6 +141,11 @@ pub const fn update_control_2(mode: RefreshMode, screen_is_on: bool, turn_off: b
     }
     match mode {
         RefreshMode::Full => value | 0x34,
+        // A panel that is on carries the temperature its last update loaded.
+        // One just initialised has none, and without it the OTP load picks
+        // no page-turn waveform: the update powers up and ends at once,
+        // drawing nothing. Powering up therefore loads the temperature too.
+        RefreshMode::Fast if !screen_is_on => value | 0x3C,
         RefreshMode::Fast => value | 0x1C,
         // Load LUT (display mode 1) + display, deliberately without the
         // 0x20 load-temperature bit so the FAST_CLEAN_TEMPERATURE override

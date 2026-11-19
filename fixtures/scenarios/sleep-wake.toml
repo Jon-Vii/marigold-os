@@ -8,5 +8,8 @@ button = "Power"
 view = "Home"
 sleeping = false
 panel_sleeping = false
-last_refresh = "FastClean"
+# The sleep screen is still in the previous-frame buffer, so the wake is a
+# page turn. The X3's panel was powered down for the sleep and cleans instead.
+last_refresh = "Fast"
+last_refresh_x3 = "FastClean"
 history_contains = "deep_sleep"

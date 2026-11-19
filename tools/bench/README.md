@@ -160,7 +160,14 @@ another starting position and `--max-latency-ms` for a different panel budget.
 Alternating `np` inside one RAM section does not exercise section boundaries.
 
 The same feature adds a two-second timer wake alongside the Power wake source,
-so deep-sleep cycles can run unattended. It also runs an isolated custom-font
+so deep-sleep cycles can run unattended. Bench builds go straight to deep
+sleep for that reason, skipping the hour of standby a normal build rests in
+first. Set `MARIGOLD_STANDBY_SECS` when building to give one a standby
+window: `s` then sleeps the reader, a second `s` inside the window wakes it
+from standby (`bench: standby woken`), and after the window it deep-sleeps
+and the timer wakes it. A wake logs `bench: wake_frame held=...`, which says
+whether the first paint could be a page turn from the sleep screen. It also
+runs an isolated custom-font
 cache/read benchmark at boot using a temporary root-level `FNTBENCH.BIN`.
 Creation refuses an existing file; successful runs verify and remove their
 fixture. It doesn't change the selected font or reading settings. Inspect the

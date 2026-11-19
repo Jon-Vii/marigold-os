@@ -175,11 +175,12 @@ async fn refresh(
     crate::light_sleep::trace::refresh(elapsed.as_millis());
     esp_println::println!("display: refresh busy {} ms", elapsed.as_millis());
     esp_println::println!(
-        "bench: refresh mode={:?} busy_ms={} screen_on={} quick_frames={}",
+        "bench: refresh mode={:?} busy_ms={} screen_on={} quick_frames={} ctrl2={:#04x}",
         mode,
         elapsed.as_millis(),
         screen_on,
         quick_frames.unwrap_or(0),
+        sequence,
     );
     if mode == RefreshMode::FastClean {
         // Re-load the real sensor temperature so the next Fast partial

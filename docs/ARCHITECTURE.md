@@ -131,7 +131,8 @@ input_task
 
 power_task
   observes activity and display-settled events
-  asks display_task to sleep the panel, then enters ESP32-C3 deep sleep
+  asks display_task to sleep the panel, rests in standby for an hour, then
+  enters ESP32-C3 deep sleep
   (light sleep between turns is the esp-rtos idle hook, not this task)
 
 wifi_task
@@ -217,6 +218,25 @@ power task's idle timeout and the power button lead to the deepest sleep: the
 power task asks the display task to draw a visible sleep screen and power down
 the panel, then moves the ESP32-C3 into deep sleep. The power button requests
 this sleep path rather than being treated as ordinary navigation input.
+
+Deep sleep does not begin at once. With the sleep screen up and the panel
+powered down, the power task first rests in standby for an hour
+(`tasks::power::STANDBY`): the chip light-sleeps as it does between page
+turns, but with the Power button as its only wake source, as in deep sleep.
+The input task stops reading the ladders, so the ADC stays off and a button
+leaned on in a bag neither wakes the chip nor holds it awake. Nothing has
+been lost, so a Power press in standby paints the view the reader left over
+the sleep screen. The app task knows the display is asleep and treats that
+press as a wake, its `Activity` ends the power task's standby, and the
+previous-frame buffer still holds the sleep screen, so the paint is a page
+turn (see "Display model"). Light sleep draws more than deep sleep, on the
+order of a milliamp against microamps, which is why the window is bounded:
+an hour of it costs a fraction of a percent of the battery, and a reader
+put down for the night spends the night in deep sleep. A Wi-Fi session
+skips standby, since its radio holds the chip awake until the reset that
+ends it. So does a sleep more than three hours after boot: the panel
+temperature that sets the page turn's length is read at boot, and a wake
+that reboots reads it again.
 
 Between page turns the chip light-sleeps (`fw::light_sleep`). esp-rtos runs an
 idle hook whenever no thread is ready; ours sleeps until the next timer is due
@@ -344,11 +364,32 @@ reboot, so every wake reads it again.
 `RefreshMode::FastClean` sits between those two: a clean with one flicker. On
 the SSD1677 it runs the display-mode-1 waveform with the temperature register
 overridden to 90 C, which selects the hotter (shorter) OTP LUT. That cleans up
-ghosting in ~1.5 s at a small cost in contrast. Waking from the sleep screen
-and view/context changes use it instead of the full waveform, since the
-panel's contents are known. After a FastClean settles, the update sequence
-reloads the sensed temperature so later fast refreshes go back to
-sensor-accurate timing.
+ghosting in ~1.5 s at a small cost in contrast. Wherever a clean is due and
+the panel's contents are known, it runs instead of the full waveform. After a
+FastClean settles, the update sequence reloads the sensed temperature so
+later fast refreshes go back to sensor-accurate timing.
+
+A clean is due where ghosting has built up, and the planner counts the fast
+refreshes since the last one. A change of view (or of book) is where a
+flicker is expected, so it takes the clean once
+`DEFAULT_FULL_REFRESH_INTERVAL` (9) fast refreshes have built up; before
+that there is nothing to clean and the view changes like a page turn. A
+change of type settings or orientation always cleans.
+
+Waking needs no clean either: the sleep screen was painted with the full
+waveform and nothing has been drawn since. A fast refresh drives each pixel
+from the previous frame to the new one, so the wake only needs the sleep
+screen's pixels as that previous frame. In standby they are still in the
+previous-frame buffer. After deep sleep the buffer is gone, so the sleep
+path leaves a 30-bit digest of the frame in the wake mark, and the first
+render draws the sleep screen again from its own request and the restored
+store (`hold_woken_sleep_frame`). If that digests to the same value, it is
+the frame on the panel, and the first paint is a page turn with the panel's
+own waveform. If the state it was drawn from has moved (a chapter cursor
+that settled after the last paint, say), the digests differ and the paint
+takes the FastClean, which reads no previous frame. The X3's driver turns a
+fast refresh on a panel it has just powered up into its FastClean, so the
+X3 still wakes with one flicker.
 
 The X3's UC8253 has two RAM planes (DTM1 "old", DTM2 "new") instead of BW/RED,
 and its waveform LUTs are uploaded per refresh. Each `RefreshMode` therefore
@@ -360,14 +401,15 @@ default), `FullOnWake`, and `FullEveryTen` (shown as "clean every ten").
 Under `FullEveryTen`, once `DEFAULT_FULL_REFRESH_INTERVAL` (9) consecutive fast
 refreshes have built up, the refresh planner schedules a cleaning refresh
 (FastClean) for the tenth page instead of another fast one. Deep sleep reboots
-the chip, so the planner itself doesn't survive it. `fw::wake_mark` keeps the
-one fact that matters in the RTC STORE0 retention register (RTC fast memory is
-powered down in deep sleep). The display task sets it when the sleep screen
-finishes and consumes it at boot, trusting it only when the reset reason is a
-deep-sleep wake. A marked wake seeds the planner as if it had just slept, so
-the first paint takes FastClean; `FullOnWake` keeps the deep Full there. A
-cold boot, a reset for any other reason, or a sleep whose screen failed paints
-with Full.
+the chip, so the planner itself doesn't survive it. `fw::wake_mark` keeps
+what matters in the RTC STORE0 retention register (RTC fast memory is powered
+down in deep sleep): that the sleep screen is up, the digest of its pixels,
+and whether the reader slept on a reading page. The display task sets it when
+the sleep screen finishes and boot consumes it, trusting it only when the
+reset reason is a deep-sleep wake. A marked wake seeds the planner as if it
+had just slept, so the first paint is the page turn or FastClean described
+above; `FullOnWake` keeps the deep Full there. A cold boot, a reset for any
+other reason, or a sleep whose screen failed paints with Full.
 
 `display::epd::ssd1677` has three transform constants, as validated during
 bring-up: `MIRROR_X = true`, `MIRROR_Y = false`, and `REVERSE_BITS = true`.
@@ -1173,6 +1215,13 @@ resident furniture. Home shows a small battery percentage because it is a
 status surface. On the X4, GPIO0 is sampled as the current rough battery
 source, assuming a 2:1 divider and a simple 3300-4200 mV LiPo percentage
 curve. The X3 reads state of charge from its BQ27220 gauge.
+
+A reader who falls asleep on a page wakes on it. From standby the app state
+is whole and the Reading view is painted again. After deep sleep the wake
+mark says the sleep began on a reading page, the app task boots with
+`ReaderState::boot_into_reading`, and the restored position opens the book
+as Home's continue key would, so the first paint is the page. A sleep begun
+anywhere else, a cold boot, and a reset all land on Home.
 
 The current book may be the built-in fallback or the restored/last-selected
 microSD EPUB. Home triggers SD scan and state restore on first render, then
