@@ -1,11 +1,17 @@
-//! Light sleep between page turns.
+//! Light sleep in standby.
 //!
-//! A reader spends nearly all of its awake time waiting for the next press.
-//! Waiting used to be a `wfi` at 160 MHz with every clock running; this
-//! module replaces esp-rtos's idle hook so that, when no task needs the
-//! chip, it light-sleeps instead: RAM, registers and pad states stay put,
-//! the clocks and the PLL stop, and the chip resumes in place when the next
-//! timer is due or a wake button goes low.
+//! While the sleep screen is up but the chip has not gone to deep sleep yet
+//! (standby, see `tasks::power`), the chip light-sleeps between polls of the
+//! Power button instead of idling at 160 MHz: RAM, registers and pad states
+//! stay put, the clocks and the PLL stop, and the chip resumes in place when
+//! the Power button goes low or the USB cable is plugged in.
+//!
+//! Outside standby the idle hook waits with `wfi` only. The RTC main-timer
+//! alarm that would end a timer-bounded light sleep never fires from light
+//! sleep on this ESP32-C3 (measured on rev v0.4: the alarm fires while
+//! awake, but a light sleep armed with it as its wake source never wakes),
+//! so a sleep that waits for the next timer deadline would sleep until a
+//! button press — on battery, with nobody pressing, that is a lockup.
 //!
 //! Tasks that are mid-way through hardware work hold the chip awake (see
 //! [`Hold`]). The idle hook only runs when every thread is blocked, so
@@ -138,6 +144,15 @@ static USB_ENUMERATING_UNTIL_US: AtomicU64 = AtomicU64::new(0);
 /// esp-rtos idle hook: runs whenever no thread is ready. esp-rtos does not
 /// save the idle context, so every idle period re-enters this function from
 /// the top; anything that must outlive one idle period lives in a static.
+///
+/// Light sleep is only entered in standby, where the Power button (and a
+/// USB plug) are the only wake sources that matter. On this ESP32-C3 the
+/// RTC main-timer alarm never ends a light sleep — measured on rev v0.4
+/// with the raw register sequence as well as esp-hal's: the alarm fires
+/// while awake, but in light sleep the chip never wakes from it — so any
+/// sleep that waits on a timer deadline would sleep until a button press,
+/// which outside standby is a lockup. Everywhere else the hook waits with
+/// `wfi`, which any interrupt (the next TIMG0 alarm included) ends.
 pub extern "C" fn idle_hook() -> ! {
     // SAFETY: the RTC block is shared with the power task's `Rtc`, which
     // only uses it for the terminal deep sleep. Light sleep runs in a
@@ -148,6 +163,7 @@ pub extern "C" fn idle_hook() -> ! {
         let slept = HOLDS.load(Ordering::SeqCst) == 0
             && !sleep_switched_off()
             && !usb_keeps_awake(usb_host_attached())
+            && standby()
             && critical_section::with(|_| sleep_once(&mut rtc));
         if !slept {
             esp_hal::interrupt::wait_for_interrupt();
