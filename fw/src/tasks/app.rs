@@ -66,6 +66,10 @@ pub async fn run() {
     // The sleep screen is up and the power task is in standby or on its way
     // to deep sleep. The Power button wakes the reader where it was.
     let mut asleep = false;
+    // A Power press asked for sleep and the display's sleep render is still
+    // in flight; the screen is not asleep yet, but the transition must not
+    // be aborted by a stray button event from before the press.
+    let mut sleep_pending = false;
     let mut next_page = NextPageOffer::new();
     if STORAGE_COMMANDS
         .try_send(StorageCommand::LoadCatalogCache)
@@ -190,6 +194,7 @@ pub async fn run() {
                         // standby, and the view the reader left is painted
                         // over the sleep screen.
                         esp_println::println!("app: wake requested");
+                        sleep_pending = false;
                         state = state.apply_input(ctx, event);
                         let _ = POWER_EVENTS.send(PowerEvent::Activity).await;
                         send_render(
@@ -222,6 +227,17 @@ pub async fn run() {
                         STORAGE_COMMANDS.send(command).await;
                     }
                     let _ = POWER_EVENTS.send(PowerEvent::SleepNow).await;
+                    sleep_pending = true;
+                    continue;
+                }
+
+                if asleep || sleep_pending {
+                    // The sleep screen is up, or its render is still in
+                    // flight: as in standby and deep sleep, only the Power
+                    // button is heard. A ladder event queued from just
+                    // before the Power press must neither abort the sleep
+                    // transition nor wake the reader afterwards.
+                    esp_println::println!("app: input ignored while sleeping");
                     continue;
                 }
 
@@ -380,6 +396,7 @@ pub async fn run() {
                 }
                 DisplayEvent::Asleep => {
                     esp_println::println!("app: display asleep");
+                    sleep_pending = false;
                     asleep = true;
                     rendering = false;
                     render_pending = false;
