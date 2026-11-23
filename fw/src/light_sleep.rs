@@ -6,12 +6,15 @@
 //! stay put, the clocks and the PLL stop, and the chip resumes in place when
 //! the Power button goes low or the USB cable is plugged in.
 //!
-//! Outside standby the idle hook waits with `wfi` only. The RTC main-timer
-//! alarm that would end a timer-bounded light sleep never fires from light
-//! sleep on this ESP32-C3 (measured on rev v0.4: the alarm fires while
-//! awake, but a light sleep armed with it as its wake source never wakes),
-//! so a sleep that waits for the next timer deadline would sleep until a
-//! button press — on battery, with nobody pressing, that is a lockup.
+//! Outside standby the idle hook light-sleeps between page turns only on
+//! silicon where the RTC main-timer alarm reliably ends a light sleep (see
+//! [`timer_wake_reliable`]); on ESP32-C3 rev v0.4 it never fires from light
+//! sleep (measured: the alarm fires while awake, but a light sleep armed
+//! with it as its wake source never wakes), so a sleep that waits for the
+//! next timer deadline would sleep until a button press — on battery, with
+//! nobody pressing, that is a lockup. On such silicon the hook waits with
+//! `wfi` outside standby instead, which any interrupt (the next TIMG0
+//! alarm included) ends.
 //!
 //! Tasks that are mid-way through hardware work hold the chip awake (see
 //! [`Hold`]). The idle hook only runs when every thread is blocked, so
@@ -74,6 +77,18 @@ pub fn set_standby(on: bool) {
 
 pub fn standby() -> bool {
     STANDBY.load(Ordering::SeqCst)
+}
+
+/// Whether the RTC main-timer alarm reliably ends a light sleep on this
+/// silicon, so a timer-bounded sleep between page turns is safe. Measured
+/// broken on ESP32-C3 rev v0.4 (an X3): the alarm fires while awake, but a
+/// light sleep armed with it as its wake source never wakes — even the RTC
+/// watchdog does not fire during such a sleep, i.e. the RTC slow clock
+/// appears stalled in light sleep. Only rev v0.4 was measured; later
+/// revisions keep the between-page-turns sleep.
+fn timer_wake_reliable() -> bool {
+    let rev = esp_hal::efuse::chip_revision();
+    rev.major > 0 || rev.minor > 4
 }
 
 /// Whether a sleep may rest in standby before deep sleep. A Wi-Fi session
@@ -145,14 +160,15 @@ static USB_ENUMERATING_UNTIL_US: AtomicU64 = AtomicU64::new(0);
 /// save the idle context, so every idle period re-enters this function from
 /// the top; anything that must outlive one idle period lives in a static.
 ///
-/// Light sleep is only entered in standby, where the Power button (and a
-/// USB plug) are the only wake sources that matter. On this ESP32-C3 the
-/// RTC main-timer alarm never ends a light sleep — measured on rev v0.4
-/// with the raw register sequence as well as esp-hal's: the alarm fires
-/// while awake, but in light sleep the chip never wakes from it — so any
+/// Light sleep is always entered in standby, where the Power button (and a
+/// USB plug) are the only wake sources that matter. Outside standby it is
+/// entered only when [`timer_wake_reliable`] says the RTC main-timer alarm
+/// ends a light sleep on this silicon; on ESP32-C3 rev v0.4 it never does
+/// (measured with the raw register sequence as well as esp-hal's), so any
 /// sleep that waits on a timer deadline would sleep until a button press,
-/// which outside standby is a lockup. Everywhere else the hook waits with
-/// `wfi`, which any interrupt (the next TIMG0 alarm included) ends.
+/// which outside standby is a lockup. Where the timer wake cannot be
+/// trusted the hook waits with `wfi` instead, which any interrupt (the
+/// next TIMG0 alarm included) ends.
 pub extern "C" fn idle_hook() -> ! {
     // SAFETY: the RTC block is shared with the power task's `Rtc`, which
     // only uses it for the terminal deep sleep. Light sleep runs in a
@@ -163,7 +179,7 @@ pub extern "C" fn idle_hook() -> ! {
         let slept = HOLDS.load(Ordering::SeqCst) == 0
             && !sleep_switched_off()
             && !usb_keeps_awake(usb_host_attached())
-            && standby()
+            && (standby() || timer_wake_reliable())
             && critical_section::with(|_| sleep_once(&mut rtc));
         if !slept {
             esp_hal::interrupt::wait_for_interrupt();
