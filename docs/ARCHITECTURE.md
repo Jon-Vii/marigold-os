@@ -218,6 +218,9 @@ power task's idle timeout and the power button lead to the deepest sleep: the
 power task asks the display task to draw a visible sleep screen and power down
 the panel, then moves the ESP32-C3 into deep sleep. The power button requests
 this sleep path rather than being treated as ordinary navigation input.
+From the moment a sleep begins, asked for or after the idle timeout, the
+app hears only the Power button, so a press during the sleep screen's paint
+neither stops the sleep nor paints over it.
 
 Deep sleep does not begin at once. With the sleep screen up and the panel
 powered down, the power task first rests in standby for an hour
@@ -228,15 +231,15 @@ leaned on in a bag neither wakes the chip nor holds it awake. Nothing has
 been lost, so a Power press in standby paints the view the reader left over
 the sleep screen. The app task knows the display is asleep and treats that
 press as a wake, its `Activity` ends the power task's standby, and the
-previous-frame buffer still holds the sleep screen, so the paint is a page
-turn (see "Display model"). Light sleep draws more than deep sleep, on the
+paint is the one-flicker clean (see "Display model"). Light sleep draws more than deep sleep, on the
 order of a milliamp against microamps, which is why the window is bounded:
 an hour of it costs a fraction of a percent of the battery, and a reader
 put down for the night spends the night in deep sleep. A Wi-Fi session
 skips standby, since its radio holds the chip awake until the reset that
 ends it. So does a sleep more than three hours after boot: the panel
 temperature that sets the page turn's length is read at boot, and a wake
-that reboots reads it again.
+that reboots reads it again. The X3 skips standby, and light sleep, as
+described next.
 
 Between page turns the chip light-sleeps (`fw::light_sleep`). esp-rtos runs an
 idle hook whenever no thread is ready; ours sleeps until the next timer is due
@@ -252,6 +255,14 @@ an I2C read. Light sleep also stops the systimer behind `Instant::now()` and
 the TIMG0 alarm esp-rtos wakes on, so each sleep runs to that alarm's
 deadline, moves the systimer forward by the time the RTC clock counted, and
 fires the alarm at once; every embassy timer keeps wall-clock time.
+
+All of this is on the X4 only. On an X3 the RTC timer alarm never ends a
+light sleep (it fires while the chip is awake, and a sleep waiting on it
+never wakes), so every sleep lasted until a button pulled a pin low, and
+v0.9.0 stopped answering most buttons on battery. The X4 has the same
+chip revision and its timer works, so the cause is on the X3's board. Until
+it is found the X3 idles with `wfi`, as before light sleep, and goes from
+the sleep screen straight to deep sleep.
 
 The Power button and Next on either ladder pull their lines to 0 V and end a
 sleep the moment they are pressed. The other ladder buttons sit too high to

@@ -1,20 +1,20 @@
-//! Light sleep in standby.
+//! Light sleep between page turns, and in standby.
 //!
-//! While the sleep screen is up but the chip has not gone to deep sleep yet
-//! (standby, see `tasks::power`), the chip light-sleeps between polls of the
-//! Power button instead of idling at 160 MHz: RAM, registers and pad states
-//! stay put, the clocks and the PLL stop, and the chip resumes in place when
-//! the Power button goes low or the USB cable is plugged in.
+//! A reader spends nearly all of its awake time waiting for the next press.
+//! Waiting used to be a `wfi` at 160 MHz with every clock running; this
+//! module replaces esp-rtos's idle hook so that, when no task needs the
+//! chip, it light-sleeps instead: RAM, registers and pad states stay put,
+//! the clocks and the PLL stop, and the chip resumes in place when the next
+//! timer is due or a wake button goes low.
 //!
-//! Outside standby the idle hook light-sleeps between page turns only on
-//! silicon where the RTC main-timer alarm reliably ends a light sleep (see
-//! [`timer_wake_reliable`]); on ESP32-C3 rev v0.4 it never fires from light
-//! sleep (measured: the alarm fires while awake, but a light sleep armed
-//! with it as its wake source never wakes), so a sleep that waits for the
-//! next timer deadline would sleep until a button press — on battery, with
-//! nobody pressing, that is a lockup. On such silicon the hook waits with
-//! `wfi` outside standby instead, which any interrupt (the next TIMG0
-//! alarm included) ends.
+//! The X4 only (see [`supported`]). On an X3 the RTC timer alarm never ends
+//! a light sleep: it fires while the chip is awake, but a sleep with it as
+//! the wake source does not wake, and even the RTC watchdog stays quiet,
+//! as if the RTC slow clock stops (measured by Jan Steinke, Nov 2026). Every
+//! sleep would then last until a button pulls a pin low, and most buttons
+//! never do. The X4 carries the same chip revision (v0.4) and its timer
+//! wakes it thousands of times a minute, so the cause is on the X3's board,
+//! not in the silicon.
 //!
 //! Tasks that are mid-way through hardware work hold the chip awake (see
 //! [`Hold`]). The idle hook only runs when every thread is blocked, so
@@ -79,22 +79,18 @@ pub fn standby() -> bool {
     STANDBY.load(Ordering::SeqCst)
 }
 
-/// Whether the RTC main-timer alarm reliably ends a light sleep on this
-/// silicon, so a timer-bounded sleep between page turns is safe. Measured
-/// broken on ESP32-C3 rev v0.4 (an X3): the alarm fires while awake, but a
-/// light sleep armed with it as its wake source never wakes — even the RTC
-/// watchdog does not fire during such a sleep, i.e. the RTC slow clock
-/// appears stalled in light sleep. Only rev v0.4 was measured; later
-/// revisions keep the between-page-turns sleep.
-fn timer_wake_reliable() -> bool {
-    let rev = esp_hal::efuse::chip_revision();
-    rev.major > 0 || rev.minor > 4
+/// Whether this board's RTC timer ends a light sleep, so the chip may
+/// light-sleep at all. Off on the X3, which then idles with `wfi` as before
+/// light sleep existed (see the module comment).
+const fn supported() -> bool {
+    !cfg!(feature = "device-x3")
 }
 
 /// Whether a sleep may rest in standby before deep sleep. A Wi-Fi session
-/// holds the chip awake until its reset, so it goes straight down.
+/// holds the chip awake until its reset, so it goes straight down. So does
+/// a board without light sleep, where standby would idle at full power.
 pub fn standby_allowed() -> bool {
-    HOLDS.load(Ordering::SeqCst) & Hold::Wifi as u8 == 0
+    supported() && HOLDS.load(Ordering::SeqCst) & Hold::Wifi as u8 == 0
 }
 
 /// Raised after a sleep that a button ended, so the input task samples at
@@ -159,16 +155,6 @@ static USB_ENUMERATING_UNTIL_US: AtomicU64 = AtomicU64::new(0);
 /// esp-rtos idle hook: runs whenever no thread is ready. esp-rtos does not
 /// save the idle context, so every idle period re-enters this function from
 /// the top; anything that must outlive one idle period lives in a static.
-///
-/// Light sleep is always entered in standby, where the Power button (and a
-/// USB plug) are the only wake sources that matter. Outside standby it is
-/// entered only when [`timer_wake_reliable`] says the RTC main-timer alarm
-/// ends a light sleep on this silicon; on ESP32-C3 rev v0.4 it never does
-/// (measured with the raw register sequence as well as esp-hal's), so any
-/// sleep that waits on a timer deadline would sleep until a button press,
-/// which outside standby is a lockup. Where the timer wake cannot be
-/// trusted the hook waits with `wfi` instead, which any interrupt (the
-/// next TIMG0 alarm included) ends.
 pub extern "C" fn idle_hook() -> ! {
     // SAFETY: the RTC block is shared with the power task's `Rtc`, which
     // only uses it for the terminal deep sleep. Light sleep runs in a
@@ -176,10 +162,10 @@ pub extern "C" fn idle_hook() -> ! {
     #[allow(unsafe_code)]
     let mut rtc = Rtc::new(unsafe { LPWR::steal() });
     loop {
-        let slept = HOLDS.load(Ordering::SeqCst) == 0
+        let slept = supported()
+            && HOLDS.load(Ordering::SeqCst) == 0
             && !sleep_switched_off()
             && !usb_keeps_awake(usb_host_attached())
-            && (standby() || timer_wake_reliable())
             && critical_section::with(|_| sleep_once(&mut rtc));
         if !slept {
             esp_hal::interrupt::wait_for_interrupt();
