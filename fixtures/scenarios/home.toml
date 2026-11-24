@@ -7,7 +7,7 @@ button = "Back"
 [expect]
 view = "Home"
 selection = 0
-# Boot itself is the deep Full (asserted via history); the panel is clean
-# after it, so the post-boot re-render is a fast refresh.
-last_refresh = "Fast"
+# Boot itself is the deep Full (asserted via history); coming back to Home
+# from Files is a change of view, the one-flicker FastClean.
+last_refresh = "FastClean"
 history_contains = "refresh Full"

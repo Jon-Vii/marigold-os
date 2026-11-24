@@ -369,27 +369,15 @@ the panel's contents are known, it runs instead of the full waveform. After a
 FastClean settles, the update sequence reloads the sensed temperature so
 later fast refreshes go back to sensor-accurate timing.
 
-A clean is due where ghosting has built up, and the planner counts the fast
-refreshes since the last one. A change of view (or of book) is where a
-flicker is expected, so it takes the clean once
-`DEFAULT_FULL_REFRESH_INTERVAL` (9) fast refreshes have built up; before
-that there is nothing to clean and the view changes like a page turn. A
-change of type settings or orientation always cleans.
+A change of view (or of book) always takes the clean. It redraws the whole
+screen, and a fast refresh, which only drives the pixels that differ, leaves
+the old view showing through. A change of type settings or orientation
+cleans for the same reason. Moves inside a view stay fast.
 
-Waking needs no clean either: the sleep screen was painted with the full
-waveform and nothing has been drawn since. A fast refresh drives each pixel
-from the previous frame to the new one, so the wake only needs the sleep
-screen's pixels as that previous frame. In standby they are still in the
-previous-frame buffer. After deep sleep the buffer is gone, so the sleep
-path leaves a 30-bit digest of the frame in the wake mark, and the first
-render draws the sleep screen again from its own request and the restored
-store (`hold_woken_sleep_frame`). If that digests to the same value, it is
-the frame on the panel, and the first paint is a page turn with the panel's
-own waveform. If the state it was drawn from has moved (a chapter cursor
-that settled after the last paint, say), the digests differ and the paint
-takes the FastClean, which reads no previous frame. The X3's driver turns a
-fast refresh on a panel it has just powered up into its FastClean, so the
-X3 still wakes with one flicker.
+Waking takes the clean too. The sleep screen was painted with the full
+waveform, so the panel's state is known and the full waveform is not needed
+again, but the page replaces the whole screen and a fast refresh would leave
+the sleep screen showing through.
 
 The X3's UC8253 has two RAM planes (DTM1 "old", DTM2 "new") instead of BW/RED,
 and its waveform LUTs are uploaded per refresh. Each `RefreshMode` therefore
@@ -403,12 +391,11 @@ refreshes have built up, the refresh planner schedules a cleaning refresh
 (FastClean) for the tenth page instead of another fast one. Deep sleep reboots
 the chip, so the planner itself doesn't survive it. `fw::wake_mark` keeps
 what matters in the RTC STORE0 retention register (RTC fast memory is powered
-down in deep sleep): that the sleep screen is up, the digest of its pixels,
-and whether the reader slept on a reading page. The display task sets it when
+down in deep sleep): that the sleep screen is up, and whether the reader
+slept on a reading page. The display task sets it when
 the sleep screen finishes and boot consumes it, trusting it only when the
 reset reason is a deep-sleep wake. A marked wake seeds the planner as if it
-had just slept, so the first paint is the page turn or FastClean described
-above; `FullOnWake` keeps the deep Full there. A cold boot, a reset for any
+had just slept, so the first paint is the FastClean described above; `FullOnWake` keeps the deep Full there. A cold boot, a reset for any
 other reason, or a sleep whose screen failed paints with Full.
 
 `display::epd::ssd1677` has three transform constants, as validated during
