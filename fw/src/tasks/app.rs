@@ -79,9 +79,8 @@ pub async fn run() {
     // The sleep screen is up and the power task is in standby or on its way
     // to deep sleep. The Power button wakes the reader where it was.
     let mut asleep = false;
-    // A Power press asked for sleep and the display's sleep render is still
-    // in flight; the screen is not asleep yet, but the transition must not
-    // be aborted by a stray button event from before the press.
+    // A Power press asked for sleep and the power task may not have started
+    // it yet. From then until a wake, only Power is heard (see `sleeping`).
     let mut sleep_pending = false;
     let mut next_page = NextPageOffer::new();
     if STORAGE_COMMANDS
@@ -99,7 +98,7 @@ pub async fn run() {
             ctx,
             !rendering
                 && !render_pending
-                && !asleep
+                && !sleeping(asleep, sleep_pending)
                 && pending_storage.is_none()
                 && opening_book.is_none()
                 && !suppress_input_until_open_settled
@@ -166,7 +165,9 @@ pub async fn run() {
                     &mut pending_progress,
                 );
             }
-            if !should_render || awaiting_reader_data {
+            if !should_render || awaiting_reader_data || sleeping(asleep, sleep_pending) {
+                // While sleeping nothing is painted over the sleep screen;
+                // the wake paints the state as it stands then.
                 continue;
             }
             resuming = false;
@@ -210,7 +211,6 @@ pub async fn run() {
                         // standby, and the view the reader left is painted
                         // over the sleep screen.
                         esp_println::println!("app: wake requested");
-                        sleep_pending = false;
                         state = state.apply_input(ctx, event);
                         let _ = POWER_EVENTS.send(PowerEvent::Activity).await;
                         send_render(
@@ -244,15 +244,17 @@ pub async fn run() {
                     }
                     let _ = POWER_EVENTS.send(PowerEvent::SleepNow).await;
                     sleep_pending = true;
+                    // A render still owed to an earlier press would be queued
+                    // behind the sleep and painted over its screen.
+                    render_pending = false;
                     continue;
                 }
 
-                if asleep || sleep_pending {
-                    // The sleep screen is up, or its render is still in
-                    // flight: as in standby and deep sleep, only the Power
-                    // button is heard. A ladder event queued from just
-                    // before the Power press must neither abort the sleep
-                    // transition nor wake the reader afterwards.
+                if sleeping(asleep, sleep_pending) {
+                    // A sleep has begun, asked for or after the idle timeout,
+                    // and its screen is being painted or is up: as in standby
+                    // and deep sleep, only the Power button is heard. A press
+                    // here must neither abort the sleep nor paint over it.
                     esp_println::println!("app: input ignored while sleeping");
                     continue;
                 }
@@ -281,7 +283,6 @@ pub async fn run() {
                 }
 
                 let _ = POWER_EVENTS.try_send(PowerEvent::Activity);
-                asleep = false;
                 let previous = state;
                 let previous_persisted = state.persisted();
                 state = state.apply_input(ctx, event);
@@ -399,7 +400,9 @@ pub async fn run() {
                     if let Some(command) = pending_progress.take() {
                         STORAGE_COMMANDS.send(command).await;
                     }
-                    if render_pending {
+                    if render_pending && sleeping(asleep, sleep_pending) {
+                        render_pending = false;
+                    } else if render_pending {
                         send_render(
                             first_render_kind(&mut boot_render_pending),
                             &state,
@@ -436,7 +439,7 @@ pub async fn run() {
             Either4::Third(_) => {}
             Either4::Fourth(event) => {
                 state = state.apply_sync_event(event);
-                if state.view != AppView::Wireless {
+                if state.view != AppView::Wireless || sleeping(asleep, sleep_pending) {
                     continue;
                 }
                 if rendering {
@@ -454,6 +457,13 @@ pub async fn run() {
             }
         }
     }
+}
+
+/// Whether a sleep has begun and no Power press has woken the reader since:
+/// one the app asked for, one the power task started after the idle
+/// timeout, or a sleep screen that is up.
+fn sleeping(asleep: bool, sleep_pending: bool) -> bool {
+    asleep || sleep_pending || crate::tasks::power::sleeping()
 }
 
 /// Hand a reader command to the display task, or park it for the next

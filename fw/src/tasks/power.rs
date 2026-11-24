@@ -3,6 +3,7 @@ use embassy_futures::select::{select, Either};
 use embassy_time::{Duration, Instant, Timer};
 use esp_hal::peripherals::{GPIO3, LPWR};
 use esp_hal::rtc_cntl::Rtc;
+use portable_atomic::{AtomicBool, Ordering};
 
 /// Idle time with no input before the device puts itself into deep sleep.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
@@ -51,6 +52,16 @@ const fn parse_secs(text: Option<&str>) -> u64 {
     secs
 }
 
+/// Set while a sleep runs, from its start (asked for, or after the idle
+/// timeout) until a press ends it.
+static SLEEPING: AtomicBool = AtomicBool::new(false);
+
+/// Whether a sleep has begun and nothing has ended it yet. The app hears
+/// only the Power button meanwhile.
+pub fn sleeping() -> bool {
+    SLEEPING.load(Ordering::Relaxed)
+}
+
 #[embassy_executor::task]
 pub async fn run(lpwr: LPWR<'static>) {
     esp_println::println!("power: started");
@@ -65,7 +76,7 @@ pub async fn run(lpwr: LPWR<'static>) {
                 // Power button: sleep on demand.
                 PowerEvent::SleepNow => {
                     enter_sleep(&mut rtc).await;
-                    // Only reached if a late button press aborted the handshake.
+                    // Only reached once a Power press has ended the sleep.
                     deadline = Instant::now() + IDLE_TIMEOUT;
                 }
                 PowerEvent::DisplaySettled
@@ -86,13 +97,15 @@ pub async fn run(lpwr: LPWR<'static>) {
 /// pending reading progress, rests in standby, then powers the SoC down
 /// into deep sleep with the Power button as the wake source.
 ///
-/// Deep sleep is terminal — the chip reboots on wake — so this only returns
-/// if a button press arrives first: during the display handshake, which
-/// aborts the transition, or in standby, which the Power button ends.
+/// Deep sleep is terminal (the chip reboots on wake), so this only returns
+/// if the Power button wakes the reader from standby first. Once a sleep
+/// begins the app hears no other button, so nothing else ends it; an
+/// `Activity` sent just before the sleep began still does.
 /// Waiting for `DisplayAsleep` lets the display write pending progress and
 /// paint its sleep image first; it answers even when either of those fails.
 async fn enter_sleep(rtc: &mut Rtc<'_>) {
     esp_println::println!("power: display sleep");
+    SLEEPING.store(true, Ordering::Relaxed);
     DISPLAY_COMMANDS.send(DisplayCommand::Sleep).await;
     let mut deadline = Instant::now() + SLEEP_HANDSHAKE_TIMEOUT;
     let mut standing_by = false;
@@ -133,6 +146,7 @@ async fn enter_sleep(rtc: &mut Rtc<'_>) {
                     );
                 }
                 crate::light_sleep::set_standby(false);
+                SLEEPING.store(false, Ordering::Relaxed);
                 return;
             }
             // Outcomes of renders still in flight when sleep was requested;
