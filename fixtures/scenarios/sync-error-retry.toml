@@ -20,4 +20,4 @@ button = "Back"
 [expect]
 view = "Home"
 sync_status = "idle"
-last_refresh = "Fast"
+last_refresh = "FastClean"

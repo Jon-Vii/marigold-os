@@ -1,4 +1,4 @@
-//! Light sleep between page turns.
+//! Light sleep between page turns, and in standby.
 //!
 //! A reader spends nearly all of its awake time waiting for the next press.
 //! Waiting used to be a `wfi` at 160 MHz with every clock running; this
@@ -6,6 +6,15 @@
 //! chip, it light-sleeps instead: RAM, registers and pad states stay put,
 //! the clocks and the PLL stop, and the chip resumes in place when the next
 //! timer is due or a wake button goes low.
+//!
+//! The X4 only (see [`supported`]). On an X3 the RTC timer alarm never ends
+//! a light sleep: it fires while the chip is awake, but a sleep with it as
+//! the wake source does not wake, and even the RTC watchdog stays quiet,
+//! as if the RTC slow clock stops (measured by Jan Steinke, Nov 2026). Every
+//! sleep would then last until a button pulls a pin low, and most buttons
+//! never do. The X4 carries the same chip revision (v0.4) and its timer
+//! wakes it thousands of times a minute, so the cause is on the X3's board,
+//! not in the silicon.
 //!
 //! Tasks that are mid-way through hardware work hold the chip awake (see
 //! [`Hold`]). The idle hook only runs when every thread is blocked, so
@@ -70,10 +79,18 @@ pub fn standby() -> bool {
     STANDBY.load(Ordering::SeqCst)
 }
 
+/// Whether this board's RTC timer ends a light sleep, so the chip may
+/// light-sleep at all. Off on the X3, which then idles with `wfi` as before
+/// light sleep existed (see the module comment).
+const fn supported() -> bool {
+    !cfg!(feature = "device-x3")
+}
+
 /// Whether a sleep may rest in standby before deep sleep. A Wi-Fi session
-/// holds the chip awake until its reset, so it goes straight down.
+/// holds the chip awake until its reset, so it goes straight down. So does
+/// a board without light sleep, where standby would idle at full power.
 pub fn standby_allowed() -> bool {
-    HOLDS.load(Ordering::SeqCst) & Hold::Wifi as u8 == 0
+    supported() && HOLDS.load(Ordering::SeqCst) & Hold::Wifi as u8 == 0
 }
 
 /// Raised after a sleep that a button ended, so the input task samples at
@@ -145,7 +162,8 @@ pub extern "C" fn idle_hook() -> ! {
     #[allow(unsafe_code)]
     let mut rtc = Rtc::new(unsafe { LPWR::steal() });
     loop {
-        let slept = HOLDS.load(Ordering::SeqCst) == 0
+        let slept = supported()
+            && HOLDS.load(Ordering::SeqCst) == 0
             && !sleep_switched_off()
             && !usb_keeps_awake(usb_host_attached())
             && critical_section::with(|_| sleep_once(&mut rtc));

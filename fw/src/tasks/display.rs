@@ -79,10 +79,9 @@ pub async fn run(
     let mut sync_session = SyncSession::default();
     let mut refresh_planner = RefreshPlanner::new();
     // Waking from deep sleep is a reboot; the mark says the panel still
-    // shows the sleep screen, so the first paint has nothing to clean. It
-    // is a page turn if the sleep screen can be drawn again as it was (see
-    // `hold_woken_sleep_frame`).
-    let mut woke_on_sleep_screen = crate::wake_mark::at_boot();
+    // shows the sleep screen, so the first paint takes the one-flicker
+    // clean instead of a cold boot's full waveform.
+    let woke_on_sleep_screen = crate::wake_mark::at_boot();
     if woke_on_sleep_screen.is_some() {
         refresh_planner.record_sleep();
     }
@@ -353,20 +352,6 @@ pub async fn run(
                     panel_ready = true;
                 }
 
-                // The first paint over a sleep screen takes the panel's own
-                // page turn: the screen may have stood for days.
-                let waking = refresh_planner.panel_shows_sleep_screen();
-                if let Some(screen) = woke_on_sleep_screen.take() {
-                    if waking {
-                        hold_woken_sleep_frame(
-                            screen,
-                            prev_fb,
-                            request,
-                            sd_library,
-                            &mut refresh_planner,
-                        );
-                    }
-                }
                 let mode = refresh_planner.mode_for(request);
                 if content_context_changed {
                     esp_println::println!(
@@ -377,7 +362,7 @@ pub async fn run(
                 }
                 let flush_start = Instant::now();
                 let has_images = crate::views::reader_page_has_images(request, sd_library);
-                let quick_allowed = !(has_images || shown_has_images || waking);
+                let quick_allowed = !(has_images || shown_has_images);
                 let flushed = if staged {
                     display_flush::flush_staged(
                         &mut epd,
@@ -528,7 +513,6 @@ pub async fn run(
                     );
                 }
                 let sleep_screen = crate::wake_mark::SleepScreen {
-                    digest: crate::wake_mark::frame_digest(fb),
                     reading: refresh_planner
                         .last_request()
                         .is_some_and(|last| last.view == AppView::Reading),
@@ -568,10 +552,7 @@ pub async fn run(
                 let ok = panel_slept && sleep_frame_settled;
                 crate::wake_mark::set(ok.then_some(sleep_screen));
                 if ok {
-                    // prev_fb holds the sleep screen for as long as the chip
-                    // stays up, so a wake before deep sleep is a page turn.
                     refresh_planner.record_sleep();
-                    refresh_planner.hold_sleep_frame();
                 } else {
                     // The panel may hold a half-written frame or be powered
                     // down; if this sleep is aborted, the next render must
@@ -649,7 +630,7 @@ pub async fn run(
                         .await
                         .is_ok()
                         {
-                            refresh_planner.record_render(loading_request, mode);
+                            refresh_planner.record_loading_plate(loading_request, mode);
                             last_reader_render_ready = false;
                             prev_fb.copy_from(fb);
                             prev_prestaged = false;
@@ -1745,37 +1726,6 @@ fn restored_page_count(
     } else {
         reader_cache::restore_book_page_count(epd, sd_cs, index, library)
     }
-}
-
-/// After a deep-sleep wake, draw the sleep screen into `prev_fb` as the
-/// sleep path drew it, from the first render's request and the restored
-/// store. If it digests to what the sleep path recorded, `prev_fb` is the
-/// frame on the panel and the planner may turn the page from it. If the
-/// state it was drawn from has moved (a chapter cursor that settled after
-/// the last paint, a page count that grew), the digest differs and the
-/// paint takes the clean, which reads no previous frame.
-fn hold_woken_sleep_frame(
-    screen: crate::wake_mark::SleepScreen,
-    prev_fb: &mut Framebuffer,
-    request: RenderRequest,
-    library: &ReaderStore,
-    refresh_planner: &mut RefreshPlanner,
-) {
-    let start = Instant::now();
-    crate::views::render_sleep(prev_fb, request, library);
-    let held = crate::wake_mark::matches(screen, prev_fb);
-    if held {
-        refresh_planner.hold_sleep_frame();
-    }
-    esp_println::println!(
-        "bench: wake_frame held={} view={:?} page={} page_count={} chapter={} draw_us={}",
-        held,
-        request.view,
-        request.page,
-        request.page_count,
-        request.chapter,
-        start.elapsed().as_micros(),
-    );
 }
 
 fn sleep_request_from_saved_state(

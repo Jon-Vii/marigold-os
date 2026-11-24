@@ -416,8 +416,6 @@ impl Emulator {
         self.prev_prestaged = false;
         self.panel.deep_sleep().expect("panel deep sleep");
         self.refresh_planner.record_sleep();
-        // As in the firmware's standby: prev_fb still holds the sleep screen.
-        self.refresh_planner.hold_sleep_frame();
     }
 }
 

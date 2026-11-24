@@ -144,8 +144,8 @@ pub enum FrontButtons {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RefreshPolicy {
-    /// Page turns ride the fast refresh, and so does waking from the sleep
-    /// screen this firmware drew.
+    /// Page turns ride the fast refresh; waking onto the sleep screen this
+    /// firmware drew takes the one-flicker clean.
     FastOnly,
     /// As `FastOnly`, but every wake takes the deep multi-flash full
     /// waveform.
@@ -157,8 +157,7 @@ pub enum RefreshPolicy {
 
 /// Fast refreshes between periodic cleans under `FullEveryTen`: nine fast
 /// turns, then the tenth page cleans (a one-flicker FastClean, not the
-/// multi-flash Full). Under every policy a change of view cleans once this
-/// many have built up.
+/// multi-flash Full).
 pub const DEFAULT_FULL_REFRESH_INTERVAL: u8 = 9;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,7 +168,9 @@ pub struct RefreshPlanner {
     fast_refresh_enabled: bool,
     full_refresh_interval: u8,
     panel_shows_sleep_screen: bool,
-    sleep_frame_held: bool,
+    /// The panel shows a reader loading plate, which the page it stands
+    /// in for replaces whole.
+    panel_shows_loading_plate: bool,
 }
 
 impl Default for RefreshPlanner {
@@ -187,7 +188,7 @@ impl RefreshPlanner {
             fast_refresh_enabled: true,
             full_refresh_interval: DEFAULT_FULL_REFRESH_INTERVAL,
             panel_shows_sleep_screen: false,
-            sleep_frame_held: false,
+            panel_shows_loading_plate: false,
         }
     }
 
@@ -204,31 +205,21 @@ impl RefreshPlanner {
         self.last_request
     }
 
-    /// Whether the panel shows the sleep screen and nothing has been drawn
-    /// over it yet.
-    pub const fn panel_shows_sleep_screen(&self) -> bool {
-        self.panel_shows_sleep_screen
-    }
-
     pub fn mode_for(&self, request: RenderRequest) -> RefreshMode {
         let Some(last) = self.last_request else {
             // Cold boot leaves unknown pixels on the panel; only the deep
             // full waveform reliably clears them. After a display sleep the
-            // panel still shows the sleep screen this firmware drew with
-            // that waveform, so nothing needs cleaning: with the screen's
-            // pixels in hand as the previous frame, waking is a page turn.
-            // Without them the one-flicker clean, which needs no previous
-            // frame, is enough. A reader who asked for the full waveform on
-            // every wake gets it.
-            return if !self.fast_refresh_enabled
-                || !self.panel_shows_sleep_screen
-                || request.refresh_policy == RefreshPolicy::FullOnWake
+            // panel still shows the sleep screen this firmware drew, so the
+            // one-flicker clean is enough to wake, unless the reader asked
+            // for the full waveform on every wake. A fast refresh would
+            // leave the sleep screen showing through the page.
+            return if self.fast_refresh_enabled
+                && self.panel_shows_sleep_screen
+                && request.refresh_policy != RefreshPolicy::FullOnWake
             {
-                RefreshMode::Full
-            } else if self.sleep_frame_held {
-                RefreshMode::Fast
-            } else {
                 RefreshMode::FastClean
+            } else {
+                RefreshMode::Full
             };
         };
         if !self.fast_refresh_enabled || !self.screen_on {
@@ -245,16 +236,21 @@ impl RefreshPlanner {
         {
             return RefreshMode::FastClean;
         }
-        let due = self.fast_refreshes >= self.full_refresh_interval;
-        // A change of view is where the reader expects a flicker, so it is
-        // where the ghosting that fast refreshes have built up is cleaned,
-        // with the one-flicker clean since the panel state is known. A
-        // panel cleaned a few refreshes ago has nothing to clean, and the
-        // view changes like a page turn.
-        let context_changed = request.view != last.view
+        // A change of view redraws the whole screen, and a fast refresh
+        // only drives the pixels that differ, which leaves the old view
+        // showing through. The panel state is known (the frame just shown),
+        // so the one-flicker clean suffices and the multi-flash full
+        // waveform stays reserved for boot and sleep.
+        if request.view != last.view
             || request.book_id != last.book_id
-            || Self::needs_clean_library_refresh(request, last);
-        if due && (context_changed || request.refresh_policy == RefreshPolicy::FullEveryTen) {
+            || self.panel_shows_loading_plate
+            || Self::needs_clean_library_refresh(request, last)
+        {
+            return RefreshMode::FastClean;
+        }
+        if request.refresh_policy == RefreshPolicy::FullEveryTen
+            && self.fast_refreshes >= self.full_refresh_interval
+        {
             RefreshMode::FastClean
         } else {
             RefreshMode::Fast
@@ -265,12 +261,20 @@ impl RefreshPlanner {
         self.screen_on = true;
         self.last_request = Some(request);
         self.panel_shows_sleep_screen = false;
-        self.sleep_frame_held = false;
+        self.panel_shows_loading_plate = false;
         if mode == RefreshMode::Fast {
             self.fast_refreshes = self.fast_refreshes.saturating_add(1);
         } else {
             self.fast_refreshes = 0;
         }
+    }
+
+    /// As [`record_render`](Self::record_render), for a reader loading
+    /// plate: it shares the page's view and book, but the page that follows
+    /// replaces it whole, so that paint cleans as a change of view would.
+    pub fn record_loading_plate(&mut self, request: RenderRequest, mode: RefreshMode) {
+        self.record_render(request, mode);
+        self.panel_shows_loading_plate = true;
     }
 
     /// The panel now shows the sleep screen. Also called at boot when the
@@ -281,13 +285,7 @@ impl RefreshPlanner {
         self.fast_refreshes = 0;
         self.last_request = None;
         self.panel_shows_sleep_screen = true;
-        self.sleep_frame_held = false;
-    }
-
-    /// The previous-frame buffer holds the sleep screen on the panel, pixel
-    /// for pixel, so the first paint over it can be a fast refresh.
-    pub fn hold_sleep_frame(&mut self) {
-        self.sleep_frame_held = self.panel_shows_sleep_screen;
+        self.panel_shows_loading_plate = false;
     }
 
     /// The panel's state is no longer known (a sleep transition failed part
@@ -298,7 +296,7 @@ impl RefreshPlanner {
         self.fast_refreshes = 0;
         self.last_request = None;
         self.panel_shows_sleep_screen = false;
-        self.sleep_frame_held = false;
+        self.panel_shows_loading_plate = false;
     }
 
     fn needs_clean_library_refresh(request: RenderRequest, last: RenderRequest) -> bool {
@@ -3008,7 +3006,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_plan_cleans_a_view_change_only_once_ghosting_has_built_up() {
+    fn refresh_plan_uses_fast_clean_for_view_changes_and_fast_for_selection() {
         let mut planner = RefreshPlanner::new();
         let mut request = ReaderState::boot().render_request(RenderKind::Boot);
 
@@ -3017,31 +3015,30 @@ mod tests {
         assert_eq!(planner.mode_for(request), RefreshMode::Full);
         planner.record_render(request, RefreshMode::Full);
 
-        // The panel was just cleaned: the next paint and a change of view
-        // have nothing to clean.
+        // The panel was just cleaned: painting the same view again has
+        // nothing to clean.
         request.kind = RenderKind::Page;
         assert_eq!(planner.mode_for(request), RefreshMode::Fast);
-        request.view = AppView::Settings;
-        assert_eq!(planner.mode_for(request), RefreshMode::Fast);
-        planner.record_render(request, RefreshMode::Fast);
 
-        // Fast refreshes build up; under FastOnly they never clean by
-        // themselves.
-        for selection in 1..=DEFAULT_FULL_REFRESH_INTERVAL {
+        // A change of view takes the one-flicker clean, however recently
+        // the panel was cleaned.
+        request.view = AppView::Settings;
+        assert_eq!(planner.mode_for(request), RefreshMode::FastClean);
+        planner.record_render(request, RefreshMode::FastClean);
+
+        // Cursor moves inside Settings ride the fast differential refresh,
+        // and under FastOnly they never clean by themselves.
+        for selection in 1..=DEFAULT_FULL_REFRESH_INTERVAL + 1 {
             request.selection = u16::from(selection);
             assert_eq!(planner.mode_for(request), RefreshMode::Fast);
             planner.record_render(request, RefreshMode::Fast);
         }
-        request.selection = 0;
-        assert_eq!(planner.mode_for(request), RefreshMode::Fast);
 
-        // The next change of view takes the one-flicker clean, and the
-        // count starts again.
         request.view = AppView::Home;
         assert_eq!(planner.mode_for(request), RefreshMode::FastClean);
         planner.record_render(request, RefreshMode::FastClean);
         request.view = AppView::Library;
-        assert_eq!(planner.mode_for(request), RefreshMode::Fast);
+        assert_eq!(planner.mode_for(request), RefreshMode::FastClean);
     }
 
     #[test]
@@ -3055,6 +3052,20 @@ mod tests {
         planner.record_render(request, RefreshMode::Full);
         request.selection = 1;
 
+        assert_eq!(planner.mode_for(request), RefreshMode::Fast);
+    }
+
+    #[test]
+    fn refresh_plan_cleans_the_page_after_a_loading_plate() {
+        let mut planner = RefreshPlanner::new();
+        let mut state = ReaderState::boot();
+        state.view = AppView::Reading;
+        let request = state.render_request(RenderKind::Page);
+        planner.record_render(request, RefreshMode::Full);
+
+        planner.record_loading_plate(request, RefreshMode::Fast);
+        assert_eq!(planner.mode_for(request), RefreshMode::FastClean);
+        planner.record_render(request, RefreshMode::FastClean);
         assert_eq!(planner.mode_for(request), RefreshMode::Fast);
     }
 
@@ -3097,21 +3108,16 @@ mod tests {
     }
 
     #[test]
-    fn waking_is_a_page_turn_when_the_sleep_screen_is_in_hand() {
+    fn waking_cleans_the_sleep_screen_off_the_panel() {
         let mut planner = RefreshPlanner::new();
         let mut state = ReaderState::boot();
         let request = state.render_request(RenderKind::Page);
 
-        // Nothing says the panel shows the sleep screen: holding a frame
-        // changes nothing.
-        planner.hold_sleep_frame();
+        // Nothing says the panel shows the sleep screen.
         assert_eq!(planner.mode_for(request), RefreshMode::Full);
 
         planner.record_sleep();
-        assert!(planner.panel_shows_sleep_screen());
         assert_eq!(planner.mode_for(request), RefreshMode::FastClean);
-        planner.hold_sleep_frame();
-        assert_eq!(planner.mode_for(request), RefreshMode::Fast);
 
         // The reader's choice of a full refresh on every wake stands.
         state.refresh_policy = RefreshPolicy::FullOnWake;
@@ -3120,15 +3126,7 @@ mod tests {
             RefreshMode::Full
         );
 
-        // The frame is spent by the paint over it, and a later sleep has to
-        // hand over its own.
-        planner.record_render(request, RefreshMode::Fast);
-        assert!(!planner.panel_shows_sleep_screen());
-        planner.record_sleep();
-        assert_eq!(planner.mode_for(request), RefreshMode::FastClean);
-
-        // A sleep that failed part way holds nothing.
-        planner.hold_sleep_frame();
+        // A sleep that failed part way leaves an unknown panel.
         planner.record_panel_unknown();
         assert_eq!(planner.mode_for(request), RefreshMode::Full);
     }
