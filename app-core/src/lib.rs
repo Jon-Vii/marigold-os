@@ -168,6 +168,9 @@ pub struct RefreshPlanner {
     fast_refresh_enabled: bool,
     full_refresh_interval: u8,
     panel_shows_sleep_screen: bool,
+    /// The panel shows a reader loading plate, which the page it stands
+    /// in for replaces whole.
+    panel_shows_loading_plate: bool,
 }
 
 impl Default for RefreshPlanner {
@@ -185,6 +188,7 @@ impl RefreshPlanner {
             fast_refresh_enabled: true,
             full_refresh_interval: DEFAULT_FULL_REFRESH_INTERVAL,
             panel_shows_sleep_screen: false,
+            panel_shows_loading_plate: false,
         }
     }
 
@@ -239,6 +243,7 @@ impl RefreshPlanner {
         // waveform stays reserved for boot and sleep.
         if request.view != last.view
             || request.book_id != last.book_id
+            || self.panel_shows_loading_plate
             || Self::needs_clean_library_refresh(request, last)
         {
             return RefreshMode::FastClean;
@@ -256,11 +261,20 @@ impl RefreshPlanner {
         self.screen_on = true;
         self.last_request = Some(request);
         self.panel_shows_sleep_screen = false;
+        self.panel_shows_loading_plate = false;
         if mode == RefreshMode::Fast {
             self.fast_refreshes = self.fast_refreshes.saturating_add(1);
         } else {
             self.fast_refreshes = 0;
         }
+    }
+
+    /// As [`record_render`](Self::record_render), for a reader loading
+    /// plate: it shares the page's view and book, but the page that follows
+    /// replaces it whole, so that paint cleans as a change of view would.
+    pub fn record_loading_plate(&mut self, request: RenderRequest, mode: RefreshMode) {
+        self.record_render(request, mode);
+        self.panel_shows_loading_plate = true;
     }
 
     /// The panel now shows the sleep screen. Also called at boot when the
@@ -271,6 +285,7 @@ impl RefreshPlanner {
         self.fast_refreshes = 0;
         self.last_request = None;
         self.panel_shows_sleep_screen = true;
+        self.panel_shows_loading_plate = false;
     }
 
     /// The panel's state is no longer known (a sleep transition failed part
@@ -281,6 +296,7 @@ impl RefreshPlanner {
         self.fast_refreshes = 0;
         self.last_request = None;
         self.panel_shows_sleep_screen = false;
+        self.panel_shows_loading_plate = false;
     }
 
     fn needs_clean_library_refresh(request: RenderRequest, last: RenderRequest) -> bool {
@@ -3036,6 +3052,20 @@ mod tests {
         planner.record_render(request, RefreshMode::Full);
         request.selection = 1;
 
+        assert_eq!(planner.mode_for(request), RefreshMode::Fast);
+    }
+
+    #[test]
+    fn refresh_plan_cleans_the_page_after_a_loading_plate() {
+        let mut planner = RefreshPlanner::new();
+        let mut state = ReaderState::boot();
+        state.view = AppView::Reading;
+        let request = state.render_request(RenderKind::Page);
+        planner.record_render(request, RefreshMode::Full);
+
+        planner.record_loading_plate(request, RefreshMode::Fast);
+        assert_eq!(planner.mode_for(request), RefreshMode::FastClean);
+        planner.record_render(request, RefreshMode::FastClean);
         assert_eq!(planner.mode_for(request), RefreshMode::Fast);
     }
 

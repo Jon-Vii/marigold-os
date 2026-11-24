@@ -630,7 +630,7 @@ pub async fn run(
                         .await
                         .is_ok()
                         {
-                            refresh_planner.record_render(loading_request, mode);
+                            refresh_planner.record_loading_plate(loading_request, mode);
                             last_reader_render_ready = false;
                             prev_fb.copy_from(fb);
                             prev_prestaged = false;

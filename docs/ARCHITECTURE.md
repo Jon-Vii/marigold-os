@@ -227,34 +227,34 @@ powered down, the power task first rests in standby for an hour
 (`tasks::power::STANDBY`): the chip light-sleeps as it does between page
 turns, but with the Power button as its only wake source, as in deep sleep.
 The input task stops reading the ladders, so the ADC stays off and a button
-leaned on in a bag neither wakes the chip nor holds it awake. Nothing has
-been lost, so a Power press in standby paints the view the reader left over
-the sleep screen. The app task knows the display is asleep and treats that
-press as a wake, its `Activity` ends the power task's standby, and the
-paint is the one-flicker clean (see "Display model"). Light sleep draws more than deep sleep, on the
-order of a milliamp against microamps, which is why the window is bounded:
-an hour of it costs a fraction of a percent of the battery, and a reader
-put down for the night spends the night in deep sleep. A Wi-Fi session
-skips standby, since its radio holds the chip awake until the reset that
-ends it. So does a sleep more than three hours after boot: the panel
-temperature that sets the page turn's length is read at boot, and a wake
-that reboots reads it again. The X3 skips standby, and light sleep, as
-described next.
+leaned on in a bag neither wakes the chip nor holds it awake. Nothing has been
+lost, so a Power press in standby paints the view the reader left over the
+sleep screen. The app task knows the display is asleep and treats that press
+as a wake, its `Activity` ends the power task's standby, and the paint is the
+one-flicker clean (see "Display model"). Light sleep draws more than deep
+sleep, on the order of a milliamp against microamps, which is why the window
+is bounded: an hour of it costs a fraction of a percent of the battery, and a
+reader put down for the night spends the night in deep sleep. A Wi-Fi session
+skips standby, since its radio holds the chip awake until the reset that ends
+it. So does a sleep more than three hours after boot: the panel temperature
+that sets the page turn's length is read at boot, and a wake that reboots
+reads it again. The X3 skips standby, and light sleep, as described next.
 
 Between page turns the chip light-sleeps (`fw::light_sleep`). esp-rtos runs an
 idle hook whenever no thread is ready; ours sleeps until the next timer is due
 instead of waiting with `wfi` at 160 MHz. Resting on a page, the chip is
-asleep about 97.7% of the time (measured on an X4 with the 15 ms button
-poll), which by the datasheet's figures is about 1 mA instead of about 20. On an X4 turning a page every 30 s off USB, the battery
-voltage fell 3 to 7 times slower with light sleep on than in the phases with it
-off before and after. RAM, registers and pad states survive; the
-clocks stop. A task with hardware work in flight holds the chip awake: the
-display task everywhere except its wait for the next command, the input task
-while it samples, a Wi-Fi session from start to reset, and the X3 gauge during
-an I2C read. Light sleep also stops the systimer behind `Instant::now()` and
-the TIMG0 alarm esp-rtos wakes on, so each sleep runs to that alarm's
-deadline, moves the systimer forward by the time the RTC clock counted, and
-fires the alarm at once; every embassy timer keeps wall-clock time.
+asleep about 97.7% of the time (measured on an X4 with the 15 ms button poll),
+which by the datasheet's figures is about 1 mA instead of about 20. On an X4
+turning a page every 30 s off USB, the battery voltage fell 3 to 7 times
+slower with light sleep on than in the phases with it off before and after.
+RAM, registers and pad states survive; the clocks stop. A task with hardware
+work in flight holds the chip awake: the display task everywhere except its
+wait for the next command, the input task while it samples, a Wi-Fi session
+from start to reset, and the X3 gauge during an I2C read. Light sleep also
+stops the systimer behind `Instant::now()` and the TIMG0 alarm esp-rtos wakes
+on, so each sleep runs to that alarm's deadline, moves the systimer forward by
+the time the RTC clock counted, and fires the alarm at once; every embassy
+timer keeps wall-clock time.
 
 All of this is on the X4 only. On an X3 the RTC timer alarm never ends a
 light sleep (it fires while the chip is awake, and a sleep waiting on it
@@ -391,7 +391,9 @@ later fast refreshes go back to sensor-accurate timing.
 A change of view (or of book) always takes the clean. It redraws the whole
 screen, and a fast refresh, which only drives the pixels that differ, leaves
 the old view showing through. A change of type settings or orientation
-cleans for the same reason. Moves inside a view stay fast.
+cleans for the same reason, and so does the first page after a reader
+loading plate, which shares the page's view and book. Moves inside a view
+stay fast.
 
 Waking takes the clean too. The sleep screen was painted with the full
 waveform, so the panel's state is known and the full waveform is not needed
@@ -404,18 +406,19 @@ maps to a LUT bank plus a CDI mode byte, and FastClean is a half-scrub LUT bank
 (see `display/src/epd/uc8253.rs`).
 
 The user-facing `RefreshPolicy` in Settings chooses between `FastOnly` (the
-default), `FullOnWake`, and `FullEveryTen` (shown as "clean every ten").
-Under `FullEveryTen`, once `DEFAULT_FULL_REFRESH_INTERVAL` (9) consecutive fast
+default), `FullOnWake`, and `FullEveryTen` (shown as "clean every ten"). Under
+`FullEveryTen`, once `DEFAULT_FULL_REFRESH_INTERVAL` (9) consecutive fast
 refreshes have built up, the refresh planner schedules a cleaning refresh
 (FastClean) for the tenth page instead of another fast one. Deep sleep reboots
-the chip, so the planner itself doesn't survive it. `fw::wake_mark` keeps
-what matters in the RTC STORE0 retention register (RTC fast memory is powered
-down in deep sleep): that the sleep screen is up, and whether the reader
-slept on a reading page. The display task sets it when
-the sleep screen finishes and boot consumes it, trusting it only when the
-reset reason is a deep-sleep wake. A marked wake seeds the planner as if it
-had just slept, so the first paint is the FastClean described above; `FullOnWake` keeps the deep Full there. A cold boot, a reset for any
-other reason, or a sleep whose screen failed paints with Full.
+the chip, so the planner itself doesn't survive it. `fw::wake_mark` keeps what
+matters in the RTC STORE0 retention register (RTC fast memory is powered down
+in deep sleep): that the sleep screen is up, and whether the reader slept on a
+reading page. The display task sets it when the sleep screen finishes and boot
+consumes it, trusting it only when the reset reason is a deep-sleep wake. A
+marked wake seeds the planner as if it had just slept, so the first paint is
+the FastClean described above; `FullOnWake` keeps the deep Full there. A cold
+boot, a reset for any other reason, or a sleep whose screen failed paints with
+Full.
 
 `display::epd::ssd1677` has three transform constants, as validated during
 bring-up: `MIRROR_X = true`, `MIRROR_Y = false`, and `REVERSE_BITS = true`.
