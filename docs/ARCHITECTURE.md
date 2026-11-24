@@ -262,6 +262,13 @@ reset holds it low, and the chip stays awake for three seconds to enumerate.
 While a host keeps sending start-of-frame packets the chip does not sleep at
 all, so flashing and the serial console work as before.
 
+The console is the USB serial port only (`esp-println`'s `jtag-serial`).
+Its default picks the UART when no USB host has been seen since reset, as on
+battery, and the UART sends each line at 115200 baud with interrupts off:
+about 5 ms a line and 40 ms a page turn, to pins nobody reads. With no host
+the USB FIFO fills once, one wait times out, and later lines return in
+about 15 µs.
+
 Input/render backpressure is coalesced on purpose. The app keeps at most one
 display render in flight. While the display is refreshing, new button events
 still update `ReaderState`, but they set a single pending-render flag instead
