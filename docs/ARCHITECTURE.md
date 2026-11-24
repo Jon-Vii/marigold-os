@@ -241,8 +241,8 @@ that reboots reads it again.
 Between page turns the chip light-sleeps (`fw::light_sleep`). esp-rtos runs an
 idle hook whenever no thread is ready; ours sleeps until the next timer is due
 instead of waiting with `wfi` at 160 MHz. Resting on a page, the chip is
-asleep about 97% of the time, which by the datasheet's figures is about 1 mA
-instead of about 20. On an X4 turning a page every 30 s off USB, the battery
+asleep about 97.7% of the time (measured on an X4 with the 15 ms button
+poll), which by the datasheet's figures is about 1 mA instead of about 20. On an X4 turning a page every 30 s off USB, the battery
 voltage fell 3 to 7 times slower with light sleep on than in the phases with it
 off before and after. RAM, registers and pad states survive; the
 clocks stop. A task with hardware work in flight holds the chip awake: the
@@ -255,8 +255,9 @@ fires the alarm at once; every embassy timer keeps wall-clock time.
 
 The Power button and Next on either ladder pull their lines to 0 V and end a
 sleep the moment they are pressed. The other ladder buttons sit too high to
-read as a digital low and are found by the input poll: every 15 ms for 10 s
-after a press, then every 40 ms. USB D+ is a wake source too: a computer's bus
+read as a digital low and are found by the input poll, every 15 ms. A slower
+poll while idle (40 ms) saved about 1.4% of the time awake, but missed half
+the taps of 20-30 ms. USB D+ is a wake source too: a computer's bus
 reset holds it low, and the chip stays awake for three seconds to enumerate.
 While a host keeps sending start-of-frame packets the chip does not sleep at
 all, so flashing and the serial console work as before.

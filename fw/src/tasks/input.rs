@@ -20,21 +20,19 @@ pub type BatteryGauge =
     hal_ext::bq27220::Bq27220<esp_hal::i2c::master::I2c<'static, esp_hal::Async>>;
 
 // 15 ms polling; the tick-based constants below are scaled to keep their
-// wall-clock behavior.
+// wall-clock behavior. The chip light-sleeps between polls (see
+// crate::light_sleep). Next on either ladder and the Power button wake it
+// the moment they go low, but the buttons higher on the ladders sit at
+// voltages that read high, so only a poll sees them, and a tap shorter
+// than the gap between polls can fall between two. Slowing the poll to
+// 40 ms while idle missed half of the 20-30 ms taps (Nov 2026).
 const POLL_MS: u64 = 15;
-// Once no button has been down for ACTIVE_MS the poll slows to
-// IDLE_POLL_MS, and the chip light-sleeps between polls (see
-// crate::light_sleep). Next on either ladder and the Power button wake the
-// chip the moment they go low, so only the buttons that sit higher on the
-// ladders wait for a slow poll. A press brings back 15 ms polling before
-// any tick-counted debounce or repeat starts.
-const ACTIVE_MS: u64 = 10_000;
-const IDLE_POLL_MS: u64 = 40;
 // In standby (the sleep screen is up, deep sleep has not begun) only the
 // Power button is listened to. Pressing it ends the chip's light sleep at
 // once, so while the chip is sleeping between polls they can be far apart.
-// A chip kept awake (by a USB host) polls at the idle rate instead.
+// A chip kept awake (by a USB host) polls every STANDBY_AWAKE_POLL_MS.
 const STANDBY_POLL_MS: u64 = 2_000;
+const STANDBY_AWAKE_POLL_MS: u64 = 40;
 const CALIBRATION_ONLY: bool = false;
 const RAW_LOG_ENABLED: bool = false;
 const DEBOUNCE_TICKS: u8 = 2;
@@ -175,7 +173,6 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
     let mut raw_log_ticks = 0u8;
     let mut reported_percent: Option<u8> = None;
     let mut battery_seeded = false;
-    let mut last_active = Instant::now();
     let mut was_standby = false;
     let mut standby_sleeps = 0;
 
@@ -190,13 +187,10 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
             } else if slept_since_last_poll {
                 STANDBY_POLL_MS
             } else {
-                IDLE_POLL_MS
+                STANDBY_AWAKE_POLL_MS
             }
-        } else if light_sleep::sleep_switched_off() || last_active.elapsed().as_millis() < ACTIVE_MS
-        {
-            POLL_MS
         } else {
-            IDLE_POLL_MS
+            POLL_MS
         };
         // Sampling runs the ADC, so the chip may only sleep while this
         // task waits for its next poll.
@@ -234,10 +228,9 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
         }
         if core::mem::take(&mut was_standby) {
             // Back from standby: a ladder button held through the wake is
-            // not a press, and the buttons get the fast poll again.
+            // not a press.
             nav_stable = StableButton::new();
             page_stable = StableButton::new();
-            last_active = Instant::now();
         }
 
         let (battery_mv, raw_percent, aux) = read_power(&mut adc, &mut pins).await;
@@ -263,13 +256,6 @@ pub async fn run(mut adc: BoardAdcDriver, mut pins: InputPins) {
 
         if CALIBRATION_ONLY {
             continue;
-        }
-
-        if pins.power.is_low()
-            || classify(sample.nav, NAV).is_some()
-            || classify(sample.page, PAGE).is_some()
-        {
-            last_active = Instant::now();
         }
 
         let percent = stable_percent(&mut reported_percent, raw_percent);
