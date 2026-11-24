@@ -10,6 +10,10 @@ use embassy_futures::select::{select4, Either4};
 use embassy_time::{Duration, Instant};
 
 const POST_OPEN_CONFIRM_BLOCK_MS: u64 = 700;
+/// Longest a wake into reading drops presses while it waits for the saved
+/// position (see `wake_hold_until`); a card that never answers must not
+/// leave the buttons dead.
+const WAKE_INPUT_HOLD_MS: u64 = 10_000;
 
 #[embassy_executor::task]
 pub async fn run() {
@@ -24,6 +28,14 @@ pub async fn run() {
     } else {
         ReaderState::boot()
     };
+    // Until the boot catalog load reports back, the state behind the sleep
+    // screen is a placeholder Home, and a press would act on it: Back would
+    // open Files and a page key Settings or Wireless instead of the page
+    // the reader expects. Presses until then are dropped, as they are while
+    // a book opens. Every boot ends its catalog load with Scanned, after
+    // Restored when there is a position to restore.
+    let mut wake_hold_until =
+        wake_into_reading.then(|| Instant::now() + Duration::from_millis(WAKE_INPUT_HOLD_MS));
     // Compile-time dev credentials name the network immediately; the
     // display task's boot probe of /XTEINK/WIFI.BIN arrives later and
     // overrides, matching the wifi task's stored-beats-built-in order.
@@ -56,8 +68,9 @@ pub async fn run() {
     // book loads from SD ~1.5s later. Instead, kick the catalog + saved-position
     // restore now and leave the retained image (the sleep screen, on a deep-sleep
     // wake) up until it resolves; the first render is sent when Restored/Scanned
-    // lands, or by an earlier button press (see first_render_kind), so wake is a
-    // single refresh straight onto the restored book. Now that sleep is
+    // lands, or by an earlier button press (see first_render_kind; a wake into
+    // reading drops those, see wake_hold_until), so wake is a single refresh
+    // straight onto the restored book. Now that sleep is
     // terminal, wake is a full reboot. Before that, this cold-boot path never
     // showed: the real book stayed resident.
     let mut boot_render_pending = true;
@@ -109,6 +122,9 @@ pub async fn run() {
         if let Some(event) = library_event {
             if !library_event_is_current(&event) {
                 continue;
+            }
+            if library_event_allows_first_render(&event) {
+                wake_hold_until = None;
             }
             if let Some(book_id) = loaded_book_id(&event) {
                 if opening_book == Some(book_id) {
@@ -238,6 +254,11 @@ pub async fn run() {
                     // before the Power press must neither abort the sleep
                     // transition nor wake the reader afterwards.
                     esp_println::println!("app: input ignored while sleeping");
+                    continue;
+                }
+
+                if wake_hold_until.is_some_and(|until| Instant::now() < until) {
+                    esp_println::println!("app: input ignored while waking");
                     continue;
                 }
 
